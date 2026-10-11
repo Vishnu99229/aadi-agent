@@ -7,6 +7,7 @@ import {
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
 import { clearMessages } from "./db.js";
+import { handleReminderCallback } from "./reminders.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -83,6 +84,15 @@ bot.callbackQuery(
     const operation = ctx.match[1] as "send" | "edit" | "discard";
     const actionId = Number(ctx.match[2]);
     await handleApprovalCallback(ctx, operation, actionId);
+  },
+);
+
+bot.callbackQuery(
+  /^reminder:(done|snooze|tomorrow):(\d+)$/,
+  async (ctx) => {
+    const operation = ctx.match[1] as "done" | "snooze" | "tomorrow";
+    const reminderId = Number(ctx.match[2]);
+    await handleReminderCallback(ctx, operation, reminderId);
   },
 );
 
