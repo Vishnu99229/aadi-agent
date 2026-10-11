@@ -1,0 +1,37 @@
+---
+description: Aadi personal agent — project context and hard rules
+alwaysApply: true
+---
+
+# Project: Aadi
+Aadi is Vishnu's personal AI agent. Vishnu talks to it on Telegram. It answers questions, searches the web, and (in later stages) handles his Gmail, Google Calendar and Google Sheets, sends a morning brief, and reminds him of tasks.
+
+## Architecture
+- Telegram bot (grammY, long polling) is the only interface.
+- A Claude tool-use agent loop is the brain (official @anthropic-ai/sdk). Claude decides; our code executes tools.
+- SQLite (better-sqlite3) stores conversation history, memory and reminders.
+- TypeScript, Node 20+, ESM. Run with tsx in dev.
+- Timezone: Asia/Kolkata for everything user-facing.
+
+## Folder structure
+- src/index.ts – entry point
+- src/config.ts – loads and validates env vars (fail fast with a clear error)
+- src/bot.ts – Telegram handlers
+- src/agent.ts – the agent loop
+- src/db.ts – SQLite setup and queries
+- src/tools/ – one file per tool, plus index.ts as the registry
+- prompts/system.md – Aadi's system prompt
+
+## Hard rules (never break these)
+1. The bot responds ONLY to the Telegram user ID in OWNER_TELEGRAM_ID. Silently ignore everyone else.
+2. Any action that sends, deletes, books, accepts or spends must go through a Telegram approval button. Reading, searching and drafting are allowed freely.
+3. Secrets come only from .env. Never hardcode or log them. .env must be in .gitignore.
+4. Never log full email bodies or message contents. Log metadata only.
+5. Model name comes from the CLAUDE_MODEL env var, never hardcoded.
+6. Before using any Anthropic API feature (tool types, versions, stop reasons), check the current official docs. Do not rely on memory.
+
+## How we work
+- We build in stages. Each stage ends with a CHECKPOINT.
+- At a checkpoint: stop, summarise what you built, list exactly how I should test it, and wait for my "go" before continuing.
+- Do not add features beyond the current stage, even if they seem helpful. Suggest them in your summary instead.
+- Keep it simple: no frameworks beyond what's listed, no premature abstractions.

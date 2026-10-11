@@ -1,0 +1,35 @@
+{
+  "name": "aadi---agent",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "google:auth": "tsx src/google/authorize.ts",
+    "google:test": "tsx src/google/test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "description": "",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.132.1",
+    "@google-cloud/local-auth": "^3.0.1",
+    "better-sqlite3": "^12.11.1",
+    "dotenv": "^18.0.6",
+    "googleapis": "^185.0.0",
+    "grammy": "^1.46.0",
+    "node-cron": "^4.6.0",
+    "openai": "^7.31.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
