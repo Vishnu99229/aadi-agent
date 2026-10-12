@@ -7,6 +7,7 @@ import {
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
 import { clearMessages } from "./db.js";
+import { runFollowupScan, sendFollowupNudgeSummary } from "./followups.js";
 import { handleReminderCallback } from "./reminders.js";
 import { transcribeTelegramVoice } from "./voice.js";
 
@@ -77,6 +78,13 @@ bot.command("reset", async (ctx) => {
 
 bot.command("brief", async (ctx) => {
   await whileTyping(ctx, () => sendMorningBrief(ctx.api));
+});
+
+bot.command("followups", async (ctx) => {
+  await whileTyping(ctx, async () => {
+    await runFollowupScan();
+    await sendFollowupNudgeSummary(ctx.api);
+  });
 });
 
 bot.callbackQuery(

@@ -45,6 +45,14 @@ const briefTime = process.env.BRIEF_TIME!;
 const briefTimeMatch = /^(\d{2}):(\d{2})$/.exec(briefTime);
 const briefHour = Number(briefTimeMatch?.[1]);
 const briefMinute = Number(briefTimeMatch?.[2]);
+const followupAfterHours = Number(
+  process.env.FOLLOWUP_AFTER_HOURS?.trim() || "72",
+);
+const followupScanTime =
+  process.env.FOLLOWUP_SCAN_TIME?.trim() || "10:00";
+const followupScanTimeMatch = /^(\d{2}):(\d{2})$/.exec(followupScanTime);
+const followupScanHour = Number(followupScanTimeMatch?.[1]);
+const followupScanMinute = Number(followupScanTimeMatch?.[2]);
 const rawGoogleSheetId = process.env.GOOGLE_SHEET_ID?.trim();
 const googleSheetId =
   rawGoogleSheetId && rawGoogleSheetId.toLowerCase() !== "none"
@@ -59,6 +67,24 @@ if (
   briefMinute > 59
 ) {
   console.error("BRIEF_TIME must use 24-hour HH:MM format, for example 08:00.");
+  process.exit(1);
+}
+
+if (!Number.isFinite(followupAfterHours) || followupAfterHours <= 0) {
+  console.error("FOLLOWUP_AFTER_HOURS must be a positive number.");
+  process.exit(1);
+}
+
+if (
+  !followupScanTimeMatch ||
+  followupScanHour < 0 ||
+  followupScanHour > 23 ||
+  followupScanMinute < 0 ||
+  followupScanMinute > 59
+) {
+  console.error(
+    "FOLLOWUP_SCAN_TIME must use 24-hour HH:MM format, for example 10:00.",
+  );
   process.exit(1);
 }
 
@@ -84,6 +110,10 @@ export const config = {
   briefTime,
   briefHour,
   briefMinute,
+  followupAfterHours,
+  followupScanTime,
+  followupScanHour,
+  followupScanMinute,
   llmProvider: provider,
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
   claudeModel: process.env.CLAUDE_MODEL ?? "",

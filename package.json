@@ -5,6 +5,9 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
+    "deploy": "./deploy.sh",
+    "phone:pause": "./scripts/phone-pause.sh",
+    "phone:resume": "./scripts/phone-resume.sh",
     "google:auth": "tsx src/google/authorize.ts",
     "google:test": "tsx src/google/test.ts"
   },
@@ -31,5 +34,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true,
+    "esbuild@0.28.2": true
   }
 }

@@ -50,6 +50,34 @@ export interface ReminderRecord {
   created_at: string;
 }
 
+export type FollowupStatus =
+  | "waiting"
+  | "replied"
+  | "snoozed"
+  | "dismissed";
+
+export interface FollowupRecord {
+  id: number;
+  thread_id: string;
+  recipient: string;
+  subject: string;
+  tag: ItemTag;
+  last_sent_at: string;
+  status: FollowupStatus;
+  nudge_count: number;
+  next_check_at: string;
+  created_at: string;
+}
+
+export interface FollowupInput {
+  threadId: string;
+  recipient: string;
+  subject: string;
+  tag: ItemTag;
+  lastSentAt: string;
+  nextCheckAt: string;
+}
+
 const db = new Database("./aadi.db");
 
 db.exec(`
@@ -101,6 +129,23 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_reminders_status_time
     ON reminders (status, remind_at);
+
+  CREATE TABLE IF NOT EXISTS followups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL UNIQUE,
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
+    last_sent_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting'
+      CHECK (status IN ('waiting', 'replied', 'snoozed', 'dismissed')),
+    nudge_count INTEGER NOT NULL DEFAULT 0,
+    next_check_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_followups_status_next_check
+    ON followups (status, next_check_at);
 `);
 
 const insertMessage = db.prepare(
@@ -317,6 +362,128 @@ export function transitionReminderStatus(
        WHERE id = ? AND status = ?`,
     )
     .run(to, id, from);
+
+  return result.changes === 1;
+}
+
+export function getFollowup(id: number): FollowupRecord | undefined {
+  return db
+    .prepare(
+      `SELECT id, thread_id, recipient, subject, tag, last_sent_at,
+              status, nudge_count, next_check_at, created_at
+       FROM followups
+       WHERE id = ?`,
+    )
+    .get(id) as FollowupRecord | undefined;
+}
+
+export function getFollowupByThread(
+  threadId: string,
+): FollowupRecord | undefined {
+  return db
+    .prepare(
+      `SELECT id, thread_id, recipient, subject, tag, last_sent_at,
+              status, nudge_count, next_check_at, created_at
+       FROM followups
+       WHERE thread_id = ?`,
+    )
+    .get(threadId) as FollowupRecord | undefined;
+}
+
+export function getFollowups(): FollowupRecord[] {
+  return db
+    .prepare(
+      `SELECT id, thread_id, recipient, subject, tag, last_sent_at,
+              status, nudge_count, next_check_at, created_at
+       FROM followups
+       ORDER BY last_sent_at ASC, id ASC`,
+    )
+    .all() as FollowupRecord[];
+}
+
+export function createFollowup(input: FollowupInput): FollowupRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO followups (
+         thread_id, recipient, subject, tag, last_sent_at, next_check_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.threadId,
+      input.recipient,
+      input.subject,
+      input.tag,
+      input.lastSentAt,
+      input.nextCheckAt,
+    );
+
+  return getFollowup(Number(result.lastInsertRowid))!;
+}
+
+export function restartFollowup(
+  id: number,
+  input: FollowupInput,
+): FollowupRecord {
+  db.prepare(
+    `UPDATE followups
+     SET recipient = ?,
+         subject = ?,
+         tag = ?,
+         last_sent_at = ?,
+         status = 'waiting',
+         nudge_count = 0,
+         next_check_at = ?
+     WHERE id = ?`,
+  ).run(
+    input.recipient,
+    input.subject,
+    input.tag,
+    input.lastSentAt,
+    input.nextCheckAt,
+    id,
+  );
+
+  return getFollowup(id)!;
+}
+
+export function refreshFollowupSentMessage(
+  id: number,
+  recipient: string,
+  subject: string,
+  lastSentAt: string,
+  nextCheckAt: string,
+): FollowupRecord {
+  db.prepare(
+    `UPDATE followups
+     SET recipient = ?,
+         subject = ?,
+         last_sent_at = ?,
+         status = 'waiting',
+         nudge_count = 0,
+         next_check_at = ?
+     WHERE id = ? AND status IN ('waiting', 'snoozed')`,
+  ).run(recipient, subject, lastSentAt, nextCheckAt, id);
+
+  return getFollowup(id)!;
+}
+
+export function transitionFollowupStatus(
+  id: number,
+  from: FollowupStatus | FollowupStatus[],
+  to: FollowupStatus,
+): boolean {
+  const statuses = Array.isArray(from) ? from : [from];
+  if (statuses.length === 0) {
+    return false;
+  }
+  const placeholders = statuses.map(() => "?").join(", ");
+  const result = db
+    .prepare(
+      `UPDATE followups
+       SET status = ?
+       WHERE id = ? AND status IN (${placeholders})`,
+    )
+    .run(to, id, ...statuses);
 
   return result.changes === 1;
 }
