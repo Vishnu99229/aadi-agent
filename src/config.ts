@@ -89,6 +89,7 @@ export const config = {
   claudeModel: process.env.CLAUDE_MODEL ?? "",
   openRouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
   openRouterModel: process.env.OPENROUTER_MODEL ?? "",
+  sarvamApiKey: process.env.SARVAM_API_KEY?.trim() ?? "",
   inputCostPerMillion: readRate("LLM_INPUT_COST_PER_MILLION"),
   outputCostPerMillion: readRate("LLM_OUTPUT_COST_PER_MILLION"),
   cacheCreationCostPerMillion: readRate(
