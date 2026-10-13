@@ -106,12 +106,6 @@ export async function deliverWrapUp(
   ctx: Context,
   rawInput: string,
 ): Promise<void> {
-  if (config.llmProvider !== "claude") {
-    await ctx.reply(
-      "Wrap-up notes need LLM_PROVIDER=claude for structured extraction.",
-    );
-    return;
-  }
   const analysis = await buildWrapUpNotes(rawInput);
   const pending =
     analysis.action_items.length > 0 ? analysis.action_items : null;
@@ -177,7 +171,13 @@ ${note.content}
 
 People involved: ${note.people}`;
 
-  const reply = await runAgent(instruction, { saveUserMessage: false });
+  // Drafting stays on Claude: the Gemma bench skipped a required tool call
+  // (answered from context instead of get_current_time), so reply drafts
+  // are not trusted to the global /model switch yet.
+  const reply = await runAgent(instruction, {
+    saveUserMessage: false,
+    backend: "claude",
+  });
   await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
   await ctx.reply(reply);
 }

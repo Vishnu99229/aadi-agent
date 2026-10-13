@@ -1,24 +1,25 @@
 import "dotenv/config";
 
-export type LlmProvider = "claude" | "openrouter";
+export type LlmProvider = "claude" | "cloud-gemma";
 
-const provider = process.env.LLM_PROVIDER?.trim();
-
-if (provider !== "claude" && provider !== "openrouter") {
-  console.error('LLM_PROVIDER must be either "claude" or "openrouter".');
+function readProvider(): LlmProvider {
+  const value = process.env.LLM_PROVIDER?.trim() || "claude";
+  if (value === "claude" || value === "cloud-gemma") {
+    return value;
+  }
+  console.error('LLM_PROVIDER must be either "claude" or "cloud-gemma".');
   process.exit(1);
 }
 
-const providerEnvVars =
-  provider === "claude"
-    ? (["ANTHROPIC_API_KEY", "CLAUDE_MODEL"] as const)
-    : (["OPENROUTER_API_KEY", "OPENROUTER_MODEL"] as const);
+const provider = readProvider();
 
 const requiredEnvVars = [
   "TELEGRAM_BOT_TOKEN",
   "OWNER_TELEGRAM_ID",
   "BRIEF_TIME",
-  ...providerEnvVars,
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_MODEL",
+  ...(provider === "cloud-gemma" ? (["OPENROUTER_API_KEY"] as const) : []),
 ] as const;
 
 const missingEnvVars = requiredEnvVars.filter(

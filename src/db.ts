@@ -200,6 +200,11 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_important_dates_month_day
     ON important_dates (month_day);
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `);
 
 const insertMessage = db.prepare(
@@ -825,4 +830,18 @@ export function getImportantDates(): ImportantDateRecord[] {
 export function removeImportantDate(id: number): boolean {
   const result = db.prepare(`DELETE FROM important_dates WHERE id = ?`).run(id);
   return result.changes === 1;
+}
+
+export function getSetting(key: string): string | undefined {
+  const row = db
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function setSetting(key: string, value: string): void {
+  db.prepare(
+    `INSERT INTO settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  ).run(key, value);
 }

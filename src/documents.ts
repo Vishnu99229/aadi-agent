@@ -98,13 +98,6 @@ export async function processIncomingDocument(
   fileId: string,
   mimeType?: string,
 ): Promise<number | null> {
-  if (config.llmProvider !== "claude") {
-    await ctx.reply(
-      "Document reading needs LLM_PROVIDER=claude. Switch provider in .env to use PDFs and document photos.",
-    );
-    return null;
-  }
-
   const lower = fileName.toLowerCase();
   const isPdf = lower.endsWith(".pdf") || mimeType === "application/pdf";
   const isDocx = lower.endsWith(".docx");
@@ -216,13 +209,6 @@ function extractedFallback(analysis: {
 }
 
 export async function processIncomingPhoto(ctx: Context): Promise<number | null> {
-  if (config.llmProvider !== "claude") {
-    await ctx.reply(
-      "Document reading needs LLM_PROVIDER=claude. Switch provider in .env to use PDFs and document photos.",
-    );
-    return null;
-  }
-
   const photos = ctx.message?.photo;
   if (!photos?.length) {
     return null;

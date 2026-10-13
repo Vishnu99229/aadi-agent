@@ -5,6 +5,7 @@ import type {
   ToolCall,
 } from "./llm.js";
 import { readFile } from "node:fs/promises";
+import { getChatBackend } from "./chat_backend.js";
 import { getRecentMessages, saveMessage } from "./db.js";
 import { complete } from "./llm.js";
 import { recentUploadLine } from "./recent_upload.js";
@@ -81,7 +82,7 @@ function saveConversation(
 export interface RunAgentOptions {
   saveUserMessage?: boolean;
   saveAssistantMessage?: boolean;
-  /** Per-job backend. Omitted = production default (claude). */
+  /** Per-job backend. Omitted = persisted /model choice (or LLM_PROVIDER). */
   backend?: LlmBackend;
   skipHistory?: boolean;
 }
@@ -114,13 +115,14 @@ export async function runAgent(
   messages.push({ role: "user", content: userText });
 
   const collectedText: string[] = [];
+  const backend = options.backend ?? getChatBackend();
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     const response = await complete({
       system,
       tools: toolDefinitions,
       messages,
-      backend: options.backend,
+      backend,
     });
 
     const responseText = response.textParts.join("\n").trim();
@@ -133,7 +135,7 @@ export async function runAgent(
     const cacheReadTokens = response.usage.cacheReadInputTokens ?? 0;
 
     console.log(
-      `Agent iteration ${iteration}: tools=[${calledTools.join(", ")}], input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}, cache_creation_input_tokens=${cacheCreationTokens}, cache_read_input_tokens=${cacheReadTokens}, estimated_cost_usd=${response.usage.estimatedCostUsd.toFixed(6)}`,
+      `Agent iteration ${iteration}: backend=${backend}, tools=[${calledTools.join(", ")}], input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}, cache_creation_input_tokens=${cacheCreationTokens}, cache_read_input_tokens=${cacheReadTokens}, estimated_cost_usd=${response.usage.estimatedCostUsd.toFixed(6)}`,
     );
 
     if (response.stopReason === "tool_use") {

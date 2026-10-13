@@ -1,6 +1,12 @@
 import { Bot, type Context } from "grammy";
 import { runAgent } from "./agent.js";
 import {
+  chatBackendLabel,
+  getChatBackend,
+  isChatBackend,
+  setChatBackend,
+} from "./chat_backend.js";
+import {
   consumeDraftEdit,
   handleApprovalCallback,
 } from "./approvals.js";
@@ -95,6 +101,34 @@ bot.command("weekly", async (ctx) => {
   await whileTyping(ctx, () => sendWeeklyReview(ctx.api));
 });
 
+bot.command("model", async (ctx) => {
+  const arg = (typeof ctx.match === "string" ? ctx.match : "")
+    .trim()
+    .toLowerCase();
+  if (!arg) {
+    await ctx.reply(`Current backend: ${chatBackendLabel(getChatBackend())}`);
+    return;
+  }
+  const requested =
+    arg === "gemma" || arg === "cloud-gemma"
+      ? "cloud-gemma"
+      : arg === "claude"
+        ? "claude"
+        : null;
+  if (!requested || !isChatBackend(requested)) {
+    await ctx.reply("Use /model, /model claude, or /model gemma.");
+    return;
+  }
+  if (requested === "cloud-gemma" && !config.openRouterApiKey) {
+    await ctx.reply("cloud Gemma needs OPENROUTER_API_KEY in .env.");
+    return;
+  }
+  setChatBackend(requested);
+  await ctx.reply(
+    requested === "claude" ? "Now using Claude" : "Now using cloud Gemma",
+  );
+});
+
 bot.command("followups", async (ctx) => {
   await whileTyping(ctx, async () => {
     await runFollowupScan();
@@ -179,14 +213,27 @@ ${userText}
 </edit_instructions>
 
 Call update_draft exactly once with the draft ID above and the complete revised body. Do not create a new draft and do not send anything. If the requested change requires missing information, ask Vishnu instead of updating the draft.`;
+    // Drafting stays on Claude: the Gemma bench skipped a required tool call
+    // (answered from context instead of get_current_time), so reply drafts
+    // are not trusted to the global /model switch yet.
     const reply = await whileTyping(ctx, () =>
-      runAgent(editInstruction, { saveUserMessage: false }),
+      runAgent(editInstruction, {
+        saveUserMessage: false,
+        backend: "claude",
+      }),
     );
     await sendPlainText(ctx, reply);
     return;
   }
 
-  const reply = await whileTyping(ctx, () => runAgent(userText));
+  const drafting =
+    /\bdraft\b/i.test(userText) && /\b(email|reply|gmail)\b/i.test(userText);
+  const reply = await whileTyping(ctx, () =>
+    runAgent(
+      userText,
+      drafting ? { backend: "claude" } : {},
+    ),
+  );
   await sendPlainText(ctx, reply);
 }
 

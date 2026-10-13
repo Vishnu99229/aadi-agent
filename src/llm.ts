@@ -14,6 +14,7 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
+import { getChatBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import { assertLocalModelAllowed } from "./local_llm_guard.js";
 
@@ -99,8 +100,8 @@ export interface CompleteParams {
   /** Override the default chat model (used for background classification). */
   model?: string;
   /**
-   * Per-call backend. When omitted, production routing is unchanged:
-   * LLM_PROVIDER=claude uses Claude; LLM_PROVIDER=openrouter uses OPENROUTER_MODEL.
+   * Per-call backend. When omitted, uses the persisted /model choice
+   * (or LLM_PROVIDER: claude | cloud-gemma).
    */
   backend?: LlmBackend;
   maxTokens?: number;
@@ -669,21 +670,6 @@ async function completeWithOpenAiCompatible(
   };
 }
 
-async function completeWithOpenRouter(
-  params: CompleteParams,
-): Promise<CompleteResult> {
-  if (!openRouter) {
-    throw new Error("OpenRouter client is not configured.");
-  }
-  return completeWithOpenAiCompatible(
-    openRouter,
-    params,
-    params.model ?? config.openRouterModel,
-    costRatesForModel(params.model ?? config.openRouterModel),
-    "OpenRouter",
-  );
-}
-
 async function completeWithNamedBackend(
   backend: LlmBackend,
   params: CompleteParams,
@@ -718,20 +704,17 @@ async function completeWithNamedBackend(
 export async function complete(
   params: CompleteParams,
 ): Promise<CompleteResult> {
-  if (params.backend) {
-    return completeWithNamedBackend(params.backend, params);
-  }
-  return config.llmProvider === "claude"
-    ? completeWithClaude(params)
-    : completeWithOpenRouter(params);
+  const backend = params.backend ?? getChatBackend();
+  return completeWithNamedBackend(backend, params);
 }
 
 export async function completeBackground(
-  params: Omit<CompleteParams, "model">,
+  params: Omit<CompleteParams, "model" | "backend">,
 ): Promise<CompleteResult> {
-  const model =
-    config.llmProvider === "claude"
-      ? config.backgroundModel
-      : config.openRouterModel;
-  return complete({ ...params, model });
+  // Follow-up and bill classification stay on Claude Haiku regardless of /model.
+  return complete({
+    ...params,
+    backend: "claude",
+    model: config.backgroundModel,
+  });
 }
