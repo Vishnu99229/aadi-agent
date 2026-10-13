@@ -1,4 +1,5 @@
 import type {
+  LlmBackend,
   LlmMessage,
   LlmTool,
   ToolCall,
@@ -80,6 +81,9 @@ function saveConversation(
 export interface RunAgentOptions {
   saveUserMessage?: boolean;
   saveAssistantMessage?: boolean;
+  /** Per-job backend. Omitted = production default (claude). */
+  backend?: LlmBackend;
+  skipHistory?: boolean;
 }
 
 export async function runAgent(
@@ -96,7 +100,9 @@ export async function runAgent(
     dynamic: `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}${recentUpload ? `\n${recentUpload}` : ""}`,
   };
 
-  const messages: LlmMessage[] = getRecentMessages().map((message) =>
+  const messages: LlmMessage[] = (
+    options.skipHistory ? [] : getRecentMessages()
+  ).map((message) =>
     message.role === "user"
       ? { role: "user", content: message.content }
       : {
@@ -114,6 +120,7 @@ export async function runAgent(
       system,
       tools: toolDefinitions,
       messages,
+      backend: options.backend,
     });
 
     const responseText = response.textParts.join("\n").trim();

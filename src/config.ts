@@ -143,6 +143,21 @@ const HAIKU_55_COST_DEFAULTS: ModelCostRates = {
   cacheReadCostPerMillion: 0.01,
 };
 
+/** OpenRouter google/gemma-4-31b-it — openrouter.ai/google/gemma-4-31b-it */
+const GEMMA_CLOUD_COST_DEFAULTS: ModelCostRates = {
+  inputCostPerMillion: 0.09,
+  outputCostPerMillion: 0.34,
+  cacheCreationCostPerMillion: 0,
+  cacheReadCostPerMillion: 0.05,
+};
+
+const ZERO_COST_RATES: ModelCostRates = {
+  inputCostPerMillion: 0,
+  outputCostPerMillion: 0,
+  cacheCreationCostPerMillion: 0,
+  cacheReadCostPerMillion: 0,
+};
+
 function readRate(name: string, fallback: number): number {
   const rawValue = process.env[name]?.trim();
   if (!rawValue) {
@@ -159,7 +174,7 @@ function readRate(name: string, fallback: number): number {
 }
 
 function readCostRates(
-  prefix: "LLM" | "BACKGROUND",
+  prefix: "LLM" | "BACKGROUND" | "GEMMA_CLOUD",
   defaults: ModelCostRates,
 ): ModelCostRates {
   return {
@@ -207,6 +222,13 @@ export const config = {
   openRouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
   openRouterModel: process.env.OPENROUTER_MODEL ?? "",
   sarvamApiKey: process.env.SARVAM_API_KEY?.trim() ?? "",
+  gemmaCloudModel:
+    process.env.GEMMA_CLOUD_MODEL?.trim() || "google/gemma-4-31b-it",
+  localLlmBaseUrl:
+    process.env.LOCAL_LLM_BASE_URL?.trim() || "http://127.0.0.1:11434/v1",
+  localLlmModel: process.env.LOCAL_LLM_MODEL?.trim() || "gemma4:e4b",
   chatCostRates: readCostRates("LLM", SONNET_55_COST_DEFAULTS),
   backgroundCostRates: readCostRates("BACKGROUND", HAIKU_55_COST_DEFAULTS),
+  gemmaCloudCostRates: readCostRates("GEMMA_CLOUD", GEMMA_CLOUD_COST_DEFAULTS),
+  localCostRates: ZERO_COST_RATES,
 } as const;

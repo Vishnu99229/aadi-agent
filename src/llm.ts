@@ -10,10 +10,12 @@ import type {
 import type { ModelCostRates } from "./config.js";
 import OpenAI from "openai";
 import type {
+  ChatCompletionContentPart,
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import { config } from "./config.js";
+import { assertLocalModelAllowed } from "./local_llm_guard.js";
 
 const MAX_TOKENS = 4096;
 const MAX_SERVER_CONTINUATIONS = 8;
@@ -32,8 +34,21 @@ export interface ToolInputSchema extends Record<string, unknown> {
   required?: string[] | null;
 }
 
+export type LlmContentPart =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      mediaType: "image/jpeg" | "image/png" | "image/webp" | "image/gif";
+      data: string;
+    }
+  | {
+      type: "document";
+      mediaType: "application/pdf";
+      data: string;
+    };
+
 export type LlmMessage =
-  | { role: "user"; content: string }
+  | { role: "user"; content: string | LlmContentPart[] }
   | { role: "assistant"; textParts: string[]; toolCalls: ToolCall[] }
   | {
       role: "tool";
@@ -75,12 +90,21 @@ export type LlmStopReason =
   | "refusal"
   | "other";
 
+export type LlmBackend = "claude" | "cloud-gemma" | "local-gemma";
+
 export interface CompleteParams {
   system: LlmSystemPrompt;
   messages: LlmMessage[];
   tools: LlmTool[];
   /** Override the default chat model (used for background classification). */
   model?: string;
+  /**
+   * Per-call backend. When omitted, production routing is unchanged:
+   * LLM_PROVIDER=claude uses Claude; LLM_PROVIDER=openrouter uses OPENROUTER_MODEL.
+   */
+  backend?: LlmBackend;
+  maxTokens?: number;
+  timeoutMs?: number;
 }
 
 export interface CompleteResult {
@@ -90,22 +114,26 @@ export interface CompleteResult {
   stopReason: LlmStopReason;
 }
 
-const anthropic =
-  config.llmProvider === "claude"
-    ? new Anthropic({ apiKey: config.anthropicApiKey })
-    : undefined;
+const anthropic = config.anthropicApiKey
+  ? new Anthropic({ apiKey: config.anthropicApiKey })
+  : undefined;
 
-const openRouter =
-  config.llmProvider === "openrouter"
-    ? new OpenAI({
-        apiKey: config.openRouterApiKey,
-        baseURL: OPENROUTER_BASE_URL,
-        defaultHeaders: {
-          "HTTP-Referer": "http://localhost",
-          "X-OpenRouter-Title": "Aadi",
-        },
-      })
-    : undefined;
+const openRouter = config.openRouterApiKey
+  ? new OpenAI({
+      apiKey: config.openRouterApiKey,
+      baseURL: OPENROUTER_BASE_URL,
+      defaultHeaders: {
+        "HTTP-Referer": "http://localhost",
+        "X-OpenRouter-Title": "Aadi",
+      },
+    })
+  : undefined;
+
+const localLlm = new OpenAI({
+  apiKey: "ollama",
+  baseURL: config.localLlmBaseUrl,
+  timeout: 15 * 60 * 1000,
+});
 
 let loggedOpenRouterWebSearchDisabled = false;
 
@@ -149,10 +177,11 @@ function buildClaudeMessageCreateParams(
   system: LlmSystemPrompt,
   messages: AnthropicMessage[],
   tools: AnthropicTool[],
+  maxTokens: number,
 ): MessageCreateParamsNonStreaming {
   const base: MessageCreateParamsNonStreaming = {
     model,
-    max_tokens: MAX_TOKENS,
+    max_tokens: maxTokens,
     system: toAnthropicSystem(system),
     messages: withLatestMessageCacheBreakpoint(messages),
     tools,
@@ -167,6 +196,37 @@ function buildClaudeMessageCreateParams(
   };
 }
 
+function toAnthropicUserContent(
+  content: string | LlmContentPart[],
+): string | ContentBlockParam[] {
+  if (typeof content === "string") {
+    return content;
+  }
+  return content.map((part): ContentBlockParam => {
+    if (part.type === "text") {
+      return { type: "text", text: part.text };
+    }
+    if (part.type === "image") {
+      return {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: part.mediaType,
+          data: part.data,
+        },
+      };
+    }
+    return {
+      type: "document",
+      source: {
+        type: "base64",
+        media_type: part.mediaType,
+        data: part.data,
+      },
+    };
+  });
+}
+
 function toAnthropicMessages(messages: LlmMessage[]): AnthropicMessage[] {
   const converted: AnthropicMessage[] = [];
 
@@ -174,7 +234,10 @@ function toAnthropicMessages(messages: LlmMessage[]): AnthropicMessage[] {
     const message = messages[index];
 
     if (message.role === "user") {
-      converted.push({ role: "user", content: message.content });
+      converted.push({
+        role: "user",
+        content: toAnthropicUserContent(message.content),
+      });
       continue;
     }
 
@@ -369,7 +432,9 @@ async function completeWithClaude(
         params.system,
         messages,
         tools,
+        params.maxTokens ?? MAX_TOKENS,
       ),
+      params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
     );
     lastResponse = response;
 
@@ -425,6 +490,30 @@ async function completeWithClaude(
   };
 }
 
+function toOpenAiUserContent(
+  content: string | LlmContentPart[],
+): string | ChatCompletionContentPart[] {
+  if (typeof content === "string") {
+    return content;
+  }
+  return content.map((part): ChatCompletionContentPart => {
+    if (part.type === "text") {
+      return { type: "text", text: part.text };
+    }
+    if (part.type === "image") {
+      return {
+        type: "image_url",
+        image_url: {
+          url: `data:${part.mediaType};base64,${part.data}`,
+        },
+      };
+    }
+    throw new Error(
+      "PDF document parts are not supported on OpenAI-compatible backends; render pages as images first.",
+    );
+  });
+}
+
 function toOpenRouterMessages(
   system: LlmSystemPrompt,
   messages: LlmMessage[],
@@ -436,7 +525,7 @@ function toOpenRouterMessages(
       : []),
     ...messages.map((message): ChatCompletionMessageParam => {
       if (message.role === "user") {
-        return { role: "user", content: message.content };
+        return { role: "user", content: toOpenAiUserContent(message.content) };
       }
 
       if (message.role === "tool") {
@@ -507,19 +596,19 @@ function openRouterStopReason(reason: string | null): LlmStopReason {
   }
 }
 
-async function completeWithOpenRouter(
+async function completeWithOpenAiCompatible(
+  client: OpenAI,
   params: CompleteParams,
+  model: string,
+  rates: ModelCostRates,
+  label: string,
 ): Promise<CompleteResult> {
-  if (!openRouter) {
-    throw new Error("OpenRouter client is not configured.");
-  }
-
   const webSearchRequested = params.tools.some(
     (tool) => tool.type === "web_search",
   );
   if (webSearchRequested && !loggedOpenRouterWebSearchDisabled) {
     console.log(
-      "Web search disabled for OpenRouter: Anthropic server-side web search is unavailable and no paid search API is configured.",
+      `Web search disabled for ${label}: Anthropic server-side web search is unavailable and no paid search API is configured.`,
     );
     loggedOpenRouterWebSearchDisabled = true;
   }
@@ -531,20 +620,21 @@ async function completeWithOpenRouter(
         dynamic: `${params.system.dynamic ?? ""}\nWeb search is unavailable for this provider. Be explicit about that limitation and do not present unverified current information as fresh.`,
       }
     : params.system;
-  const response = await openRouter.chat.completions.create({
-    model: params.model ?? config.openRouterModel,
-    messages: toOpenRouterMessages(system, params.messages),
-    ...(tools.length > 0 ? { tools } : {}),
-    max_tokens: MAX_TOKENS,
-  });
+  const response = await client.chat.completions.create(
+    {
+      model,
+      messages: toOpenRouterMessages(system, params.messages),
+      ...(tools.length > 0 ? { tools } : {}),
+      max_tokens: params.maxTokens ?? MAX_TOKENS,
+    },
+    params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
+  );
   const choice = response.choices[0];
 
   if (!choice) {
-    throw new Error("OpenRouter returned no completion choices.");
+    throw new Error(`${label} returned no completion choices.`);
   }
 
-  // OpenRouter caching is automatic and model/provider-dependent. These are
-  // the cache counters it returns when the selected route supports them.
   const promptDetails = response.usage?.prompt_tokens_details as
     | {
         cached_tokens?: number;
@@ -552,7 +642,6 @@ async function completeWithOpenRouter(
       }
     | undefined;
 
-  const model = params.model ?? config.openRouterModel;
   const usage = withEstimatedCost(
     {
       inputTokens: response.usage?.prompt_tokens ?? 0,
@@ -561,7 +650,7 @@ async function completeWithOpenRouter(
       cacheReadInputTokens: promptDetails?.cached_tokens,
     },
     true,
-    costRatesForModel(model),
+    rates,
   );
 
   return {
@@ -580,9 +669,58 @@ async function completeWithOpenRouter(
   };
 }
 
+async function completeWithOpenRouter(
+  params: CompleteParams,
+): Promise<CompleteResult> {
+  if (!openRouter) {
+    throw new Error("OpenRouter client is not configured.");
+  }
+  return completeWithOpenAiCompatible(
+    openRouter,
+    params,
+    params.model ?? config.openRouterModel,
+    costRatesForModel(params.model ?? config.openRouterModel),
+    "OpenRouter",
+  );
+}
+
+async function completeWithNamedBackend(
+  backend: LlmBackend,
+  params: CompleteParams,
+): Promise<CompleteResult> {
+  if (backend === "claude") {
+    return completeWithClaude(params);
+  }
+  if (backend === "cloud-gemma") {
+    if (!openRouter) {
+      throw new Error(
+        "cloud-gemma requires OPENROUTER_API_KEY. It is unused unless a call sets backend=cloud-gemma.",
+      );
+    }
+    return completeWithOpenAiCompatible(
+      openRouter,
+      params,
+      config.gemmaCloudModel,
+      config.gemmaCloudCostRates,
+      "cloud-gemma",
+    );
+  }
+  await assertLocalModelAllowed();
+  return completeWithOpenAiCompatible(
+    localLlm,
+    params,
+    config.localLlmModel,
+    config.localCostRates,
+    "local-gemma",
+  );
+}
+
 export async function complete(
   params: CompleteParams,
 ): Promise<CompleteResult> {
+  if (params.backend) {
+    return completeWithNamedBackend(params.backend, params);
+  }
   return config.llmProvider === "claude"
     ? completeWithClaude(params)
     : completeWithOpenRouter(params);
