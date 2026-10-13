@@ -7,8 +7,19 @@ import {
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
 import { clearMessages } from "./db.js";
+import { handleBillCallback } from "./bills.js";
 import { runFollowupScan, sendFollowupNudgeSummary } from "./followups.js";
+import { handleDateWishCallback } from "./important_dates.js";
+import { sendWeeklyReview } from "./weekly.js";
 import { handleReminderCallback } from "./reminders.js";
+import {
+  DOCUMENT_READ_ERROR,
+  handleDocumentCallback,
+  processIncomingDocument,
+  processIncomingPhoto,
+} from "./documents.js";
+import { deliverWrapUp, handleNoteCallback } from "./notes.js";
+import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
 import { transcribeTelegramVoice } from "./voice.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -80,11 +91,32 @@ bot.command("brief", async (ctx) => {
   await whileTyping(ctx, () => sendMorningBrief(ctx.api));
 });
 
+bot.command("weekly", async (ctx) => {
+  await whileTyping(ctx, () => sendWeeklyReview(ctx.api));
+});
+
 bot.command("followups", async (ctx) => {
   await whileTyping(ctx, async () => {
     await runFollowupScan();
     await sendFollowupNudgeSummary(ctx.api);
   });
+});
+
+bot.command("wrapup", async (ctx) => {
+  const text = (ctx.message?.text ?? "")
+    .replace(/^\/wrapup(?:@\w+)?\s*/i, "")
+    .trim();
+  if (!text) {
+    await ctx.reply("Send notes after /wrapup, for example: /wrapup discussed pricing with Acme.");
+    return;
+  }
+  try {
+    await whileTyping(ctx, () => deliverWrapUp(ctx, text));
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Wrap-up failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
 });
 
 bot.callbackQuery(
@@ -104,6 +136,29 @@ bot.callbackQuery(
     await handleReminderCallback(ctx, operation, reminderId);
   },
 );
+
+bot.callbackQuery(/^document:(tasks|skip):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "tasks" | "skip";
+  const documentId = Number(ctx.match[2]);
+  await handleDocumentCallback(ctx, operation, documentId);
+});
+
+bot.callbackQuery(/^bill:(paid|remind|ignore):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "paid" | "remind" | "ignore";
+  const billId = Number(ctx.match[2]);
+  await handleBillCallback(ctx, operation, billId);
+});
+
+bot.callbackQuery(/^date:wish:(\d+)$/, async (ctx) => {
+  const dateId = Number(ctx.match[1]);
+  await handleDateWishCallback(ctx, dateId);
+});
+
+bot.callbackQuery(/^note:(tasks|draft|done):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "tasks" | "draft" | "done";
+  const noteId = Number(ctx.match[2]);
+  await handleNoteCallback(ctx, operation, noteId);
+});
 
 async function handleUserText(
   ctx: Context,
@@ -155,6 +210,12 @@ bot.on("message:voice", async (ctx) => {
 
   try {
     await sendPlainText(ctx, `Heard: ${transcript}`);
+    if (isWrapUpText(transcript)) {
+      await whileTyping(ctx, () =>
+        deliverWrapUp(ctx, stripWrapUpPrefix(transcript)),
+      );
+      return;
+    }
     await handleUserText(ctx, ctx.from.id, transcript);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -163,9 +224,92 @@ bot.on("message:voice", async (ctx) => {
   }
 });
 
+async function answerDocumentCaption(
+  ctx: Context,
+  caption: string,
+  documentId: number,
+  fileName: string,
+): Promise<void> {
+  const reply = await whileTyping(ctx, () =>
+    runAgent(
+      `Vishnu's question about the document just uploaded (id ${documentId}, file "${fileName}"): ${caption}\nUse read_document with id ${documentId} to answer from its saved text.`,
+    ),
+  );
+  await sendPlainText(ctx, reply);
+}
+
+bot.on("message:document", async (ctx) => {
+  const doc = ctx.message.document;
+  if (!doc) {
+    return;
+  }
+  const fileName = doc.file_name ?? "document.bin";
+  const caption = ctx.message.caption?.trim() ?? "";
+  try {
+    const documentId = await whileTyping(ctx, () =>
+      processIncomingDocument(ctx, fileName, doc.file_id, doc.mime_type),
+    );
+    if (documentId && caption && !isWrapUpText(caption)) {
+      await answerDocumentCaption(ctx, caption, documentId, fileName);
+    }
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Document processing failed (${errorType}).`);
+    await ctx.reply(DOCUMENT_READ_ERROR);
+  }
+});
+
+bot.on("message:photo", async (ctx) => {
+  const caption = ctx.message.caption?.trim();
+  if (caption) {
+    if (isWrapUpText(caption)) {
+      try {
+        await whileTyping(ctx, () =>
+          deliverWrapUp(ctx, stripWrapUpPrefix(caption)),
+        );
+      } catch (error) {
+        const errorType = error instanceof Error ? error.name : "UnknownError";
+        console.error(`Wrap-up failed (${errorType}).`);
+        await ctx.reply(`Something broke: ${shortError(error)}`);
+      }
+      return;
+    }
+    try {
+      const documentId = await whileTyping(ctx, () =>
+        processIncomingPhoto(ctx),
+      );
+      if (documentId) {
+        await answerDocumentCaption(
+          ctx,
+          caption,
+          documentId,
+          "photo-document.jpg",
+        );
+      }
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Document photo failed (${errorType}).`);
+      await ctx.reply(DOCUMENT_READ_ERROR);
+    }
+    return;
+  }
+  try {
+    await whileTyping(ctx, () => processIncomingPhoto(ctx));
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Document photo failed (${errorType}).`);
+    await ctx.reply(DOCUMENT_READ_ERROR);
+  }
+});
+
 bot.on("message:text", async (ctx) => {
   try {
-    await handleUserText(ctx, ctx.from.id, ctx.message.text);
+    const text = ctx.message.text;
+    if (isWrapUpText(text)) {
+      await whileTyping(ctx, () => deliverWrapUp(ctx, stripWrapUpPrefix(text)));
+      return;
+    }
+    await handleUserText(ctx, ctx.from.id, text);
   } catch (error) {
     console.error("Agent error:", error);
     await ctx.reply(`Something broke: ${shortError(error)}`);

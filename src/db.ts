@@ -146,6 +146,60 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_followups_status_next_check
     ON followups (status, next_check_at);
+
+  CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_name TEXT NOT NULL,
+    tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
+    extracted_text TEXT NOT NULL,
+    pending_action_items TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_documents_created
+    ON documents (created_at);
+
+  CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    people TEXT NOT NULL,
+    tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
+    content TEXT NOT NULL,
+    pending_action_items TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_notes_created
+    ON notes (created_at);
+
+  CREATE TABLE IF NOT EXISTS bills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    biller TEXT NOT NULL,
+    amount REAL,
+    currency TEXT NOT NULL DEFAULT 'INR',
+    due_date TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'upcoming'
+      CHECK (status IN ('upcoming', 'paid', 'ignored')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_bills_dedupe
+    ON bills (biller, due_date, amount, currency);
+
+  CREATE TABLE IF NOT EXISTS important_dates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person TEXT NOT NULL,
+    relation TEXT NOT NULL DEFAULT '',
+    month_day TEXT NOT NULL,
+    year INTEGER,
+    type TEXT NOT NULL CHECK (type IN ('birthday', 'anniversary', 'other')),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_important_dates_month_day
+    ON important_dates (month_day);
 `);
 
 const insertMessage = db.prepare(
@@ -485,5 +539,290 @@ export function transitionFollowupStatus(
     )
     .run(to, id, ...statuses);
 
+  return result.changes === 1;
+}
+
+export interface DocumentActionItem {
+  text: string;
+  tag: ItemTag;
+  due_at: string | null;
+}
+
+export interface DocumentRecord {
+  id: number;
+  file_name: string;
+  tag: ItemTag;
+  extracted_text: string;
+  pending_action_items: string | null;
+  created_at: string;
+}
+
+export interface NoteActionItem {
+  text: string;
+  owner: "vishnu" | "other";
+  owner_email: string | null;
+  tag: ItemTag;
+  due_at: string | null;
+}
+
+export interface NoteRecord {
+  id: number;
+  title: string;
+  people: string;
+  tag: ItemTag;
+  content: string;
+  pending_action_items: string | null;
+  created_at: string;
+}
+
+export function createDocument(
+  fileName: string,
+  tag: ItemTag,
+  extractedText: string,
+  pendingActionItems: DocumentActionItem[] | null,
+): DocumentRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO documents (file_name, tag, extracted_text, pending_action_items)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(
+      fileName,
+      tag,
+      extractedText,
+      pendingActionItems ? JSON.stringify(pendingActionItems) : null,
+    );
+  return getDocument(Number(result.lastInsertRowid))!;
+}
+
+export function getDocument(id: number): DocumentRecord | undefined {
+  return db
+    .prepare(
+      `SELECT id, file_name, tag, extracted_text, pending_action_items, created_at
+       FROM documents WHERE id = ?`,
+    )
+    .get(id) as DocumentRecord | undefined;
+}
+
+export function updateDocument(
+  id: number,
+  update: {
+    tag: ItemTag;
+    extractedText: string;
+    pendingActionItems: DocumentActionItem[] | null;
+  },
+): void {
+  db.prepare(
+    `UPDATE documents
+     SET tag = ?, extracted_text = ?, pending_action_items = ?
+     WHERE id = ?`,
+  ).run(
+    update.tag,
+    update.extractedText,
+    update.pendingActionItems
+      ? JSON.stringify(update.pendingActionItems)
+      : null,
+    id,
+  );
+}
+
+export function clearDocumentPendingTasks(id: number): void {
+  db.prepare(
+    `UPDATE documents SET pending_action_items = NULL WHERE id = ?`,
+  ).run(id);
+}
+
+export function deleteExpiredDocuments(): number {
+  const result = db
+    .prepare(
+      `DELETE FROM documents
+       WHERE created_at <= datetime('now', '-7 days')`,
+    )
+    .run();
+  return result.changes;
+}
+
+export function createNote(
+  title: string,
+  people: string,
+  tag: ItemTag,
+  content: string,
+  pendingActionItems: NoteActionItem[] | null,
+): NoteRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO notes (title, people, tag, content, pending_action_items)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      title,
+      people,
+      tag,
+      content,
+      pendingActionItems ? JSON.stringify(pendingActionItems) : null,
+    );
+  return getNote(Number(result.lastInsertRowid))!;
+}
+
+export function getNote(id: number): NoteRecord | undefined {
+  return db
+    .prepare(
+      `SELECT id, title, people, tag, content, pending_action_items, created_at
+       FROM notes WHERE id = ?`,
+    )
+    .get(id) as NoteRecord | undefined;
+}
+
+export function clearNotePendingTasks(id: number): void {
+  db.prepare(`UPDATE notes SET pending_action_items = NULL WHERE id = ?`).run(
+    id,
+  );
+}
+
+export function searchNotes(
+  query: string,
+  sinceIso?: string,
+): NoteRecord[] {
+  const safe = query.replace(/[%_]/g, " ").trim();
+  const pattern = safe ? `%${safe}%` : "%";
+  if (sinceIso) {
+    return db
+      .prepare(
+        `SELECT id, title, people, tag, content, pending_action_items, created_at
+         FROM notes
+         WHERE created_at >= ?
+           AND (title LIKE ? OR people LIKE ? OR content LIKE ?)
+         ORDER BY created_at DESC
+         LIMIT 100`,
+      )
+      .all(sinceIso, pattern, pattern, pattern) as NoteRecord[];
+  }
+  return db
+    .prepare(
+      `SELECT id, title, people, tag, content, pending_action_items, created_at
+       FROM notes
+       WHERE title LIKE ? OR people LIKE ? OR content LIKE ?
+       ORDER BY created_at DESC
+       LIMIT 100`,
+    )
+    .all(pattern, pattern, pattern) as NoteRecord[];
+}
+
+export type BillStatus = "upcoming" | "paid" | "ignored";
+
+export interface BillRecord {
+  id: number;
+  biller: string;
+  amount: number | null;
+  currency: string;
+  due_date: string;
+  thread_id: string;
+  status: BillStatus;
+  created_at: string;
+}
+
+export type ImportantDateType = "birthday" | "anniversary" | "other";
+
+export interface ImportantDateRecord {
+  id: number;
+  person: string;
+  relation: string;
+  month_day: string;
+  year: number | null;
+  type: ImportantDateType;
+  note: string;
+  created_at: string;
+}
+
+export function createBill(
+  biller: string,
+  amount: number | null,
+  currency: string,
+  dueDate: string,
+  threadId: string,
+): BillRecord | undefined {
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO bills (biller, amount, currency, due_date, thread_id)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(biller, amount, currency, dueDate, threadId);
+    return getBill(Number(result.lastInsertRowid))!;
+  } catch {
+    return undefined;
+  }
+}
+
+export function getBill(id: number): BillRecord | undefined {
+  return db
+    .prepare(
+      `SELECT id, biller, amount, currency, due_date, thread_id, status, created_at
+       FROM bills WHERE id = ?`,
+    )
+    .get(id) as BillRecord | undefined;
+}
+
+export function getBills(): BillRecord[] {
+  return db
+    .prepare(
+      `SELECT id, biller, amount, currency, due_date, thread_id, status, created_at
+       FROM bills ORDER BY due_date ASC, id ASC`,
+    )
+    .all() as BillRecord[];
+}
+
+export function transitionBillStatus(
+  id: number,
+  from: BillStatus | BillStatus[],
+  to: BillStatus,
+): boolean {
+  const statuses = Array.isArray(from) ? from : [from];
+  const placeholders = statuses.map(() => "?").join(", ");
+  const result = db
+    .prepare(
+      `UPDATE bills SET status = ? WHERE id = ? AND status IN (${placeholders})`,
+    )
+    .run(to, id, ...statuses);
+  return result.changes === 1;
+}
+
+export function createImportantDate(
+  person: string,
+  relation: string,
+  monthDay: string,
+  year: number | null,
+  type: ImportantDateType,
+  note: string,
+): ImportantDateRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO important_dates (person, relation, month_day, year, type, note)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(person, relation, monthDay, year, type, note);
+  return getImportantDate(Number(result.lastInsertRowid))!;
+}
+
+export function getImportantDate(id: number): ImportantDateRecord | undefined {
+  return db
+    .prepare(
+      `SELECT id, person, relation, month_day, year, type, note, created_at
+       FROM important_dates WHERE id = ?`,
+    )
+    .get(id) as ImportantDateRecord | undefined;
+}
+
+export function getImportantDates(): ImportantDateRecord[] {
+  return db
+    .prepare(
+      `SELECT id, person, relation, month_day, year, type, note, created_at
+       FROM important_dates ORDER BY month_day ASC, id ASC`,
+    )
+    .all() as ImportantDateRecord[];
+}
+
+export function removeImportantDate(id: number): boolean {
+  const result = db.prepare(`DELETE FROM important_dates WHERE id = ?`).run(id);
   return result.changes === 1;
 }

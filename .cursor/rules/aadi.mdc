@@ -29,6 +29,7 @@ Aadi is Vishnu's personal AI agent. Vishnu talks to it on Telegram. It answers q
 4. Never log full email bodies or message contents. Log metadata only.
 5. Model name comes from the CLAUDE_MODEL env var, never hardcoded.
 6. Before using any Anthropic API feature (tool types, versions, stop reasons), check the current official docs. Do not rely on memory.
+7. .env must never be rebuilt, regenerated or overwritten. Only add or edit specific lines, and never blank out existing values. Before any change to .env, copy it to .env.bak first.
 
 ## How we work
 - We build in stages. Each stage ends with a CHECKPOINT.

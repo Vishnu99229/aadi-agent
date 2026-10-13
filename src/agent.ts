@@ -6,6 +6,7 @@ import type {
 import { readFile } from "node:fs/promises";
 import { getRecentMessages, saveMessage } from "./db.js";
 import { complete } from "./llm.js";
+import { recentUploadLine } from "./recent_upload.js";
 import { tools as customTools } from "./tools/index.js";
 
 const TIME_ZONE = "Asia/Kolkata";
@@ -89,9 +90,10 @@ export async function runAgent(
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
   const promptUrl = new URL("../prompts/system.md", import.meta.url);
   const basePrompt = await readFile(promptUrl, "utf8");
+  const recentUpload = recentUploadLine();
   const system = {
     cacheable: basePrompt.trim(),
-    dynamic: `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
+    dynamic: `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}${recentUpload ? `\n${recentUpload}` : ""}`,
   };
 
   const messages: LlmMessage[] = getRecentMessages().map((message) =>

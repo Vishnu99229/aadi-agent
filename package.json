@@ -9,7 +9,11 @@
     "phone:pause": "./scripts/phone-pause.sh",
     "phone:resume": "./scripts/phone-resume.sh",
     "google:auth": "tsx src/google/authorize.ts",
-    "google:test": "tsx src/google/test.ts"
+    "google:test": "tsx src/google/test.ts",
+    "test:stage5": "tsx --env-file=.env scripts/test-stage5.ts",
+    "test:stage6": "tsx --env-file=.env scripts/test-stage6.ts",
+    "test:haiku-live": "tsx --env-file=.env scripts/test-haiku-background-live.ts",
+    "test:documents": "tsx --env-file=.env scripts/test-document-analysis.ts"
   },
   "keywords": [],
   "author": "",
@@ -23,8 +27,11 @@
     "dotenv": "^18.0.6",
     "googleapis": "^185.0.0",
     "grammy": "^1.46.0",
+    "mammoth": "^1.13.0",
     "node-cron": "^4.6.0",
-    "openai": "^7.31.0"
+    "openai": "^7.31.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.4.299"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",

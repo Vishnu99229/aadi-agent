@@ -14,7 +14,7 @@ import {
   type ItemTag,
 } from "./db.js";
 import { getGoogleClient } from "./google/auth.js";
-import { complete } from "./llm.js";
+import { completeBackground } from "./llm.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const SENT_LOOKBACK_QUERY = "in:sent newer_than:14d";
@@ -313,7 +313,7 @@ async function classifyCandidates(
     sent_at: candidate.sentAt,
     snippet: candidate.snippet,
   }));
-  const response = await complete({
+  const response = await completeBackground({
     system: {
       cacheable: `You classify sent emails for a personal follow-up tracker.
 Decide whether each email reasonably expects a substantive reply.

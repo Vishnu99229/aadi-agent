@@ -9,7 +9,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_reminders",
   description:
-    "List reminders, optionally filtered by work/personal tag and pending/sent/cancelled status. Results include reminder IDs for cancellation.",
+    "List ALL matching reminders (no time window). Optionally filter by work/personal tag and pending/sent/cancelled status. Use this to find an id before cancel_reminder, including reminders far in the future.",
   inputSchema: {
     type: "object",
     properties: {

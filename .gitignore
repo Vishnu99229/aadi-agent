@@ -4,3 +4,6 @@ dist
 *.db
 google-credentials.json
 google-token.json
+test-fixtures/
+.env.bak
+.env.phone

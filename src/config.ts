@@ -53,6 +53,14 @@ const followupScanTime =
 const followupScanTimeMatch = /^(\d{2}):(\d{2})$/.exec(followupScanTime);
 const followupScanHour = Number(followupScanTimeMatch?.[1]);
 const followupScanMinute = Number(followupScanTimeMatch?.[2]);
+const billScanTime = process.env.BILL_SCAN_TIME?.trim() || "09:00";
+const billScanTimeMatch = /^(\d{2}):(\d{2})$/.exec(billScanTime);
+const billScanHour = Number(billScanTimeMatch?.[1]);
+const billScanMinute = Number(billScanTimeMatch?.[2]);
+const weeklyReviewTime = process.env.WEEKLY_REVIEW_TIME?.trim() || "19:00";
+const weeklyReviewTimeMatch = /^(\d{2}):(\d{2})$/.exec(weeklyReviewTime);
+const weeklyReviewHour = Number(weeklyReviewTimeMatch?.[1]);
+const weeklyReviewMinute = Number(weeklyReviewTimeMatch?.[2]);
 const rawGoogleSheetId = process.env.GOOGLE_SHEET_ID?.trim();
 const googleSheetId =
   rawGoogleSheetId && rawGoogleSheetId.toLowerCase() !== "none"
@@ -88,10 +96,57 @@ if (
   process.exit(1);
 }
 
-function readRate(name: string): number {
+if (
+  !billScanTimeMatch ||
+  billScanHour < 0 ||
+  billScanHour > 23 ||
+  billScanMinute < 0 ||
+  billScanMinute > 59
+) {
+  console.error("BILL_SCAN_TIME must use 24-hour HH:MM format, for example 09:00.");
+  process.exit(1);
+}
+
+if (
+  !weeklyReviewTimeMatch ||
+  weeklyReviewHour < 0 ||
+  weeklyReviewHour > 23 ||
+  weeklyReviewMinute < 0 ||
+  weeklyReviewMinute > 59
+) {
+  console.error(
+    "WEEKLY_REVIEW_TIME must use 24-hour HH:MM format, for example 19:00.",
+  );
+  process.exit(1);
+}
+
+export interface ModelCostRates {
+  inputCostPerMillion: number;
+  outputCostPerMillion: number;
+  cacheCreationCostPerMillion: number;
+  cacheReadCostPerMillion: number;
+}
+
+/** Claude Sonnet 5.5 — platform.claude.com/docs/en/about-claude/pricing */
+const SONNET_55_COST_DEFAULTS: ModelCostRates = {
+  inputCostPerMillion: 2,
+  outputCostPerMillion: 10,
+  cacheCreationCostPerMillion: 2.5,
+  cacheReadCostPerMillion: 0.1,
+};
+
+/** Claude Haiku 5.5 (prompts up to 100K tokens) */
+const HAIKU_55_COST_DEFAULTS: ModelCostRates = {
+  inputCostPerMillion: 0.1,
+  outputCostPerMillion: 0.5,
+  cacheCreationCostPerMillion: 0.125,
+  cacheReadCostPerMillion: 0.01,
+};
+
+function readRate(name: string, fallback: number): number {
   const rawValue = process.env[name]?.trim();
   if (!rawValue) {
-    return 0;
+    return fallback;
   }
 
   const value = Number(rawValue);
@@ -101,6 +156,30 @@ function readRate(name: string): number {
   }
 
   return value;
+}
+
+function readCostRates(
+  prefix: "LLM" | "BACKGROUND",
+  defaults: ModelCostRates,
+): ModelCostRates {
+  return {
+    inputCostPerMillion: readRate(
+      `${prefix}_INPUT_COST_PER_MILLION`,
+      defaults.inputCostPerMillion,
+    ),
+    outputCostPerMillion: readRate(
+      `${prefix}_OUTPUT_COST_PER_MILLION`,
+      defaults.outputCostPerMillion,
+    ),
+    cacheCreationCostPerMillion: readRate(
+      `${prefix}_CACHE_CREATION_COST_PER_MILLION`,
+      defaults.cacheCreationCostPerMillion,
+    ),
+    cacheReadCostPerMillion: readRate(
+      `${prefix}_CACHE_READ_COST_PER_MILLION`,
+      defaults.cacheReadCostPerMillion,
+    ),
+  };
 }
 
 export const config = {
@@ -114,16 +193,20 @@ export const config = {
   followupScanTime,
   followupScanHour,
   followupScanMinute,
+  billScanTime,
+  billScanHour,
+  billScanMinute,
+  weeklyReviewTime,
+  weeklyReviewHour,
+  weeklyReviewMinute,
   llmProvider: provider,
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
   claudeModel: process.env.CLAUDE_MODEL ?? "",
+  backgroundModel:
+    process.env.BACKGROUND_MODEL?.trim() || "claude-haiku-5-5",
   openRouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
   openRouterModel: process.env.OPENROUTER_MODEL ?? "",
   sarvamApiKey: process.env.SARVAM_API_KEY?.trim() ?? "",
-  inputCostPerMillion: readRate("LLM_INPUT_COST_PER_MILLION"),
-  outputCostPerMillion: readRate("LLM_OUTPUT_COST_PER_MILLION"),
-  cacheCreationCostPerMillion: readRate(
-    "LLM_CACHE_CREATION_COST_PER_MILLION",
-  ),
-  cacheReadCostPerMillion: readRate("LLM_CACHE_READ_COST_PER_MILLION"),
+  chatCostRates: readCostRates("LLM", SONNET_55_COST_DEFAULTS),
+  backgroundCostRates: readCostRates("BACKGROUND", HAIKU_55_COST_DEFAULTS),
 } as const;

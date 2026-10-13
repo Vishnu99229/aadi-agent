@@ -1,11 +1,13 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type {
   ContentBlockParam,
+  MessageCreateParamsNonStreaming,
   MessageParam as AnthropicMessage,
   TextBlockParam,
   ToolResultBlockParam,
   ToolUnion as AnthropicTool,
 } from "@anthropic-ai/sdk/resources/messages/messages";
+import type { ModelCostRates } from "./config.js";
 import OpenAI from "openai";
 import type {
   ChatCompletionMessageParam,
@@ -77,6 +79,8 @@ export interface CompleteParams {
   system: LlmSystemPrompt;
   messages: LlmMessage[];
   tools: LlmTool[];
+  /** Override the default chat model (used for background classification). */
+  model?: string;
 }
 
 export interface CompleteResult {
@@ -105,9 +109,17 @@ const openRouter =
 
 let loggedOpenRouterWebSearchDisabled = false;
 
+function costRatesForModel(model: string): ModelCostRates {
+  if (model === config.backgroundModel) {
+    return config.backgroundCostRates;
+  }
+  return config.chatCostRates;
+}
+
 function withEstimatedCost(
   usage: Omit<LlmUsage, "estimatedCostUsd">,
   inputIncludesCacheTokens: boolean,
+  rates: ModelCostRates,
 ): LlmUsage {
   const cacheCreationTokens = usage.cacheCreationInputTokens ?? 0;
   const cacheReadTokens = usage.cacheReadInputTokens ?? 0;
@@ -118,13 +130,41 @@ function withEstimatedCost(
       )
     : usage.inputTokens;
   const estimatedCostUsd =
-    (regularInputTokens * config.inputCostPerMillion +
-      usage.outputTokens * config.outputCostPerMillion +
-      cacheCreationTokens * config.cacheCreationCostPerMillion +
-      cacheReadTokens * config.cacheReadCostPerMillion) /
+    (regularInputTokens * rates.inputCostPerMillion +
+      usage.outputTokens * rates.outputCostPerMillion +
+      cacheCreationTokens * rates.cacheCreationCostPerMillion +
+      cacheReadTokens * rates.cacheReadCostPerMillion) /
     1_000_000;
 
   return { ...usage, estimatedCostUsd };
+}
+
+/** Haiku 5.5 rejects custom temperature/top_p/top_k; use effort + disabled thinking for classification. */
+function usesHaiku55RequestShape(model: string): boolean {
+  return /haiku-5-5/i.test(model);
+}
+
+function buildClaudeMessageCreateParams(
+  model: string,
+  system: LlmSystemPrompt,
+  messages: AnthropicMessage[],
+  tools: AnthropicTool[],
+): MessageCreateParamsNonStreaming {
+  const base: MessageCreateParamsNonStreaming = {
+    model,
+    max_tokens: MAX_TOKENS,
+    system: toAnthropicSystem(system),
+    messages: withLatestMessageCacheBreakpoint(messages),
+    tools,
+  };
+  if (!usesHaiku55RequestShape(model)) {
+    return base;
+  }
+  return {
+    ...base,
+    thinking: { type: "disabled" },
+    output_config: { effort: "low" },
+  };
 }
 
 function toAnthropicMessages(messages: LlmMessage[]): AnthropicMessage[] {
@@ -305,6 +345,8 @@ async function completeWithClaude(
     throw new Error("Claude client is not configured.");
   }
 
+  const model = params.model ?? config.claudeModel;
+  const rates = costRatesForModel(model);
   const messages = toAnthropicMessages(params.messages);
   const tools = toAnthropicTools(params.tools);
   const usage: Omit<LlmUsage, "estimatedCostUsd"> = {
@@ -321,13 +363,14 @@ async function completeWithClaude(
     // Anthropic allows at most four explicit cache breakpoints. This request
     // uses three: the tool definitions, the stable system prompt, and a
     // rolling breakpoint on the latest message for incremental agent turns.
-    const response = await anthropic.messages.create({
-      model: config.claudeModel,
-      max_tokens: MAX_TOKENS,
-      system: toAnthropicSystem(params.system),
-      messages: withLatestMessageCacheBreakpoint(messages),
-      tools,
-    });
+    const response = await anthropic.messages.create(
+      buildClaudeMessageCreateParams(
+        model,
+        params.system,
+        messages,
+        tools,
+      ),
+    );
     lastResponse = response;
 
     usage.inputTokens += response.usage.input_tokens;
@@ -360,7 +403,7 @@ async function completeWithClaude(
             execution:
               block.type === "server_tool_use" ? "provider" : "client",
           })),
-        usage: withEstimatedCost(usage, false),
+        usage: withEstimatedCost(usage, false, rates),
         stopReason: anthropicStopReason(response.stop_reason),
       };
     }
@@ -377,7 +420,7 @@ async function completeWithClaude(
         .filter((block): block is Anthropic.TextBlock => block.type === "text")
         .map((block) => block.text) ?? [],
     toolCalls: [],
-    usage: withEstimatedCost(usage, false),
+    usage: withEstimatedCost(usage, false, rates),
     stopReason: "pause_turn",
   };
 }
@@ -489,7 +532,7 @@ async function completeWithOpenRouter(
       }
     : params.system;
   const response = await openRouter.chat.completions.create({
-    model: config.openRouterModel,
+    model: params.model ?? config.openRouterModel,
     messages: toOpenRouterMessages(system, params.messages),
     ...(tools.length > 0 ? { tools } : {}),
     max_tokens: MAX_TOKENS,
@@ -509,6 +552,7 @@ async function completeWithOpenRouter(
       }
     | undefined;
 
+  const model = params.model ?? config.openRouterModel;
   const usage = withEstimatedCost(
     {
       inputTokens: response.usage?.prompt_tokens ?? 0,
@@ -517,6 +561,7 @@ async function completeWithOpenRouter(
       cacheReadInputTokens: promptDetails?.cached_tokens,
     },
     true,
+    costRatesForModel(model),
   );
 
   return {
@@ -541,4 +586,14 @@ export async function complete(
   return config.llmProvider === "claude"
     ? completeWithClaude(params)
     : completeWithOpenRouter(params);
+}
+
+export async function completeBackground(
+  params: Omit<CompleteParams, "model">,
+): Promise<CompleteResult> {
+  const model =
+    config.llmProvider === "claude"
+      ? config.backgroundModel
+      : config.openRouterModel;
+  return complete({ ...params, model });
 }
