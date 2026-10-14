@@ -139,6 +139,7 @@ export async function buildMorningBrief(): Promise<string> {
   const brief = await runAgent(briefInstruction(), {
     saveUserMessage: false,
     saveAssistantMessage: false,
+    task: "brief",
   });
 
   saveMessage("assistant", brief);

@@ -4,6 +4,7 @@ import type {
   ImageBlockParam,
   TextBlockParam,
 } from "@anthropic-ai/sdk/resources/messages/messages";
+import { getTaskBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import type { DocumentActionItem, ItemTag } from "./db.js";
 
@@ -265,6 +266,13 @@ async function analyzeContent(
   truncated: boolean,
   logLabel: string,
 ): Promise<DocumentAnalysis> {
+  const backend = getTaskBackend("documents");
+  if (backend !== "claude") {
+    const errorType = "UnsupportedDocumentBackend";
+    console.error(
+      `Document analysis (${logLabel}) on ${backend} failed (${errorType}); retrying on Claude.`,
+    );
+  }
   try {
     const result = await requestStructuredAnalysis(content, promptExtra);
     console.log(

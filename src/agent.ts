@@ -5,7 +5,7 @@ import type {
   ToolCall,
 } from "./llm.js";
 import { readFile } from "node:fs/promises";
-import { getChatBackend } from "./chat_backend.js";
+import { getTaskBackend, type ModelTask } from "./chat_backend.js";
 import { getRecentMessages, saveMessage } from "./db.js";
 import { complete } from "./llm.js";
 import { recentUploadLine } from "./recent_upload.js";
@@ -82,8 +82,10 @@ function saveConversation(
 export interface RunAgentOptions {
   saveUserMessage?: boolean;
   saveAssistantMessage?: boolean;
-  /** Per-job backend. Omitted = persisted /model choice (or LLM_PROVIDER). */
+  /** Per-job backend. Overrides task if both are set. */
   backend?: LlmBackend;
+  /** Persisted /model task. Omitted = chat. */
+  task?: ModelTask;
   skipHistory?: boolean;
 }
 
@@ -115,7 +117,7 @@ export async function runAgent(
   messages.push({ role: "user", content: userText });
 
   const collectedText: string[] = [];
-  const backend = options.backend ?? getChatBackend();
+  const backend = options.backend ?? getTaskBackend(options.task ?? "chat");
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     const response = await complete({

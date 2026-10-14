@@ -1,11 +1,17 @@
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { runAgent } from "./agent.js";
+import { findAccountByName } from "./account_logic.js";
+import { decodedAccounts } from "./accounts.js";
 import {
-  applyChatBackend,
+  applyAllTasksExceptDrafting,
+  applyTaskBackend,
   chatBackendLabel,
-  getChatBackend,
+  getTaskBackend,
+  getTaskBackends,
   isChatBackend,
+  TASK_LABELS,
   type ChatBackend,
+  type ModelTask,
 } from "./chat_backend.js";
 import {
   consumeDraftEdit,
@@ -118,15 +124,58 @@ function replyKeyboard(): Keyboard {
   return keyboard;
 }
 
-function modelKeyboard(): InlineKeyboard {
-  const current = getChatBackend();
-  return new InlineKeyboard()
-    .text(current === "claude" ? "• Claude" : "Claude", "model:claude")
-    .text(current === "cloud-gemma" ? "• Gemma" : "Gemma", "model:gemma");
+const TASK_BUTTON: Array<{ task: ModelTask; code: string }> = [
+  { task: "chat", code: "chat" },
+  { task: "brief", code: "brief" },
+  { task: "documents", code: "docs" },
+  { task: "meetings", code: "meet" },
+  { task: "drafting", code: "draft" },
+];
+
+const TASK_FROM_CODE: Record<string, ModelTask> = {
+  chat: "chat",
+  brief: "brief",
+  docs: "documents",
+  meet: "meetings",
+  draft: "drafting",
+};
+
+function claudeButtonLabel(selected: boolean): string {
+  return selected ? "• Claude" : "Claude";
+}
+
+function gemmaButtonLabel(task: ModelTask, selected: boolean): string {
+  if (task === "drafting") {
+    return selected ? "• Gemma (not recommended)" : "Gemma (not recommended)";
+  }
+  return selected ? "• Gemma" : "Gemma";
+}
+
+function taskModelKeyboard(): InlineKeyboard {
+  const choices = getTaskBackends();
+  const keyboard = new InlineKeyboard();
+  for (const item of TASK_BUTTON) {
+    const current = choices[item.task];
+    keyboard
+      .text(TASK_LABELS[item.task], "mt:noop")
+      .row()
+      .text(claudeButtonLabel(current === "claude"), `mt:${item.code}:c`)
+      .text(
+        gemmaButtonLabel(item.task, current === "cloud-gemma"),
+        `mt:${item.code}:g`,
+      )
+      .row();
+  }
+  keyboard.text("Background scans: Haiku 5.5 (automatic)", "mt:haiku");
+  return keyboard;
+}
+
+function modelPanelText(): string {
+  return "Choose which model handles each task. Current choice marked with •.";
 }
 
 function menuKeyboard(): InlineKeyboard {
-  const current = getChatBackend();
+  const current = getTaskBackend("chat");
   return new InlineKeyboard()
     .text(
       current === "claude" ? "• Model: Claude" : "Model: Claude",
@@ -152,7 +201,14 @@ function menuKeyboard(): InlineKeyboard {
 }
 
 function menuCaption(): string {
-  return `Aadi — using ${chatBackendLabel(getChatBackend())}.`;
+  return `Aadi — chat uses ${chatBackendLabel(getTaskBackend("chat"))}.`;
+}
+
+function isAccountOrMeetingQuestion(text: string): boolean {
+  if (findAccountByName(decodedAccounts(), text).length > 0) {
+    return true;
+  }
+  return /\b(account status|where are we with|meeting brief)\b/i.test(text);
 }
 
 async function sendMenu(ctx: Context): Promise<void> {
@@ -273,20 +329,18 @@ bot.command("menu", async (ctx) => {
 bot.command("model", async (ctx) => {
   const arg = typeof ctx.match === "string" ? ctx.match.trim() : "";
   if (!arg) {
-    await ctx.reply(`Current backend: ${chatBackendLabel(getChatBackend())}`, {
-      reply_markup: modelKeyboard(),
-    });
+    await ctx.reply(modelPanelText(), { reply_markup: taskModelKeyboard() });
     return;
   }
   const requested = parseRequestedBackend(arg);
   if (!requested || !isChatBackend(requested)) {
     await ctx.reply("Use /model, /model claude, or /model gemma.", {
-      reply_markup: modelKeyboard(),
+      reply_markup: taskModelKeyboard(),
     });
     return;
   }
-  const result = applyChatBackend(requested);
-  await ctx.reply(result.message, { reply_markup: modelKeyboard() });
+  const result = applyAllTasksExceptDrafting(requested);
+  await ctx.reply(result.message, { reply_markup: taskModelKeyboard() });
 });
 
 bot.command("showkeyboard", async (ctx) => {
@@ -406,23 +460,31 @@ bot.callbackQuery(/^meet:(wrap|remind|skip):(\d+)$/, async (ctx) => {
   await handleMeetingCallback(ctx, operation, briefId);
 });
 
-bot.callbackQuery(/^model:(claude|gemma)$/, async (ctx) => {
-  const requested = parseRequestedBackend(ctx.match[1] ?? "");
-  if (!requested) {
+bot.callbackQuery(/^mt:(noop|haiku)$/, async (ctx) => {
+  await ctx.answerCallbackQuery(
+    ctx.match[1] === "haiku"
+      ? "Bill and follow-up classification stays on Haiku 5.5."
+      : undefined,
+  );
+});
+
+bot.callbackQuery(/^mt:(chat|brief|docs|meet|draft):(c|g)$/, async (ctx) => {
+  const task = TASK_FROM_CODE[ctx.match[1] ?? ""];
+  const requested = ctx.match[2] === "g" ? "cloud-gemma" : "claude";
+  if (!task) {
     await ctx.answerCallbackQuery();
     return;
   }
-  const result = applyChatBackend(requested);
-  await ctx.answerCallbackQuery({ text: result.message });
+  const result = applyTaskBackend(task, requested);
+  await ctx.answerCallbackQuery({ text: result.message.slice(0, 200) });
   try {
-    await ctx.editMessageText(
-      `Current backend: ${chatBackendLabel(getChatBackend())}`,
-      { reply_markup: modelKeyboard() },
-    );
+    await ctx.editMessageText(modelPanelText(), {
+      reply_markup: taskModelKeyboard(),
+    });
   } catch {
-    await ctx.editMessageReplyMarkup({ reply_markup: modelKeyboard() }).catch(
-      () => undefined,
-    );
+    await ctx.editMessageReplyMarkup({
+      reply_markup: taskModelKeyboard(),
+    }).catch(() => undefined);
   }
 });
 
@@ -434,8 +496,8 @@ bot.callbackQuery(/^menu:(claude|gemma|brief|waiting|bills|tasks|keyboard)$/, as
       await ctx.answerCallbackQuery();
       return;
     }
-    const result = applyChatBackend(requested);
-    await ctx.answerCallbackQuery({ text: result.message });
+    const result = applyAllTasksExceptDrafting(requested);
+    await ctx.answerCallbackQuery({ text: result.message.slice(0, 200) });
     try {
       await ctx.editMessageText(menuCaption(), { reply_markup: menuKeyboard() });
     } catch {
@@ -512,13 +574,10 @@ ${userText}
 </edit_instructions>
 
 Call update_draft exactly once with the draft ID above and the complete revised body. Do not create a new draft and do not send anything. If the requested change requires missing information, ask Vishnu instead of updating the draft.`;
-    // Drafting stays on Claude: the Gemma bench skipped a required tool call
-    // (answered from context instead of get_current_time), so reply drafts
-    // are not trusted to the global /model switch yet.
     const reply = await whileTyping(ctx, () =>
       runAgent(editInstruction, {
         saveUserMessage: false,
-        backend: "claude",
+        task: "drafting",
       }),
     );
     await sendPlainText(ctx, reply);
@@ -531,12 +590,12 @@ Call update_draft exactly once with the draft ID above and the complete revised 
 
   const drafting =
     /\bdraft\b/i.test(userText) && /\b(email|reply|gmail)\b/i.test(userText);
-  const reply = await whileTyping(ctx, () =>
-    runAgent(
-      userText,
-      drafting ? { backend: "claude" } : {},
-    ),
-  );
+  const task: ModelTask = drafting
+    ? "drafting"
+    : isAccountOrMeetingQuestion(userText)
+      ? "meetings"
+      : "chat";
+  const reply = await whileTyping(ctx, () => runAgent(userText, { task }));
   await sendPlainText(ctx, reply);
 }
 
@@ -586,6 +645,7 @@ async function answerDocumentCaption(
   const reply = await whileTyping(ctx, () =>
     runAgent(
       `Vishnu's question about the document just uploaded (id ${documentId}, file "${fileName}"): ${caption}\nUse read_document with id ${documentId} to answer from its saved text.`,
+      { task: "documents" },
     ),
   );
   await sendPlainText(ctx, reply);

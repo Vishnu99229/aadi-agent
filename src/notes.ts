@@ -178,12 +178,9 @@ ${note.content}
 
 People involved: ${note.people}`;
 
-  // Drafting stays on Claude: the Gemma bench skipped a required tool call
-  // (answered from context instead of get_current_time), so reply drafts
-  // are not trusted to the global /model switch yet.
   const reply = await runAgent(instruction, {
     saveUserMessage: false,
-    backend: "claude",
+    task: "drafting",
   });
   await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
   await ctx.reply(reply);

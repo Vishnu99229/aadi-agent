@@ -23,6 +23,7 @@ const meetingScanTask = registerMeetingScan(bot.api);
 const weeklyBackupTask = registerWeeklyBackup(bot.api);
 const MENU_COMMANDS = [
   { command: "followups", description: "Scan and list emails waiting on a reply" },
+  { command: "model", description: "Choose which model handles each task" },
   { command: "reset", description: "Clear conversation history" },
 ] as const;
 

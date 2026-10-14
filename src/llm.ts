@@ -14,7 +14,7 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
-import { getChatBackend } from "./chat_backend.js";
+import { getTaskBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import { assertLocalModelAllowed } from "./local_llm_guard.js";
 
@@ -100,8 +100,7 @@ export interface CompleteParams {
   /** Override the default chat model (used for background classification). */
   model?: string;
   /**
-   * Per-call backend. When omitted, uses the persisted /model choice
-   * (or LLM_PROVIDER: claude | cloud-gemma).
+   * Per-call backend. When omitted, uses the persisted chat-task /model choice.
    */
   backend?: LlmBackend;
   maxTokens?: number;
@@ -704,14 +703,25 @@ async function completeWithNamedBackend(
 export async function complete(
   params: CompleteParams,
 ): Promise<CompleteResult> {
-  const backend = params.backend ?? getChatBackend();
-  return completeWithNamedBackend(backend, params);
+  const backend = params.backend ?? getTaskBackend("chat");
+  try {
+    return await completeWithNamedBackend(backend, params);
+  } catch (error) {
+    if (backend === "claude") {
+      throw error;
+    }
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(
+      `Backend ${backend} failed (${errorType}); retrying on Claude.`,
+    );
+    return completeWithNamedBackend("claude", { ...params, backend: "claude" });
+  }
 }
 
 export async function completeBackground(
   params: Omit<CompleteParams, "model" | "backend">,
 ): Promise<CompleteResult> {
-  // Follow-up and bill classification stay on Claude Haiku regardless of /model.
+  // Follow-up and bill classification stay on Claude Haiku. Not in the /model panel.
   return complete({
     ...params,
     backend: "claude",
