@@ -21,22 +21,32 @@ const reminderScheduler = await registerReminderScheduler(bot.api);
 const documentExpirySweep = startDocumentExpirySweep();
 const meetingScanTask = registerMeetingScan(bot.api);
 const weeklyBackupTask = registerWeeklyBackup(bot.api);
+const MENU_COMMANDS = [
+  { command: "followups", description: "Scan and list emails waiting on a reply" },
+  { command: "reset", description: "Clear conversation history" },
+] as const;
+
+const COMMAND_SCOPES = [
+  { type: "default" },
+  { type: "all_private_chats" },
+  { type: "all_group_chats" },
+  { type: "all_chat_administrators" },
+] as const;
+
+async function replaceBotCommandMenu(): Promise<void> {
+  for (const scope of COMMAND_SCOPES) {
+    await bot.api.deleteMyCommands({ scope });
+  }
+  await bot.api.setMyCommands(MENU_COMMANDS);
+}
+
 await logGoogleAccounts();
 bot.start({
   onStart: async () => {
-    await bot.api.setMyCommands([
-      { command: "menu", description: "Buttons for model, brief, waiting, bills, tasks" },
-      { command: "brief", description: "Send today's morning brief" },
-      { command: "weekly", description: "Send the weekly review" },
-      { command: "followups", description: "Scan and list emails waiting on a reply" },
-      { command: "next", description: "Brief for the next upcoming work meeting" },
-      { command: "accounts", description: "List Epicode deals and last activity" },
-      { command: "backup", description: "Send an encrypted copy of Aadi's database" },
-      { command: "model", description: "Switch between Claude and cloud Gemma" },
-      { command: "wrapup", description: "Save call or meeting notes" },
-      { command: "reset", description: "Clear conversation history" },
-      { command: "start", description: "Say hello" },
-    ]);
+    await replaceBotCommandMenu();
+    console.log(
+      `Telegram / menu: ${MENU_COMMANDS.map((item) => `/${item.command}`).join(", ")}`,
+    );
     console.log("Aadi is running with Telegram long polling.");
   },
 });
