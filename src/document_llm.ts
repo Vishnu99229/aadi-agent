@@ -393,6 +393,8 @@ export async function analyzeImage(
 export async function analyzeText(
   body: string,
   sourceLabel: string,
+  pagesProcessed = 0,
+  truncated = false,
 ): Promise<DocumentAnalysis> {
   return analyzeContent(
     [
@@ -402,8 +404,8 @@ export async function analyzeText(
       },
     ],
     "",
-    0,
-    false,
+    pagesProcessed,
+    truncated,
     "text",
   );
 }

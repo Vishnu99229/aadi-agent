@@ -189,11 +189,32 @@ db.exec(`
     tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
     content TEXT NOT NULL,
     pending_action_items TEXT,
+    meeting_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
   CREATE INDEX IF NOT EXISTS idx_notes_created
     ON notes (created_at);
+
+  CREATE TABLE IF NOT EXISTS attachment_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL,
+    google_account TEXT NOT NULL DEFAULT 'work'
+      CHECK (google_account IN ('personal', 'work')),
+    attachment_id TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    guessed_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'reviewed', 'ignored')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (google_account, message_id, attachment_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_attachment_alerts_status
+    ON attachment_alerts (status, created_at);
 
   CREATE TABLE IF NOT EXISTS bills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -284,6 +305,10 @@ if (!tableHasColumn("accounts", "via_partner_id")) {
 }
 if (!tableHasColumn("accounts", "people")) {
   db.exec(`ALTER TABLE accounts ADD COLUMN people TEXT NOT NULL DEFAULT '[]'`);
+}
+
+if (!tableHasColumn("notes", "meeting_json")) {
+  db.exec(`ALTER TABLE notes ADD COLUMN meeting_json TEXT`);
 }
 
 if (!tableHasColumn("pending_actions", "google_account")) {
@@ -715,8 +740,11 @@ export interface NoteRecord {
   tag: ItemTag;
   content: string;
   pending_action_items: string | null;
+  meeting_json: string | null;
   created_at: string;
 }
+
+const NOTE_COLUMNS = `id, title, people, tag, content, pending_action_items, meeting_json, created_at`;
 
 export function createDocument(
   fileName: string,
@@ -791,11 +819,12 @@ export function createNote(
   tag: ItemTag,
   content: string,
   pendingActionItems: NoteActionItem[] | null,
+  meetingJson: string | null = null,
 ): NoteRecord {
   const result = db
     .prepare(
-      `INSERT INTO notes (title, people, tag, content, pending_action_items)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO notes (title, people, tag, content, pending_action_items, meeting_json)
+       VALUES (?, ?, ?, ?, ?, ?)`,
     )
     .run(
       title,
@@ -803,16 +832,14 @@ export function createNote(
       tag,
       content,
       pendingActionItems ? JSON.stringify(pendingActionItems) : null,
+      meetingJson,
     );
   return getNote(Number(result.lastInsertRowid))!;
 }
 
 export function getNote(id: number): NoteRecord | undefined {
   return db
-    .prepare(
-      `SELECT id, title, people, tag, content, pending_action_items, created_at
-       FROM notes WHERE id = ?`,
-    )
+    .prepare(`SELECT ${NOTE_COLUMNS} FROM notes WHERE id = ?`)
     .get(id) as NoteRecord | undefined;
 }
 
@@ -831,7 +858,7 @@ export function searchNotes(
   if (sinceIso) {
     return db
       .prepare(
-        `SELECT id, title, people, tag, content, pending_action_items, created_at
+        `SELECT ${NOTE_COLUMNS}
          FROM notes
          WHERE created_at >= ?
            AND (title LIKE ? OR people LIKE ? OR content LIKE ?)
@@ -842,13 +869,102 @@ export function searchNotes(
   }
   return db
     .prepare(
-      `SELECT id, title, people, tag, content, pending_action_items, created_at
+      `SELECT ${NOTE_COLUMNS}
        FROM notes
        WHERE title LIKE ? OR people LIKE ? OR content LIKE ?
        ORDER BY created_at DESC
        LIMIT 100`,
     )
     .all(pattern, pattern, pattern) as NoteRecord[];
+}
+
+export type AttachmentAlertStatus = "pending" | "reviewed" | "ignored";
+
+export interface AttachmentAlertRecord {
+  id: number;
+  message_id: string;
+  google_account: GoogleAccountId;
+  attachment_id: string;
+  file_name: string;
+  mime_type: string;
+  sender: string;
+  subject: string;
+  guessed_type: string;
+  status: AttachmentAlertStatus;
+  created_at: string;
+}
+
+const ATTACHMENT_ALERT_COLUMNS = `id, message_id, google_account, attachment_id, file_name,
+  mime_type, sender, subject, guessed_type, status, created_at`;
+
+export function createAttachmentAlert(input: {
+  messageId: string;
+  googleAccount: GoogleAccountId;
+  attachmentId: string;
+  fileName: string;
+  mimeType: string;
+  sender: string;
+  subject: string;
+  guessedType: string;
+}): AttachmentAlertRecord | undefined {
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO attachment_alerts (
+         message_id, google_account, attachment_id, file_name, mime_type,
+         sender, subject, guessed_type
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.messageId,
+      input.googleAccount,
+      input.attachmentId,
+      input.fileName,
+      input.mimeType,
+      input.sender,
+      input.subject,
+      input.guessedType,
+    );
+  if (result.changes !== 1) {
+    return undefined;
+  }
+  return getAttachmentAlert(Number(result.lastInsertRowid));
+}
+
+export function getAttachmentAlert(id: number): AttachmentAlertRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${ATTACHMENT_ALERT_COLUMNS} FROM attachment_alerts WHERE id = ?`,
+    )
+    .get(id) as AttachmentAlertRecord | undefined;
+}
+
+export function getAttachmentAlertByMessage(
+  googleAccount: GoogleAccountId,
+  messageId: string,
+  attachmentId: string,
+): AttachmentAlertRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${ATTACHMENT_ALERT_COLUMNS}
+       FROM attachment_alerts
+       WHERE google_account = ? AND message_id = ? AND attachment_id = ?`,
+    )
+    .get(googleAccount, messageId, attachmentId) as
+    | AttachmentAlertRecord
+    | undefined;
+}
+
+export function transitionAttachmentAlert(
+  id: number,
+  from: AttachmentAlertStatus,
+  to: AttachmentAlertStatus,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE attachment_alerts SET status = ? WHERE id = ? AND status = ?`,
+    )
+    .run(to, id, from);
+  return result.changes === 1;
 }
 
 export type BillStatus = "upcoming" | "paid" | "ignored";

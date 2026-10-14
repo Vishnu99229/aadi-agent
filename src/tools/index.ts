@@ -7,7 +7,10 @@ import * as markBillPaid from "./mark_bill_paid.js";
 import * as removeDate from "./remove_date.js";
 import * as cancelReminder from "./cancel_reminder.js";
 import * as completeTask from "./complete_task.js";
+import * as draftMom from "./draft_mom.js";
 import * as draftReply from "./draft_reply.js";
+import * as listAttachments from "./list_attachments.js";
+import * as readAttachment from "./read_attachment.js";
 import * as getCurrentTime from "./get_current_time.js";
 import * as addDate from "./add_date.js";
 import * as listAccounts from "./list_accounts.js";
@@ -42,9 +45,11 @@ export const tools: Record<string, RegisteredTool> = {
   add_task: addTask,
   cancel_reminder: cancelReminder,
   complete_task: completeTask,
+  draft_mom: draftMom,
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
   list_accounts: listAccounts,
+  list_attachments: listAttachments,
   list_bills: listBills,
   list_dates: listDates,
   list_events: listEvents,
@@ -53,6 +58,7 @@ export const tools: Record<string, RegisteredTool> = {
   list_tasks: listTasks,
   list_waiting: listWaiting,
   mark_bill_paid: markBillPaid,
+  read_attachment: readAttachment,
   read_document: readDocument,
   remove_account: removeAccount,
   remove_date: removeDate,

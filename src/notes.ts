@@ -11,6 +11,11 @@ import {
 } from "./db.js";
 import { runAgent } from "./agent.js";
 import { offerAccountUpdateAfterWrapUp } from "./accounts.js";
+import { draftMomForNote } from "./mom.js";
+import {
+  hasMomRecipients,
+  type NoteMeeting,
+} from "./mom_logic.js";
 
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
@@ -96,31 +101,40 @@ export async function buildWrapUpNotes(rawInput: string): Promise<WrapUpAnalysis
   return parseWrapUp(text);
 }
 
-function noteKeyboard(noteId: number): InlineKeyboard {
-  return new InlineKeyboard()
+function noteKeyboard(noteId: number, showMom: boolean): InlineKeyboard {
+  const keyboard = new InlineKeyboard()
     .text("Add my action items as tasks", `note:tasks:${noteId}`)
-    .text("Draft follow-up email", `note:draft:${noteId}`)
-    .text("Done", `note:done:${noteId}`);
+    .row()
+    .text("Draft follow-up email", `note:draft:${noteId}`);
+  if (showMom) {
+    keyboard.row().text("Draft MoM email", `note:mom:${noteId}`);
+  }
+  return keyboard.row().text("Done", `note:done:${noteId}`);
 }
 
 export async function deliverWrapUp(
   ctx: Context,
   rawInput: string,
+  meeting?: NoteMeeting | null,
 ): Promise<void> {
   const analysis = await buildWrapUpNotes(rawInput);
   const pending =
     analysis.action_items.length > 0 ? analysis.action_items : null;
+  const showMom = Boolean(meeting && hasMomRecipients(meeting.attendees));
   const note = createNote(
     analysis.title,
     analysis.people,
     analysis.tag,
     analysis.content,
     pending,
+    meeting ? JSON.stringify(meeting) : null,
   );
   console.log(`Note ${note.id}: stored`);
 
   const reply = `${analysis.title} (${analysis.tag})\n\n${analysis.content}\n\nNote id: ${note.id}`;
-  await ctx.reply(reply, { reply_markup: noteKeyboard(note.id) });
+  await ctx.reply(reply, {
+    reply_markup: noteKeyboard(note.id, showMom),
+  });
   try {
     await offerAccountUpdateAfterWrapUp(ctx, analysis);
   } catch (error) {
@@ -131,7 +145,7 @@ export async function deliverWrapUp(
 
 export async function handleNoteCallback(
   ctx: Context,
-  operation: "tasks" | "draft" | "done",
+  operation: "tasks" | "draft" | "done" | "mom",
   noteId: number,
 ): Promise<void> {
   await ctx.answerCallbackQuery();
@@ -144,6 +158,17 @@ export async function handleNoteCallback(
   if (operation === "done") {
     clearNotePendingTasks(noteId);
     await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
+    return;
+  }
+
+  if (operation === "mom") {
+    try {
+      await draftMomForNote(noteId);
+      await ctx.reply("MoM draft is waiting for your approval. It will not send until you tap Send.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.reply(message);
+    }
     return;
   }
 

@@ -15,6 +15,7 @@
     "test:stage6": "tsx --env-file=.env scripts/test-stage6.ts",
     "test:stage7": "tsx --env-file=.env scripts/test-stage7.ts",
     "test:stage8": "tsx --env-file=.env scripts/test-stage8.ts",
+    "test:stage10": "tsx --env-file=.env scripts/test-stage10.ts",
     "test:haiku-live": "tsx --env-file=.env scripts/test-haiku-background-live.ts",
     "test:documents": "tsx --env-file=.env scripts/test-document-analysis.ts",
     "bench:models": "tsx --env-file=.env scripts/bench-models.ts"
@@ -35,7 +36,8 @@
     "node-cron": "^4.6.0",
     "openai": "^7.31.0",
     "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "^6.4.299"
+    "pdfjs-dist": "^6.4.299",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",

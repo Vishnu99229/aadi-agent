@@ -26,6 +26,7 @@ export interface DraftApprovalPreview {
   subject: string;
   body: string;
   googleAccount: "personal" | "work";
+  extraLines?: string[];
 }
 
 export interface DraftEditContext {
@@ -51,12 +52,14 @@ function truncate(text: string, limit: number): string {
 function previewText(preview: DraftApprovalPreview): string {
   const mailbox =
     preview.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
+  const extra = (preview.extraLines ?? []).filter((line) => line.trim());
   const prefix = [
     "Draft waiting for approval",
     "",
     `Account: ${mailbox}`,
     `To: ${preview.to}`,
     `Subject: ${preview.subject}`,
+    ...(extra.length ? ["", ...extra] : []),
     "",
   ].join("\n");
 

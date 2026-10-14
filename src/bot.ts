@@ -19,7 +19,7 @@ import {
 } from "./approvals.js";
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
-import { clearMessages, getSetting, setSetting } from "./db.js";
+import { clearMessages, getMeetingBrief, getSetting, setSetting } from "./db.js";
 import { handler as listBills } from "./tools/list_bills.js";
 import { handler as listTasks } from "./tools/list_tasks.js";
 import { handler as listWaiting } from "./tools/list_waiting.js";
@@ -49,6 +49,8 @@ import {
   handleAccountUpdateCallback,
 } from "./accounts.js";
 import { sendDatabaseBackup } from "./backup.js";
+import { handleAttachmentAlertCallback } from "./attachment_alerts.js";
+import { meetingFromBrief } from "./mom.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -442,10 +444,16 @@ bot.callbackQuery(/^date:wish:(\d+)$/, async (ctx) => {
   await handleDateWishCallback(ctx, dateId);
 });
 
-bot.callbackQuery(/^note:(tasks|draft|done):(\d+)$/, async (ctx) => {
-  const operation = ctx.match[1] as "tasks" | "draft" | "done";
+bot.callbackQuery(/^note:(tasks|draft|done|mom):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "tasks" | "draft" | "done" | "mom";
   const noteId = Number(ctx.match[2]);
   await handleNoteCallback(ctx, operation, noteId);
+});
+
+bot.callbackQuery(/^att:(review|ignore):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "review" | "ignore";
+  const alertId = Number(ctx.match[2]);
+  await handleAttachmentAlertCallback(ctx, operation, alertId);
 });
 
 bot.callbackQuery(/^acct:(yes|no):(\d+)$/, async (ctx) => {
@@ -548,8 +556,10 @@ async function deliverPendingMeetingWrapUp(
   const body = isWrapUpText(userText)
     ? stripWrapUpPrefix(userText)
     : userText;
+  const brief = getMeetingBrief(pending.briefId);
+  const meeting = brief ? meetingFromBrief(brief) : null;
   await whileTyping(ctx, () =>
-    deliverWrapUp(ctx, formatWrapUpPrefill(pending, body)),
+    deliverWrapUp(ctx, formatWrapUpPrefill(pending, body), meeting),
   );
   markMeetingWrapped(pending.briefId);
   return true;

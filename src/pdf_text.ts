@@ -5,6 +5,7 @@ const MIN_TEXT_LAYER_CHARS = 80;
 export interface PdfTextExtract {
   text: string;
   pages: number;
+  totalPages: number;
   hasTextLayer: boolean;
 }
 
@@ -31,7 +32,7 @@ function hasEol(item: unknown): boolean {
 
 export async function extractPdfText(
   bytes: Uint8Array,
-  maxPages: number,
+  maxPages?: number,
 ): Promise<PdfTextExtract> {
   const document = await getDocument({
     // Copy: pdf.js transfers/detaches the ArrayBuffer.
@@ -41,7 +42,10 @@ export async function extractPdfText(
     isEvalSupported: false,
   }).promise;
 
-  const pages = Math.min(document.numPages, maxPages);
+  const pages =
+    maxPages === undefined
+      ? document.numPages
+      : Math.min(document.numPages, maxPages);
   const parts: string[] = [];
   let letters = 0;
 
@@ -66,6 +70,7 @@ export async function extractPdfText(
   return {
     text,
     pages,
+    totalPages: document.numPages,
     hasTextLayer: letters >= MIN_TEXT_LAYER_CHARS,
   };
 }
