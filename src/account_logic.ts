@@ -1,9 +1,13 @@
 export type WaitingOn = "me" | "them" | "nobody";
+export type AccountRelationship = "partner" | "end_client";
 
 export interface AccountFields {
   name: string;
   aliases: string[];
   email_domains: string[];
+  relationship: AccountRelationship;
+  via_partner_id: number | null;
+  people: string[];
   stage: string;
   next_step: string;
   next_step_due: string | null;
@@ -21,6 +25,9 @@ export function decodeAccount(row: {
   name: string;
   aliases: string;
   email_domains: string;
+  relationship?: AccountRelationship | string | null;
+  via_partner_id?: number | null;
+  people?: string;
   stage: string;
   next_step: string;
   next_step_due: string | null;
@@ -28,11 +35,16 @@ export function decodeAccount(row: {
   last_activity_at: string | null;
   created_at: string;
 }): AccountRecord {
+  const relationship =
+    row.relationship === "end_client" ? "end_client" : "partner";
   return {
     id: row.id,
     name: row.name,
     aliases: parseJsonList(row.aliases),
     email_domains: parseJsonList(row.email_domains).map(normalizeDomain),
+    relationship,
+    via_partner_id: row.via_partner_id ?? null,
+    people: parseJsonList(row.people ?? "[]"),
     stage: row.stage,
     next_step: row.next_step,
     next_step_due: row.next_step_due,
@@ -68,6 +80,13 @@ export function parseWaitingOn(value: unknown): WaitingOn {
     return value;
   }
   throw new Error('waiting_on must be "me", "them", or "nobody".');
+}
+
+export function parseRelationship(value: unknown): AccountRelationship {
+  if (value === "partner" || value === "end_client") {
+    return value;
+  }
+  throw new Error('relationship must be "partner" or "end_client".');
 }
 
 export function parseStringList(value: unknown): string[] {
@@ -127,6 +146,25 @@ export function accountNeedles(account: AccountFields): string[] {
   return [...new Set(needles)];
 }
 
+export function accountNameNeedles(account: AccountFields): string[] {
+  return [...new Set(
+    [account.name, ...account.aliases]
+      .map((item) => item.trim().toLowerCase())
+      .filter((item) => item.length >= 3 && !item.includes("@")),
+  )];
+}
+
+export function namesMatchText(account: AccountFields, haystack: string): boolean {
+  const lower = haystack.toLowerCase();
+  return accountNameNeedles(account).some((needle) => lower.includes(needle));
+}
+
+export function extractEmailAddresses(header: string): string[] {
+  return [...header.matchAll(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi)].map(
+    (match) => match[0]!.toLowerCase(),
+  );
+}
+
 export function accountMatchesText(
   account: AccountFields,
   haystack: string,
@@ -139,14 +177,74 @@ export function accountMatchesEmail(
   account: AccountFields,
   email: string,
 ): boolean {
-  const address = email.toLowerCase();
-  const domain = address.includes("@")
-    ? address.slice(address.lastIndexOf("@") + 1)
-    : "";
+  const addresses = extractEmailAddresses(email);
+  const domains =
+    addresses.length > 0
+      ? addresses.map((address) => address.slice(address.lastIndexOf("@") + 1))
+      : [
+          email.includes("@")
+            ? email.toLowerCase().slice(email.lastIndexOf("@") + 1)
+            : "",
+        ];
   return account.email_domains.some((item) => {
     const wanted = normalizeDomain(item);
-    return wanted !== "" && (domain === wanted || domain.endsWith(`.${wanted}`));
+    return (
+      wanted !== "" &&
+      domains.some((domain) => domain === wanted || domain.endsWith(`.${wanted}`))
+    );
   });
+}
+
+function headerInvolvesAccount(
+  account: AccountFields,
+  from: string,
+  to: string,
+): boolean {
+  return (
+    accountMatchesEmail(account, from) ||
+    accountMatchesEmail(account, to) ||
+    namesMatchText(account, `${from} ${to}`)
+  );
+}
+
+export function accountMatchesThread(
+  account: AccountFields,
+  headers: { from: string; to: string; subject: string; body?: string },
+  _partner?: AccountFields | null,
+): boolean {
+  if (account.relationship === "end_client") {
+    if (accountMatchesEmail(account, headers.from) || accountMatchesEmail(account, headers.to)) {
+      return true;
+    }
+    return namesMatchText(
+      account,
+      `${headers.subject}\n${headers.body ?? ""}`,
+    );
+  }
+  if (headerInvolvesAccount(account, headers.from, headers.to)) {
+    return true;
+  }
+  return namesMatchText(account, headers.subject);
+}
+
+export function partnerFor(
+  account: AccountFields,
+  accounts: AccountRecord[],
+): AccountRecord | undefined {
+  if (account.via_partner_id == null) {
+    return undefined;
+  }
+  return accounts.find((item) => item.id === account.via_partner_id);
+}
+
+export function endClientsOf(
+  partner: AccountRecord,
+  accounts: AccountRecord[],
+): AccountRecord[] {
+  return accounts.filter(
+    (item) =>
+      item.relationship === "end_client" && item.via_partner_id === partner.id,
+  );
 }
 
 export function findAccountsInText(
@@ -264,18 +362,36 @@ export function latestActivityIso(interactions: InteractionLine[]): string | nul
   return new Date(newest.dateMs).toISOString();
 }
 
-export function formatAccountListLine(account: AccountRecord): string {
+export function formatAccountListLine(
+  account: AccountRecord,
+  partnerName?: string,
+): string {
   const stage = account.stage.trim() || "no stage";
   const activity = account.last_activity_at
     ? account.last_activity_at.slice(0, 10)
     : "no activity";
-  return `#${account.id} ${account.name} — ${stage} — last ${activity}`;
+  const rel =
+    account.relationship === "end_client"
+      ? `end client via ${partnerName || "partner"}`
+      : "partner";
+  return `#${account.id} ${account.name} — ${rel} — ${stage} — last ${activity}`;
+}
+
+export function formatLinkedEndClientLine(account: AccountRecord): string {
+  const stage = account.stage.trim() || "no stage";
+  const activity = account.last_activity_at
+    ? account.last_activity_at.slice(0, 10)
+    : "no activity";
+  const next = account.next_step.trim() || "no next step";
+  return `• ${account.name} — ${stage} — last ${activity} — ${next}`;
 }
 
 export function formatAccountStatus(params: {
   account: AccountRecord;
   interactions: InteractionLine[];
   openItems: OpenItemLine[];
+  viaPartnerName?: string;
+  linkedEndClients?: AccountRecord[];
 }): string {
   const recent = [...params.interactions]
     .sort((left, right) => right.dateMs - left.dateMs)
@@ -296,10 +412,31 @@ export function formatAccountStatus(params: {
   const due = params.account.next_step_due
     ? ` (due ${params.account.next_step_due.slice(0, 10)})`
     : "";
+  const via =
+    params.account.relationship === "end_client"
+      ? `Via partner: ${params.viaPartnerName || "unknown"}`
+      : "Relationship: partner";
+  const people =
+    params.account.people.length > 0
+      ? `People: ${params.account.people.join(", ")}`
+      : "";
+  const linked =
+    params.account.relationship === "partner" &&
+    params.linkedEndClients &&
+    params.linkedEndClients.length > 0
+      ? [
+          "",
+          "End clients:",
+          ...params.linkedEndClients.map(formatLinkedEndClientLine),
+        ]
+      : [];
   return [
     `${params.account.name} — ${params.account.stage.trim() || "no stage"}`,
+    via,
+    ...(people ? [people] : []),
     `Next step: ${params.account.next_step.trim() || "none"}${due}`,
     `Waiting on: ${params.account.waiting_on}`,
+    ...linked,
     "",
     "Last interactions:",
     threads,
@@ -315,12 +452,24 @@ export function formatAccountStatus(params: {
   ].join("\n");
 }
 
-export function gmailQueryForAccount(account: AccountFields): string {
+export function gmailQueryForAccount(
+  account: AccountFields,
+  _partner?: AccountFields | null,
+): string {
   const parts: string[] = [];
+  if (account.relationship === "end_client") {
+    for (const domain of account.email_domains.map(normalizeDomain).filter(Boolean)) {
+      parts.push(`from:@${domain}`, `to:@${domain}`);
+    }
+    for (const needle of accountNameNeedles(account)) {
+      parts.push(`"${needle}"`);
+    }
+    return parts.join(" OR ");
+  }
   for (const domain of account.email_domains.map(normalizeDomain).filter(Boolean)) {
     parts.push(`from:@${domain}`, `to:@${domain}`);
   }
-  for (const alias of account.aliases) {
+  for (const alias of [...account.aliases, account.name]) {
     const trimmed = alias.trim();
     if (trimmed.includes("@")) {
       parts.push(`from:${trimmed}`, `to:${trimmed}`);

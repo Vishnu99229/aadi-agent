@@ -38,6 +38,37 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude google-token.json --exclude google-token-work.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
+ROOT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+BACKUP_DIR="$ROOT/backups"
+mkdir -p "$BACKUP_DIR"
+
+snapshot_phone_db() {
+  stamp="$(TZ=Asia/Kolkata date +%Y%m%d-%H%M%S)"
+  dest="$BACKUP_DIR/aadi-$stamp.db"
+  echo "Snapshotting phone aadi.db to backups/aadi-$stamp.db"
+  ssh -p "$PHONE_PORT" "$PHONE" "mkdir -p ~/aadi-agent/scripts"
+  scp -q -P "$PHONE_PORT" "$ROOT/scripts/sqlite-backup.cjs" "$PHONE:~/aadi-agent/scripts/sqlite-backup.cjs"
+  if ssh -p "$PHONE_PORT" "$PHONE" 'cd ~/aadi-agent && node scripts/sqlite-backup.cjs "$HOME/aadi-agent/.aadi-deploy-backup.db"'; then
+    scp -q -P "$PHONE_PORT" "$PHONE:~/aadi-agent/.aadi-deploy-backup.db" "$dest"
+    ssh -p "$PHONE_PORT" "$PHONE" 'rm -f "$HOME/aadi-agent/.aadi-deploy-backup.db"'
+    echo "Saved $dest"
+  else
+    ssh -p "$PHONE_PORT" "$PHONE" 'rm -f "$HOME/aadi-agent/.aadi-deploy-backup.db"' || true
+    echo "Warning: could not snapshot phone aadi.db. Continuing deploy."
+    return 0
+  fi
+  keep=10
+  n=0
+  for f in $(ls -t "$BACKUP_DIR"/aadi-*.db 2>/dev/null); do
+    n=$((n + 1))
+    if [ "$n" -gt "$keep" ]; then
+      rm -f "$f"
+    fi
+  done
+}
+
+snapshot_phone_db
+
+rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude backups --exclude google-token.json --exclude google-token-work.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
 ssh -p "$PHONE_PORT" "$PHONE" 'cd ~/aadi-agent && npm install --no-audit --no-fund && pkill -f "[t]sx src/index.ts" || true'
 echo "Deployed. Aadi restarts on the phone in about 5 seconds."

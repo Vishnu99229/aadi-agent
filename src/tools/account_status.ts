@@ -6,7 +6,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "account_status",
   description:
-    'Status of one Epicode deal/account from the work mailbox and saved notes. Use for questions like "where are we with Pinnacle?". Does not change stage or next step.',
+    'Status of one Epicode deal/account from the work mailbox and saved notes. Partners include a one-line summary of each linked end client. End clients show they run via the partner and include relevant partner threads. Use for questions like "where are we with Pinnacle?". Does not change stage or next step.',
   inputSchema: {
     type: "object",
     properties: {

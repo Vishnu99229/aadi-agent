@@ -16,14 +16,16 @@ import {
 import { loadGoogleAccounts } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import {
-  accountMatchesEmail,
   accountMatchesText,
+  accountMatchesThread,
   decodeAccount,
+  endClientsOf,
   findAccountsInText,
   formatAccountListLine,
   formatAccountStatus,
   gmailQueryForAccount,
   latestActivityIso,
+  partnerFor,
   suggestedUpdateFromWrapUp,
   type AccountRecord,
   type InteractionLine,
@@ -39,6 +41,48 @@ function header(
     headers?.find((item) => item.name?.toLowerCase() === name.toLowerCase())
       ?.value ?? ""
   );
+}
+
+function decodePartBody(data: string | null | undefined): string {
+  return data ? Buffer.from(data, "base64url").toString("utf8") : "";
+}
+
+function collectPlainText(part: {
+  mimeType?: string | null;
+  body?: { data?: string | null } | null;
+  parts?: Array<{
+    mimeType?: string | null;
+    body?: { data?: string | null } | null;
+    parts?: unknown[];
+  }> | null;
+}): string {
+  const chunks: string[] = [];
+  if (part.mimeType?.toLowerCase() === "text/plain" && part.body?.data) {
+    chunks.push(decodePartBody(part.body.data));
+  }
+  for (const child of part.parts ?? []) {
+    chunks.push(collectPlainText(child));
+  }
+  return chunks.join("\n");
+}
+
+function matchTextFromMessage(
+  payload:
+    | {
+        mimeType?: string | null;
+        body?: { data?: string | null } | null;
+        parts?: Array<{
+          mimeType?: string | null;
+          body?: { data?: string | null } | null;
+          parts?: unknown[];
+        }> | null;
+      }
+    | null
+    | undefined,
+  snippet?: string | null,
+): string {
+  const plain = payload ? collectPlainText(payload) : "";
+  return `${snippet ?? ""}\n${plain}`;
 }
 
 export function decodedAccounts(): AccountRecord[] {
@@ -108,8 +152,9 @@ function openItemsFor(account: AccountRecord): OpenItemLine[] {
 
 async function workEmailInteractions(
   account: AccountRecord,
+  partner?: AccountRecord | null,
 ): Promise<InteractionLine[]> {
-  const query = gmailQueryForAccount(account);
+  const query = gmailQueryForAccount(account, partner);
   if (!query) {
     return [];
   }
@@ -131,7 +176,7 @@ async function workEmailInteractions(
     const response = await gmail.users.messages.get({
       userId: "me",
       id: message.id,
-      format: "metadata",
+      format: account.relationship === "end_client" ? "full" : "metadata",
       metadataHeaders: ["From", "To", "Subject", "Date"],
     });
     const headers = response.data.payload?.headers;
@@ -139,11 +184,11 @@ async function workEmailInteractions(
     const to = header(headers, "To");
     const subject = header(headers, "Subject");
     const date = header(headers, "Date");
-    if (
-      !accountMatchesEmail(account, from) &&
-      !accountMatchesEmail(account, to) &&
-      !accountMatchesText(account, `${from} ${to} ${subject}`)
-    ) {
+    const body =
+      account.relationship === "end_client"
+        ? matchTextFromMessage(response.data.payload, response.data.snippet)
+        : "";
+    if (!accountMatchesThread(account, { from, to, subject, body }, partner)) {
       continue;
     }
     const threadId = response.data.threadId ?? message.id;
@@ -178,11 +223,17 @@ export function formatAccountsList(): string {
   if (accounts.length === 0) {
     return "No accounts tracked yet.";
   }
-  return accounts.map(formatAccountListLine).join("\n");
+  return accounts
+    .map((account) =>
+      formatAccountListLine(account, partnerFor(account, accounts)?.name),
+    )
+    .join("\n");
 }
 
 export async function buildAccountStatus(account: AccountRecord): Promise<string> {
-  const emails = await workEmailInteractions(account);
+  const all = decodedAccounts();
+  const partner = partnerFor(account, all);
+  const emails = await workEmailInteractions(account, partner);
   const notes = noteInteractions(account);
   const interactions = [...emails, ...notes];
   const activity = latestActivityIso(interactions);
@@ -194,6 +245,8 @@ export async function buildAccountStatus(account: AccountRecord): Promise<string
     account: fresh,
     interactions,
     openItems: openItemsFor(account),
+    viaPartnerName: partner?.name,
+    linkedEndClients: endClientsOf(fresh, all),
   });
 }
 

@@ -248,4 +248,5 @@ export const config = {
   backgroundCostRates: readCostRates("BACKGROUND", HAIKU_55_COST_DEFAULTS),
   gemmaCloudCostRates: readCostRates("GEMMA_CLOUD", GEMMA_CLOUD_COST_DEFAULTS),
   localCostRates: ZERO_COST_RATES,
+  backupPassword: process.env.BACKUP_PASSWORD?.trim() ?? "",
 } as const;

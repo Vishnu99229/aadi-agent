@@ -42,6 +42,7 @@ import {
   formatAccountsList,
   handleAccountUpdateCallback,
 } from "./accounts.js";
+import { sendDatabaseBackup } from "./backup.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -305,6 +306,23 @@ bot.command("followups", async (ctx) => {
 
 bot.command("accounts", async (ctx) => {
   await sendPlainText(ctx, formatAccountsList());
+});
+
+bot.command("backup", async (ctx) => {
+  try {
+    const result = await whileTyping(ctx, () =>
+      sendDatabaseBackup(ctx.api, "on-demand"),
+    );
+    if (result === "skipped") {
+      await ctx.reply("No backup sent: BACKUP_PASSWORD is not set.");
+      return;
+    }
+    await ctx.reply("Encrypted backup sent.");
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`On-demand backup failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
 });
 
 bot.command("next", async (ctx) => {

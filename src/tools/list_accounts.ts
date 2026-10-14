@@ -5,7 +5,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_accounts",
   description:
-    "List tracked Epicode deals/accounts, most stale first (least recent activity). Each line has id, name, stage, and last activity date.",
+    "List tracked Epicode deals/accounts, most stale first (least recent activity). Each line has id, name, partner/end-client, stage, and last activity date.",
   inputSchema: {
     type: "object",
     properties: {},

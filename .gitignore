@@ -2,6 +2,7 @@ node_modules
 dist
 .env
 *.db
+backups/
 google-credentials.json
 google-token.json
 google-token-work.json

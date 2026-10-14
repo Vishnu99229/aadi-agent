@@ -9,6 +9,7 @@ import { startDocumentExpirySweep } from "./documents.js";
 import { registerReminderScheduler } from "./reminders.js";
 import { logGoogleAccounts } from "./google/auth.js";
 import { registerMeetingScan } from "./meetings.js";
+import { registerWeeklyBackup } from "./backup.js";
 
 const morningBriefTask = registerMorningBrief(bot.api);
 const billScanTask = registerBillScan(bot.api);
@@ -19,6 +20,7 @@ const approvalExpirySweep = startApprovalExpirySweep();
 const reminderScheduler = await registerReminderScheduler(bot.api);
 const documentExpirySweep = startDocumentExpirySweep();
 const meetingScanTask = registerMeetingScan(bot.api);
+const weeklyBackupTask = registerWeeklyBackup(bot.api);
 await logGoogleAccounts();
 bot.start({
   onStart: async () => {
@@ -29,6 +31,7 @@ bot.start({
       { command: "followups", description: "Scan and list emails waiting on a reply" },
       { command: "next", description: "Brief for the next upcoming work meeting" },
       { command: "accounts", description: "List Epicode deals and last activity" },
+      { command: "backup", description: "Send an encrypted copy of Aadi's database" },
       { command: "model", description: "Switch between Claude and cloud Gemma" },
       { command: "wrapup", description: "Save call or meeting notes" },
       { command: "reset", description: "Clear conversation history" },
@@ -45,6 +48,7 @@ process.once("SIGINT", () => {
   weeklyReviewTask.stop();
   followupScanTask.stop();
   meetingScanTask.stop();
+  weeklyBackupTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
@@ -57,6 +61,7 @@ process.once("SIGTERM", () => {
   weeklyReviewTask.stop();
   followupScanTask.stop();
   meetingScanTask.stop();
+  weeklyBackupTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);

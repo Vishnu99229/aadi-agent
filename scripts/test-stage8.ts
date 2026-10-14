@@ -14,6 +14,7 @@ ensureTestEnv();
 const {
   accountMatchesEmail,
   accountMatchesText,
+  accountMatchesThread,
   decodeAccount,
   findAccountByName,
   findAccountsInText,
@@ -219,7 +220,132 @@ function testWrapUpConfirmIsExplicit(): void {
   assert(offer?.waiting_on === "me", "waiting on me");
 }
 
+function testPartnerEndClientModel(): void {
+  const partner = decodeAccount(
+    getAccount(
+      (
+        JSON.parse(
+          addAccount({
+            name: `${NAME} Pinnacle`,
+            aliases: "Pinnacle",
+            email_domains: "pinnacle-stage8.example",
+            relationship: "partner",
+          }),
+        ) as { id: number }
+      ).id,
+    )!,
+  );
+  const eternal = decodeAccount(
+    getAccount(
+      (
+        JSON.parse(
+          addAccount({
+            name: `${NAME} Eternal`,
+            aliases: "Eternal, Zomato",
+            email_domains: "eternal-stage8.example",
+            people: "Ananya Saxena, Girish Rao",
+            relationship: "end_client",
+            via_partner: `${NAME} Pinnacle`,
+          }),
+        ) as { id: number }
+      ).id,
+    )!,
+  );
+  assert(eternal.relationship === "end_client", "eternal is end_client");
+  assert(eternal.via_partner_id === partner.id, "eternal linked to pinnacle");
+  assert(eternal.people.includes("Ananya Saxena"), "people stored for display");
+  assert(
+    accountMatchesThread(
+      eternal,
+      {
+        from: "ops@eternal-stage8.example",
+        to: "vishnu@epicode.in",
+        subject: "Voice panel",
+      },
+      partner,
+    ),
+    "end client own domain matches",
+  );
+  assert(
+    accountMatchesThread(
+      eternal,
+      {
+        from: "sales@pinnacle-stage8.example",
+        to: "vishnu@epicode.in",
+        subject: "Eternal voice panel deal",
+      },
+      partner,
+    ),
+    "pinnacle thread with Eternal in the subject matches the end client",
+  );
+  assert(
+    accountMatchesThread(
+      eternal,
+      {
+        from: "sales@pinnacle-stage8.example",
+        to: "vishnu@epicode.in",
+        subject: "Sandbox",
+        body: "Please provision Zomato voice panel access",
+      },
+      partner,
+    ),
+    "end client matches name in the body",
+  );
+  assert(
+    !accountMatchesThread(
+      eternal,
+      {
+        from: "Ananya Saxena <ananya.saxena@pinnacle-stage8.example>",
+        to: "vishnu@epicode.in",
+        subject: "Weekly partner sync",
+        body: "Agenda for tomorrow",
+      },
+      partner,
+    ),
+    "pinnacle contact does not match the end client",
+  );
+  assert(
+    accountMatchesThread(partner, {
+      from: "Ananya Saxena <ananya.saxena@pinnacle-stage8.example>",
+      to: "vishnu@epicode.in",
+      subject: "Weekly partner sync",
+    }),
+    "pinnacle domain matches only the partner",
+  );
+  const partnerStatus = formatAccountStatus({
+    account: { ...partner, people: ["Hardik Singh"] },
+    interactions: [],
+    openItems: [],
+    linkedEndClients: [eternal],
+  });
+  assert(partnerStatus.includes("People: Hardik Singh"), "people are display-only");
+  assert(partnerStatus.includes("Relationship: partner"), "partner label");
+  assert(partnerStatus.includes("End clients:"), "lists end clients");
+  assert(partnerStatus.includes(eternal.name), "end client name on partner status");
+  const eternalStatus = formatAccountStatus({
+    account: eternal,
+    interactions: [
+      {
+        kind: "email",
+        date: "10 Oct 2026",
+        dateMs: Date.parse("2026-10-10T10:00:00+05:30"),
+        text: "Eternal voice panel deal",
+      },
+    ],
+    openItems: [],
+    viaPartnerName: partner.name,
+  });
+  assert(eternalStatus.includes(`Via partner: ${partner.name}`), "via partner line");
+  assert(
+    eternalStatus.includes("Eternal voice panel deal"),
+    "includes the pinnacle thread",
+  );
+  const line = formatAccountListLine(eternal, partner.name);
+  assert(line.includes("end client via"), "list line shows via partner");
+}
+
 testCrudAndStaleOrder();
 testMatchingAndStatus();
 testWrapUpConfirmIsExplicit();
+testPartnerEndClientModel();
 console.log("Stage 8 checks passed.");

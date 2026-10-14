@@ -83,7 +83,13 @@ export interface FollowupInput {
   nextCheckAt: string;
 }
 
-const db = new Database("./aadi.db");
+export const DB_PATH = "./aadi.db";
+
+const db = new Database(DB_PATH);
+
+export async function backupDatabaseTo(destPath: string): Promise<void> {
+  await db.backup(destPath);
+}
 
 function tableHasColumn(table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
@@ -245,6 +251,10 @@ db.exec(`
     name TEXT NOT NULL,
     aliases TEXT NOT NULL DEFAULT '[]',
     email_domains TEXT NOT NULL DEFAULT '[]',
+    relationship TEXT NOT NULL DEFAULT 'partner'
+      CHECK (relationship IN ('partner', 'end_client')),
+    via_partner_id INTEGER,
+    people TEXT NOT NULL DEFAULT '[]',
     stage TEXT NOT NULL DEFAULT '',
     next_step TEXT NOT NULL DEFAULT '',
     next_step_due TEXT,
@@ -263,6 +273,18 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 `);
+
+if (!tableHasColumn("accounts", "relationship")) {
+  db.exec(
+    `ALTER TABLE accounts ADD COLUMN relationship TEXT NOT NULL DEFAULT 'partner'`,
+  );
+}
+if (!tableHasColumn("accounts", "via_partner_id")) {
+  db.exec(`ALTER TABLE accounts ADD COLUMN via_partner_id INTEGER`);
+}
+if (!tableHasColumn("accounts", "people")) {
+  db.exec(`ALTER TABLE accounts ADD COLUMN people TEXT NOT NULL DEFAULT '[]'`);
+}
 
 if (!tableHasColumn("pending_actions", "google_account")) {
   db.exec(
@@ -1067,12 +1089,16 @@ export function updateMeetingNudge(
 }
 
 export type WaitingOn = "me" | "them" | "nobody";
+export type AccountRelationship = "partner" | "end_client";
 
 export interface AccountRecord {
   id: number;
   name: string;
   aliases: string;
   email_domains: string;
+  relationship: AccountRelationship;
+  via_partner_id: number | null;
+  people: string;
   stage: string;
   next_step: string;
   next_step_due: string | null;
@@ -1081,13 +1107,16 @@ export interface AccountRecord {
   created_at: string;
 }
 
-const ACCOUNT_COLUMNS = `id, name, aliases, email_domains, stage, next_step,
-              next_step_due, waiting_on, last_activity_at, created_at`;
+const ACCOUNT_COLUMNS = `id, name, aliases, email_domains, relationship, via_partner_id,
+              people, stage, next_step, next_step_due, waiting_on, last_activity_at, created_at`;
 
 export function createAccount(input: {
   name: string;
   aliases?: string;
   emailDomains?: string;
+  relationship?: AccountRelationship;
+  viaPartnerId?: number | null;
+  people?: string;
   stage?: string;
   nextStep?: string;
   nextStepDue?: string | null;
@@ -1096,13 +1125,17 @@ export function createAccount(input: {
   const result = db
     .prepare(
       `INSERT INTO accounts (
-         name, aliases, email_domains, stage, next_step, next_step_due, waiting_on
-       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         name, aliases, email_domains, relationship, via_partner_id, people,
+         stage, next_step, next_step_due, waiting_on
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.name,
       input.aliases ?? "[]",
       input.emailDomains ?? "[]",
+      input.relationship ?? "partner",
+      input.viaPartnerId ?? null,
+      input.people ?? "[]",
       input.stage ?? "",
       input.nextStep ?? "",
       input.nextStepDue ?? null,
@@ -1133,6 +1166,9 @@ export function updateAccount(
     name?: string;
     aliases?: string;
     emailDomains?: string;
+    relationship?: AccountRelationship;
+    viaPartnerId?: number | null;
+    people?: string;
     stage?: string;
     nextStep?: string;
     nextStepDue?: string | null;
@@ -1148,6 +1184,9 @@ export function updateAccount(
      SET name = ?,
          aliases = ?,
          email_domains = ?,
+         relationship = ?,
+         via_partner_id = ?,
+         people = ?,
          stage = ?,
          next_step = ?,
          next_step_due = ?,
@@ -1157,6 +1196,11 @@ export function updateAccount(
     patch.name ?? current.name,
     patch.aliases ?? current.aliases,
     patch.emailDomains ?? current.email_domains,
+    patch.relationship ?? current.relationship,
+    patch.viaPartnerId === undefined
+      ? current.via_partner_id
+      : patch.viaPartnerId,
+    patch.people ?? current.people,
     patch.stage ?? current.stage,
     patch.nextStep ?? current.next_step,
     patch.nextStepDue === undefined ? current.next_step_due : patch.nextStepDue,
