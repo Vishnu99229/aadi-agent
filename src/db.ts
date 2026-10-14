@@ -222,6 +222,23 @@ db.exec(`
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS meeting_briefs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL,
+    title TEXT NOT NULL,
+    attendees_json TEXT NOT NULL,
+    briefed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    nudge_status TEXT NOT NULL DEFAULT 'briefed'
+      CHECK (nudge_status IN (
+        'briefed', 'nudged', 'remind_scheduled', 're_nudged',
+        'skipped', 'wrapping', 'wrapped'
+      )),
+    nudge_at TEXT,
+    UNIQUE (event_id, start_at)
+  );
 `);
 
 if (!tableHasColumn("pending_actions", "google_account")) {
@@ -920,4 +937,108 @@ export function setSetting(key: string, value: string): void {
     `INSERT INTO settings (key, value) VALUES (?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
   ).run(key, value);
+}
+
+export function deleteSetting(key: string): void {
+  db.prepare("DELETE FROM settings WHERE key = ?").run(key);
+}
+
+export type MeetingNudgeStatus =
+  | "briefed"
+  | "nudged"
+  | "remind_scheduled"
+  | "re_nudged"
+  | "skipped"
+  | "wrapping"
+  | "wrapped";
+
+export interface MeetingBriefRecord {
+  id: number;
+  event_id: string;
+  start_at: string;
+  end_at: string;
+  title: string;
+  attendees_json: string;
+  briefed_at: string;
+  nudge_status: MeetingNudgeStatus;
+  nudge_at: string | null;
+}
+
+const MEETING_BRIEF_COLUMNS = `id, event_id, start_at, end_at, title, attendees_json,
+              briefed_at, nudge_status, nudge_at`;
+
+export function getMeetingBrief(id: number): MeetingBriefRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_BRIEF_COLUMNS} FROM meeting_briefs WHERE id = ?`,
+    )
+    .get(id) as MeetingBriefRecord | undefined;
+}
+
+export function getMeetingBriefByEvent(
+  eventId: string,
+  startAt: string,
+): MeetingBriefRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_BRIEF_COLUMNS}
+       FROM meeting_briefs
+       WHERE event_id = ? AND start_at = ?`,
+    )
+    .get(eventId, startAt) as MeetingBriefRecord | undefined;
+}
+
+export function recordMeetingBrief(input: {
+  eventId: string;
+  startAt: string;
+  endAt: string;
+  title: string;
+  attendeesJson: string;
+  nudgeAt: string;
+}): MeetingBriefRecord {
+  const existing = getMeetingBriefByEvent(input.eventId, input.startAt);
+  if (existing) {
+    return existing;
+  }
+  const result = db
+    .prepare(
+      `INSERT INTO meeting_briefs (
+         event_id, start_at, end_at, title, attendees_json, nudge_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.eventId,
+      input.startAt,
+      input.endAt,
+      input.title,
+      input.attendeesJson,
+      input.nudgeAt,
+    );
+  return getMeetingBrief(Number(result.lastInsertRowid))!;
+}
+
+export function listMeetingBriefs(): MeetingBriefRecord[] {
+  return db
+    .prepare(
+      `SELECT ${MEETING_BRIEF_COLUMNS}
+       FROM meeting_briefs
+       ORDER BY start_at ASC, id ASC`,
+    )
+    .all() as MeetingBriefRecord[];
+}
+
+export function updateMeetingNudge(
+  id: number,
+  status: MeetingNudgeStatus,
+  nudgeAt?: string | null,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE meeting_briefs
+       SET nudge_status = ?,
+           nudge_at = CASE WHEN ? = 1 THEN ? ELSE nudge_at END
+       WHERE id = ?`,
+    )
+    .run(status, nudgeAt === undefined ? 0 : 1, nudgeAt ?? null, id);
+  return result.changes === 1;
 }

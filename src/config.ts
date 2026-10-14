@@ -62,6 +62,15 @@ const weeklyReviewTime = process.env.WEEKLY_REVIEW_TIME?.trim() || "19:00";
 const weeklyReviewTimeMatch = /^(\d{2}):(\d{2})$/.exec(weeklyReviewTime);
 const weeklyReviewHour = Number(weeklyReviewTimeMatch?.[1]);
 const weeklyReviewMinute = Number(weeklyReviewTimeMatch?.[2]);
+const preMeetingMinutes = Number(
+  process.env.PRE_MEETING_MINUTES?.trim() || "15",
+);
+const skipInternalRaw =
+  process.env.SKIP_INTERNAL_RECURRING?.trim().toLowerCase() ?? "";
+const skipInternalRecurring =
+  skipInternalRaw !== "false" &&
+  skipInternalRaw !== "0" &&
+  skipInternalRaw !== "no";
 const rawGoogleSheetId = process.env.GOOGLE_SHEET_ID?.trim();
 const googleSheetId =
   rawGoogleSheetId && rawGoogleSheetId.toLowerCase() !== "none"
@@ -118,6 +127,11 @@ if (
   console.error(
     "WEEKLY_REVIEW_TIME must use 24-hour HH:MM format, for example 19:00.",
   );
+  process.exit(1);
+}
+
+if (!Number.isFinite(preMeetingMinutes) || preMeetingMinutes <= 0) {
+  console.error("PRE_MEETING_MINUTES must be a positive number.");
   process.exit(1);
 }
 
@@ -215,6 +229,8 @@ export const config = {
   weeklyReviewTime,
   weeklyReviewHour,
   weeklyReviewMinute,
+  preMeetingMinutes,
+  skipInternalRecurring,
   llmProvider: provider,
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
   claudeModel: process.env.CLAUDE_MODEL ?? "",

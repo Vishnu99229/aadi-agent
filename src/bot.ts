@@ -31,6 +31,13 @@ import {
 import { deliverWrapUp, handleNoteCallback } from "./notes.js";
 import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
 import { transcribeTelegramVoice } from "./voice.js";
+import {
+  consumePendingMeetingWrapUp,
+  formatWrapUpPrefill,
+  handleMeetingCallback,
+  markMeetingWrapped,
+  sendNextMeetingBrief,
+} from "./meetings.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -292,6 +299,17 @@ bot.command("followups", async (ctx) => {
   });
 });
 
+bot.command("next", async (ctx) => {
+  try {
+    const text = await whileTyping(ctx, () => sendNextMeetingBrief(ctx.api));
+    await sendPlainText(ctx, text);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Next meeting brief failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
+});
+
 bot.command("wrapup", async (ctx) => {
   const text = (ctx.message?.text ?? "")
     .replace(/^\/wrapup(?:@\w+)?\s*/i, "")
@@ -348,6 +366,12 @@ bot.callbackQuery(/^note:(tasks|draft|done):(\d+)$/, async (ctx) => {
   const operation = ctx.match[1] as "tasks" | "draft" | "done";
   const noteId = Number(ctx.match[2]);
   await handleNoteCallback(ctx, operation, noteId);
+});
+
+bot.callbackQuery(/^meet:(wrap|remind|skip):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "wrap" | "remind" | "skip";
+  const briefId = Number(ctx.match[2]);
+  await handleMeetingCallback(ctx, operation, briefId);
 });
 
 bot.callbackQuery(/^model:(claude|gemma)$/, async (ctx) => {
@@ -419,6 +443,24 @@ bot.callbackQuery(/^menu:(claude|gemma|brief|waiting|bills|tasks|keyboard)$/, as
   await sendMenu(ctx);
 });
 
+async function deliverPendingMeetingWrapUp(
+  ctx: Context,
+  userText: string,
+): Promise<boolean> {
+  const pending = consumePendingMeetingWrapUp();
+  if (!pending) {
+    return false;
+  }
+  const body = isWrapUpText(userText)
+    ? stripWrapUpPrefix(userText)
+    : userText;
+  await whileTyping(ctx, () =>
+    deliverWrapUp(ctx, formatWrapUpPrefill(pending, body)),
+  );
+  markMeetingWrapped(pending.briefId);
+  return true;
+}
+
 async function handleUserText(
   ctx: Context,
   userId: number,
@@ -448,6 +490,10 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       }),
     );
     await sendPlainText(ctx, reply);
+    return;
+  }
+
+  if (await deliverPendingMeetingWrapUp(ctx, userText)) {
     return;
   }
 
@@ -482,6 +528,9 @@ bot.on("message:voice", async (ctx) => {
 
   try {
     await sendPlainText(ctx, `Heard: ${transcript}`);
+    if (await deliverPendingMeetingWrapUp(ctx, transcript)) {
+      return;
+    }
     if (isWrapUpText(transcript)) {
       await whileTyping(ctx, () =>
         deliverWrapUp(ctx, stripWrapUpPrefix(transcript)),
@@ -594,6 +643,9 @@ bot.on("message:text", async (ctx) => {
       }
       await sendOpenTasks(ctx);
       await sendMenu(ctx);
+      return;
+    }
+    if (await deliverPendingMeetingWrapUp(ctx, text)) {
       return;
     }
     if (isWrapUpText(text)) {
