@@ -10,7 +10,7 @@ import {
   transitionPendingAction,
   type PendingAction,
 } from "./db.js";
-import { getGoogleClient } from "./google/auth.js";
+import { getGoogleClientFor } from "./google/auth.js";
 
 const PREVIEW_LIMIT = 3800;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
@@ -25,6 +25,7 @@ export interface DraftApprovalPreview {
   to: string;
   subject: string;
   body: string;
+  googleAccount: "personal" | "work";
 }
 
 export interface DraftEditContext {
@@ -48,9 +49,12 @@ function truncate(text: string, limit: number): string {
 }
 
 function previewText(preview: DraftApprovalPreview): string {
+  const mailbox =
+    preview.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
   const prefix = [
     "Draft waiting for approval",
     "",
+    `Account: ${mailbox}`,
     `To: ${preview.to}`,
     `Subject: ${preview.subject}`,
     "",
@@ -125,7 +129,11 @@ export async function queueDraftApproval(
   }
 
   if (!action) {
-    action = createPendingAction(preview.draftId, preview.threadId);
+    action = createPendingAction(
+      preview.draftId,
+      preview.threadId,
+      preview.googleAccount,
+    );
   }
 
   const text = previewText(preview);
@@ -190,7 +198,7 @@ async function currentPendingAction(
 
 async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   try {
-    const auth = await getGoogleClient();
+    const auth = await getGoogleClientFor(action.google_account);
     const gmail = google.gmail({ version: "v1", auth });
     await gmail.users.drafts.send({
       userId: "me",
@@ -226,7 +234,7 @@ async function discardDraft(
   action: PendingAction,
 ): Promise<void> {
   try {
-    const auth = await getGoogleClient();
+    const auth = await getGoogleClientFor(action.google_account);
     const gmail = google.gmail({ version: "v1", auth });
     await gmail.users.drafts.delete({
       userId: "me",
@@ -329,7 +337,7 @@ export async function consumeDraftEdit(
     return undefined;
   }
 
-  const auth = await getGoogleClient();
+  const auth = await getGoogleClientFor(action.google_account);
   const gmail = google.gmail({ version: "v1", auth });
   const draft = await gmail.users.drafts.get({
     userId: "me",

@@ -9,6 +9,7 @@
     "phone:pause": "./scripts/phone-pause.sh",
     "phone:resume": "./scripts/phone-resume.sh",
     "google:auth": "tsx src/google/authorize.ts",
+    "google:auth:work": "tsx src/google/authorize.ts --work",
     "google:test": "tsx src/google/test.ts",
     "test:stage5": "tsx --env-file=.env scripts/test-stage5.ts",
     "test:stage6": "tsx --env-file=.env scripts/test-stage6.ts",

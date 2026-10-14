@@ -1,5 +1,5 @@
 import { InlineKeyboard, type Api } from "grammy";
-import { google, type gmail_v1 } from "googleapis";
+import type { gmail_v1 } from "googleapis";
 import cron, { type ScheduledTask } from "node-cron";
 import { config } from "./config.js";
 import {
@@ -13,7 +13,11 @@ import {
   type FollowupRecord,
   type ItemTag,
 } from "./db.js";
-import { getGoogleClient } from "./google/auth.js";
+import {
+  loadGoogleAccounts,
+  type LoadedGoogleAccount,
+} from "./google/auth.js";
+import { gmailClient } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
 
 const TIME_ZONE = "Asia/Kolkata";
@@ -140,10 +144,12 @@ async function getThread(
 
 async function reconcileTrackedThreads(
   gmail: gmail_v1.Gmail,
+  googleAccount: LoadedGoogleAccount["id"],
 ): Promise<void> {
   const active = getFollowups().filter(
     (followup) =>
-      followup.status === "waiting" || followup.status === "snoozed",
+      followup.google_account === googleAccount &&
+      (followup.status === "waiting" || followup.status === "snoozed"),
   );
 
   for (const followup of active) {
@@ -221,10 +227,13 @@ function isHardExcluded(candidate: SentCandidate, ownAddress: string): boolean {
 async function collectCandidates(
   gmail: gmail_v1.Gmail,
   ownAddress: string,
+  googleAccount: LoadedGoogleAccount["id"],
 ): Promise<SentCandidate[]> {
   const threshold = Date.now() - config.followupAfterHours * HOUR_MS;
   const existingByThread = new Map(
-    getFollowups().map((followup) => [followup.thread_id, followup]),
+    getFollowups()
+      .filter((followup) => followup.google_account === googleAccount)
+      .map((followup) => [followup.thread_id, followup]),
   );
   const candidates: SentCandidate[] = [];
 
@@ -347,16 +356,19 @@ Return only a JSON array with exactly one object per candidate:
 function persistClassification(
   candidate: SentCandidate,
   classification: Classification,
+  googleAccount: LoadedGoogleAccount,
 ): FollowupRecord {
   const input: FollowupInput = {
     threadId: candidate.threadId,
     recipient: candidate.recipient,
     subject: candidate.subject,
-    tag: classification.tag,
+    tag: googleAccount.tag,
     lastSentAt: candidate.sentAt,
     nextCheckAt: nextCheckAt(candidate.sentAt),
+    googleAccount: googleAccount.id,
   };
-  const existing = getFollowupByThread(candidate.threadId);
+  void classification.tag;
+  const existing = getFollowupByThread(candidate.threadId, googleAccount.id);
   const followup = existing
     ? restartFollowup(existing.id, input)
     : createFollowup(input);
@@ -365,36 +377,42 @@ function persistClassification(
 }
 
 export async function runFollowupScan(): Promise<void> {
-  const auth = await getGoogleClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  await reconcileTrackedThreads(gmail);
+  const accounts = await loadGoogleAccounts();
+  let totalCandidates = 0;
+  let totalTracked = 0;
 
-  const profile = await gmail.users.getProfile({ userId: "me" });
-  const ownAddress = profile.data.emailAddress?.toLowerCase();
-  if (!ownAddress) {
-    throw new Error("Gmail profile did not return an email address.");
-  }
+  for (const account of accounts) {
+    const gmail = gmailClient(account);
+    await reconcileTrackedThreads(gmail, account.id);
 
-  const candidates = await collectCandidates(gmail, ownAddress);
-  if (candidates.length === 0) {
-    console.log("Follow-up scan complete: candidates=0, tracked=0");
-    return;
-  }
+    const profile = await gmail.users.getProfile({ userId: "me" });
+    const ownAddress = profile.data.emailAddress?.toLowerCase();
+    if (!ownAddress) {
+      throw new Error("Gmail profile did not return an email address.");
+    }
 
-  const classifications = await classifyCandidates(candidates);
-  let tracked = 0;
-  for (const classification of classifications) {
-    if (!classification.expects_reply) {
+    const candidates = await collectCandidates(gmail, ownAddress, account.id);
+    totalCandidates += candidates.length;
+    if (candidates.length === 0) {
       continue;
     }
-    persistClassification(
-      candidates[classification.candidate_id - 1]!,
-      classification,
-    );
-    tracked += 1;
+
+    const classifications = await classifyCandidates(candidates);
+    for (const classification of classifications) {
+      if (!classification.expects_reply) {
+        continue;
+      }
+      persistClassification(
+        candidates[classification.candidate_id - 1]!,
+        classification,
+        account,
+      );
+      totalTracked += 1;
+    }
   }
+
   console.log(
-    `Follow-up scan complete: candidates=${candidates.length}, tracked=${tracked}`,
+    `Follow-up scan complete: candidates=${totalCandidates}, tracked=${totalTracked}`,
   );
 }
 
@@ -445,36 +463,56 @@ export async function trackLatestSentTo(
   recipientSearch: string,
   tag: ItemTag,
 ): Promise<FollowupRecord> {
-  const auth = await getGoogleClient();
-  const gmail = google.gmail({ version: "v1", auth });
+  const accounts = await loadGoogleAccounts();
   const escapedSearch = recipientSearch.replace(/["\\]/g, " ").trim();
-  const result = await gmail.users.messages.list({
-    userId: "me",
-    q: `in:sent to:"${escapedSearch}"`,
-    maxResults: 20,
-  });
+  let best:
+    | {
+        account: LoadedGoogleAccount;
+        gmail: gmail_v1.Gmail;
+        candidate: SentCandidate;
+      }
+    | undefined;
 
-  const sentMessages = await Promise.all(
-    (result.data.messages ?? []).map(async (message) => {
-      const response = await gmail.users.messages.get({
-        userId: "me",
-        id: message.id!,
-        format: "metadata",
-        metadataHeaders: ["To", "Subject"],
-      });
-      return response.data;
-    }),
-  );
-  const latestSent = sentMessages.sort(
-    (left, right) => messageTime(right) - messageTime(left),
-  )[0];
-  const candidate = latestSent
-    ? candidateFromMessage(latestSent)
-    : undefined;
-  if (!candidate) {
+  for (const account of accounts) {
+    const gmail = gmailClient(account);
+    const result = await gmail.users.messages.list({
+      userId: "me",
+      q: `in:sent to:"${escapedSearch}"`,
+      maxResults: 20,
+    });
+
+    const sentMessages = await Promise.all(
+      (result.data.messages ?? []).map(async (message) => {
+        const response = await gmail.users.messages.get({
+          userId: "me",
+          id: message.id!,
+          format: "metadata",
+          metadataHeaders: ["To", "Subject"],
+        });
+        return response.data;
+      }),
+    );
+    const latestSent = sentMessages.sort(
+      (left, right) => messageTime(right) - messageTime(left),
+    )[0];
+    const candidate = latestSent
+      ? candidateFromMessage(latestSent)
+      : undefined;
+    if (
+      candidate &&
+      (!best ||
+        new Date(candidate.sentAt).getTime() >
+          new Date(best.candidate.sentAt).getTime())
+    ) {
+      best = { account, gmail, candidate };
+    }
+  }
+
+  if (!best) {
     throw new Error("No sent email was found for that recipient.");
   }
 
+  const { account, gmail, candidate } = best;
   const thread = await getThread(gmail, candidate.threadId);
   const latestInThread = latestNonDraftMessage(thread);
   if (
@@ -492,8 +530,9 @@ export async function trackLatestSentTo(
     tag,
     lastSentAt: candidate.sentAt,
     nextCheckAt: nextCheckAt(candidate.sentAt),
+    googleAccount: account.id,
   };
-  const existing = getFollowupByThread(candidate.threadId);
+  const existing = getFollowupByThread(candidate.threadId, account.id);
   const followup = existing
     ? restartFollowup(existing.id, input)
     : createFollowup(input);

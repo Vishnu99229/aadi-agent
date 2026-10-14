@@ -95,6 +95,7 @@ export function handler(input: unknown): string {
       recipient: followup.recipient,
       subject: followup.subject,
       tag: followup.tag,
+      account: followup.google_account,
       status: followup.status,
       days_waiting: Math.max(
         0,

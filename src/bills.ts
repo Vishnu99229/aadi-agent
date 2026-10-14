@@ -1,4 +1,5 @@
-import { google, type gmail_v1 } from "googleapis";
+import type { gmail_v1 } from "googleapis";
+
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
 import { config } from "./config.js";
@@ -10,7 +11,8 @@ import {
   transitionBillStatus,
   type BillRecord,
 } from "./db.js";
-import { getGoogleClient } from "./google/auth.js";
+import { loadGoogleAccounts } from "./google/auth.js";
+import { gmailClient } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
 import { stripSensitive } from "./sensitive.js";
 
@@ -73,31 +75,32 @@ function billKeyboard(id: number): InlineKeyboard {
 }
 
 async function listBillCandidates(): Promise<BillCandidate[]> {
-  const auth = await getGoogleClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const listed = await gmail.users.messages.list({
-    userId: "me",
-    q: SCAN_QUERY,
-    maxResults: 40,
-  });
   const candidates: BillCandidate[] = [];
-  for (const message of listed.data.messages ?? []) {
-    const response = await gmail.users.messages.get({
+  for (const account of await loadGoogleAccounts()) {
+    const gmail = gmailClient(account);
+    const listed = await gmail.users.messages.list({
       userId: "me",
-      id: message.id!,
-      format: "metadata",
-      metadataHeaders: ["Subject"],
+      q: SCAN_QUERY,
+      maxResults: 40,
     });
-    const threadId = response.data.threadId;
-    if (!threadId) {
-      continue;
+    for (const message of listed.data.messages ?? []) {
+      const response = await gmail.users.messages.get({
+        userId: "me",
+        id: message.id!,
+        format: "metadata",
+        metadataHeaders: ["Subject"],
+      });
+      const threadId = response.data.threadId;
+      if (!threadId) {
+        continue;
+      }
+      candidates.push({
+        messageId: message.id!,
+        threadId,
+        subject: header(response.data.payload?.headers, "Subject"),
+        snippet: stripSensitive(response.data.snippet ?? ""),
+      });
     }
-    candidates.push({
-      messageId: message.id!,
-      threadId,
-      subject: header(response.data.payload?.headers, "Subject"),
-      snippet: stripSensitive(response.data.snippet ?? ""),
-    });
   }
   return candidates;
 }

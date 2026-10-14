@@ -1,13 +1,14 @@
-import { google, type gmail_v1 } from "googleapis";
+import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { queueDraftApproval } from "../approvals.js";
-import { getGoogleClient } from "../google/auth.js";
+import { parseGoogleAccountFilter } from "../google/auth.js";
+import { gmailClient, resolveGmailMessage } from "../google/mail.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "draft_reply",
   description:
-    "Create, but never send, a Gmail draft replying to an existing email in the same thread. Use only after the reply has all required facts. Returns the Gmail draft ID. Sending requires separate Telegram approval and is not available to this tool.",
+    "Create, but never send, a Gmail draft replying to an existing email in the same thread and the SAME account the email arrived on (personal Gmail or Epicode work). Use only after the reply has all required facts. Returns the Gmail draft ID. Sending requires separate Telegram approval and is not available to this tool.",
   inputSchema: {
     type: "object",
     properties: {
@@ -20,6 +21,12 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         type: "string",
         description:
           'The complete plain-text reply body, written as Vishnu and ending with "Vishnu".',
+      },
+      account: {
+        type: "string",
+        enum: ["personal", "work"],
+        description:
+          "Mailbox the original email is in. Use the account field from search_emails when present.",
       },
     },
     required: ["email_id", "body"],
@@ -78,7 +85,11 @@ function buildReplyMessage(params: {
 }
 
 export async function handler(input: unknown): Promise<string> {
-  const values = input as { email_id?: unknown; body?: unknown };
+  const values = input as {
+    email_id?: unknown;
+    body?: unknown;
+    account?: unknown;
+  };
   if (typeof values.email_id !== "string" || !values.email_id.trim()) {
     throw new Error("email_id must be a non-empty Gmail message ID.");
   }
@@ -86,16 +97,15 @@ export async function handler(input: unknown): Promise<string> {
     throw new Error("body must be a non-empty plain-text reply.");
   }
 
-  const auth = await getGoogleClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const original = await gmail.users.messages.get({
-    userId: "me",
-    id: values.email_id,
-    format: "metadata",
-    metadataHeaders: ["From", "Subject", "Message-ID", "References"],
-  });
-  const headers = original.data.payload?.headers;
-  const threadId = original.data.threadId;
+  const { account, message: original } = await resolveGmailMessage(
+    values.email_id.trim(),
+    parseGoogleAccountFilter(values.account),
+    "metadata",
+    ["From", "Subject", "Message-ID", "References"],
+  );
+  const gmail = gmailClient(account);
+  const headers = original.payload?.headers;
+  const threadId = original.threadId;
   const from = header(headers, "From");
   const messageId = header(headers, "Message-ID");
 
@@ -133,7 +143,12 @@ export async function handler(input: unknown): Promise<string> {
     to: safeHeader(from),
     subject,
     body: values.body,
+    googleAccount: account.id,
   });
 
-  return JSON.stringify({ draft_id: result.data.id });
+  return JSON.stringify({
+    draft_id: result.data.id,
+    account: account.id,
+    tag: account.tag,
+  });
 }

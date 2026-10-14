@@ -7,6 +7,7 @@ import { registerImportantDateReminders } from "./important_dates.js";
 import { registerWeeklyReview } from "./weekly.js";
 import { startDocumentExpirySweep } from "./documents.js";
 import { registerReminderScheduler } from "./reminders.js";
+import { logGoogleAccounts } from "./google/auth.js";
 
 const morningBriefTask = registerMorningBrief(bot.api);
 const billScanTask = registerBillScan(bot.api);
@@ -16,6 +17,7 @@ const followupScanTask = registerFollowupScan();
 const approvalExpirySweep = startApprovalExpirySweep();
 const reminderScheduler = await registerReminderScheduler(bot.api);
 const documentExpirySweep = startDocumentExpirySweep();
+await logGoogleAccounts();
 bot.start({
   onStart: async () => {
     await bot.api.setMyCommands([

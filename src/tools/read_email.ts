@@ -1,6 +1,7 @@
-import { google, type gmail_v1 } from "googleapis";
+import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
-import { getGoogleClient } from "../google/auth.js";
+import { parseGoogleAccountFilter } from "../google/auth.js";
+import { resolveGmailMessage } from "../google/mail.js";
 
 const BODY_LIMIT = 3000;
 
@@ -8,13 +9,19 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "read_email",
   description:
-    "Read one Gmail message by its message ID. Returns From, To, Subject, Date, and a cleaned plain-text body. Use search_emails first to obtain the message ID. Earlier quoted replies are removed and the body is limited to 3000 characters.",
+    "Read one Gmail message by its message ID from personal Gmail or Epicode work mail. Returns account, tag, From, To, Subject, Date, and a cleaned plain-text body. Use search_emails first to obtain the message ID and account. Earlier quoted replies are removed and the body is limited to 3000 characters.",
   inputSchema: {
     type: "object",
     properties: {
       id: {
         type: "string",
         description: "The Gmail message ID returned by search_emails.",
+      },
+      account: {
+        type: "string",
+        enum: ["personal", "work"],
+        description:
+          "Optional mailbox. Omit to try connected accounts until the ID is found.",
       },
     },
     required: ["id"],
@@ -128,19 +135,16 @@ function truncate(text: string): string {
 }
 
 export async function handler(input: unknown): Promise<string> {
-  const values = input as { id?: unknown };
+  const values = input as { id?: unknown; account?: unknown };
   if (typeof values.id !== "string" || !values.id.trim()) {
     throw new Error("id must be a non-empty Gmail message ID.");
   }
 
-  const auth = await getGoogleClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const response = await gmail.users.messages.get({
-    userId: "me",
-    id: values.id,
-    format: "full",
-  });
-  const payload = response.data.payload;
+  const { account, message } = await resolveGmailMessage(
+    values.id.trim(),
+    parseGoogleAccountFilter(values.account),
+  );
+  const payload = message.payload;
   if (!payload) {
     throw new Error("The email did not contain a readable MIME payload.");
   }
@@ -155,6 +159,8 @@ export async function handler(input: unknown): Promise<string> {
   const headers = payload.headers;
 
   return [
+    `Account: ${account.label}`,
+    `Tag: ${account.tag}`,
     `From: ${header(headers, "From")}`,
     `To: ${header(headers, "To")}`,
     `Subject: ${header(headers, "Subject")}`,

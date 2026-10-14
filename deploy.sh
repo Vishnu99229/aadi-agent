@@ -38,6 +38,6 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude google-token.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
+rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude google-token.json --exclude google-token-work.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
 ssh -p "$PHONE_PORT" "$PHONE" 'cd ~/aadi-agent && npm install --no-audit --no-fund && pkill -f "[t]sx src/index.ts" || true'
 echo "Deployed. Aadi restarts on the phone in about 5 seconds."

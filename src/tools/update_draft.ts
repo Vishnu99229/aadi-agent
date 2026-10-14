@@ -1,7 +1,8 @@
-import { google, type gmail_v1 } from "googleapis";
+import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { queueDraftApproval } from "../approvals.js";
-import { getGoogleClient } from "../google/auth.js";
+import { getPendingActionForDraft } from "../db.js";
+import { gmailClient, resolveGmailDraft } from "../google/mail.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -80,14 +81,13 @@ export async function handler(input: unknown): Promise<string> {
     throw new Error("body must be a non-empty plain-text reply.");
   }
 
-  const auth = await getGoogleClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const existing = await gmail.users.drafts.get({
-    userId: "me",
-    id: values.draft_id,
-    format: "full",
-  });
-  const message = existing.data.message;
+  const pending = getPendingActionForDraft(values.draft_id.trim());
+  const { account, draft: existing } = await resolveGmailDraft(
+    values.draft_id.trim(),
+    pending?.google_account,
+  );
+  const gmail = gmailClient(account);
+  const message = existing.message;
   const headers = message?.payload?.headers;
   const threadId = message?.threadId;
 
@@ -117,7 +117,12 @@ export async function handler(input: unknown): Promise<string> {
     to: safeHeader(to),
     subject: safeHeader(subject),
     body: values.body,
+    googleAccount: account.id,
   });
 
-  return JSON.stringify({ draft_id: draftId });
+  return JSON.stringify({
+    draft_id: draftId,
+    account: account.id,
+    tag: account.tag,
+  });
 }

@@ -1,5 +1,5 @@
 import { google, type calendar_v3 } from "googleapis";
-import { getGoogleClient } from "./auth.js";
+import { loadGoogleAccounts } from "./auth.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const INDIA_OFFSET = "+05:30";
@@ -46,19 +46,27 @@ async function countEventsToday(
 }
 
 async function main(): Promise<void> {
-  const auth = await getGoogleClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const calendar = google.calendar({ version: "v3", auth });
+  const accounts = await loadGoogleAccounts();
+  if (accounts.length === 0) {
+    throw new Error(
+      "No Google accounts connected. Run npm run google:auth first.",
+    );
+  }
 
-  const [profile, unreadLabel, eventCount] = await Promise.all([
-    gmail.users.getProfile({ userId: "me" }),
-    gmail.users.labels.get({ userId: "me", id: "UNREAD" }),
-    countEventsToday(calendar),
-  ]);
+  for (const account of accounts) {
+    const gmail = google.gmail({ version: "v1", auth: account.client });
+    const calendar = google.calendar({ version: "v3", auth: account.client });
+    const [profile, unreadLabel, eventCount] = await Promise.all([
+      gmail.users.getProfile({ userId: "me" }),
+      gmail.users.labels.get({ userId: "me", id: "UNREAD" }),
+      countEventsToday(calendar),
+    ]);
 
-  console.log(`Gmail address: ${profile.data.emailAddress ?? "unknown"}`);
-  console.log(`Unread emails: ${unreadLabel.data.messagesTotal ?? 0}`);
-  console.log(`Calendar events today: ${eventCount}`);
+    console.log(`Account: ${account.label}`);
+    console.log(`Address: ${profile.data.emailAddress ?? "unknown"}`);
+    console.log(`Unread emails: ${unreadLabel.data.messagesTotal ?? 0}`);
+    console.log(`Calendar events today: ${eventCount}`);
+  }
 }
 
 main().catch((error: unknown) => {

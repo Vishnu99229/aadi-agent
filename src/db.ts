@@ -15,11 +15,14 @@ export type PendingActionStatus =
   | "discarded"
   | "expired";
 
+export type GoogleAccountId = "personal" | "work";
+
 export interface PendingAction {
   id: number;
   type: "send_draft";
   draft_id: string;
   thread_id: string;
+  google_account: GoogleAccountId;
   status: PendingActionStatus;
   telegram_message_id: number | null;
   created_at: string;
@@ -62,6 +65,7 @@ export interface FollowupRecord {
   recipient: string;
   subject: string;
   tag: ItemTag;
+  google_account: GoogleAccountId;
   last_sent_at: string;
   status: FollowupStatus;
   nudge_count: number;
@@ -74,11 +78,19 @@ export interface FollowupInput {
   recipient: string;
   subject: string;
   tag: ItemTag;
+  googleAccount: GoogleAccountId;
   lastSentAt: string;
   nextCheckAt: string;
 }
 
 const db = new Database("./aadi.db");
+
+function tableHasColumn(table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
+  return rows.some((row) => row.name === column);
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -93,6 +105,8 @@ db.exec(`
     type TEXT NOT NULL CHECK (type = 'send_draft'),
     draft_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
+    google_account TEXT NOT NULL DEFAULT 'personal'
+      CHECK (google_account IN ('personal', 'work')),
     status TEXT NOT NULL DEFAULT 'pending'
       CHECK (status IN ('pending', 'sent', 'discarded', 'expired')),
     telegram_message_id INTEGER,
@@ -132,16 +146,19 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS followups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL UNIQUE,
+    thread_id TEXT NOT NULL,
     recipient TEXT NOT NULL,
     subject TEXT NOT NULL,
     tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
+    google_account TEXT NOT NULL DEFAULT 'personal'
+      CHECK (google_account IN ('personal', 'work')),
     last_sent_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'waiting'
       CHECK (status IN ('waiting', 'replied', 'snoozed', 'dismissed')),
     nudge_count INTEGER NOT NULL DEFAULT 0,
     next_check_at TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (google_account, thread_id)
   );
 
   CREATE INDEX IF NOT EXISTS idx_followups_status_next_check
@@ -207,6 +224,59 @@ db.exec(`
   );
 `);
 
+if (!tableHasColumn("pending_actions", "google_account")) {
+  db.exec(
+    `ALTER TABLE pending_actions ADD COLUMN google_account TEXT NOT NULL DEFAULT 'personal'`,
+  );
+}
+
+const followupsSchema =
+  (
+    db
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'followups'`,
+      )
+      .get() as { sql: string } | undefined
+  )?.sql ?? "";
+
+if (!tableHasColumn("followups", "google_account")) {
+  db.exec(
+    `ALTER TABLE followups ADD COLUMN google_account TEXT NOT NULL DEFAULT 'personal'`,
+  );
+}
+
+if (followupsSchema.includes("thread_id TEXT NOT NULL UNIQUE")) {
+  db.exec(`
+    CREATE TABLE followups_migrate (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
+      google_account TEXT NOT NULL DEFAULT 'personal'
+        CHECK (google_account IN ('personal', 'work')),
+      last_sent_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting'
+        CHECK (status IN ('waiting', 'replied', 'snoozed', 'dismissed')),
+      nudge_count INTEGER NOT NULL DEFAULT 0,
+      next_check_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (google_account, thread_id)
+    );
+    INSERT INTO followups_migrate (
+      id, thread_id, recipient, subject, tag, google_account, last_sent_at,
+      status, nudge_count, next_check_at, created_at
+    )
+    SELECT id, thread_id, recipient, subject, tag, google_account, last_sent_at,
+           status, nudge_count, next_check_at, created_at
+    FROM followups;
+    DROP TABLE followups;
+    ALTER TABLE followups_migrate RENAME TO followups;
+    CREATE INDEX IF NOT EXISTS idx_followups_status_next_check
+      ON followups (status, next_check_at);
+  `);
+}
+
 const insertMessage = db.prepare(
   "INSERT INTO messages (role, content) VALUES (?, ?)",
 );
@@ -233,16 +303,20 @@ export function clearMessages(): void {
   db.prepare("DELETE FROM messages").run();
 }
 
+const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
+              telegram_message_id, created_at`;
+
 export function createPendingAction(
   draftId: string,
   threadId: string,
+  googleAccount: GoogleAccountId = "personal",
 ): PendingAction {
   const result = db
     .prepare(
-      `INSERT INTO pending_actions (type, draft_id, thread_id)
-       VALUES ('send_draft', ?, ?)`,
+      `INSERT INTO pending_actions (type, draft_id, thread_id, google_account)
+       VALUES ('send_draft', ?, ?, ?)`,
     )
-    .run(draftId, threadId);
+    .run(draftId, threadId, googleAccount);
 
   return getPendingAction(Number(result.lastInsertRowid))!;
 }
@@ -250,8 +324,7 @@ export function createPendingAction(
 export function getPendingAction(id: number): PendingAction | undefined {
   return db
     .prepare(
-      `SELECT id, type, draft_id, thread_id, status,
-              telegram_message_id, created_at
+      `SELECT ${PENDING_ACTION_COLUMNS}
        FROM pending_actions
        WHERE id = ?`,
     )
@@ -263,8 +336,7 @@ export function getPendingActionForDraft(
 ): PendingAction | undefined {
   return db
     .prepare(
-      `SELECT id, type, draft_id, thread_id, status,
-              telegram_message_id, created_at
+      `SELECT ${PENDING_ACTION_COLUMNS}
        FROM pending_actions
        WHERE draft_id = ? AND status = 'pending'
        ORDER BY id DESC
@@ -303,8 +375,7 @@ export function transitionPendingAction(
 export function getExpiredPendingActions(): PendingAction[] {
   return db
     .prepare(
-      `SELECT id, type, draft_id, thread_id, status,
-              telegram_message_id, created_at
+      `SELECT ${PENDING_ACTION_COLUMNS}
        FROM pending_actions
        WHERE status = 'pending'
          AND created_at <= datetime('now', '-24 hours')`,
@@ -425,11 +496,13 @@ export function transitionReminderStatus(
   return result.changes === 1;
 }
 
+const FOLLOWUP_COLUMNS = `id, thread_id, recipient, subject, tag, google_account,
+              last_sent_at, status, nudge_count, next_check_at, created_at`;
+
 export function getFollowup(id: number): FollowupRecord | undefined {
   return db
     .prepare(
-      `SELECT id, thread_id, recipient, subject, tag, last_sent_at,
-              status, nudge_count, next_check_at, created_at
+      `SELECT ${FOLLOWUP_COLUMNS}
        FROM followups
        WHERE id = ?`,
     )
@@ -438,22 +511,21 @@ export function getFollowup(id: number): FollowupRecord | undefined {
 
 export function getFollowupByThread(
   threadId: string,
+  googleAccount: GoogleAccountId = "personal",
 ): FollowupRecord | undefined {
   return db
     .prepare(
-      `SELECT id, thread_id, recipient, subject, tag, last_sent_at,
-              status, nudge_count, next_check_at, created_at
+      `SELECT ${FOLLOWUP_COLUMNS}
        FROM followups
-       WHERE thread_id = ?`,
+       WHERE thread_id = ? AND google_account = ?`,
     )
-    .get(threadId) as FollowupRecord | undefined;
+    .get(threadId, googleAccount) as FollowupRecord | undefined;
 }
 
 export function getFollowups(): FollowupRecord[] {
   return db
     .prepare(
-      `SELECT id, thread_id, recipient, subject, tag, last_sent_at,
-              status, nudge_count, next_check_at, created_at
+      `SELECT ${FOLLOWUP_COLUMNS}
        FROM followups
        ORDER BY last_sent_at ASC, id ASC`,
     )
@@ -464,14 +536,16 @@ export function createFollowup(input: FollowupInput): FollowupRecord {
   const result = db
     .prepare(
       `INSERT INTO followups (
-         thread_id, recipient, subject, tag, last_sent_at, next_check_at
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
+         thread_id, recipient, subject, tag, google_account,
+         last_sent_at, next_check_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.threadId,
       input.recipient,
       input.subject,
       input.tag,
+      input.googleAccount,
       input.lastSentAt,
       input.nextCheckAt,
     );
@@ -488,6 +562,7 @@ export function restartFollowup(
      SET recipient = ?,
          subject = ?,
          tag = ?,
+         google_account = ?,
          last_sent_at = ?,
          status = 'waiting',
          nudge_count = 0,
@@ -497,6 +572,7 @@ export function restartFollowup(
     input.recipient,
     input.subject,
     input.tag,
+    input.googleAccount,
     input.lastSentAt,
     input.nextCheckAt,
     id,
