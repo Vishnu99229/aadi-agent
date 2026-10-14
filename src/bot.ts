@@ -38,6 +38,10 @@ import {
   markMeetingWrapped,
   sendNextMeetingBrief,
 } from "./meetings.js";
+import {
+  formatAccountsList,
+  handleAccountUpdateCallback,
+} from "./accounts.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -299,6 +303,10 @@ bot.command("followups", async (ctx) => {
   });
 });
 
+bot.command("accounts", async (ctx) => {
+  await sendPlainText(ctx, formatAccountsList());
+});
+
 bot.command("next", async (ctx) => {
   try {
     const text = await whileTyping(ctx, () => sendNextMeetingBrief(ctx.api));
@@ -366,6 +374,12 @@ bot.callbackQuery(/^note:(tasks|draft|done):(\d+)$/, async (ctx) => {
   const operation = ctx.match[1] as "tasks" | "draft" | "done";
   const noteId = Number(ctx.match[2]);
   await handleNoteCallback(ctx, operation, noteId);
+});
+
+bot.callbackQuery(/^acct:(yes|no):(\d+)$/, async (ctx) => {
+  const apply = ctx.match[1] === "yes";
+  const pendingId = Number(ctx.match[2]);
+  await handleAccountUpdateCallback(ctx, apply, pendingId);
 });
 
 bot.callbackQuery(/^meet:(wrap|remind|skip):(\d+)$/, async (ctx) => {

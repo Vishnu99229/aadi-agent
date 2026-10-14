@@ -239,6 +239,29 @@ db.exec(`
     nudge_at TEXT,
     UNIQUE (event_id, start_at)
   );
+
+  CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '[]',
+    email_domains TEXT NOT NULL DEFAULT '[]',
+    stage TEXT NOT NULL DEFAULT '',
+    next_step TEXT NOT NULL DEFAULT '',
+    next_step_due TEXT,
+    waiting_on TEXT NOT NULL DEFAULT 'nobody'
+      CHECK (waiting_on IN ('me', 'them', 'nobody')),
+    last_activity_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS pending_account_updates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    suggested_stage TEXT NOT NULL DEFAULT '',
+    suggested_next_step TEXT NOT NULL DEFAULT '',
+    suggested_waiting_on TEXT NOT NULL DEFAULT 'nobody',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 if (!tableHasColumn("pending_actions", "google_account")) {
@@ -1041,4 +1064,176 @@ export function updateMeetingNudge(
     )
     .run(status, nudgeAt === undefined ? 0 : 1, nudgeAt ?? null, id);
   return result.changes === 1;
+}
+
+export type WaitingOn = "me" | "them" | "nobody";
+
+export interface AccountRecord {
+  id: number;
+  name: string;
+  aliases: string;
+  email_domains: string;
+  stage: string;
+  next_step: string;
+  next_step_due: string | null;
+  waiting_on: WaitingOn;
+  last_activity_at: string | null;
+  created_at: string;
+}
+
+const ACCOUNT_COLUMNS = `id, name, aliases, email_domains, stage, next_step,
+              next_step_due, waiting_on, last_activity_at, created_at`;
+
+export function createAccount(input: {
+  name: string;
+  aliases?: string;
+  emailDomains?: string;
+  stage?: string;
+  nextStep?: string;
+  nextStepDue?: string | null;
+  waitingOn?: WaitingOn;
+}): AccountRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO accounts (
+         name, aliases, email_domains, stage, next_step, next_step_due, waiting_on
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.name,
+      input.aliases ?? "[]",
+      input.emailDomains ?? "[]",
+      input.stage ?? "",
+      input.nextStep ?? "",
+      input.nextStepDue ?? null,
+      input.waitingOn ?? "nobody",
+    );
+  return getAccount(Number(result.lastInsertRowid))!;
+}
+
+export function getAccount(id: number): AccountRecord | undefined {
+  return db
+    .prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE id = ?`)
+    .get(id) as AccountRecord | undefined;
+}
+
+export function getAccounts(): AccountRecord[] {
+  return db
+    .prepare(
+      `SELECT ${ACCOUNT_COLUMNS}
+       FROM accounts
+       ORDER BY last_activity_at IS NULL DESC, last_activity_at ASC, name ASC`,
+    )
+    .all() as AccountRecord[];
+}
+
+export function updateAccount(
+  id: number,
+  patch: {
+    name?: string;
+    aliases?: string;
+    emailDomains?: string;
+    stage?: string;
+    nextStep?: string;
+    nextStepDue?: string | null;
+    waitingOn?: WaitingOn;
+  },
+): AccountRecord | undefined {
+  const current = getAccount(id);
+  if (!current) {
+    return undefined;
+  }
+  db.prepare(
+    `UPDATE accounts
+     SET name = ?,
+         aliases = ?,
+         email_domains = ?,
+         stage = ?,
+         next_step = ?,
+         next_step_due = ?,
+         waiting_on = ?
+     WHERE id = ?`,
+  ).run(
+    patch.name ?? current.name,
+    patch.aliases ?? current.aliases,
+    patch.emailDomains ?? current.email_domains,
+    patch.stage ?? current.stage,
+    patch.nextStep ?? current.next_step,
+    patch.nextStepDue === undefined ? current.next_step_due : patch.nextStepDue,
+    patch.waitingOn ?? current.waiting_on,
+    id,
+  );
+  return getAccount(id);
+}
+
+export function updateAccountActivity(
+  id: number,
+  lastActivityAt: string,
+): void {
+  const current = getAccount(id);
+  if (!current) {
+    return;
+  }
+  if (
+    current.last_activity_at &&
+    new Date(current.last_activity_at).getTime() >=
+      new Date(lastActivityAt).getTime()
+  ) {
+    return;
+  }
+  db.prepare(`UPDATE accounts SET last_activity_at = ? WHERE id = ?`).run(
+    lastActivityAt,
+    id,
+  );
+}
+
+export function removeAccount(id: number): boolean {
+  const result = db.prepare(`DELETE FROM accounts WHERE id = ?`).run(id);
+  return result.changes === 1;
+}
+
+export interface PendingAccountUpdate {
+  id: number;
+  account_id: number;
+  suggested_stage: string;
+  suggested_next_step: string;
+  suggested_waiting_on: WaitingOn;
+  created_at: string;
+}
+
+export function createPendingAccountUpdate(input: {
+  accountId: number;
+  suggestedStage: string;
+  suggestedNextStep: string;
+  suggestedWaitingOn: WaitingOn;
+}): PendingAccountUpdate {
+  const result = db
+    .prepare(
+      `INSERT INTO pending_account_updates (
+         account_id, suggested_stage, suggested_next_step, suggested_waiting_on
+       ) VALUES (?, ?, ?, ?)`,
+    )
+    .run(
+      input.accountId,
+      input.suggestedStage,
+      input.suggestedNextStep,
+      input.suggestedWaitingOn,
+    );
+  return getPendingAccountUpdate(Number(result.lastInsertRowid))!;
+}
+
+export function getPendingAccountUpdate(
+  id: number,
+): PendingAccountUpdate | undefined {
+  return db
+    .prepare(
+      `SELECT id, account_id, suggested_stage, suggested_next_step,
+              suggested_waiting_on, created_at
+       FROM pending_account_updates WHERE id = ?`,
+    )
+    .get(id) as PendingAccountUpdate | undefined;
+}
+
+export function deletePendingAccountUpdate(id: number): void {
+  db.prepare(`DELETE FROM pending_account_updates WHERE id = ?`).run(id);
 }

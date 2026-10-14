@@ -28,6 +28,7 @@ bot.start({
       { command: "weekly", description: "Send the weekly review" },
       { command: "followups", description: "Scan and list emails waiting on a reply" },
       { command: "next", description: "Brief for the next upcoming work meeting" },
+      { command: "accounts", description: "List Epicode deals and last activity" },
       { command: "model", description: "Switch between Claude and cloud Gemma" },
       { command: "wrapup", description: "Save call or meeting notes" },
       { command: "reset", description: "Clear conversation history" },

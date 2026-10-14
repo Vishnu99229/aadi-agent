@@ -10,6 +10,7 @@ import {
   type NoteActionItem,
 } from "./db.js";
 import { runAgent } from "./agent.js";
+import { offerAccountUpdateAfterWrapUp } from "./accounts.js";
 
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
@@ -120,6 +121,12 @@ export async function deliverWrapUp(
 
   const reply = `${analysis.title} (${analysis.tag})\n\n${analysis.content}\n\nNote id: ${note.id}`;
   await ctx.reply(reply, { reply_markup: noteKeyboard(note.id) });
+  try {
+    await offerAccountUpdateAfterWrapUp(ctx, analysis);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Account wrap-up offer failed (${errorType}).`);
+  }
 }
 
 export async function handleNoteCallback(
