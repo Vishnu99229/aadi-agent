@@ -20,7 +20,7 @@ const PHONE_SSH = [
   "ConnectTimeout=8",
   "-o",
   "BatchMode=yes",
-  "u0_a289@192.168.1.7",
+  "u0_a289@i2301",
 ];
 
 export class LocalLlmBlockedError extends Error {
@@ -89,7 +89,7 @@ async function resolveTarget(): Promise<"local" | "phone"> {
   } catch {
     return "local";
   }
-  if (url.hostname === "192.168.1.7") {
+  if (url.hostname === "i2301" || url.hostname === "100.79.235.3") {
     return "phone";
   }
   if (url.hostname === "127.0.0.1" || url.hostname === "localhost") {

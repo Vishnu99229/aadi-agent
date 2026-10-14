@@ -1,6 +1,6 @@
 #!/bin/sh
 set -e
-PHONE="u0_a289@192.168.1.7"
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/scripts/phone-host.sh"
 
 if [ ! -f .env ]; then
   echo "Refusing to deploy: local .env is missing. Nothing was copied."
@@ -38,6 +38,6 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude google-token.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone -e "ssh -p 8022" ./ "$PHONE:~/aadi-agent/"
-ssh -p 8022 "$PHONE" 'cd ~/aadi-agent && npm install --no-audit --no-fund && pkill -f "[t]sx src/index.ts" || true'
+rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude google-token.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
+ssh -p "$PHONE_PORT" "$PHONE" 'cd ~/aadi-agent && npm install --no-audit --no-fund && pkill -f "[t]sx src/index.ts" || true'
 echo "Deployed. Aadi restarts on the phone in about 5 seconds."

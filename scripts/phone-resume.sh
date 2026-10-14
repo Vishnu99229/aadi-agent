@@ -1,6 +1,7 @@
 #!/bin/sh
-if ssh -p 8022 u0_a289@192.168.1.7 'tmux has-session -t aadi 2>/dev/null'; then
+. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/phone-host.sh"
+if ssh -p "$PHONE_PORT" "$PHONE" 'tmux has-session -t aadi 2>/dev/null'; then
   echo "tmux session aadi already running."
   exit 0
 fi
-ssh -p 8022 u0_a289@192.168.1.7 "tmux new-session -d -s aadi 'cd ~/aadi-agent && while true; do npm start; sleep 5; done'"
+ssh -p "$PHONE_PORT" "$PHONE" "tmux new-session -d -s aadi 'cd ~/aadi-agent && while true; do npm start; sleep 5; done'"

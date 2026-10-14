@@ -38,7 +38,8 @@ Aadi is Vishnu's personal AI agent. Vishnu talks to it on Telegram. It answers q
 - Keep it simple: no frameworks beyond what's listed, no premature abstractions.
 
 ## Deployment
-- Aadi runs permanently on Vishnu's Android phone (Termux), reachable over SSH at `u0_a289@192.168.1.7` port `8022`. Only **one** copy of Aadi may run at a time (Mac or phone), or Telegram long polling will conflict.
+- Aadi runs permanently on Vishnu's Android phone (Termux), reachable over SSH at `u0_a289@i2301` port `8022` (Tailscale MagicDNS; IP `100.79.235.3`). The host is `PHONE_HOST` in `scripts/phone-host.sh`. Only **one** copy of Aadi may run at a time (Mac or phone), or Telegram long polling will conflict.
+- The Mac's Tailscale must be connected to the PERSONAL account (vishnu.rajan294@gmail.com) to reach the phone. If Tailscale is on the Epicode account, switch to personal before deploying. Deploys work from any network.
 - Before testing on the Mac with `npm run dev`, run `npm run phone:pause`.
 - After a stage passes: stop the Mac copy, confirm `.env` on the Mac has real values (not test placeholders), run `npm run deploy`, then `npm run phone:resume`.
 - `deploy.sh` / `npm run deploy` rsyncs the project to `~/aadi-agent` on the phone, runs `npm install`, and kills the running process so the tmux auto-restart loop brings Aadi back. It never copies `*.db` or `google-token.json`; the phone's SQLite database and Google OAuth token are the live ones.

@@ -37,7 +37,7 @@ const PHONE_SSH = [
   "ConnectTimeout=8",
   "-o",
   "BatchMode=yes",
-  "u0_a289@192.168.1.7",
+  "u0_a289@i2301",
 ];
 const BACKENDS: LlmBackend[] = ["claude", "cloud-gemma", "local-gemma"];
 const TASKS = ["document", "chat", "search_draft", "brief"] as const;
