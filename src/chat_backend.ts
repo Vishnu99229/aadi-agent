@@ -24,3 +24,21 @@ export function setChatBackend(backend: ChatBackend): void {
 export function chatBackendLabel(backend: ChatBackend): string {
   return backend === "claude" ? "Claude" : "cloud Gemma";
 }
+
+export function applyChatBackend(backend: ChatBackend): {
+  switched: boolean;
+  message: string;
+} {
+  if (backend === "cloud-gemma" && !config.openRouterApiKey) {
+    return {
+      switched: false,
+      message: "cloud Gemma needs OPENROUTER_API_KEY in .env.",
+    };
+  }
+  setChatBackend(backend);
+  return {
+    switched: true,
+    message:
+      backend === "claude" ? "Now using Claude" : "Now using cloud Gemma",
+  };
+}

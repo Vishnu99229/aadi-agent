@@ -17,7 +17,17 @@ const approvalExpirySweep = startApprovalExpirySweep();
 const reminderScheduler = await registerReminderScheduler(bot.api);
 const documentExpirySweep = startDocumentExpirySweep();
 bot.start({
-  onStart: () => {
+  onStart: async () => {
+    await bot.api.setMyCommands([
+      { command: "menu", description: "Buttons for model, brief, waiting, bills, tasks" },
+      { command: "brief", description: "Send today's morning brief" },
+      { command: "weekly", description: "Send the weekly review" },
+      { command: "followups", description: "Scan and list emails waiting on a reply" },
+      { command: "model", description: "Switch between Claude and cloud Gemma" },
+      { command: "wrapup", description: "Save call or meeting notes" },
+      { command: "reset", description: "Clear conversation history" },
+      { command: "start", description: "Say hello" },
+    ]);
     console.log("Aadi is running with Telegram long polling.");
   },
 });

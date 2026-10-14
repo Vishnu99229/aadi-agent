@@ -1,10 +1,11 @@
-import { Bot, type Context } from "grammy";
+import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { runAgent } from "./agent.js";
 import {
+  applyChatBackend,
   chatBackendLabel,
   getChatBackend,
   isChatBackend,
-  setChatBackend,
+  type ChatBackend,
 } from "./chat_backend.js";
 import {
   consumeDraftEdit,
@@ -12,7 +13,10 @@ import {
 } from "./approvals.js";
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
-import { clearMessages } from "./db.js";
+import { clearMessages, getSetting, setSetting } from "./db.js";
+import { handler as listBills } from "./tools/list_bills.js";
+import { handler as listTasks } from "./tools/list_tasks.js";
+import { handler as listWaiting } from "./tools/list_waiting.js";
 import { handleBillCallback } from "./bills.js";
 import { runFollowupScan, sendFollowupNudgeSummary } from "./followups.js";
 import { handleDateWishCallback } from "./important_dates.js";
@@ -84,6 +88,155 @@ function shortError(error: unknown): string {
   return message.replace(/\s+/g, " ").trim().slice(0, 180) || "Unknown error";
 }
 
+const KEYBOARD_SETTING = "reply_keyboard";
+const QUICK_ACTIONS = ["Menu", "Brief", "Waiting on", "Tasks"] as const;
+
+function replyKeyboardOn(): boolean {
+  return getSetting(KEYBOARD_SETTING) === "on";
+}
+
+function replyKeyboard(): Keyboard {
+  const keyboard = new Keyboard()
+    .text("Menu")
+    .text("Brief")
+    .text("Waiting on")
+    .text("Tasks");
+  keyboard.resize_keyboard = true;
+  keyboard.is_persistent = true;
+  return keyboard;
+}
+
+function modelKeyboard(): InlineKeyboard {
+  const current = getChatBackend();
+  return new InlineKeyboard()
+    .text(current === "claude" ? "• Claude" : "Claude", "model:claude")
+    .text(current === "cloud-gemma" ? "• Gemma" : "Gemma", "model:gemma");
+}
+
+function menuKeyboard(): InlineKeyboard {
+  const current = getChatBackend();
+  return new InlineKeyboard()
+    .text(
+      current === "claude" ? "• Model: Claude" : "Model: Claude",
+      "menu:claude",
+    )
+    .text(
+      current === "cloud-gemma" ? "• Model: Gemma" : "Model: Gemma",
+      "menu:gemma",
+    )
+    .row()
+    .text("Morning brief", "menu:brief")
+    .row()
+    .text("Waiting on", "menu:waiting")
+    .row()
+    .text("Upcoming bills", "menu:bills")
+    .row()
+    .text("Open tasks", "menu:tasks")
+    .row()
+    .text(
+      replyKeyboardOn() ? "Hide keyboard" : "Show keyboard",
+      "menu:keyboard",
+    );
+}
+
+function menuCaption(): string {
+  return `Aadi — using ${chatBackendLabel(getChatBackend())}.`;
+}
+
+async function sendMenu(ctx: Context): Promise<void> {
+  await ctx.reply(menuCaption(), { reply_markup: menuKeyboard() });
+}
+
+function parseRequestedBackend(arg: string): ChatBackend | null {
+  const value = arg.trim().toLowerCase();
+  if (value === "gemma" || value === "cloud-gemma") {
+    return "cloud-gemma";
+  }
+  if (value === "claude") {
+    return "claude";
+  }
+  return null;
+}
+
+function formatWaiting(raw: string): string {
+  if (raw === "No matching email follow-ups.") {
+    return raw;
+  }
+  try {
+    const rows = JSON.parse(raw) as Array<{
+      id: number;
+      recipient: string;
+      subject: string;
+      tag: string;
+      status: string;
+      days_waiting: number;
+    }>;
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return "No matching email follow-ups.";
+    }
+    return rows
+      .map(
+        (row) =>
+          `#${row.id} ${row.status} (${row.tag}) ${row.recipient} — ${row.subject} — ${row.days_waiting}d`,
+      )
+      .join("\n");
+  } catch {
+    return "No matching email follow-ups.";
+  }
+}
+
+function formatBills(raw: string, heading: string): string {
+  if (raw === "No matching bills.") {
+    return `${heading}\nNone`;
+  }
+  try {
+    const rows = JSON.parse(raw) as Array<{
+      id: number;
+      biller: string;
+      amount: number | null;
+      currency: string;
+      due_date: string;
+      status: string;
+    }>;
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return `${heading}\nNone`;
+    }
+    const lines = rows.map((row) => {
+      const amount =
+        row.amount === null ? "amount unknown" : `${row.currency} ${row.amount}`;
+      return `#${row.id} ${row.biller} — ${amount} — due ${row.due_date}`;
+    });
+    return `${heading}\n${lines.join("\n")}`;
+  } catch {
+    return `${heading}\nNone`;
+  }
+}
+
+async function sendWaitingList(ctx: Context): Promise<void> {
+  await sendPlainText(ctx, formatWaiting(listWaiting({})));
+}
+
+async function sendUpcomingBills(ctx: Context): Promise<void> {
+  const upcoming = formatBills(listBills({ filter: "upcoming" }), "Upcoming");
+  const overdue = formatBills(listBills({ filter: "overdue" }), "Overdue");
+  await sendPlainText(ctx, `${upcoming}\n\n${overdue}`);
+}
+
+async function sendOpenTasks(ctx: Context): Promise<void> {
+  await sendPlainText(ctx, listTasks({ status: "open" }));
+}
+
+async function setReplyKeyboard(ctx: Context, on: boolean): Promise<void> {
+  setSetting(KEYBOARD_SETTING, on ? "on" : "off");
+  if (on) {
+    await ctx.reply("Keyboard on.", { reply_markup: replyKeyboard() });
+    return;
+  }
+  await ctx.reply("Keyboard hidden.", {
+    reply_markup: { remove_keyboard: true },
+  });
+}
+
 bot.command("start", async (ctx) => {
   await ctx.reply("Hi Vishnu — I'm Aadi. How can I help?");
 });
@@ -101,32 +254,35 @@ bot.command("weekly", async (ctx) => {
   await whileTyping(ctx, () => sendWeeklyReview(ctx.api));
 });
 
+bot.command("menu", async (ctx) => {
+  await sendMenu(ctx);
+});
+
 bot.command("model", async (ctx) => {
-  const arg = (typeof ctx.match === "string" ? ctx.match : "")
-    .trim()
-    .toLowerCase();
+  const arg = typeof ctx.match === "string" ? ctx.match.trim() : "";
   if (!arg) {
-    await ctx.reply(`Current backend: ${chatBackendLabel(getChatBackend())}`);
+    await ctx.reply(`Current backend: ${chatBackendLabel(getChatBackend())}`, {
+      reply_markup: modelKeyboard(),
+    });
     return;
   }
-  const requested =
-    arg === "gemma" || arg === "cloud-gemma"
-      ? "cloud-gemma"
-      : arg === "claude"
-        ? "claude"
-        : null;
+  const requested = parseRequestedBackend(arg);
   if (!requested || !isChatBackend(requested)) {
-    await ctx.reply("Use /model, /model claude, or /model gemma.");
+    await ctx.reply("Use /model, /model claude, or /model gemma.", {
+      reply_markup: modelKeyboard(),
+    });
     return;
   }
-  if (requested === "cloud-gemma" && !config.openRouterApiKey) {
-    await ctx.reply("cloud Gemma needs OPENROUTER_API_KEY in .env.");
-    return;
-  }
-  setChatBackend(requested);
-  await ctx.reply(
-    requested === "claude" ? "Now using Claude" : "Now using cloud Gemma",
-  );
+  const result = applyChatBackend(requested);
+  await ctx.reply(result.message, { reply_markup: modelKeyboard() });
+});
+
+bot.command("showkeyboard", async (ctx) => {
+  await setReplyKeyboard(ctx, true);
+});
+
+bot.command("hidekeyboard", async (ctx) => {
+  await setReplyKeyboard(ctx, false);
 });
 
 bot.command("followups", async (ctx) => {
@@ -192,6 +348,75 @@ bot.callbackQuery(/^note:(tasks|draft|done):(\d+)$/, async (ctx) => {
   const operation = ctx.match[1] as "tasks" | "draft" | "done";
   const noteId = Number(ctx.match[2]);
   await handleNoteCallback(ctx, operation, noteId);
+});
+
+bot.callbackQuery(/^model:(claude|gemma)$/, async (ctx) => {
+  const requested = parseRequestedBackend(ctx.match[1] ?? "");
+  if (!requested) {
+    await ctx.answerCallbackQuery();
+    return;
+  }
+  const result = applyChatBackend(requested);
+  await ctx.answerCallbackQuery({ text: result.message });
+  try {
+    await ctx.editMessageText(
+      `Current backend: ${chatBackendLabel(getChatBackend())}`,
+      { reply_markup: modelKeyboard() },
+    );
+  } catch {
+    await ctx.editMessageReplyMarkup({ reply_markup: modelKeyboard() }).catch(
+      () => undefined,
+    );
+  }
+});
+
+bot.callbackQuery(/^menu:(claude|gemma|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {
+  const action = ctx.match[1];
+  if (action === "claude" || action === "gemma") {
+    const requested = parseRequestedBackend(action);
+    if (!requested) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    const result = applyChatBackend(requested);
+    await ctx.answerCallbackQuery({ text: result.message });
+    try {
+      await ctx.editMessageText(menuCaption(), { reply_markup: menuKeyboard() });
+    } catch {
+      await ctx.editMessageReplyMarkup({ reply_markup: menuKeyboard() }).catch(
+        () => undefined,
+      );
+    }
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+  if (action === "keyboard") {
+    await setReplyKeyboard(ctx, !replyKeyboardOn());
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: menuKeyboard() });
+    } catch {
+      // Message may already match; the keyboard toggle still applied.
+    }
+    return;
+  }
+
+  try {
+    if (action === "brief") {
+      await whileTyping(ctx, () => sendMorningBrief(ctx.api));
+    } else if (action === "waiting") {
+      await sendWaitingList(ctx);
+    } else if (action === "bills") {
+      await sendUpcomingBills(ctx);
+    } else if (action === "tasks") {
+      await sendOpenTasks(ctx);
+    }
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Menu action failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
+  await sendMenu(ctx);
 });
 
 async function handleUserText(
@@ -352,6 +577,25 @@ bot.on("message:photo", async (ctx) => {
 bot.on("message:text", async (ctx) => {
   try {
     const text = ctx.message.text;
+    if ((QUICK_ACTIONS as readonly string[]).includes(text)) {
+      if (text === "Menu") {
+        await sendMenu(ctx);
+        return;
+      }
+      if (text === "Brief") {
+        await whileTyping(ctx, () => sendMorningBrief(ctx.api));
+        await sendMenu(ctx);
+        return;
+      }
+      if (text === "Waiting on") {
+        await sendWaitingList(ctx);
+        await sendMenu(ctx);
+        return;
+      }
+      await sendOpenTasks(ctx);
+      await sendMenu(ctx);
+      return;
+    }
     if (isWrapUpText(text)) {
       await whileTyping(ctx, () => deliverWrapUp(ctx, stripWrapUpPrefix(text)));
       return;
