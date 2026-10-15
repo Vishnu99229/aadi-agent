@@ -7,8 +7,11 @@ import type {
 import { getTaskBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import type { DocumentActionItem, ItemTag } from "./db.js";
+import { estimateLlmCostUsd, isHaiku55Model, logAnthropicUsage } from "./usage.js";
 
 const MAX_PDF_PAGES = 50;
+const HAIKU_PDF_PAGES_PER_CALL = 15;
+const HAIKU_TEXT_CHUNK_CHARS = 32_000;
 const SUMMARY_MAX_TOKENS = 8192;
 
 export interface DocumentAnalysisUsage {
@@ -79,13 +82,32 @@ Do not dump the full document. Keep each string short. Never invent figures or d
 
 const fallbackPrompt = `Summarize this document for Vishnu in short plain-text bullets: what it is, key dates, amounts, and anything needing his action. Plain text only, no JSON. Never invent figures or dates not present.`;
 
-function estimateCostUsd(inputTokens: number, outputTokens: number): number {
-  const rates = config.chatCostRates;
-  return (
-    (inputTokens * rates.inputCostPerMillion +
-      outputTokens * rates.outputCostPerMillion) /
-    1_000_000
-  );
+function documentsModel(): string {
+  return getTaskBackend("documents") === "claude"
+    ? config.claudeModel
+    : config.backgroundModel;
+}
+
+function estimateCostUsd(
+  inputTokens: number,
+  outputTokens: number,
+  model = documentsModel(),
+): number {
+  return estimateLlmCostUsd({ inputTokens, outputTokens }, model);
+}
+
+function uniqueStrings(items: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of items) {
+    const key = item.trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(item.trim());
+  }
+  return out;
 }
 
 function normalizeAnalysis(parsed: unknown): Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage"> {
@@ -148,11 +170,16 @@ async function requestStructuredAnalysis(
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
+      const model = documentsModel();
       const response = await anthropic.messages.create({
-        model: config.claudeModel,
+        model,
         max_tokens: SUMMARY_MAX_TOKENS,
+        ...(isHaiku55Model(model)
+          ? { thinking: { type: "disabled" as const } }
+          : {}),
         output_config: {
           format: { type: "json_schema", schema: analysisSchema },
+          ...(isHaiku55Model(model) ? { effort: "low" as const } : {}),
         },
         messages: [
           {
@@ -166,6 +193,7 @@ async function requestStructuredAnalysis(
       });
       inputTokens += response.usage.input_tokens;
       outputTokens += response.usage.output_tokens;
+      logAnthropicUsage("document", model, response.usage);
       if (response.stop_reason === "refusal") {
         throw new Error("Document analysis was refused by the model.");
       }
@@ -201,9 +229,16 @@ async function requestFallbackSummary(
   promptExtra: string,
   usage: DocumentAnalysisUsage,
 ): Promise<{ analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">; usage: DocumentAnalysisUsage }> {
+  const model = documentsModel();
   const response = await anthropic.messages.create({
-    model: config.claudeModel,
+    model,
     max_tokens: SUMMARY_MAX_TOKENS,
+    ...(isHaiku55Model(model)
+      ? {
+          thinking: { type: "disabled" as const },
+          output_config: { effort: "low" as const },
+        }
+      : {}),
     messages: [
       {
         role: "user",
@@ -219,6 +254,7 @@ async function requestFallbackSummary(
     .map((block) => block.text)
     .join("\n")
     .trim();
+  logAnthropicUsage("document", model, response.usage);
   const lines = text
     .split("\n")
     .map((line) => line.replace(/^[-•\s]+/, "").trim())
@@ -267,10 +303,9 @@ async function analyzeContent(
   logLabel: string,
 ): Promise<DocumentAnalysis> {
   const backend = getTaskBackend("documents");
-  if (backend !== "claude") {
-    const errorType = "UnsupportedDocumentBackend";
+  if (backend === "cloud-gemma") {
     console.error(
-      `Document analysis (${logLabel}) on ${backend} failed (${errorType}); retrying on Claude.`,
+      `Document analysis (${logLabel}) on cloud-gemma is not supported; using ${documentsModel()}.`,
     );
   }
   try {
@@ -296,14 +331,20 @@ async function analyzeContent(
   }
 }
 
-/** Plain-text transcription for image-only PDFs. Not used when a local text layer exists. */
-export async function transcribePdfVisibleText(
+async function transcribePdfChunk(
   pdfBytes: Uint8Array,
   pagesProcessed: number,
+  model: string,
 ): Promise<{ text: string; usage: DocumentAnalysisUsage }> {
   const response = await anthropic.messages.create({
-    model: config.claudeModel,
+    model,
     max_tokens: SUMMARY_MAX_TOKENS,
+    ...(isHaiku55Model(model)
+      ? {
+          thinking: { type: "disabled" as const },
+          output_config: { effort: "low" as const },
+        }
+      : {}),
     messages: [
       {
         role: "user",
@@ -331,12 +372,14 @@ Plain text only. Do not summarize and do not use JSON.`,
     .map((block) => block.text)
     .join("\n")
     .trim();
+  logAnthropicUsage("document", model, response.usage);
   const usage = {
     inputTokens: response.usage.input_tokens,
     outputTokens: response.usage.output_tokens,
     estimatedCostUsd: estimateCostUsd(
       response.usage.input_tokens,
       response.usage.output_tokens,
+      model,
     ),
   };
   console.log(
@@ -345,27 +388,122 @@ Plain text only. Do not summarize and do not use JSON.`,
   return { text, usage };
 }
 
+/** Plain-text transcription for image-only PDFs. Not used when a local text layer exists. */
+export async function transcribePdfVisibleText(
+  pdfBytes: Uint8Array,
+  pagesProcessed: number,
+): Promise<{ text: string; usage: DocumentAnalysisUsage }> {
+  const model = documentsModel();
+  const batchSize = isHaiku55Model(model)
+    ? HAIKU_PDF_PAGES_PER_CALL
+    : MAX_PDF_PAGES;
+  if (pagesProcessed <= batchSize) {
+    return transcribePdfChunk(pdfBytes, pagesProcessed, model);
+  }
+  const texts: string[] = [];
+  const usage: DocumentAnalysisUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0,
+  };
+  for (let start = 0; start < pagesProcessed; start += batchSize) {
+    const count = Math.min(batchSize, pagesProcessed - start);
+    const slice = await slicePdfPages(pdfBytes, start, count);
+    const part = await transcribePdfChunk(slice, count, model);
+    texts.push(part.text);
+    usage.inputTokens += part.usage.inputTokens;
+    usage.outputTokens += part.usage.outputTokens;
+    usage.estimatedCostUsd += part.usage.estimatedCostUsd;
+  }
+  return { text: texts.join("\n"), usage };
+}
+
+function mergeAnalyses(
+  parts: Array<Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage"> & { usage: DocumentAnalysisUsage }>,
+): { analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">; usage: DocumentAnalysisUsage } {
+  const summary = uniqueStrings(parts.flatMap((part) => part.summary_bullets)).slice(0, 5);
+  const dates = uniqueStrings(parts.flatMap((part) => part.dates));
+  const money = uniqueStrings(parts.flatMap((part) => part.money));
+  const risks = uniqueStrings(parts.flatMap((part) => part.risks));
+  const action_items = parts.flatMap((part) => part.action_items);
+  const document_type =
+    parts.find((part) => part.document_type && part.document_type !== "document")
+      ?.document_type ?? "document";
+  const usage = parts.reduce(
+    (sum, part) => ({
+      inputTokens: sum.inputTokens + part.usage.inputTokens,
+      outputTokens: sum.outputTokens + part.usage.outputTokens,
+      estimatedCostUsd: sum.estimatedCostUsd + part.usage.estimatedCostUsd,
+    }),
+    { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+  );
+  return {
+    analysis: {
+      tag: parts.some((part) => part.tag === "work") ? "work" : "personal",
+      document_type,
+      summary_bullets: summary,
+      dates,
+      money,
+      risks,
+      action_items,
+      extracted_text: [document_type, ...summary, ...dates, ...money, ...risks, ...action_items.map((item) => item.text)]
+        .filter(Boolean)
+        .join("\n"),
+    },
+    usage,
+  };
+}
+
 export async function analyzePdf(
   pdfBytes: Uint8Array,
   pagesProcessed: number,
   truncated: boolean,
 ): Promise<DocumentAnalysis> {
-  return analyzeContent(
-    [
-      {
-        type: "document",
-        source: {
-          type: "base64",
-          media_type: "application/pdf",
-          data: Buffer.from(pdfBytes).toString("base64"),
+  const model = documentsModel();
+  const batchSize =
+    isHaiku55Model(model) ? HAIKU_PDF_PAGES_PER_CALL : MAX_PDF_PAGES;
+  if (pagesProcessed <= batchSize) {
+    return analyzeContent(
+      [
+        {
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: Buffer.from(pdfBytes).toString("base64"),
+          },
         },
-      },
-    ],
-    `Pages sent: ${pagesProcessed}. truncated: ${truncated}.`,
-    pagesProcessed,
-    truncated,
-    "pdf",
-  );
+      ],
+      `Pages sent: ${pagesProcessed}. truncated: ${truncated}.`,
+      pagesProcessed,
+      truncated,
+      "pdf",
+    );
+  }
+  const parts = [];
+  for (let start = 0; start < pagesProcessed; start += batchSize) {
+    const count = Math.min(batchSize, pagesProcessed - start);
+    const slice = await slicePdfPages(pdfBytes, start, count);
+    const part = await analyzeContent(
+      [
+        {
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: Buffer.from(slice).toString("base64"),
+          },
+        },
+      ],
+      `Pages ${start + 1}-${start + count} of ${pagesProcessed}. truncated: ${truncated}.`,
+      count,
+      false,
+      `pdf-${start + 1}`,
+    );
+    parts.push(part);
+  }
+  const merged = mergeAnalyses(parts);
+  return withPages(merged, pagesProcessed, truncated, parts.some((part) => part.fallback_summary));
 }
 
 export async function analyzeImage(
@@ -396,17 +534,45 @@ export async function analyzeText(
   pagesProcessed = 0,
   truncated = false,
 ): Promise<DocumentAnalysis> {
-  return analyzeContent(
-    [
-      {
-        type: "text",
-        text: `Source: ${sourceLabel}\n\n<document_text>\n${body}\n</document_text>`,
-      },
-    ],
-    "",
+  const model = documentsModel();
+  if (!isHaiku55Model(model) || body.length <= HAIKU_TEXT_CHUNK_CHARS) {
+    return analyzeContent(
+      [
+        {
+          type: "text",
+          text: `Source: ${sourceLabel}\n\n<document_text>\n${body}\n</document_text>`,
+        },
+      ],
+      "",
+      pagesProcessed,
+      truncated,
+      "text",
+    );
+  }
+  const { chunkText } = await import("./document_review_logic.js");
+  const chunks = chunkText(body, HAIKU_TEXT_CHUNK_CHARS, 400);
+  const parts = [];
+  for (const [index, chunk] of chunks.entries()) {
+    const part = await analyzeContent(
+      [
+        {
+          type: "text",
+          text: `Source: ${sourceLabel} (chunk ${index + 1} of ${chunks.length})\n\n<document_text>\n${chunk}\n</document_text>`,
+        },
+      ],
+      "",
+      pagesProcessed,
+      truncated,
+      `text-${index + 1}`,
+    );
+    parts.push(part);
+  }
+  const merged = mergeAnalyses(parts);
+  return withPages(
+    merged,
     pagesProcessed,
     truncated,
-    "text",
+    parts.some((part) => part.fallback_summary),
   );
 }
 
@@ -430,6 +596,23 @@ export async function trimPdfToMaxPages(
   }
   const pdf = await target.save();
   return { pdf: new Uint8Array(pdf), totalPages, truncated: true };
+}
+
+async function slicePdfPages(
+  bytes: Uint8Array,
+  start: number,
+  count: number,
+): Promise<Uint8Array> {
+  const { PDFDocument } = await import("pdf-lib");
+  const source = await PDFDocument.load(bytes);
+  const target = await PDFDocument.create();
+  const indices = Array.from({ length: count }, (_, index) => start + index);
+  const copied = await target.copyPages(source, indices);
+  for (const page of copied) {
+    target.addPage(page);
+  }
+  const pdf = await target.save();
+  return new Uint8Array(pdf);
 }
 
 export function formatDocumentReply(

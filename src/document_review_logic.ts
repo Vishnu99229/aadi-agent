@@ -53,7 +53,7 @@ export interface QuestionnaireReview {
 
 export type TypedReview = ContractReview | RfpReview | QuestionnaireReview;
 
-export const TEXT_CHUNK_CHARS = 12_000;
+export const TEXT_CHUNK_CHARS = 8_000;
 export const TEXT_CHUNK_OVERLAP = 400;
 
 export function chunkText(

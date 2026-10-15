@@ -14,7 +14,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "add_account",
   description:
-    "Add an Epicode deal/account to the tracker. relationship is partner (direct) or end_client (via a partner). End clients require via_partner. aliases and email_domains are used to match mail and notes. people is display-only (names involved, not matchers). Only call this when Vishnu asked to add or confirmed the name, domains, and contacts. Stage and next step stay empty unless he provided them.",
+    "Add an Epicode deal. End clients need via_partner. aliases/email_domains match mail. Only when Vishnu asked or confirmed. Stage/next step stay empty unless he gave them.",
   inputSchema: {
     type: "object",
     properties: {

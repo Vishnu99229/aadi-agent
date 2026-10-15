@@ -17,6 +17,8 @@
     "test:stage8": "tsx --env-file=.env scripts/test-stage8.ts",
     "test:stage10": "tsx --env-file=.env scripts/test-stage10.ts",
     "test:memory": "tsx --env-file=.env scripts/test-memory.ts",
+    "test:usage": "tsx --env-file=.env scripts/test-usage.ts",
+    "prefix-size": "tsx --env-file=.env scripts/prefix-size.ts",
     "test:haiku-live": "tsx --env-file=.env scripts/test-haiku-background-live.ts",
     "test:documents": "tsx --env-file=.env scripts/test-document-analysis.ts",
     "bench:models": "tsx --env-file=.env scripts/bench-models.ts"

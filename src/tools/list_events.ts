@@ -13,7 +13,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_events",
   description:
-    "List events from Vishnu's personal Gmail and Epicode work calendars using Asia/Kolkata dates. Each event is tagged personal or work by account. Use this for questions about today's, tomorrow's, or a date range's schedule. start_date and end_date are inclusive YYYY-MM-DD dates. Pass account to read one calendar; omit it to read both.",
+    "List calendar events (personal and work) for an inclusive YYYY-MM-DD range in Asia/Kolkata. Omit account to read both calendars.",
   inputSchema: {
     type: "object",
     properties: {

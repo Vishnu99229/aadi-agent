@@ -1,5 +1,4 @@
 import type { LlmTool } from "../llm.js";
-import { config } from "../config.js";
 import * as accountStatus from "./account_status.js";
 import * as addAccount from "./add_account.js";
 import * as addTask from "./add_task.js";
@@ -43,7 +42,7 @@ export interface RegisteredTool {
   handler: (input: unknown) => string | Promise<string>;
 }
 
-export const tools: Record<string, RegisteredTool> = {
+const modules = {
   account_status: accountStatus,
   add_account: addAccount,
   add_date: addDate,
@@ -71,7 +70,7 @@ export const tools: Record<string, RegisteredTool> = {
   remove_date: removeDate,
   read_email: readEmail,
   remember,
-  ...(config.googleSheetId ? { read_sheet: readSheet } : {}),
+  read_sheet: readSheet,
   search_emails: searchEmails,
   search_memories: searchMemories,
   search_notes: searchNotes,
@@ -81,4 +80,49 @@ export const tools: Record<string, RegisteredTool> = {
   update_account: updateAccount,
   update_memory: updateMemory,
   update_draft: updateDraft,
-};
+} as const satisfies Record<string, RegisteredTool>;
+
+/** Fixed order so the Anthropic cached prefix never changes with object-key churn or optional tools. */
+export const TOOL_ORDER = [
+  "account_status",
+  "add_account",
+  "add_date",
+  "add_task",
+  "cancel_reminder",
+  "complete_task",
+  "draft_mom",
+  "forget_memory",
+  "draft_reply",
+  "get_current_time",
+  "list_accounts",
+  "list_attachments",
+  "list_bills",
+  "list_dates",
+  "list_events",
+  "list_upcoming_dates",
+  "list_reminders",
+  "list_tasks",
+  "list_memories",
+  "list_waiting",
+  "mark_bill_paid",
+  "read_attachment",
+  "read_document",
+  "remove_account",
+  "remove_date",
+  "read_email",
+  "remember",
+  "read_sheet",
+  "search_emails",
+  "search_memories",
+  "search_notes",
+  "set_reminder",
+  "stop_tracking",
+  "track_thread",
+  "update_account",
+  "update_memory",
+  "update_draft",
+] as const;
+
+export const tools: Record<string, RegisteredTool> = Object.fromEntries(
+  TOOL_ORDER.map((name) => [name, modules[name]]),
+);

@@ -7,7 +7,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_attachments",
   description:
-    "List file attachments on a Gmail message in personal or work mail. Pass the email_id from search_emails. Returns attachment ids, filenames, types and sizes — not file contents. Then use read_attachment to open one.",
+    "List attachments on a Gmail message (ids, names, types, sizes). Then use read_attachment.",
   inputSchema: {
     type: "object",
     properties: {

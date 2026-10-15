@@ -7,7 +7,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_bills",
   description:
-    "List tracked bills. Default filter is all (every saved bill, including ignored and paid in past months). Other filters: upcoming, overdue, paid, paid_this_month, ignored. Use all when looking something up to mark paid or ignore it.",
+    "List tracked bills. Default filter all. Other filters: upcoming, overdue, paid, paid_this_month, ignored.",
   inputSchema: {
     type: "object",
     properties: {

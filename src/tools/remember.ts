@@ -7,7 +7,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "remember",
   description:
-    "Save one long-term fact. Use when Vishnu asks to remember something, or when a durable fact should persist across chats. Do not store passwords, OTPs, card/account numbers, or health details. If this updates an existing fact, still call remember with the new wording; duplicates are merged.",
+    "Save one long-term fact. No passwords, OTPs, card numbers, or health details. Duplicates are merged.",
   inputSchema: {
     type: "object",
     properties: {

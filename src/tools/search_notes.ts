@@ -7,7 +7,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "search_notes",
   description:
-    "Search saved call/meeting notes. Query is optional: omit it to list recent notes. Do not pass since_days when looking something up to delete or quote; search all saved notes unless Vishnu asked for a time window.",
+    "Search saved meeting notes. Omit query to list recent notes. Search all notes unless Vishnu asked for a time window.",
   inputSchema: {
     type: "object",
     properties: {

@@ -9,7 +9,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_dates",
   description:
-    "List ALL saved important dates (birthdays, anniversaries, other), not just the next 7 days. Use this to find a date before removing it. Optional query matches person, relation, type, note, or MM-DD. Optional type filter.",
+    "List all saved important dates, not just the next 7 days. Optional query on person, type, or MM-DD.",
   inputSchema: {
     type: "object",
     properties: {

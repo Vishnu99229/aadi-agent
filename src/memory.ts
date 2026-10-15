@@ -224,6 +224,7 @@ At most 2 facts. Prefer one. Content under 140 characters.`,
     ],
     tools: [],
     maxTokens: 512,
+    task: "memory_extraction",
   });
   console.log(
     `Memory capture: facts_raw_len=${response.textParts.join("").length} input_tokens=${response.usage.inputTokens} output_tokens=${response.usage.outputTokens}`,

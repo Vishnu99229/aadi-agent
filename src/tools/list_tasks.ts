@@ -11,7 +11,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_tasks",
   description:
-    "List ALL matching tasks (no time window). Optionally filter by work/personal tag, open/done status, and an exact Asia/Kolkata due date (YYYY-MM-DD). Omit due_date when looking a task up to complete or delete it.",
+    "List matching tasks. Optional tag, status, and YYYY-MM-DD due_date. Omit due_date when looking a task up.",
   inputSchema: {
     type: "object",
     properties: {

@@ -7,7 +7,6 @@ import type {
   ToolResultBlockParam,
   ToolUnion as AnthropicTool,
 } from "@anthropic-ai/sdk/resources/messages/messages";
-import type { ModelCostRates } from "./config.js";
 import OpenAI from "openai";
 import type {
   ChatCompletionContentPart,
@@ -17,6 +16,13 @@ import type {
 import { getTaskBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import { assertLocalModelAllowed } from "./local_llm_guard.js";
+import {
+  estimateLlmCostUsd,
+  isHaiku55Model,
+  logTokenUsage,
+  type EffortLevel,
+  type UsageTask,
+} from "./usage.js";
 
 const MAX_TOKENS = 4096;
 const MAX_SERVER_CONTINUATIONS = 8;
@@ -91,7 +97,7 @@ export type LlmStopReason =
   | "refusal"
   | "other";
 
-export type LlmBackend = "claude" | "cloud-gemma" | "local-gemma";
+export type LlmBackend = "claude" | "haiku" | "cloud-gemma" | "local-gemma";
 
 export interface CompleteParams {
   system: LlmSystemPrompt;
@@ -105,6 +111,13 @@ export interface CompleteParams {
   backend?: LlmBackend;
   maxTokens?: number;
   timeoutMs?: number;
+  /** Logged to usage_log (counts only). */
+  task?: UsageTask;
+  /** Haiku 5.5 / Sonnet 5.5 output_config.effort. Omitted: Haiku low, Sonnet API default. */
+  effort?: EffortLevel;
+  /** Prompt-cache TTL. Omitted: 1h for chat-like tasks, 5m for one-burst jobs. */
+  cacheTtl?: "5m" | "1h";
+  skipUsageLog?: boolean;
 }
 
 export interface CompleteResult {
@@ -137,39 +150,85 @@ const localLlm = new OpenAI({
 
 let loggedOpenRouterWebSearchDisabled = false;
 
-function costRatesForModel(model: string): ModelCostRates {
-  if (model === config.backgroundModel) {
-    return config.backgroundCostRates;
-  }
-  return config.chatCostRates;
-}
-
 function withEstimatedCost(
   usage: Omit<LlmUsage, "estimatedCostUsd">,
   inputIncludesCacheTokens: boolean,
-  rates: ModelCostRates,
+  model: string,
 ): LlmUsage {
-  const cacheCreationTokens = usage.cacheCreationInputTokens ?? 0;
-  const cacheReadTokens = usage.cacheReadInputTokens ?? 0;
-  const regularInputTokens = inputIncludesCacheTokens
-    ? Math.max(
-        0,
-        usage.inputTokens - cacheCreationTokens - cacheReadTokens,
-      )
-    : usage.inputTokens;
-  const estimatedCostUsd =
-    (regularInputTokens * rates.inputCostPerMillion +
-      usage.outputTokens * rates.outputCostPerMillion +
-      cacheCreationTokens * rates.cacheCreationCostPerMillion +
-      cacheReadTokens * rates.cacheReadCostPerMillion) /
-    1_000_000;
-
-  return { ...usage, estimatedCostUsd };
+  return {
+    ...usage,
+    estimatedCostUsd: estimateLlmCostUsd(
+      {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheWriteTokens: usage.cacheCreationInputTokens,
+        cacheReadTokens: usage.cacheReadInputTokens,
+        inputIncludesCacheTokens,
+      },
+      model,
+    ),
+  };
 }
 
-/** Haiku 5.5 rejects custom temperature/top_p/top_k; use effort + disabled thinking for classification. */
-function usesHaiku55RequestShape(model: string): boolean {
-  return /haiku-5-5/i.test(model);
+function cacheWriteSplit(usage: Anthropic.Messages.Usage): {
+  cacheWriteTokens: number;
+  cacheWrite1hTokens: number;
+} {
+  const total = usage.cache_creation_input_tokens ?? 0;
+  const details = (
+    usage as Anthropic.Messages.Usage & {
+      cache_creation?: {
+        ephemeral_5m_input_tokens?: number;
+        ephemeral_1h_input_tokens?: number;
+      };
+    }
+  ).cache_creation;
+  const cacheWrite1hTokens = details?.ephemeral_1h_input_tokens ?? 0;
+  return { cacheWriteTokens: total, cacheWrite1hTokens };
+}
+
+function recordUsage(
+  params: CompleteParams,
+  model: string,
+  usage: Omit<LlmUsage, "estimatedCostUsd">,
+  inputIncludesCacheTokens: boolean,
+): LlmUsage {
+  const withCost = withEstimatedCost(usage, inputIncludesCacheTokens, model);
+  if (!params.skipUsageLog) {
+    logTokenUsage(params.task ?? "other", model, {
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheWriteTokens: usage.cacheCreationInputTokens,
+      cacheReadTokens: usage.cacheReadInputTokens,
+      inputIncludesCacheTokens,
+    });
+  }
+  return withCost;
+}
+
+type CacheTtl = "5m" | "1h";
+
+function cacheTtlForTask(task?: UsageTask): CacheTtl {
+  if (
+    task === "brief" ||
+    task === "classification" ||
+    task === "document" ||
+    task === "contract_review" ||
+    task === "memory_extraction" ||
+    task === "other"
+  ) {
+    return "5m";
+  }
+  return "1h";
+}
+
+function cacheControl(ttl: CacheTtl): {
+  type: "ephemeral";
+  ttl?: "1h";
+} {
+  return ttl === "1h"
+    ? { type: "ephemeral", ttl: "1h" }
+    : { type: "ephemeral" };
 }
 
 function buildClaudeMessageCreateParams(
@@ -178,21 +237,31 @@ function buildClaudeMessageCreateParams(
   messages: AnthropicMessage[],
   tools: AnthropicTool[],
   maxTokens: number,
+  effort: EffortLevel | undefined,
+  cacheTtl: CacheTtl,
 ): MessageCreateParamsNonStreaming {
   const base: MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
-    system: toAnthropicSystem(system),
+    system: toAnthropicSystem(system, cacheTtl),
     messages: withLatestMessageCacheBreakpoint(messages),
-    tools,
+    tools: withToolsCacheBreakpoint(tools, cacheTtl),
   };
-  if (!usesHaiku55RequestShape(model)) {
+  if (!isHaiku55Model(model) && !effort) {
     return base;
+  }
+  const haikuEffort = effort ?? "low";
+  if (isHaiku55Model(model) && haikuEffort === "low") {
+    return {
+      ...base,
+      thinking: { type: "disabled" },
+      output_config: { effort: "low" },
+    };
   }
   return {
     ...base,
-    thinking: { type: "disabled" },
-    output_config: { effort: "low" },
+    ...(isHaiku55Model(model) ? { thinking: { type: "adaptive" as const } } : {}),
+    output_config: { effort: effort ?? haikuEffort },
   };
 }
 
@@ -330,7 +399,7 @@ function withLatestMessageCacheBreakpoint(
 
   const lastBlockIndex = latestMessage.content.length - 1;
   if (lastBlockIndex >= 0) {
-    latestMessage.content[lastBlockIndex] = {
+        latestMessage.content[lastBlockIndex] = {
       ...latestMessage.content[lastBlockIndex],
       cache_control: { type: "ephemeral" },
     } as ContentBlockParam;
@@ -340,7 +409,7 @@ function withLatestMessageCacheBreakpoint(
 }
 
 function toAnthropicTools(tools: LlmTool[]): AnthropicTool[] {
-  const converted = tools.map((tool): AnthropicTool => {
+  return tools.map((tool): AnthropicTool => {
     if (tool.type === "web_search") {
       // web_search_20260318 defaults to code_execution-based programmatic
       // calling. Anthropic does not allow forced tool_choice settings or
@@ -358,24 +427,33 @@ function toAnthropicTools(tools: LlmTool[]): AnthropicTool[] {
       input_schema: tool.inputSchema,
     };
   });
-
-  const lastTool = converted.at(-1);
-  if (lastTool) {
-    converted[converted.length - 1] = {
-      ...lastTool,
-      cache_control: { type: "ephemeral" },
-    } as AnthropicTool;
-  }
-
-  return converted;
 }
 
-function toAnthropicSystem(system: LlmSystemPrompt): TextBlockParam[] {
+function withToolsCacheBreakpoint(
+  tools: AnthropicTool[],
+  ttl: CacheTtl,
+): AnthropicTool[] {
+  const lastTool = tools.at(-1);
+  if (!lastTool) {
+    return tools;
+  }
+  const next = [...tools];
+  next[next.length - 1] = {
+    ...lastTool,
+    cache_control: cacheControl(ttl),
+  } as AnthropicTool;
+  return next;
+}
+
+function toAnthropicSystem(
+  system: LlmSystemPrompt,
+  ttl: CacheTtl,
+): TextBlockParam[] {
   const blocks: TextBlockParam[] = [
     {
       type: "text",
       text: system.cacheable,
-      cache_control: { type: "ephemeral" },
+      cache_control: cacheControl(ttl),
     },
   ];
 
@@ -409,7 +487,8 @@ async function completeWithClaude(
   }
 
   const model = params.model ?? config.claudeModel;
-  const rates = costRatesForModel(model);
+  const cacheTtl = params.cacheTtl ?? cacheTtlForTask(params.task);
+  const effort = params.effort ?? (isHaiku55Model(model) ? "low" : undefined);
   const messages = toAnthropicMessages(params.messages);
   const tools = toAnthropicTools(params.tools);
   const usage: Omit<LlmUsage, "estimatedCostUsd"> = {
@@ -424,8 +503,10 @@ async function completeWithClaude(
     continuation += 1
   ) {
     // Anthropic allows at most four explicit cache breakpoints. This request
-    // uses three: the tool definitions, the stable system prompt, and a
-    // rolling breakpoint on the latest message for incremental agent turns.
+    // uses three: tools and the stable system prompt (1h for chat, 5m for
+    // one-burst jobs), plus a 5-minute rolling breakpoint on the latest
+    // message for incremental agent turns. Date, memories, and the latest
+    // user text sit in system.dynamic / messages after those breakpoints.
     const response = await anthropic.messages.create(
       buildClaudeMessageCreateParams(
         model,
@@ -433,19 +514,30 @@ async function completeWithClaude(
         messages,
         tools,
         params.maxTokens ?? MAX_TOKENS,
+        effort,
+        cacheTtl,
       ),
       params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
     );
     lastResponse = response;
 
+    const cacheWrites = cacheWriteSplit(response.usage);
     usage.inputTokens += response.usage.input_tokens;
     usage.outputTokens += response.usage.output_tokens;
     usage.cacheCreationInputTokens =
-      (usage.cacheCreationInputTokens ?? 0) +
-      (response.usage.cache_creation_input_tokens ?? 0);
+      (usage.cacheCreationInputTokens ?? 0) + cacheWrites.cacheWriteTokens;
     usage.cacheReadInputTokens =
       (usage.cacheReadInputTokens ?? 0) +
       (response.usage.cache_read_input_tokens ?? 0);
+    if (!params.skipUsageLog) {
+      logTokenUsage(params.task ?? "other", model, {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        cacheWriteTokens: cacheWrites.cacheWriteTokens,
+        cacheWrite1hTokens: cacheWrites.cacheWrite1hTokens,
+        cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+      });
+    }
 
     if (response.stop_reason !== "pause_turn") {
       return {
@@ -468,7 +560,7 @@ async function completeWithClaude(
             execution:
               block.type === "server_tool_use" ? "provider" : "client",
           })),
-        usage: withEstimatedCost(usage, false, rates),
+        usage: withEstimatedCost(usage, false, model),
         stopReason: anthropicStopReason(response.stop_reason),
       };
     }
@@ -485,7 +577,7 @@ async function completeWithClaude(
         .filter((block): block is Anthropic.TextBlock => block.type === "text")
         .map((block) => block.text) ?? [],
     toolCalls: [],
-    usage: withEstimatedCost(usage, false, rates),
+    usage: withEstimatedCost(usage, false, model),
     stopReason: "pause_turn",
   };
 }
@@ -600,7 +692,6 @@ async function completeWithOpenAiCompatible(
   client: OpenAI,
   params: CompleteParams,
   model: string,
-  rates: ModelCostRates,
   label: string,
 ): Promise<CompleteResult> {
   const webSearchRequested = params.tools.some(
@@ -642,7 +733,9 @@ async function completeWithOpenAiCompatible(
       }
     | undefined;
 
-  const usage = withEstimatedCost(
+  const usage = recordUsage(
+    params,
+    model,
     {
       inputTokens: response.usage?.prompt_tokens ?? 0,
       outputTokens: response.usage?.completion_tokens ?? 0,
@@ -650,7 +743,6 @@ async function completeWithOpenAiCompatible(
       cacheReadInputTokens: promptDetails?.cached_tokens,
     },
     true,
-    rates,
   );
 
   return {
@@ -673,8 +765,11 @@ async function completeWithNamedBackend(
   backend: LlmBackend,
   params: CompleteParams,
 ): Promise<CompleteResult> {
-  if (backend === "claude") {
-    return completeWithClaude(params);
+  if (backend === "claude" || backend === "haiku") {
+    const model =
+      params.model ??
+      (backend === "haiku" ? config.backgroundModel : config.claudeModel);
+    return completeWithClaude({ ...params, model });
   }
   if (backend === "cloud-gemma") {
     if (!openRouter) {
@@ -686,7 +781,6 @@ async function completeWithNamedBackend(
       openRouter,
       params,
       config.gemmaCloudModel,
-      config.gemmaCloudCostRates,
       "cloud-gemma",
     );
   }
@@ -695,7 +789,6 @@ async function completeWithNamedBackend(
     localLlm,
     params,
     config.localLlmModel,
-    config.localCostRates,
     "local-gemma",
   );
 }
@@ -714,7 +807,12 @@ export async function complete(
     console.error(
       `Backend ${backend} failed (${errorType}); retrying on Claude.`,
     );
-    return completeWithNamedBackend("claude", { ...params, backend: "claude" });
+    return completeWithNamedBackend("claude", {
+      ...params,
+      backend: "claude",
+      model: config.claudeModel,
+      effort: undefined,
+    });
   }
 }
 
@@ -726,5 +824,7 @@ export async function completeBackground(
     ...params,
     backend: "claude",
     model: config.backgroundModel,
+    task: params.task ?? "classification",
+    effort: params.effort ?? "low",
   });
 }

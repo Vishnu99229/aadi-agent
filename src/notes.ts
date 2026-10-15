@@ -1,6 +1,4 @@
 import { InlineKeyboard, type Context } from "grammy";
-import Anthropic from "@anthropic-ai/sdk";
-import { config } from "./config.js";
 import {
   createNote,
   createTask,
@@ -10,14 +8,13 @@ import {
   type NoteActionItem,
 } from "./db.js";
 import { runAgent } from "./agent.js";
+import { complete } from "./llm.js";
 import { offerAccountUpdateAfterWrapUp } from "./accounts.js";
 import { draftMomForNote } from "./mom.js";
 import {
   hasMomRecipients,
   type NoteMeeting,
 } from "./mom_logic.js";
-
-const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
 export interface WrapUpAnalysis {
   title: string;
@@ -81,22 +78,24 @@ function formatNoteContent(analysis: WrapUpAnalysis): string {
 }
 
 export async function buildWrapUpNotes(rawInput: string): Promise<WrapUpAnalysis> {
-  const response = await anthropic.messages.create({
-    model: config.claudeModel,
-    max_tokens: 4096,
+  const response = await complete({
+    backend: "haiku",
+    effort: "low",
+    cacheTtl: "5m",
+    task: "meeting_brief",
+    maxTokens: 4096,
+    tools: [],
+    system: { cacheable: wrapUpPrompt },
     messages: [
       {
         role: "user",
-        content: `${wrapUpPrompt}\n\n<raw_notes>\n${rawInput}\n</raw_notes>`,
+        content: `<raw_notes>\n${rawInput}\n</raw_notes>`,
       },
     ],
   });
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
+  const text = response.textParts.join("\n");
   console.log(
-    `Wrap-up analysis: input_tokens=${response.usage.input_tokens}, output_tokens=${response.usage.output_tokens}`,
+    `Wrap-up analysis: input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}`,
   );
   return parseWrapUp(text);
 }

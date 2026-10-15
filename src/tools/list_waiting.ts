@@ -7,7 +7,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_waiting",
   description:
-    'List email threads Vishnu is waiting on, plus snoozed and replied threads still in the tracker. Use this to find a thread before stop_tracking, not only "due" nudges. Optional query matches recipient or subject. Optional status: waiting, snoozed, replied, dismissed, all (default: waiting, snoozed, and replied).',
+    "List tracked follow-up threads. Optional query on recipient/subject. Default status: waiting, snoozed, and replied.",
   inputSchema: {
     type: "object",
     properties: {

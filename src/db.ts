@@ -246,6 +246,23 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
+  CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    task TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_usage_log_timestamp
+    ON usage_log (timestamp);
+  CREATE INDEX IF NOT EXISTS idx_usage_log_task
+    ON usage_log (task, timestamp);
+
   CREATE TABLE IF NOT EXISTS bills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     biller TEXT NOT NULL,
@@ -444,8 +461,15 @@ export function getRecentMessages(limit = 10): StoredMessage[] {
   return rows.reverse();
 }
 
+export const CONVERSATION_SUMMARY_KEY = "conversation_summary";
+export const CONVERSATION_SUMMARY_UNTIL_KEY = "conversation_summary_until_id";
+
 export function clearMessages(): void {
   db.prepare("DELETE FROM messages").run();
+  db.prepare("DELETE FROM settings WHERE key IN (?, ?)").run(
+    CONVERSATION_SUMMARY_KEY,
+    CONVERSATION_SUMMARY_UNTIL_KEY,
+  );
 }
 
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
@@ -1142,6 +1166,51 @@ export function getImportantDates(): ImportantDateRecord[] {
 export function removeImportantDate(id: number): boolean {
   const result = db.prepare(`DELETE FROM important_dates WHERE id = ?`).run(id);
   return result.changes === 1;
+}
+
+export interface UsageLogRow {
+  timestamp: string;
+  task: string;
+  model: string;
+  input_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+}
+
+export function insertUsageLog(row: UsageLogRow): void {
+  db.prepare(
+    `INSERT INTO usage_log (
+       timestamp, task, model, input_tokens, cache_write_tokens,
+       cache_read_tokens, output_tokens, cost_usd
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    row.timestamp,
+    row.task,
+    row.model,
+    row.input_tokens,
+    row.cache_write_tokens,
+    row.cache_read_tokens,
+    row.output_tokens,
+    row.cost_usd,
+  );
+}
+
+export function deleteUsageLogsByTimestamp(timestamp: string): void {
+  db.prepare("DELETE FROM usage_log WHERE timestamp = ?").run(timestamp);
+}
+
+export function listUsageLogs(fromIso: string, toIso: string): UsageLogRow[] {
+  return db
+    .prepare(
+      `SELECT timestamp, task, model, input_tokens, cache_write_tokens,
+              cache_read_tokens, output_tokens, cost_usd
+       FROM usage_log
+       WHERE timestamp >= ? AND timestamp < ?
+       ORDER BY timestamp ASC`,
+    )
+    .all(fromIso, toIso) as UsageLogRow[];
 }
 
 export function getSetting(key: string): string | undefined {

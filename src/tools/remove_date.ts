@@ -10,7 +10,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "remove_date",
   description:
-    "Remove a saved important date. Prefer query like \"Amma birthday\" so it works no matter how far away the date is. You can also pass a numeric id from list_dates. If several match, nothing is deleted and the matches are returned.",
+    'Remove a saved important date by query (e.g. "Amma birthday") or id. If several match, nothing is deleted.',
   inputSchema: {
     type: "object",
     properties: {

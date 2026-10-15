@@ -11,7 +11,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "search_emails",
   description:
-    'Search Vishnu\'s Gmail (personal) and Epicode (work) accounts using Gmail search syntax. Returns message metadata plus snippets, never full bodies, each tagged account/tag (personal or work). Use queries such as "is:unread newer_than:1d", "from:person@example.com", "after:2026/10/01", or combinations of Gmail operators. Pass account "work" or "personal" to search one mailbox; omit it to search both.',
+    'Search personal and work Gmail. Returns metadata and snippets, not full bodies. Gmail query syntax, e.g. "is:unread newer_than:1d". Omit account to search both mailboxes.',
   inputSchema: {
     type: "object",
     properties: {

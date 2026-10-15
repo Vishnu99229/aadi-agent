@@ -9,7 +9,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "read_email",
   description:
-    "Read one Gmail message by its message ID from personal Gmail or Epicode work mail. Returns account, tag, From, To, Subject, Date, and a cleaned plain-text body. Use search_emails first to obtain the message ID and account. Earlier quoted replies are removed and the body is limited to 3000 characters.",
+    "Read one Gmail message by id from search_emails. Returns headers and a cleaned body (quoted replies stripped, 3000-character cap).",
   inputSchema: {
     type: "object",
     properties: {

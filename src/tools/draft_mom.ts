@@ -5,7 +5,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "draft_mom",
   description:
-    'Create, but never send, a NEW Minutes of Meeting email from Vishnu\'s Epicode work account to the calendar meeting attendees (internal and external, excluding Vishnu). Use when he asks to send or draft MoM for a call. Finds the latest matching wrap-up notes. Subject is "MoM – <title> – <date>". Not a reply; do not use draft_reply. Sending requires Telegram approval.',
+    'Draft a new MoM email from work mail to meeting attendees (excluding Vishnu). Not a reply. Sending needs Telegram approval.',
   inputSchema: {
     type: "object",
     properties: {

@@ -3,6 +3,7 @@ import { runAgent } from "./agent.js";
 import { findAccountByName } from "./account_logic.js";
 import { decodedAccounts } from "./accounts.js";
 import {
+  applyAllTasks,
   applyAllTasksExceptDrafting,
   applyTaskBackend,
   chatBackendLabel,
@@ -20,6 +21,7 @@ import {
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
 import { clearMessages, getMeetingBrief, getSetting, setSetting } from "./db.js";
+import { formatCostReport } from "./usage.js";
 import { handler as listBills } from "./tools/list_bills.js";
 import { handler as listTasks } from "./tools/list_tasks.js";
 import { handler as listWaiting } from "./tools/list_waiting.js";
@@ -159,7 +161,11 @@ const TASK_FROM_CODE: Record<string, ModelTask> = {
 };
 
 function claudeButtonLabel(selected: boolean): string {
-  return selected ? "• Claude" : "Claude";
+  return selected ? "• Claude (Sonnet)" : "Claude (Sonnet)";
+}
+
+function fastButtonLabel(selected: boolean): string {
+  return selected ? "• Fast" : "Fast";
 }
 
 function gemmaButtonLabel(task: ModelTask, selected: boolean): string {
@@ -178,6 +184,7 @@ function taskModelKeyboard(): InlineKeyboard {
       .text(TASK_LABELS[item.task], "mt:noop")
       .row()
       .text(claudeButtonLabel(current === "claude"), `mt:${item.code}:c`)
+      .text(fastButtonLabel(current === "haiku"), `mt:${item.code}:h`)
       .text(
         gemmaButtonLabel(item.task, current === "cloud-gemma"),
         `mt:${item.code}:g`,
@@ -189,7 +196,7 @@ function taskModelKeyboard(): InlineKeyboard {
 }
 
 function modelPanelText(): string {
-  return "Choose which model handles each task. Current choice marked with •.";
+  return "Fast (Haiku 5.5, low effort) is the default for every task. Claude (Sonnet 5.5) is a manual override. Current choice marked with •.";
 }
 
 function menuKeyboard(): InlineKeyboard {
@@ -198,6 +205,10 @@ function menuKeyboard(): InlineKeyboard {
     .text(
       current === "claude" ? "• Model: Claude" : "Model: Claude",
       "menu:claude",
+    )
+    .text(
+      current === "haiku" ? "• Model: Fast" : "Model: Fast",
+      "menu:haiku",
     )
     .text(
       current === "cloud-gemma" ? "• Model: Gemma" : "Model: Gemma",
@@ -238,7 +249,10 @@ function parseRequestedBackend(arg: string): ChatBackend | null {
   if (value === "gemma" || value === "cloud-gemma") {
     return "cloud-gemma";
   }
-  if (value === "claude") {
+  if (value === "haiku" || value === "fast" || value === "claude-haiku") {
+    return "haiku";
+  }
+  if (value === "claude" || value === "sonnet") {
     return "claude";
   }
   return null;
@@ -362,12 +376,15 @@ bot.command("model", async (ctx) => {
   }
   const requested = parseRequestedBackend(arg);
   if (!requested || !isChatBackend(requested)) {
-    await ctx.reply("Use /model, /model claude, or /model gemma.", {
+    await ctx.reply("Use /model, /model claude, /model fast, or /model gemma.", {
       reply_markup: taskModelKeyboard(),
     });
     return;
   }
-  const result = applyAllTasksExceptDrafting(requested);
+  const result =
+    requested === "cloud-gemma"
+      ? applyAllTasksExceptDrafting(requested)
+      : applyAllTasks(requested);
   await ctx.reply(result.message, { reply_markup: taskModelKeyboard() });
 });
 
@@ -384,6 +401,10 @@ bot.command("followups", async (ctx) => {
     await runFollowupScan();
     await sendFollowupNudgeSummary(ctx.api);
   });
+});
+
+bot.command("cost", async (ctx) => {
+  await sendPlainText(ctx, formatCostReport());
 });
 
 bot.command("accounts", async (ctx) => {
@@ -526,9 +547,14 @@ bot.callbackQuery(/^mt:(noop|haiku)$/, async (ctx) => {
   );
 });
 
-bot.callbackQuery(/^mt:(chat|brief|docs|meet|draft):(c|g)$/, async (ctx) => {
+bot.callbackQuery(/^mt:(chat|brief|docs|meet|draft):(c|g|h)$/, async (ctx) => {
   const task = TASK_FROM_CODE[ctx.match[1] ?? ""];
-  const requested = ctx.match[2] === "g" ? "cloud-gemma" : "claude";
+  const requested =
+    ctx.match[2] === "g"
+      ? "cloud-gemma"
+      : ctx.match[2] === "h"
+        ? "haiku"
+        : "claude";
   if (!task) {
     await ctx.answerCallbackQuery();
     return;
@@ -546,15 +572,18 @@ bot.callbackQuery(/^mt:(chat|brief|docs|meet|draft):(c|g)$/, async (ctx) => {
   }
 });
 
-bot.callbackQuery(/^menu:(claude|gemma|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {
+bot.callbackQuery(/^menu:(claude|gemma|haiku|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {
   const action = ctx.match[1];
-  if (action === "claude" || action === "gemma") {
+  if (action === "claude" || action === "gemma" || action === "haiku") {
     const requested = parseRequestedBackend(action);
     if (!requested) {
       await ctx.answerCallbackQuery();
       return;
     }
-    const result = applyAllTasksExceptDrafting(requested);
+    const result =
+      requested === "cloud-gemma"
+        ? applyAllTasksExceptDrafting(requested)
+        : applyAllTasks(requested);
     await ctx.answerCallbackQuery({ text: result.message.slice(0, 200) });
     try {
       await ctx.editMessageText(menuCaption(), { reply_markup: menuKeyboard() });
@@ -663,12 +692,24 @@ Call update_draft exactly once with the draft ID above and the complete revised 
 
   const drafting =
     /\bdraft\b/i.test(userText) && /\b(email|reply|gmail)\b/i.test(userText);
+  const accountQuestion =
+    findAccountByName(decodedAccounts(), userText).length > 0 ||
+    /\b(account status|where are we with)\b/i.test(userText);
   const task: ModelTask = drafting
     ? "drafting"
     : isAccountOrMeetingQuestion(userText)
       ? "meetings"
       : "chat";
-  const reply = await whileTyping(ctx, () => runAgent(userText, { task }));
+  const reply = await whileTyping(ctx, () =>
+    runAgent(userText, {
+      task,
+      usageTask: drafting
+        ? "drafting"
+        : accountQuestion
+          ? "account_status"
+          : undefined,
+    }),
+  );
   await sendPlainText(ctx, reply);
   void captureFromUserMessage(ctx, userText).catch((error: unknown) => {
     const errorType = error instanceof Error ? error.name : "UnknownError";

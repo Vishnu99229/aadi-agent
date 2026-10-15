@@ -15,7 +15,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "read_attachment",
   description:
-    "Download and review one Gmail attachment (PDF, DOCX, XLSX/XLS, or image) from personal or work mail. Pass email_id and the attachment id or filename from list_attachments. Stores the extracted text for 7 days so follow-up questions can use read_document. Skips files over 25 MB. Never send or forward the file.",
+    "Download and review one Gmail attachment (PDF, DOCX, XLSX, image). Stores text 7 days for read_document. Skips files over 25 MB. Never send the file.",
   inputSchema: {
     type: "object",
     properties: {

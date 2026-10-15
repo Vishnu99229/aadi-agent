@@ -6,7 +6,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "track_thread",
   description:
-    "Track Vishnu's latest sent email to a named recipient while waiting for their reply. Use this when Vishnu explicitly asks to track or follow up on his last email to someone. This only tracks the thread; it does not draft or send email.",
+    "Track Vishnu's latest sent email to a recipient. Does not draft or send. Use when he asks to follow up.",
   inputSchema: {
     type: "object",
     properties: {

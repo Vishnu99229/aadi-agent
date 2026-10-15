@@ -6,7 +6,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "forget_memory",
   description:
-    "Delete one long-term memory by id, or search and delete when exactly one match. If several match, return the list and do not delete. Never delete all memories with this tool.",
+    "Delete one memory by id, or by search when exactly one match. Never delete all.",
   inputSchema: {
     type: "object",
     properties: {

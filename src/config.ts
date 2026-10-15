@@ -139,6 +139,8 @@ export interface ModelCostRates {
   inputCostPerMillion: number;
   outputCostPerMillion: number;
   cacheCreationCostPerMillion: number;
+  /** 1-hour cache writes; 2× base input when unset in env. */
+  cacheCreation1hCostPerMillion: number;
   cacheReadCostPerMillion: number;
 }
 
@@ -147,6 +149,7 @@ const SONNET_55_COST_DEFAULTS: ModelCostRates = {
   inputCostPerMillion: 2,
   outputCostPerMillion: 10,
   cacheCreationCostPerMillion: 2.5,
+  cacheCreation1hCostPerMillion: 4,
   cacheReadCostPerMillion: 0.1,
 };
 
@@ -155,6 +158,7 @@ const HAIKU_55_COST_DEFAULTS: ModelCostRates = {
   inputCostPerMillion: 0.1,
   outputCostPerMillion: 0.5,
   cacheCreationCostPerMillion: 0.125,
+  cacheCreation1hCostPerMillion: 0.2,
   cacheReadCostPerMillion: 0.01,
 };
 
@@ -163,6 +167,7 @@ const GEMMA_CLOUD_COST_DEFAULTS: ModelCostRates = {
   inputCostPerMillion: 0.09,
   outputCostPerMillion: 0.34,
   cacheCreationCostPerMillion: 0,
+  cacheCreation1hCostPerMillion: 0,
   cacheReadCostPerMillion: 0.05,
 };
 
@@ -170,6 +175,7 @@ const ZERO_COST_RATES: ModelCostRates = {
   inputCostPerMillion: 0,
   outputCostPerMillion: 0,
   cacheCreationCostPerMillion: 0,
+  cacheCreation1hCostPerMillion: 0,
   cacheReadCostPerMillion: 0,
 };
 
@@ -204,6 +210,10 @@ function readCostRates(
     cacheCreationCostPerMillion: readRate(
       `${prefix}_CACHE_CREATION_COST_PER_MILLION`,
       defaults.cacheCreationCostPerMillion,
+    ),
+    cacheCreation1hCostPerMillion: readRate(
+      `${prefix}_CACHE_CREATION_1H_COST_PER_MILLION`,
+      defaults.cacheCreation1hCostPerMillion,
     ),
     cacheReadCostPerMillion: readRate(
       `${prefix}_CACHE_READ_COST_PER_MILLION`,

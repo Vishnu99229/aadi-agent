@@ -6,14 +6,25 @@ import type {
 } from "./llm.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, type ModelTask } from "./chat_backend.js";
-import { getRecentMessages, saveMessage } from "./db.js";
+import {
+  CONVERSATION_SUMMARY_KEY,
+  CONVERSATION_SUMMARY_UNTIL_KEY,
+  getRecentMessages,
+  getSetting,
+  saveMessage,
+  setSetting,
+  type StoredMessage,
+} from "./db.js";
 import { complete } from "./llm.js";
+import type { UsageTask } from "./usage.js";
 import { memoryContextLine } from "./memory.js";
 import { recentUploadLine } from "./recent_upload.js";
-import { tools as customTools } from "./tools/index.js";
+import { TOOL_ORDER, tools as customTools } from "./tools/index.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ITERATIONS = 8;
+const HISTORY_KEEP = 8;
+const HISTORY_LOOKBACK = 40;
 
 const webSearchTool: LlmTool = {
   type: "web_search",
@@ -21,7 +32,7 @@ const webSearchTool: LlmTool = {
 };
 
 const toolDefinitions: LlmTool[] = [
-  ...Object.values(customTools).map((tool) => tool.definition),
+  ...TOOL_ORDER.map((name) => customTools[name]!.definition),
   webSearchTool,
 ];
 
@@ -87,7 +98,84 @@ export interface RunAgentOptions {
   backend?: LlmBackend;
   /** Persisted /model task. Omitted = chat. */
   task?: ModelTask;
+  /** usage_log task. Omitted = derived from task. */
+  usageTask?: UsageTask;
   skipHistory?: boolean;
+}
+
+async function summariseOlderMessages(
+  older: StoredMessage[],
+  previous: string,
+): Promise<string> {
+  const lines = older.map(
+    (message) => `${message.role}: ${message.content.slice(0, 400)}`,
+  );
+  const result = await complete({
+    backend: "haiku",
+    effort: "low",
+    cacheTtl: "5m",
+    task: "other",
+    maxTokens: 400,
+    tools: [],
+    system: {
+      cacheable:
+        "Summarise this Telegram chat for Aadi. Keep names, dates, decisions, and open tasks. Plain text, under 120 words. No secrets.",
+    },
+    messages: [
+      {
+        role: "user",
+        content: `${previous ? `Previous summary:\n${previous}\n\n` : ""}New turns:\n${lines.join("\n")}`,
+      },
+    ],
+  });
+  return result.textParts.join("\n").trim() || previous;
+}
+
+async function historyForAgent(skipHistory: boolean): Promise<{
+  summary: string;
+  messages: StoredMessage[];
+}> {
+  if (skipHistory) {
+    return { summary: "", messages: [] };
+  }
+  const all = getRecentMessages(HISTORY_LOOKBACK);
+  if (all.length <= HISTORY_KEEP) {
+    return {
+      summary: getSetting(CONVERSATION_SUMMARY_KEY) ?? "",
+      messages: all,
+    };
+  }
+  const older = all.slice(0, -HISTORY_KEEP);
+  const recent = all.slice(-HISTORY_KEEP);
+  const untilId = older.at(-1)!.id;
+  const storedUntil = Number(getSetting(CONVERSATION_SUMMARY_UNTIL_KEY) ?? 0);
+  let summary = getSetting(CONVERSATION_SUMMARY_KEY) ?? "";
+  if (storedUntil !== untilId) {
+    try {
+      summary = await summariseOlderMessages(older, summary);
+      setSetting(CONVERSATION_SUMMARY_KEY, summary);
+      setSetting(CONVERSATION_SUMMARY_UNTIL_KEY, String(untilId));
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Conversation summary failed (${errorType}).`);
+    }
+  }
+  return { summary, messages: recent };
+}
+
+function usageTaskForAgent(task: ModelTask | undefined): UsageTask {
+  switch (task) {
+    case "brief":
+      return "brief";
+    case "documents":
+      return "document";
+    case "meetings":
+      return "meeting_brief";
+    case "drafting":
+      return "drafting";
+    default:
+      return "chat";
+  }
 }
 
 export async function runAgent(
@@ -100,20 +188,22 @@ export async function runAgent(
   const basePrompt = await readFile(promptUrl, "utf8");
   const recentUpload = recentUploadLine();
   const memories = memoryContextLine(userText);
+  const history = await historyForAgent(options.skipHistory === true);
   const system = {
     cacheable: basePrompt.trim(),
     dynamic: [
       `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
       recentUpload,
       memories,
+      history.summary
+        ? `Earlier conversation summary:\n${history.summary}`
+        : "",
     ]
       .filter(Boolean)
       .join("\n"),
   };
 
-  const messages: LlmMessage[] = (
-    options.skipHistory ? [] : getRecentMessages()
-  ).map((message) =>
+  const messages: LlmMessage[] = history.messages.map((message) =>
     message.role === "user"
       ? { role: "user", content: message.content }
       : {
@@ -133,6 +223,8 @@ export async function runAgent(
       tools: toolDefinitions,
       messages,
       backend,
+      task: options.usageTask ?? usageTaskForAgent(options.task),
+      effort: backend === "haiku" ? "low" : undefined,
     });
 
     const responseText = response.textParts.join("\n").trim();

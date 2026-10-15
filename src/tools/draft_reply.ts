@@ -8,7 +8,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "draft_reply",
   description:
-    "Create, but never send, a Gmail draft replying to an existing email in the same thread and the SAME account the email arrived on (personal Gmail or Epicode work). Use only after the reply has all required facts. Returns the Gmail draft ID. Sending requires separate Telegram approval and is not available to this tool.",
+    "Create a Gmail reply draft in the same thread and mailbox. Never sends. Sending needs Telegram approval.",
   inputSchema: {
     type: "object",
     properties: {

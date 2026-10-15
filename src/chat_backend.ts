@@ -4,7 +4,7 @@ import { getSetting, setSetting } from "./db.js";
 const TASK_SETTING = "llm_task_backends";
 const LEGACY_SETTING = "llm_backend";
 
-export type ChatBackend = LlmProvider;
+export type ChatBackend = LlmProvider | "haiku";
 export type ModelTask =
   | "chat"
   | "brief"
@@ -31,20 +31,23 @@ export const TASK_LABELS: Record<ModelTask, string> = {
 export type TaskBackendMap = Record<ModelTask, ChatBackend>;
 
 export function isChatBackend(value: string): value is ChatBackend {
-  return value === "claude" || value === "cloud-gemma";
+  return value === "claude" || value === "haiku" || value === "cloud-gemma";
 }
 
 export function isModelTask(value: string): value is ModelTask {
   return (MODEL_TASKS as string[]).includes(value);
 }
 
+const DEFAULTS_GENERATION = "haiku-low-all";
+const GENERATION_SETTING = "llm_task_defaults_generation";
+
 function defaultChoices(): TaskBackendMap {
   return {
-    chat: "claude",
-    brief: "claude",
-    documents: "claude",
-    meetings: "claude",
-    drafting: "claude",
+    chat: "haiku",
+    brief: "haiku",
+    documents: "haiku",
+    meetings: "haiku",
+    drafting: "haiku",
   };
 }
 
@@ -54,31 +57,43 @@ function persist(choices: TaskBackendMap): void {
 
 function migrateIfNeeded(): TaskBackendMap {
   const raw = getSetting(TASK_SETTING);
+  let choices = defaultChoices();
   if (raw) {
     try {
       const parsed = JSON.parse(raw) as Record<string, unknown>;
-      const choices = defaultChoices();
       for (const task of MODEL_TASKS) {
         const value = parsed[task];
         if (typeof value === "string" && isChatBackend(value)) {
           choices[task] = value;
         }
       }
-      return choices;
     } catch {
-      // fall through to legacy
+      choices = defaultChoices();
+    }
+  } else {
+    const legacy = getSetting(LEGACY_SETTING);
+    if (legacy && isChatBackend(legacy)) {
+      choices.chat = legacy;
+      choices.brief = legacy;
+      choices.meetings = legacy;
     }
   }
-  const choices = defaultChoices();
-  const legacy = getSetting(LEGACY_SETTING);
-  if (legacy && isChatBackend(legacy)) {
-    // Old global switch drove chat and anything that used getChatBackend()
-    // (morning brief). Documents and drafting were pinned to Claude.
-    choices.chat = legacy;
-    choices.brief = legacy;
-    choices.meetings = legacy;
+  const generation = getSetting(GENERATION_SETTING);
+  if (generation !== DEFAULTS_GENERATION) {
+    // One-time: old implicit default was Claude. Flip remaining Claude
+    // tasks to Haiku. Keep explicit Gemma (or already-Haiku) choices.
+    for (const task of MODEL_TASKS) {
+      if (choices[task] === "claude") {
+        choices[task] = "haiku";
+      }
+    }
+    persist(choices);
+    setSetting(GENERATION_SETTING, DEFAULTS_GENERATION);
+    return choices;
   }
-  persist(choices);
+  if (!raw) {
+    persist(choices);
+  }
   return choices;
 }
 
@@ -96,7 +111,10 @@ export function getChatBackend(): ChatBackend {
 }
 
 export function chatBackendLabel(backend: ChatBackend): string {
-  return backend === "claude" ? "Claude" : "cloud Gemma";
+  if (backend === "haiku") {
+    return "Fast (Haiku 5.5)";
+  }
+  return backend === "claude" ? "Claude (Sonnet 5.5)" : "cloud Gemma";
 }
 
 function gemmaNeedsKey(backend: ChatBackend): string | undefined {
@@ -134,7 +152,32 @@ export function applyTaskBackend(
   };
 }
 
-/** /model claude and /model gemma: every task except email drafting. */
+/** /model claude|fast: every task, including drafting. */
+export function applyAllTasks(backend: ChatBackend): {
+  switched: boolean;
+  message: string;
+} {
+  const blocked = gemmaNeedsKey(backend);
+  if (blocked) {
+    return { switched: false, message: blocked };
+  }
+  const choices = getTaskBackends();
+  for (const task of MODEL_TASKS) {
+    choices[task] = backend;
+  }
+  persist(choices);
+  return {
+    switched: true,
+    message:
+      backend === "claude"
+        ? "All tasks now use Claude (Sonnet 5.5)."
+        : backend === "haiku"
+          ? "All tasks now use Fast (Haiku 5.5)."
+          : "All tasks now use cloud Gemma. Drafts still need your Send tap.",
+  };
+}
+
+/** /model gemma: every task except email drafting. */
 export function applyAllTasksExceptDrafting(backend: ChatBackend): {
   switched: boolean;
   message: string;
@@ -153,8 +196,6 @@ export function applyAllTasksExceptDrafting(backend: ChatBackend): {
   return {
     switched: true,
     message:
-      backend === "claude"
-        ? "Chat, briefs, documents and meetings now use Claude. Email drafting is unchanged."
-        : "Chat, briefs, documents and meetings now use cloud Gemma. Email drafting is unchanged.",
+      "Chat, briefs, documents and meetings now use cloud Gemma. Email drafting is unchanged.",
   };
 }

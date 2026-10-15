@@ -7,7 +7,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "read_sheet",
   description:
-    'Read rows from Vishnu\'s configured Google task sheet. Use an A1-notation range such as "Tasks!A1:F50" or "Tasks!A:Z". This tool only reads values and cannot edit the sheet.',
+    'Read rows from the configured Google sheet. A1 range, e.g. "Tasks!A1:F50". Read-only.',
   inputSchema: {
     type: "object",
     properties: {

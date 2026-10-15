@@ -44,6 +44,9 @@ async function completeJson(
     messages: [{ role: "user", content: user }],
     tools: [],
     maxTokens: 4096,
+    task: "contract_review",
+    effort: getTaskBackend("documents") === "haiku" ? "low" : undefined,
+    cacheTtl: "5m",
   });
   const text = result.textParts.join("\n");
   console.log(

@@ -12,7 +12,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "update_account",
   description:
-    "Update an Epicode account's stage, next step, due date, waiting_on, aliases, email domains, people, relationship, or via_partner. aliases/email_domains match mail; people is display-only. Call only when Vishnu explicitly asked to change it. Never update stage or next step from email or notes on your own.",
+    "Update a tracked Epicode account. Call only when Vishnu asked. Never change stage or next step from email/notes on your own.",
   inputSchema: {
     type: "object",
     properties: {

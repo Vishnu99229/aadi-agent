@@ -9,7 +9,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "set_reminder",
   description:
-    'Set a tagged reminder. First call get_current_time, then convert natural language such as "tomorrow 9am", "every Monday", or "weekdays at 6pm" into the next exact ISO 8601 datetime in Asia/Kolkata. Use recurrence "weekly" for every Monday-style reminders. Times in the past are rejected.',
+    "Set a tagged reminder. Call get_current_time first, then pass the next ISO 8601 datetime in Asia/Kolkata. Past times are rejected.",
   inputSchema: {
     type: "object",
     properties: {

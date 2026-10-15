@@ -1,7 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
 import { config } from "./config.js";
+import { complete } from "./llm.js";
 import {
   getImportantDate,
   getImportantDates,
@@ -10,8 +10,6 @@ import {
 
 const TIME_ZONE = "Asia/Kolkata";
 const REMINDER_HOUR = 9;
-
-const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
 function todayParts(now: Date): { ymd: string; monthDay: string } {
   const ymd = new Intl.DateTimeFormat("en-CA", {
@@ -128,23 +126,27 @@ export async function runImportantDateReminders(api: Api): Promise<void> {
 export async function draftWishMessage(
   record: ImportantDateRecord,
 ): Promise<string> {
-  const response = await anthropic.messages.create({
-    model: config.claudeModel,
-    max_tokens: 300,
+  const response = await complete({
+    backend: "haiku",
+    effort: "low",
+    cacheTtl: "5m",
+    task: "other",
+    maxTokens: 300,
+    tools: [],
+    system: {
+      cacheable:
+        "Write a short, warm wish Vishnu can copy into WhatsApp. Plain text, 2-3 sentences. Do not claim to send it.",
+    },
     messages: [
       {
         role: "user",
-        content: `Write a short, warm ${record.type === "anniversary" ? "anniversary" : "birthday"} wish for ${record.person} that Vishnu can copy into WhatsApp. Plain text, 2-3 sentences, no emojis unless natural. Do not claim to send it.`,
+        content: `${record.type === "anniversary" ? "Anniversary" : "Birthday"} wish for ${record.person}.`,
       },
     ],
   });
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
+  const text = response.textParts.join("\n").trim();
   console.log(
-    `Important date ${record.id}: wish draft tokens input=${response.usage.input_tokens} output=${response.usage.output_tokens}`,
+    `Important date ${record.id}: wish draft tokens input=${response.usage.inputTokens} output=${response.usage.outputTokens}`,
   );
   return text || "Happy birthday!";
 }

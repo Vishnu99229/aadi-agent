@@ -1,6 +1,6 @@
 /**
- * Benchmark claude / cloud-gemma / local-gemma on four tasks.
- * Does not change production routing. Sample Gmail/calendar data only.
+ * Benchmark Sonnet 5.5, Haiku 5.5 (low + medium effort), and cloud Gemma.
+ * Does not change production routing. Mocked Gmail/calendar/account data only.
  */
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { config } from "../src/config.ts";
 import type {
   LlmBackend,
@@ -21,12 +22,16 @@ import {
   LocalLlmBlockedError,
   assertLocalModelAllowed,
 } from "../src/local_llm_guard.ts";
+import { extractPdfText } from "../src/pdf_text.ts";
+import { definition as accountStatusDef } from "../src/tools/account_status.ts";
 import { definition as draftReplyDef } from "../src/tools/draft_reply.ts";
 import { definition as getCurrentTimeDef } from "../src/tools/get_current_time.ts";
 import { handler as getCurrentTime } from "../src/tools/get_current_time.ts";
 import { definition as listEventsDef } from "../src/tools/list_events.ts";
 import { definition as readEmailDef } from "../src/tools/read_email.ts";
+import { definition as rememberDef } from "../src/tools/remember.ts";
 import { definition as searchEmailsDef } from "../src/tools/search_emails.ts";
+import type { EffortLevel } from "../src/usage.ts";
 
 const execFileAsync = promisify(execFile);
 const TIME_ZONE = "Asia/Kolkata";
@@ -39,8 +44,35 @@ const PHONE_SSH = [
   "BatchMode=yes",
   "u0_a289@i2301",
 ];
-const BACKENDS: LlmBackend[] = ["claude", "cloud-gemma", "local-gemma"];
-const TASKS = ["document", "chat", "search_draft", "brief"] as const;
+type BenchKind =
+  | "sonnet"
+  | "haiku-low"
+  | "haiku-medium"
+  | "cloud-gemma"
+  | "local-gemma";
+
+interface BenchTarget {
+  kind: BenchKind;
+  backend: LlmBackend;
+  effort?: EffortLevel;
+}
+
+const DEFAULT_TARGETS: BenchTarget[] = [
+  { kind: "sonnet", backend: "claude" },
+  { kind: "haiku-low", backend: "haiku", effort: "low" },
+  { kind: "haiku-medium", backend: "haiku", effort: "medium" },
+  { kind: "cloud-gemma", backend: "cloud-gemma" },
+];
+
+const TASKS = [
+  "chat",
+  "search_draft",
+  "brief",
+  "document",
+  "contract_review",
+  "account_status",
+  "memory_extraction",
+] as const;
 type TaskName = (typeof TASKS)[number];
 
 const SAMPLE_EMAILS = [
@@ -85,6 +117,24 @@ End: 2026-10-14T16:45:00+05:30
 Location:
 Attendees:`;
 
+const SAMPLE_ACCOUNT_STATUS = `Pinnacle Teleservices (partner)
+Stage: commercial
+Next step: Share DLT/SMS rate card with Maxis
+Open: Eternal (end_client via Pinnacle) waiting on Zomato InfoSec questionnaire
+Shriram Life (end_client): PIVC delivery in progress`;
+
+const CONTRACT_FACTS = {
+  payment: "Net 45",
+  liability: "INR 50 lakh",
+  termination: "90 days",
+  law: "Singapore",
+  renewal: "24 months",
+  confidentiality: "5 years",
+};
+
+const MEMORY_MESSAGE =
+  "The Supertron demo is on 15 Oct 2026 at 16:30 Asia/Kolkata. I prefer WhatsApp for family updates.";
+
 const SAMPLE_LOCAL_DATA = JSON.stringify({
   date: "2026-10-14",
   work: {
@@ -119,7 +169,7 @@ interface ToolTrace {
 }
 
 interface BenchRow {
-  backend: LlmBackend;
+  kind: BenchKind;
   task: TaskName;
   seconds: number;
   toolCorrect: string;
@@ -188,6 +238,12 @@ function stubToolResult(call: ToolCall): string {
   if (call.name === "list_events") {
     return SAMPLE_EVENTS;
   }
+  if (call.name === "account_status") {
+    return SAMPLE_ACCOUNT_STATUS;
+  }
+  if (call.name === "remember") {
+    return JSON.stringify({ saved: true });
+  }
   return `Unknown tool: ${call.name}`;
 }
 
@@ -221,6 +277,16 @@ function argumentErrors(call: ToolCall): string[] {
     }
     return errors;
   }
+  if (call.name === "account_status") {
+    return typeof input.name === "string" && input.name.trim()
+      ? []
+      : ["account_status.name missing"];
+  }
+  if (call.name === "remember") {
+    return typeof input.content === "string" && input.content.trim()
+      ? []
+      : ["remember.content missing"];
+  }
   if (call.name === "list_events") {
     const errors = [];
     if (
@@ -246,6 +312,8 @@ async function runToolLoop(options: {
   tools: LlmTool[];
   timeoutMs: number;
   maxTokens?: number;
+  effort?: EffortLevel;
+  task?: TaskName;
 }): Promise<{
   text: string;
   traces: ToolTrace[];
@@ -267,6 +335,22 @@ async function runToolLoop(options: {
       messages,
       timeoutMs: options.timeoutMs,
       maxTokens: options.maxTokens,
+      effort: options.effort,
+      skipUsageLog: true,
+      task:
+        options.task === "document"
+          ? "document"
+          : options.task === "contract_review"
+            ? "contract_review"
+            : options.task === "brief"
+              ? "brief"
+              : options.task === "search_draft"
+                ? "drafting"
+                : options.task === "account_status"
+                  ? "account_status"
+                  : options.task === "memory_extraction"
+                    ? "memory_extraction"
+                    : "chat",
     });
     costUsd += response.usage.estimatedCostUsd;
     const responseText = response.textParts.join("\n").trim();
@@ -444,6 +528,113 @@ function scorePdf(text: string): string {
   return "fail — missed 25 Nov 2026 and page-17 phones";
 }
 
+function scoreContract(text: string): string {
+  const hits = [
+    /net\s*45/i.test(text),
+    /50\s*lakh/i.test(text),
+    /90\s*days/i.test(text),
+    /singapore/i.test(text),
+    /24\s*months/i.test(text),
+    /5\s*years/i.test(text),
+  ].filter(Boolean).length;
+  if (hits >= 5) {
+    return `5 — ${hits}/6 planted clauses`;
+  }
+  if (hits >= 4) {
+    return `4 — ${hits}/6 planted clauses`;
+  }
+  if (hits >= 2) {
+    return `3 — ${hits}/6 planted clauses`;
+  }
+  if (hits === 1) {
+    return "2 — one planted clause";
+  }
+  return "1 — missed planted MSA clauses";
+}
+
+function scoreAccount(text: string, traces: ToolTrace[]): string {
+  const called = traces.some((trace) => trace.name === "account_status");
+  const pinnacle = /pinnacle/i.test(text) && /dlt|rate card|commercial/i.test(text);
+  const eternal = /eternal|zomato/i.test(text);
+  if (called && pinnacle && eternal) {
+    return "5 — called account_status with Pinnacle + Eternal facts";
+  }
+  if (called && (pinnacle || eternal)) {
+    return "4 — called tool, partial facts";
+  }
+  if (called) {
+    return "3 — called tool, thin summary";
+  }
+  if (pinnacle || eternal) {
+    return "2 — mentioned the account without the tool";
+  }
+  return "1 — did not report account status";
+}
+
+function scoreMemory(text: string, traces: ToolTrace[]): string {
+  const remember = traces.find((trace) => trace.name === "remember");
+  const content =
+    remember && remember.input && typeof remember.input === "object"
+      ? String((remember.input as { content?: unknown }).content ?? "")
+      : text;
+  const supertron = /supertron/i.test(content);
+  const date = /2026-10-15|15\s*Oct/i.test(content);
+  const jsonFacts = /"facts"\s*:/.test(text) && supertron;
+  if ((remember && supertron && date) || (jsonFacts && date)) {
+    return "5 — Supertron demo on 15 Oct 2026";
+  }
+  if (supertron) {
+    return "3 — Supertron mentioned, date weak";
+  }
+  if (remember) {
+    return "2 — remembered something else";
+  }
+  return "1 — did not extract the demo";
+}
+
+async function buildContractPdf(): Promise<{
+  bytes: Uint8Array;
+  text: string;
+}> {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const clauses = [
+    `Payment terms: invoices are due Net 45 from the invoice date.`,
+    `Liability cap: each party's aggregate liability is capped at INR 50 lakh.`,
+    `Termination: either party may terminate for convenience with 90 days written notice.`,
+    `Governing law: this Agreement is governed by the laws of Singapore.`,
+    `Auto-renewal: the term auto-renews for successive 24 months unless notice is given.`,
+    `Confidentiality duration: confidentiality obligations survive for 5 years after expiry.`,
+  ];
+  const filler =
+    "This Master Services Agreement sets out the terms for telecommunications services between Epicode and the Customer. ".repeat(
+      8,
+    );
+  for (let pageNumber = 1; pageNumber <= 18; pageNumber += 1) {
+    const page = doc.addPage([612, 792]);
+    page.drawText(`MSA page ${pageNumber} of 18`, {
+      x: 48,
+      y: 740,
+      size: 12,
+      font,
+      color: rgb(0, 0, 0),
+    });
+    const body =
+      pageNumber % 3 === 0
+        ? `${clauses[(pageNumber / 3 - 1) % clauses.length]}\n\n${filler}`
+        : filler;
+    const lines = body.match(/.{1,90}/g) ?? [body];
+    let y = 710;
+    for (const line of lines.slice(0, 36)) {
+      page.drawText(line, { x: 48, y, size: 10, font, color: rgb(0, 0, 0) });
+      y -= 14;
+    }
+  }
+  const bytes = await doc.save();
+  const extracted = await extractPdfText(bytes);
+  return { bytes, text: extracted.text };
+}
+
 async function renderPdfJpegs(pdfPath: string): Promise<LlmContentPart[]> {
   const dir = await mkdtemp(join(tmpdir(), "aadi-bench-"));
   const script = `import os, sys
@@ -553,65 +744,91 @@ function classifyFailure(error: unknown): string {
   return `error: ${message}`;
 }
 
+function nativePdfBackend(backend: LlmBackend): boolean {
+  return backend === "claude" || backend === "haiku";
+}
+
 async function runTask(
-  backend: LlmBackend,
+  target: BenchTarget,
   task: TaskName,
   pdfBytes: Uint8Array,
   jpegParts: LlmContentPart[],
+  contractText: string,
 ): Promise<BenchRow> {
+  const { backend, kind, effort } = target;
   const started = Date.now();
-  const ram =
-    backend === "local-gemma" ? startRamSampler() : null;
-  const timeoutMs =
-    task === "document"
-      ? backend === "local-gemma"
-        ? 20 * 60 * 1000
-        : 10 * 60 * 1000
-      : backend === "local-gemma"
-        ? 15 * 60 * 1000
-        : 3 * 60 * 1000;
+  const ram = backend === "local-gemma" ? startRamSampler() : null;
+  const longTask = task === "document" || task === "contract_review";
+  const timeoutMs = longTask
+    ? backend === "local-gemma"
+      ? 20 * 60 * 1000
+      : 10 * 60 * 1000
+    : backend === "local-gemma"
+      ? 15 * 60 * 1000
+      : 3 * 60 * 1000;
+  const loop = (
+    user: string | LlmContentPart[],
+    tools: LlmTool[],
+    maxTokens?: number,
+  ) =>
+    runToolLoop({
+      backend,
+      user,
+      tools,
+      timeoutMs,
+      maxTokens,
+      effort,
+      task,
+    });
   try {
     let result: Awaited<ReturnType<typeof runToolLoop>>;
     if (task === "document") {
       const prompt =
         "Analyze this 17-page Bengaluru GCC Summit brochure. List what it is, the event date, venue, and every phone number printed on the last page (page 17). Do not invent figures. Short bullets.";
-      const user: LlmContentPart[] =
-        backend === "claude"
-          ? [
-              {
-                type: "document",
-                mediaType: "application/pdf",
-                data: Buffer.from(pdfBytes).toString("base64"),
-              },
-              { type: "text", text: prompt },
-            ]
-          : [...jpegParts, { type: "text", text: prompt }];
-      result = await runToolLoop({
-        backend,
-        user,
-        tools: [],
-        timeoutMs,
-        maxTokens: 2048,
-      });
+      const user: LlmContentPart[] = nativePdfBackend(backend)
+        ? [
+            {
+              type: "document",
+              mediaType: "application/pdf",
+              data: Buffer.from(pdfBytes).toString("base64"),
+            },
+            { type: "text", text: prompt },
+          ]
+        : [...jpegParts, { type: "text", text: prompt }];
+      result = await loop(user, [], 2048);
+    } else if (task === "contract_review") {
+      result = await loop(
+        `Review this MSA. Extract payment terms, liability cap, termination notice, governing law, auto-renewal, and confidentiality duration. Quote the figures. Flag one-sided terms. Do not invent clauses.
+
+<msa_text>
+${contractText}
+</msa_text>`,
+        [],
+        2048,
+      );
     } else if (task === "chat") {
-      result = await runToolLoop({
-        backend,
-        user: "what time is it?",
-        tools: [getCurrentTimeDef],
-        timeoutMs,
-      });
+      result = await loop("what time is it?", [getCurrentTimeDef]);
     } else if (task === "search_draft") {
-      result = await runToolLoop({
-        backend,
-        user:
-          "Priya emailed asking if I can confirm attendance at the Bengaluru GCC Summit. Search my mail, read it if needed, and draft a short reply saying yes I will attend. Do not send.",
-        tools: [searchEmailsDef, readEmailDef, draftReplyDef],
-        timeoutMs,
-      });
+      result = await loop(
+        "Priya emailed asking if I can confirm attendance at the Bengaluru GCC Summit. Search my mail, read it if needed, and draft a short reply saying yes I will attend. Do not send.",
+        [searchEmailsDef, readEmailDef, draftReplyDef],
+      );
+    } else if (task === "account_status") {
+      result = await loop(
+        "Where are we with Pinnacle? Use account_status. Do not search live email.",
+        [accountStatusDef],
+      );
+    } else if (task === "memory_extraction") {
+      result = await loop(
+        `Extract long-term facts from this Telegram message. If a durable fact should be saved, call remember. Ignore small talk. Never store passwords or health details.
+
+Message: ${MEMORY_MESSAGE}`,
+        [rememberDef],
+        512,
+      );
     } else {
-      result = await runToolLoop({
-        backend,
-        user: `Build Vishnu's morning brief now from sample data only.
+      result = await loop(
+        `Build Vishnu's morning brief now from sample data only.
 Use search_emails with query "is:unread newer_than:1d" and list_events for today (2026-10-14) in Asia/Kolkata.
 Use the local task and reminder data below. Do not call list_tasks or list_reminders.
 
@@ -620,15 +837,14 @@ ${SAMPLE_LOCAL_DATA}
 </local_task_and_reminder_data>
 
 Output two top-level sections in this exact order: WORK, then PERSONAL. Within WORK: Email, Calendar, Overdue tasks, Tasks due today, Today's reminders. Within PERSONAL: the same task/reminder subsections plus Upcoming bills and Upcoming important dates. Say "None" for an empty subsection. Plain text.`,
-        tools: [searchEmailsDef, listEventsDef],
-        timeoutMs,
-      });
+        [searchEmailsDef, listEventsDef],
+      );
     }
 
     const seconds = (Date.now() - started) / 1000;
     const peakRamMb = ram ? await ram.stop() : null;
     let tools;
-    if (task === "document") {
+    if (task === "document" || task === "contract_review") {
       tools = toolCorrectness(result.traces, []);
       if (result.traces.length === 0) {
         tools = { ok: true, label: "ok: no tools (analysis only)" };
@@ -640,19 +856,29 @@ Output two top-level sections in this exact order: WORK, then PERSONAL. Within W
         "search_emails",
         "draft_reply",
       ]);
+    } else if (task === "account_status") {
+      tools = toolCorrectness(result.traces, ["account_status"]);
+    } else if (task === "memory_extraction") {
+      tools = toolCorrectness(result.traces, ["remember"]);
     } else {
       tools = toolCorrectness(result.traces, ["search_emails", "list_events"]);
     }
     const quality =
       task === "document"
         ? scorePdf(result.text)
-        : task === "chat"
-          ? scoreChat(result.text, result.traces)
-          : task === "search_draft"
-            ? scoreDraft(result.text, result.traces)
-            : scoreBrief(result.text);
+        : task === "contract_review"
+          ? scoreContract(result.text)
+          : task === "chat"
+            ? scoreChat(result.text, result.traces)
+            : task === "search_draft"
+              ? scoreDraft(result.text, result.traces)
+              : task === "account_status"
+                ? scoreAccount(result.text, result.traces)
+                : task === "memory_extraction"
+                  ? scoreMemory(result.text, result.traces)
+                  : scoreBrief(result.text);
     return {
-      backend,
+      kind,
       task,
       seconds,
       toolCorrect: tools.label,
@@ -665,7 +891,7 @@ Output two top-level sections in this exact order: WORK, then PERSONAL. Within W
   } catch (error) {
     const peakRamMb = ram ? await ram.stop() : null;
     return {
-      backend,
+      kind,
       task,
       seconds: (Date.now() - started) / 1000,
       toolCorrect: "n/a",
@@ -680,7 +906,7 @@ Output two top-level sections in this exact order: WORK, then PERSONAL. Within W
 
 function printTable(rows: BenchRow[]): void {
   const header = [
-    "backend",
+    "model",
     "task",
     "sec",
     "costUSD",
@@ -694,7 +920,7 @@ function printTable(rows: BenchRow[]): void {
   for (const row of rows) {
     console.log(
       [
-        row.backend,
+        row.kind,
         row.task,
         row.seconds.toFixed(1),
         row.costUsd.toFixed(6),
@@ -708,21 +934,27 @@ function printTable(rows: BenchRow[]): void {
   console.log("\nPreviews:");
   for (const row of rows) {
     if (row.outputPreview) {
-      console.log(`- ${row.backend}/${row.task}: ${row.outputPreview}`);
+      console.log(`- ${row.kind}/${row.task}: ${row.outputPreview}`);
     }
   }
 }
 
 const only = process.env.BENCH_BACKENDS?.split(",")
   .map((value) => value.trim())
-  .filter(Boolean) as LlmBackend[] | undefined;
-const backends = only?.length ? only : BACKENDS;
+  .filter(Boolean) as BenchKind[] | undefined;
+const targets = only?.length
+  ? DEFAULT_TARGETS.filter((target) => only.includes(target.kind)).concat(
+      only.includes("local-gemma")
+        ? [{ kind: "local-gemma" as const, backend: "local-gemma" as const }]
+        : [],
+    )
+  : DEFAULT_TARGETS;
 const onlyTasks = process.env.BENCH_TASKS?.split(",")
   .map((value) => value.trim())
   .filter(Boolean) as TaskName[] | undefined;
 const tasks = onlyTasks?.length ? onlyTasks : [...TASKS];
 
-if (backends.includes("local-gemma")) {
+if (targets.some((target) => target.backend === "local-gemma")) {
   try {
     await assertLocalModelAllowed();
   } catch (error) {
@@ -737,26 +969,36 @@ if (backends.includes("local-gemma")) {
 
 const pdfPath = await brochurePath();
 const pdfBytes = new Uint8Array(await readFile(pdfPath));
+const contract = await buildContractPdf();
 console.log(
   `Brochure: ${pdfPath} (${(pdfBytes.byteLength / 1024 / 1024).toFixed(2)} MB)`,
 );
 console.log(
-  `Defaults unchanged: LLM_PROVIDER=${config.llmProvider} CLAUDE_MODEL=${config.claudeModel}`,
+  `Contract PDF: ${contract.text.length} chars (mocked MSA, no live email)`,
 );
 console.log(
-  `cloud-gemma=${config.gemmaCloudModel} local=${config.localLlmModel} @ ${config.localLlmBaseUrl}`,
+  `Defaults unchanged: LLM_PROVIDER=${config.llmProvider} CLAUDE_MODEL=${config.claudeModel} BACKGROUND_MODEL=${config.backgroundModel}`,
 );
+console.log(`cloud-gemma=${config.gemmaCloudModel}`);
 
-console.log("Rendering brochure pages for Gemma vision…");
-const jpegParts = await renderPdfJpegs(pdfPath);
-console.log(`Rendered ${jpegParts.length} JPEG pages.`);
+const needsJpegs = targets.some((target) => !nativePdfBackend(target.backend));
+const jpegParts = needsJpegs ? await renderPdfJpegs(pdfPath) : [];
+if (needsJpegs) {
+  console.log(`Rendered ${jpegParts.length} JPEG pages for Gemma.`);
+}
 
 const rows: BenchRow[] = [];
 
-for (const backend of backends) {
+for (const target of targets) {
   for (const task of tasks) {
-    console.log(`\n--- ${backend} / ${task} ---`);
-    const row = await runTask(backend, task, pdfBytes, jpegParts);
+    console.log(`\n--- ${target.kind} / ${task} ---`);
+    const row = await runTask(
+      target,
+      task,
+      pdfBytes,
+      jpegParts,
+      contract.text,
+    );
     rows.push(row);
     console.log(JSON.stringify(row, null, 2));
   }

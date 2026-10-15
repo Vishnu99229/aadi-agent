@@ -8,7 +8,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "read_document",
   description:
-    "Read the stored text of a document Vishnu uploaded recently. Pass the numeric document id. For long files, include question so the most relevant pages are returned.",
+    "Read stored text of an uploaded document by id. Include question to pick the relevant pages of a long file.",
   inputSchema: {
     type: "object",
     properties: {
