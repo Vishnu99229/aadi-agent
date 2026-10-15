@@ -33,6 +33,7 @@ import {
   type MeetingAttendee,
   type OpenItemLine,
 } from "./meeting_logic.js";
+import { memoriesMatchingText } from "./memory.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const PENDING_WRAPUP_KEY = "pending_meeting_wrapup";
@@ -246,6 +247,11 @@ export async function buildBriefForEvent(
   const attendees = toMeetingAttendees(event, self);
   const threads = await searchWorkThreads(account, attendees);
   const openItems = openItemsFor(attendees);
+  const memoryHay = [
+    event.summary ?? "",
+    ...attendees.map((item) => `${item.name} ${item.company}`),
+  ].join(" ");
+  const memories = memoriesMatchingText(memoryHay).map((item) => item.content);
   return {
     attendees,
     text: buildMeetingBriefText({
@@ -254,6 +260,7 @@ export async function buildBriefForEvent(
       attendees,
       threads,
       openItems,
+      memories,
     }),
   };
 }

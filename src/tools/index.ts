@@ -7,6 +7,7 @@ import * as markBillPaid from "./mark_bill_paid.js";
 import * as removeDate from "./remove_date.js";
 import * as cancelReminder from "./cancel_reminder.js";
 import * as completeTask from "./complete_task.js";
+import * as forgetMemory from "./forget_memory.js";
 import * as draftMom from "./draft_mom.js";
 import * as draftReply from "./draft_reply.js";
 import * as listAttachments from "./list_attachments.js";
@@ -20,7 +21,11 @@ import * as listDates from "./list_dates.js";
 import * as listUpcomingDates from "./list_upcoming_dates.js";
 import * as listReminders from "./list_reminders.js";
 import * as listTasks from "./list_tasks.js";
+import * as listMemories from "./list_memories.js";
 import * as listWaiting from "./list_waiting.js";
+import * as remember from "./remember.js";
+import * as searchMemories from "./search_memories.js";
+import * as updateMemory from "./update_memory.js";
 import * as readDocument from "./read_document.js";
 import * as removeAccount from "./remove_account.js";
 import * as readEmail from "./read_email.js";
@@ -46,6 +51,7 @@ export const tools: Record<string, RegisteredTool> = {
   cancel_reminder: cancelReminder,
   complete_task: completeTask,
   draft_mom: draftMom,
+  forget_memory: forgetMemory,
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
   list_accounts: listAccounts,
@@ -56,6 +62,7 @@ export const tools: Record<string, RegisteredTool> = {
   list_upcoming_dates: listUpcomingDates,
   list_reminders: listReminders,
   list_tasks: listTasks,
+  list_memories: listMemories,
   list_waiting: listWaiting,
   mark_bill_paid: markBillPaid,
   read_attachment: readAttachment,
@@ -63,12 +70,15 @@ export const tools: Record<string, RegisteredTool> = {
   remove_account: removeAccount,
   remove_date: removeDate,
   read_email: readEmail,
+  remember,
   ...(config.googleSheetId ? { read_sheet: readSheet } : {}),
   search_emails: searchEmails,
+  search_memories: searchMemories,
   search_notes: searchNotes,
   set_reminder: setReminder,
   stop_tracking: stopTracking,
   track_thread: trackThread,
   update_account: updateAccount,
+  update_memory: updateMemory,
   update_draft: updateDraft,
 };

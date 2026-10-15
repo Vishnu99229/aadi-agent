@@ -216,6 +216,36 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_attachment_alerts_status
     ON attachment_alerts (status, created_at);
 
+  CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    category TEXT NOT NULL
+      CHECK (category IN ('deal', 'plan', 'event', 'person', 'preference', 'other')),
+    tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
+    event_date TEXT,
+    source TEXT NOT NULL
+      CHECK (source IN ('explicit', 'confirmed', 'auto')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_memories_updated
+    ON memories (updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_memories_event_date
+    ON memories (event_date);
+  CREATE INDEX IF NOT EXISTS idx_memories_category
+    ON memories (category);
+
+  CREATE TABLE IF NOT EXISTS pending_memory_confirms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    category TEXT NOT NULL,
+    tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
+    event_date TEXT,
+    update_of_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS bills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     biller TEXT NOT NULL,
@@ -309,6 +339,34 @@ if (!tableHasColumn("accounts", "people")) {
 
 if (!tableHasColumn("notes", "meeting_json")) {
   db.exec(`ALTER TABLE notes ADD COLUMN meeting_json TEXT`);
+}
+
+let memoriesFtsReady = false;
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+      content,
+      content='memories',
+      content_rowid='id',
+      tokenize='porter'
+    );
+    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+      INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+      INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+  `);
+  memoriesFtsReady = true;
+} catch (error) {
+  const errorType = error instanceof Error ? error.name : "UnknownError";
+  console.error(`Memory FTS5 unavailable (${errorType}); search will use LIKE.`);
 }
 
 if (!tableHasColumn("pending_actions", "google_account")) {
@@ -1396,4 +1454,246 @@ export function getPendingAccountUpdate(
 
 export function deletePendingAccountUpdate(id: number): void {
   db.prepare(`DELETE FROM pending_account_updates WHERE id = ?`).run(id);
+}
+
+export type MemoryCategory =
+  | "deal"
+  | "plan"
+  | "event"
+  | "person"
+  | "preference"
+  | "other";
+export type MemorySource = "explicit" | "confirmed" | "auto";
+
+export interface MemoryRecord {
+  id: number;
+  content: string;
+  category: MemoryCategory;
+  tag: ItemTag;
+  event_date: string | null;
+  source: MemorySource;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryInput {
+  content: string;
+  category: MemoryCategory;
+  tag: ItemTag;
+  eventDate?: string | null;
+  source: MemorySource;
+}
+
+export interface PendingMemoryConfirm {
+  id: number;
+  content: string;
+  category: MemoryCategory;
+  tag: ItemTag;
+  event_date: string | null;
+  update_of_id: number | null;
+  created_at: string;
+}
+
+const MEMORY_COLUMNS = `id, content, category, tag, event_date, source, created_at, updated_at`;
+const MEMORY_COLUMNS_M = `m.id, m.content, m.category, m.tag, m.event_date, m.source, m.created_at, m.updated_at`;
+
+function ftsMatchQuery(raw: string): string | null {
+  const tokens = raw.toLowerCase().match(/[a-z0-9]{2,}/g) ?? [];
+  const unique = [...new Set(tokens)].slice(0, 12);
+  if (unique.length === 0) {
+    return null;
+  }
+  return unique.map((token) => `"${token.replace(/"/g, "")}"`).join(" OR ");
+}
+
+export function isMemoriesFtsReady(): boolean {
+  return memoriesFtsReady;
+}
+
+export function createMemory(input: MemoryInput): MemoryRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO memories (content, category, tag, event_date, source)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.content,
+      input.category,
+      input.tag,
+      input.eventDate ?? null,
+      input.source,
+    );
+  console.log(
+    `Memory ${Number(result.lastInsertRowid)}: created category=${input.category} tag=${input.tag} source=${input.source}`,
+  );
+  return getMemory(Number(result.lastInsertRowid))!;
+}
+
+export function getMemory(id: number): MemoryRecord | undefined {
+  return db
+    .prepare(`SELECT ${MEMORY_COLUMNS} FROM memories WHERE id = ?`)
+    .get(id) as MemoryRecord | undefined;
+}
+
+export function listMemories(): MemoryRecord[] {
+  return db
+    .prepare(
+      `SELECT ${MEMORY_COLUMNS} FROM memories
+       ORDER BY category ASC, updated_at DESC, id DESC`,
+    )
+    .all() as MemoryRecord[];
+}
+
+export function countMemories(): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM memories`).get() as {
+    n: number;
+  };
+  return row.n;
+}
+
+export function updateMemory(
+  id: number,
+  update: {
+    content?: string;
+    category?: MemoryCategory;
+    tag?: ItemTag;
+    eventDate?: string | null;
+    source?: MemorySource;
+  },
+): MemoryRecord | undefined {
+  const current = getMemory(id);
+  if (!current) {
+    return undefined;
+  }
+  db.prepare(
+    `UPDATE memories
+     SET content = ?,
+         category = ?,
+         tag = ?,
+         event_date = ?,
+         source = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(
+    update.content ?? current.content,
+    update.category ?? current.category,
+    update.tag ?? current.tag,
+    update.eventDate === undefined ? current.event_date : update.eventDate,
+    update.source ?? current.source,
+    id,
+  );
+  console.log(`Memory ${id}: updated`);
+  return getMemory(id);
+}
+
+export function deleteMemory(id: number): boolean {
+  const result = db.prepare(`DELETE FROM memories WHERE id = ?`).run(id);
+  if (result.changes === 1) {
+    console.log(`Memory ${id}: deleted`);
+  }
+  return result.changes === 1;
+}
+
+export function deleteAllMemories(): number {
+  const result = db.prepare(`DELETE FROM memories`).run();
+  console.log(`Memories: deleted count=${result.changes}`);
+  return result.changes;
+}
+
+export function searchMemories(query: string, limit = 15): MemoryRecord[] {
+  const safeLimit = Math.max(1, Math.min(50, Math.floor(limit)));
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return db
+      .prepare(
+        `SELECT ${MEMORY_COLUMNS} FROM memories
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(safeLimit) as MemoryRecord[];
+  }
+
+  const match = ftsMatchQuery(trimmed);
+  if (memoriesFtsReady && match) {
+    try {
+      const rows = db
+        .prepare(
+          `SELECT ${MEMORY_COLUMNS_M}
+           FROM memories m
+           JOIN memories_fts f ON f.rowid = m.id
+           WHERE memories_fts MATCH ?
+           ORDER BY bm25(memories_fts), m.updated_at DESC, m.id DESC
+           LIMIT ?`,
+        )
+        .all(match, safeLimit) as MemoryRecord[];
+      if (rows.length > 0) {
+        return rows;
+      }
+    } catch {
+      // fall through to LIKE
+    }
+  }
+
+  const pattern = `%${trimmed.replace(/[%_]/g, " ").trim()}%`;
+  return db
+    .prepare(
+      `SELECT ${MEMORY_COLUMNS} FROM memories
+       WHERE content LIKE ?
+       ORDER BY updated_at DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(pattern, safeLimit) as MemoryRecord[];
+}
+
+export function memoriesWithEventDateBetween(
+  startYmd: string,
+  endYmd: string,
+): MemoryRecord[] {
+  return db
+    .prepare(
+      `SELECT ${MEMORY_COLUMNS} FROM memories
+       WHERE event_date IS NOT NULL
+         AND event_date >= ?
+         AND event_date <= ?
+       ORDER BY event_date ASC, id ASC`,
+    )
+    .all(startYmd, endYmd) as MemoryRecord[];
+}
+
+export function createPendingMemoryConfirm(input: {
+  content: string;
+  category: MemoryCategory;
+  tag: ItemTag;
+  eventDate?: string | null;
+  updateOfId?: number | null;
+}): PendingMemoryConfirm {
+  const result = db
+    .prepare(
+      `INSERT INTO pending_memory_confirms (
+         content, category, tag, event_date, update_of_id
+       ) VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.content,
+      input.category,
+      input.tag,
+      input.eventDate ?? null,
+      input.updateOfId ?? null,
+    );
+  return getPendingMemoryConfirm(Number(result.lastInsertRowid))!;
+}
+
+export function getPendingMemoryConfirm(
+  id: number,
+): PendingMemoryConfirm | undefined {
+  return db
+    .prepare(
+      `SELECT id, content, category, tag, event_date, update_of_id, created_at
+       FROM pending_memory_confirms WHERE id = ?`,
+    )
+    .get(id) as PendingMemoryConfirm | undefined;
+}
+
+export function deletePendingMemoryConfirm(id: number): void {
+  db.prepare(`DELETE FROM pending_memory_confirms WHERE id = ?`).run(id);
 }

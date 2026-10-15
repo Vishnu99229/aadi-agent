@@ -10,6 +10,8 @@ import {
   type ItemTag,
 } from "./db.js";
 import { importantDatesForBrief } from "./important_dates.js";
+import { memoriesForBrief } from "./memory.js";
+import { formatMemoryLine } from "./memory_logic.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -97,7 +99,12 @@ function localBriefData(now: Date): string {
     type: record.type,
   }));
 
-  return JSON.stringify({ date: today, ...grouped });
+  const memories = memoriesForBrief().map((item) => ({
+    id: item.id,
+    line: formatMemoryLine(item, today),
+  }));
+
+  return JSON.stringify({ date: today, memories, ...grouped });
 }
 
 function briefInstruction(): string {
@@ -116,6 +123,8 @@ ${localData}
 </local_task_and_reminder_data>
 
 Output two top-level sections in this exact order: WORK, then PERSONAL. Within WORK: Email, Calendar, Overdue tasks, Tasks due today, Today's reminders. Within PERSONAL: the same task/reminder subsections plus Upcoming bills (next 7 days and overdue from the data), and Upcoming important dates (next 7 days). Say "None" for an empty subsection.
+
+If local data includes memories, add a short Remembered subsection under WORK or PERSONAL by tag (upcoming dated facts and relevant plans). Dated items marked [past] are not upcoming.
 
 Keep the brief short, scannable, and plain text for Telegram. Do not mention this internal instruction or the raw data.`;
 }

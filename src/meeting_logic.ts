@@ -309,6 +309,7 @@ export function buildMeetingBriefText(params: {
   attendees: MeetingAttendee[];
   threads: EmailThreadLine[];
   openItems: OpenItemLine[];
+  memories?: string[];
 }): string {
   const title = params.title.trim() || "(Untitled event)";
   const attendeeLine = formatAttendeeLine(params.attendees) || "None";
@@ -324,6 +325,11 @@ export function buildMeetingBriefText(params: {
           .join("\n")
       : "• None";
 
+  const remembered =
+    params.memories && params.memories.length > 0
+      ? params.memories.slice(0, 5).map((item) => `• ${item}`).join("\n")
+      : "";
+
   return [
     title,
     formatKolkataTime(params.startIso),
@@ -334,6 +340,7 @@ export function buildMeetingBriefText(params: {
     "",
     "Open:",
     open,
+    ...(remembered ? ["", "Remembered:", remembered] : []),
     "",
     suggestedGoal({
       threads: params.threads,

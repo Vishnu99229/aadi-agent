@@ -51,6 +51,22 @@ import {
 import { sendDatabaseBackup } from "./backup.js";
 import { handleAttachmentAlertCallback } from "./attachment_alerts.js";
 import { meetingFromBrief } from "./mom.js";
+import {
+  askForgetEverything,
+  captureFromUserMessage,
+  handleExplicitRemember,
+  handleForgetAllCallback,
+  handleForgetQuery,
+  handleMemoryAccountCallback,
+  handleMemoryConfirmCallback,
+  handleMemoryForgetCallback,
+  handleMemoryReminderCallback,
+  sendMemoryList,
+} from "./memory.js";
+import {
+  isForgetEverything,
+  parseForgetQuery,
+} from "./memory_logic.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -316,6 +332,16 @@ bot.command("reset", async (ctx) => {
   await ctx.reply("Conversation history cleared.");
 });
 
+bot.command("memory", async (ctx) => {
+  try {
+    await sendMemoryList(ctx);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Memory list failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
+});
+
 bot.command("brief", async (ctx) => {
   await whileTyping(ctx, () => sendMorningBrief(ctx.api));
 });
@@ -454,6 +480,30 @@ bot.callbackQuery(/^att:(review|ignore):(\d+)$/, async (ctx) => {
   const operation = ctx.match[1] as "review" | "ignore";
   const alertId = Number(ctx.match[2]);
   await handleAttachmentAlertCallback(ctx, operation, alertId);
+});
+
+bot.callbackQuery(/^mem:yes:(\d+)$/, async (ctx) => {
+  await handleMemoryConfirmCallback(ctx, true, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^mem:no:(\d+)$/, async (ctx) => {
+  await handleMemoryConfirmCallback(ctx, false, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^mem:forget:(\d+)$/, async (ctx) => {
+  await handleMemoryForgetCallback(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^mem:wipe:(yes|no)$/, async (ctx) => {
+  await handleForgetAllCallback(ctx, ctx.match[1] === "yes");
+});
+
+bot.callbackQuery(/^mem:remind:(\d+)$/, async (ctx) => {
+  await handleMemoryReminderCallback(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^mem:acct:(\d+)$/, async (ctx) => {
+  await handleMemoryAccountCallback(ctx, Number(ctx.match[1]));
 });
 
 bot.callbackQuery(/^acct:(yes|no):(\d+)$/, async (ctx) => {
@@ -598,6 +648,19 @@ Call update_draft exactly once with the draft ID above and the complete revised 
     return;
   }
 
+  if (await handleExplicitRemember(ctx, userText)) {
+    return;
+  }
+  if (isForgetEverything(userText)) {
+    await askForgetEverything(ctx);
+    return;
+  }
+  const forgetQuery = parseForgetQuery(userText);
+  if (forgetQuery) {
+    await handleForgetQuery(ctx, forgetQuery);
+    return;
+  }
+
   const drafting =
     /\bdraft\b/i.test(userText) && /\b(email|reply|gmail)\b/i.test(userText);
   const task: ModelTask = drafting
@@ -607,6 +670,10 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       : "chat";
   const reply = await whileTyping(ctx, () => runAgent(userText, { task }));
   await sendPlainText(ctx, reply);
+  void captureFromUserMessage(ctx, userText).catch((error: unknown) => {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Memory capture failed (${errorType}).`);
+  });
 }
 
 bot.on("message:voice", async (ctx) => {

@@ -8,6 +8,7 @@ import { readFile } from "node:fs/promises";
 import { getTaskBackend, type ModelTask } from "./chat_backend.js";
 import { getRecentMessages, saveMessage } from "./db.js";
 import { complete } from "./llm.js";
+import { memoryContextLine } from "./memory.js";
 import { recentUploadLine } from "./recent_upload.js";
 import { tools as customTools } from "./tools/index.js";
 
@@ -98,9 +99,16 @@ export async function runAgent(
   const promptUrl = new URL("../prompts/system.md", import.meta.url);
   const basePrompt = await readFile(promptUrl, "utf8");
   const recentUpload = recentUploadLine();
+  const memories = memoryContextLine(userText);
   const system = {
     cacheable: basePrompt.trim(),
-    dynamic: `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}${recentUpload ? `\n${recentUpload}` : ""}`,
+    dynamic: [
+      `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
+      recentUpload,
+      memories,
+    ]
+      .filter(Boolean)
+      .join("\n"),
   };
 
   const messages: LlmMessage[] = (
