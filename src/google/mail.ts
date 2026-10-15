@@ -117,3 +117,45 @@ export async function createNewEmailDraft(params: {
   const threadId = result.data.message?.threadId || result.data.id;
   return { draftId: result.data.id, threadId };
 }
+
+export async function createThreadReplyDraft(params: {
+  account: LoadedGoogleAccount;
+  threadId: string;
+  to: string;
+  subject: string;
+  inReplyTo: string;
+  references: string;
+  body: string;
+}): Promise<{ draftId: string }> {
+  const gmail = gmailClient(params.account);
+  const references = [params.references, params.inReplyTo]
+    .map(safeHeader)
+    .filter(Boolean)
+    .join(" ");
+  const raw = [
+    `To: ${safeHeader(params.to)}`,
+    `Subject: ${safeHeader(params.subject)}`,
+    `In-Reply-To: ${safeHeader(params.inReplyTo)}`,
+    `References: ${references}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeBody(params.body),
+  ].join("\r\n");
+
+  const result = await gmail.users.drafts.create({
+    userId: "me",
+    requestBody: {
+      message: {
+        threadId: params.threadId,
+        raw: Buffer.from(raw, "utf8").toString("base64url"),
+      },
+    },
+  });
+
+  if (!result.data.id) {
+    throw new Error("Gmail created the draft without returning a draft ID.");
+  }
+  return { draftId: result.data.id };
+}

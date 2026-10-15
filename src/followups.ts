@@ -1,23 +1,39 @@
-import { InlineKeyboard, type Api } from "grammy";
+import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import cron, { type ScheduledTask } from "node-cron";
+import { decodedAccounts } from "./accounts.js";
+import { queueDraftApproval } from "./approvals.js";
 import { config } from "./config.js";
 import {
   createFollowup,
+  getFollowup,
   getFollowupByThread,
   getFollowups,
   refreshFollowupSentMessage,
   restartFollowup,
+  snoozeFollowup,
   transitionFollowupStatus,
   type FollowupInput,
   type FollowupRecord,
   type ItemTag,
 } from "./db.js";
 import {
+  cleanSubjectTitle,
+  formatSentAt,
+  formatSnoozeUntil,
+  formatWaitingPhrase,
+  formatToLine,
+  followupDraftBody,
+  neededLine,
+  waitingDays,
+  type FollowupDisplay,
+} from "./followup_logic.js";
+import {
+  getGoogleAccount,
   loadGoogleAccounts,
   type LoadedGoogleAccount,
 } from "./google/auth.js";
-import { gmailClient } from "./google/mail.js";
+import { createThreadReplyDraft, gmailClient } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
 
 const TIME_ZONE = "Asia/Kolkata";
@@ -134,6 +150,8 @@ async function getThread(
       "To",
       "From",
       "Subject",
+      "Message-ID",
+      "References",
       "Content-Type",
       "List-Unsubscribe",
       "Auto-Submitted",
@@ -416,47 +434,141 @@ export async function runFollowupScan(): Promise<void> {
   );
 }
 
-export async function sendFollowupNudgeSummary(api: Api): Promise<void> {
+export function activeFollowups(): FollowupRecord[] {
+  return getFollowups().filter(
+    (followup) =>
+      followup.status === "waiting" || followup.status === "snoozed",
+  );
+}
+
+export function overdueFollowups(): FollowupRecord[] {
   const now = Date.now();
-  const overdue = getFollowups().filter(
+  return getFollowups().filter(
     (followup) =>
       followup.status === "waiting" &&
       new Date(followup.next_check_at).getTime() <= now,
   );
+}
 
-  if (overdue.length === 0) {
-    await api.sendMessage(
-      config.ownerTelegramId,
-      "No follow-ups are overdue for a nudge right now.",
-    );
-    return;
+async function snippetForFollowup(
+  followup: FollowupRecord,
+): Promise<string | undefined> {
+  try {
+    const account = await getGoogleAccount(followup.google_account);
+    const thread = await getThread(gmailClient(account), followup.thread_id);
+    const latest = latestNonDraftMessage(thread);
+    return latest?.snippet?.trim();
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Follow-up ${followup.id}: snippet failed (${errorType})`);
+    return undefined;
   }
+}
 
-  const lines = overdue.map((followup) => {
-    const days = Math.max(
-      0,
-      Math.floor(
-        (now - new Date(followup.last_sent_at).getTime()) / DAY_MS,
-      ),
-    );
-    return `• ${followup.recipient} — ${followup.subject} (${days}d waiting)`;
+export async function displaysForFollowups(
+  records: FollowupRecord[],
+): Promise<FollowupDisplay[]> {
+  const accounts = decodedAccounts();
+  const snippets = await Promise.all(records.map(snippetForFollowup));
+  return records.map((followup, index) => {
+    const days = waitingDays(followup.last_sent_at);
+    const snoozeNote =
+      followup.status === "snoozed"
+        ? `Snoozed until ${formatSnoozeUntil(followup.next_check_at)}`
+        : undefined;
+    return {
+      id: followup.id,
+      title: cleanSubjectTitle(followup.subject),
+      toLine: formatToLine(followup.recipient, accounts),
+      sentLine: `Sent: ${formatSentAt(followup.last_sent_at)} · ${formatWaitingPhrase(days)}`,
+      needed: neededLine(snippets[index]),
+      note: snoozeNote,
+    };
   });
+}
 
-  const keyboard = new InlineKeyboard();
-  for (const followup of overdue) {
-    keyboard
-      .text("Draft follow-up", `followup:draft:${followup.id}`)
-      .text("Snooze 3 days", `followup:snooze:${followup.id}`)
-      .text("Stop tracking", `followup:stop:${followup.id}`)
-      .row();
+export function snoozeFollowupThreeDays(
+  id: number,
+): { until: string } | undefined {
+  const until = new Date(Date.now() + 3 * DAY_MS).toISOString();
+  const followup = snoozeFollowup(id, until);
+  if (!followup) {
+    return undefined;
   }
+  console.log(`Follow-up ${followup.id}: status -> snoozed`);
+  return { until: followup.next_check_at };
+}
 
-  await api.sendMessage(
-    config.ownerTelegramId,
-    `Waiting on replies:\n\n${lines.join("\n")}`,
-    { reply_markup: keyboard },
+export function stopTrackingFollowup(id: number): boolean {
+  const followup = getFollowup(id);
+  if (!followup) {
+    return false;
+  }
+  if (followup.status === "dismissed") {
+    return true;
+  }
+  const changed = transitionFollowupStatus(
+    id,
+    ["waiting", "snoozed", "replied"],
+    "dismissed",
   );
-  console.log(`Follow-up nudge summary sent: threads=${overdue.length}`);
+  if (changed) {
+    console.log(`Follow-up ${id}: status -> dismissed`);
+  }
+  return changed;
+}
+
+function replySubject(subject: string): string {
+  const normalized = subject.replace(/[\r\n]+/g, " ").trim() || "(no subject)";
+  return /^re\s*:/i.test(normalized) ? normalized : `Re: ${normalized}`;
+}
+
+export async function createFollowupDraftForApproval(
+  id: number,
+  sendOnly: boolean,
+): Promise<void> {
+  const followup = getFollowup(id);
+  if (
+    !followup ||
+    (followup.status !== "waiting" && followup.status !== "snoozed")
+  ) {
+    throw new Error("That follow-up is no longer being tracked.");
+  }
+  const account = await getGoogleAccount(followup.google_account);
+  const gmail = gmailClient(account);
+  const thread = await getThread(gmail, followup.thread_id);
+  const latestSent = [...(thread.messages ?? [])]
+    .filter((message) => isSent(message) && !message.labelIds?.includes("DRAFT"))
+    .sort((left, right) => messageTime(right) - messageTime(left))[0];
+  if (!latestSent?.id) {
+    throw new Error("Could not find the sent message for that thread.");
+  }
+  const headers = latestSent.payload?.headers;
+  const messageId = header(headers, "Message-ID");
+  const to = followup.recipient || header(headers, "To");
+  const body = followupDraftBody(to);
+  const subject = replySubject(followup.subject);
+  const { draftId } = await createThreadReplyDraft({
+    account,
+    threadId: followup.thread_id,
+    to,
+    subject,
+    inReplyTo: messageId,
+    references: header(headers, "References"),
+    body,
+  });
+  await queueDraftApproval(
+    {
+      draftId,
+      threadId: followup.thread_id,
+      to,
+      subject,
+      body,
+      googleAccount: account.id,
+    },
+    { sendOnly },
+  );
+  console.log(`Follow-up ${id}: draft queued sendOnly=${sendOnly}`);
 }
 
 export async function trackLatestSentTo(
@@ -540,13 +652,19 @@ export async function trackLatestSentTo(
   return followup;
 }
 
-export function registerFollowupScan(): ScheduledTask {
+export function registerFollowupScan(
+  afterScan?: (api: Api) => Promise<void>,
+  api?: Api,
+): ScheduledTask {
   const expression = `${config.followupScanMinute} ${config.followupScanHour} * * 1-5`;
   const task = cron.schedule(
     expression,
     async () => {
       try {
         await runFollowupScan();
+        if (afterScan && api) {
+          await afterScan(api);
+        }
       } catch (error) {
         const errorType = error instanceof Error ? error.name : "UnknownError";
         console.error(`Follow-up scan failed (${errorType}).`);

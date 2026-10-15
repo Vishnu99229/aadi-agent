@@ -12,6 +12,8 @@ import {
 import { importantDatesForBrief } from "./important_dates.js";
 import { memoriesForBrief } from "./memory.js";
 import { formatMemoryLine } from "./memory_logic.js";
+import { sendWaitingOnPanel } from "./followup_panel.js";
+import { activeFollowups } from "./followups.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -159,6 +161,9 @@ export async function sendMorningBrief(api: Api): Promise<void> {
   try {
     const brief = await buildMorningBrief();
     await sendLongMessage(api, brief);
+    if (activeFollowups().length > 0) {
+      await sendWaitingOnPanel(api);
+    }
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Morning brief failed (${errorType}).`);

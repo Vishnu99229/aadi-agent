@@ -2,6 +2,7 @@ import { bot } from "./bot.js";
 import { startApprovalExpirySweep } from "./approvals.js";
 import { registerBillScan } from "./bills.js";
 import { registerMorningBrief } from "./brief.js";
+import { sendOverdueFollowupNudge } from "./followup_panel.js";
 import { registerFollowupScan } from "./followups.js";
 import { registerImportantDateReminders } from "./important_dates.js";
 import { registerWeeklyReview } from "./weekly.js";
@@ -16,7 +17,10 @@ const morningBriefTask = registerMorningBrief(bot.api);
 const billScanTask = registerBillScan(bot.api);
 const importantDateTask = registerImportantDateReminders(bot.api);
 const weeklyReviewTask = registerWeeklyReview(bot.api);
-const followupScanTask = registerFollowupScan();
+const followupScanTask = registerFollowupScan(
+  sendOverdueFollowupNudge,
+  bot.api,
+);
 const approvalExpirySweep = startApprovalExpirySweep();
 const reminderScheduler = await registerReminderScheduler(bot.api);
 const documentExpirySweep = startDocumentExpirySweep();

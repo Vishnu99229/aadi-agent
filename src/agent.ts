@@ -5,7 +5,8 @@ import type {
   ToolCall,
 } from "./llm.js";
 import { readFile } from "node:fs/promises";
-import { getTaskBackend, type ModelTask } from "./chat_backend.js";
+import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
+import { looksLikeDeferredAction } from "./deferred_action.js";
 import {
   CONVERSATION_SUMMARY_KEY,
   CONVERSATION_SUMMARY_UNTIL_KEY,
@@ -215,7 +216,13 @@ export async function runAgent(
   messages.push({ role: "user", content: userText });
 
   const collectedText: string[] = [];
-  const backend = options.backend ?? getTaskBackend(options.task ?? "chat");
+  const task = options.task ?? "chat";
+  const backend = options.backend ?? getTaskBackend(task);
+  const effort =
+    backend === "claude" || backend === "haiku"
+      ? getTaskEffort(task)
+      : undefined;
+  let deferredRetryUsed = false;
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     const response = await complete({
@@ -224,7 +231,7 @@ export async function runAgent(
       messages,
       backend,
       task: options.usageTask ?? usageTaskForAgent(options.task),
-      effort: backend === "haiku" ? "low" : undefined,
+      effort,
     });
 
     const responseText = response.textParts.join("\n").trim();
@@ -259,6 +266,26 @@ export async function runAgent(
         toolCalls: response.toolCalls,
       });
       messages.push(...toolResults);
+      continue;
+    }
+
+    if (
+      !deferredRetryUsed &&
+      response.toolCalls.length === 0 &&
+      looksLikeDeferredAction(responseText)
+    ) {
+      deferredRetryUsed = true;
+      console.log(`Deferred-action retry: iteration=${iteration}`);
+      messages.push({
+        role: "assistant",
+        textParts: response.textParts,
+        toolCalls: [],
+      });
+      messages.push({
+        role: "user",
+        content:
+          "Do that now. Call the necessary tool in this turn and reply with the result. Do not say you will do it later.",
+      });
       continue;
     }
 

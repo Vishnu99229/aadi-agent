@@ -771,6 +771,24 @@ export function refreshFollowupSentMessage(
   return getFollowup(id)!;
 }
 
+export function snoozeFollowup(
+  id: number,
+  nextCheckAt: string,
+): FollowupRecord | undefined {
+  const result = db
+    .prepare(
+      `UPDATE followups
+       SET status = 'snoozed',
+           next_check_at = ?
+       WHERE id = ? AND status IN ('waiting', 'snoozed')`,
+    )
+    .run(nextCheckAt, id);
+  if (result.changes !== 1) {
+    return undefined;
+  }
+  return getFollowup(id);
+}
+
 export function transitionFollowupStatus(
   id: number,
   from: FollowupStatus | FollowupStatus[],

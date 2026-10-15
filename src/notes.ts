@@ -8,6 +8,7 @@ import {
   type NoteActionItem,
 } from "./db.js";
 import { runAgent } from "./agent.js";
+import { apiEffortForTask, getTaskBackend } from "./chat_backend.js";
 import { complete } from "./llm.js";
 import { offerAccountUpdateAfterWrapUp } from "./accounts.js";
 import { draftMomForNote } from "./mom.js";
@@ -79,8 +80,8 @@ function formatNoteContent(analysis: WrapUpAnalysis): string {
 
 export async function buildWrapUpNotes(rawInput: string): Promise<WrapUpAnalysis> {
   const response = await complete({
-    backend: "haiku",
-    effort: "low",
+    backend: getTaskBackend("meetings"),
+    effort: apiEffortForTask("meetings"),
     cacheTtl: "5m",
     task: "meeting_brief",
     maxTokens: 4096,

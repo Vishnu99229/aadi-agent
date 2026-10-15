@@ -14,11 +14,17 @@ ensureTestEnv();
 const { deleteSetting, setSetting } = await import("../src/db.ts");
 const { TOOL_ORDER, tools } = await import("../src/tools/index.ts");
 const {
+  applyAllChoice,
   applyAllTasks,
   applyAllTasksExceptDrafting,
   applyTaskBackend,
+  applyTaskChoice,
+  formatModelSetupText,
+  formatTaskSetupLine,
   getTaskBackend,
   getTaskBackends,
+  getTaskEffort,
+  modelDisplayName,
 } = await import("../src/chat_backend.ts");
 
 function assert(condition: boolean, message: string): void {
@@ -31,6 +37,7 @@ function resetModelSettings(): void {
   deleteSetting("llm_task_backends");
   deleteSetting("llm_backend");
   deleteSetting("llm_task_defaults_generation");
+  deleteSetting("llm_task_efforts");
 }
 
 resetModelSettings();
@@ -90,7 +97,42 @@ assert(flipped.chat === "haiku", "old Claude defaults flip to Haiku");
 assert(flipped.drafting === "haiku", "old drafting Claude flips to Haiku");
 
 resetModelSettings();
+assert(getTaskEffort("chat") === "low", "default effort is low");
+assert(getTaskEffort("drafting") === "low", "drafting effort defaults low");
+assert(modelDisplayName("haiku") === "Haiku 5.5", "haiku display name");
+assert(modelDisplayName("claude") === "Claude Sonnet 5.5", "sonnet display name");
+assert(modelDisplayName("cloud-gemma") === "Gemma 4 31B", "gemma display name");
+
+const saved = applyTaskChoice("chat", "haiku", "medium");
+assert(saved.switched, "chat choice saves");
+assert(getTaskEffort("chat") === "medium", "chat effort is medium");
+assert(
+  formatTaskSetupLine("chat") === "Chat and questions — Haiku 5.5 · medium",
+  "chat setup line matches selection",
+);
+
+const allGemma = applyAllChoice("cloud-gemma");
+assert(allGemma.gemmaSkippedDrafting, "set all gemma skips drafting");
+assert(getTaskBackend("drafting") === "haiku", "drafting stays off gemma");
+assert(
+  formatModelSetupText({
+    updatedTasks: ["chat"],
+  }).includes("Chat and questions — Gemma 4 31B (no effort setting) ✅ updated"),
+  "updated gemma line",
+);
+
+const allHaiku = applyAllChoice("haiku", "medium");
+assert(allHaiku.switched, "set all haiku medium");
+assert(getTaskBackend("drafting") === "haiku", "drafting is haiku after set all");
+assert(getTaskEffort("documents") === "medium", "set all effort applies");
+assert(
+  formatModelSetupText().includes("Background scans — Haiku 5.5 (automatic)"),
+  "background scans line",
+);
+
+resetModelSettings();
 assert(getTaskBackend("chat") === "haiku", "cleanup restores Haiku default");
+assert(getTaskEffort("chat") === "low", "cleanup restores low effort");
 
 assert(TOOL_ORDER.includes("read_sheet"), "read_sheet stays in the cached tool list");
 assert(

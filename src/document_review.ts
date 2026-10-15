@@ -1,4 +1,4 @@
-import { getTaskBackend } from "./chat_backend.js";
+import { apiEffortForTask, getTaskBackend } from "./chat_backend.js";
 import {
   CONTRACT_CLAUSES,
   chunkText,
@@ -45,7 +45,7 @@ async function completeJson(
     tools: [],
     maxTokens: 4096,
     task: "contract_review",
-    effort: getTaskBackend("documents") === "haiku" ? "low" : undefined,
+    effort: apiEffortForTask("documents"),
     cacheTtl: "5m",
   });
   const text = result.textParts.join("\n");

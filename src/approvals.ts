@@ -18,6 +18,7 @@ const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
 const telegram = new Api(config.telegramBotToken);
 const activeActions = new Set<number>();
 const editingActionByUser = new Map<number, number>();
+const sendOnlyActions = new Set<number>();
 
 export interface DraftApprovalPreview {
   draftId: string;
@@ -35,7 +36,13 @@ export interface DraftEditContext {
   body: string;
 }
 
-function keyboard(actionId: number): InlineKeyboard {
+function keyboard(actionId: number, sendOnly = false): InlineKeyboard {
+  if (sendOnly) {
+    return new InlineKeyboard()
+      .text("Send", `approval:send:${actionId}`)
+      .row()
+      .text("Cancel", `approval:discard:${actionId}`);
+  }
   return new InlineKeyboard()
     .text("Send", `approval:send:${actionId}`)
     .text("Edit", `approval:edit:${actionId}`)
@@ -123,6 +130,7 @@ async function expireAction(action: PendingAction): Promise<boolean> {
 
 export async function queueDraftApproval(
   preview: DraftApprovalPreview,
+  options: { sendOnly?: boolean } = {},
 ): Promise<number> {
   let action = getPendingActionForDraft(preview.draftId);
 
@@ -140,13 +148,19 @@ export async function queueDraftApproval(
   }
 
   const text = previewText(preview);
+  if (options.sendOnly) {
+    sendOnlyActions.add(action.id);
+  } else {
+    sendOnlyActions.delete(action.id);
+  }
+  const markup = keyboard(action.id, sendOnlyActions.has(action.id));
   if (action.telegram_message_id) {
     try {
       await telegram.editMessageText(
         config.ownerTelegramId,
         action.telegram_message_id,
         text,
-        { reply_markup: keyboard(action.id) },
+        { reply_markup: markup },
       );
       console.log(`Approval action ${action.id}: preview updated`);
       return action.id;
@@ -156,7 +170,7 @@ export async function queueDraftApproval(
   }
 
   const message = await telegram.sendMessage(config.ownerTelegramId, text, {
-    reply_markup: keyboard(action.id),
+    reply_markup: markup,
   });
   setPendingActionTelegramMessage(action.id, message.message_id);
   console.log(`Approval action ${action.id}: preview sent`);

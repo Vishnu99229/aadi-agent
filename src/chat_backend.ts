@@ -1,7 +1,9 @@
 import { config, type LlmProvider } from "./config.js";
 import { getSetting, setSetting } from "./db.js";
+import type { EffortLevel } from "./usage.js";
 
 const TASK_SETTING = "llm_task_backends";
+const EFFORT_SETTING = "llm_task_efforts";
 const LEGACY_SETTING = "llm_backend";
 
 export type ChatBackend = LlmProvider | "haiku";
@@ -23,12 +25,23 @@ export const MODEL_TASKS: ModelTask[] = [
 export const TASK_LABELS: Record<ModelTask, string> = {
   chat: "Chat and questions",
   brief: "Morning brief and weekly review",
-  documents: "Documents (PDFs and photos)",
+  documents: "Documents (PDFs, contracts, RFPs)",
   meetings: "Meeting briefs and account status",
   drafting: "Email drafting",
 };
 
+export const TASK_BUTTON_LABELS: Record<ModelTask, string> = {
+  chat: "Chat",
+  brief: "Brief",
+  documents: "Documents",
+  meetings: "Meetings",
+  drafting: "Drafting",
+};
+
+export const EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high"];
+
 export type TaskBackendMap = Record<ModelTask, ChatBackend>;
+export type TaskEffortMap = Record<ModelTask, EffortLevel>;
 
 export function isChatBackend(value: string): value is ChatBackend {
   return value === "claude" || value === "haiku" || value === "cloud-gemma";
@@ -36,6 +49,21 @@ export function isChatBackend(value: string): value is ChatBackend {
 
 export function isModelTask(value: string): value is ModelTask {
   return (MODEL_TASKS as string[]).includes(value);
+}
+
+export function isEffortLevel(value: string): value is EffortLevel {
+  return value === "low" || value === "medium" || value === "high";
+}
+
+export function supportsEffort(backend: ChatBackend): boolean {
+  return backend === "claude" || backend === "haiku";
+}
+
+export function modelDisplayName(backend: ChatBackend): string {
+  if (backend === "haiku") {
+    return "Haiku 5.5";
+  }
+  return backend === "claude" ? "Claude Sonnet 5.5" : "Gemma 4 31B";
 }
 
 const DEFAULTS_GENERATION = "haiku-low-all";
@@ -111,10 +139,98 @@ export function getChatBackend(): ChatBackend {
 }
 
 export function chatBackendLabel(backend: ChatBackend): string {
-  if (backend === "haiku") {
-    return "Fast (Haiku 5.5)";
+  return modelDisplayName(backend);
+}
+
+function defaultEfforts(): TaskEffortMap {
+  return {
+    chat: "low",
+    brief: "low",
+    documents: "low",
+    meetings: "low",
+    drafting: "low",
+  };
+}
+
+function persistEfforts(efforts: TaskEffortMap): void {
+  setSetting(EFFORT_SETTING, JSON.stringify(efforts));
+}
+
+function loadEfforts(): TaskEffortMap {
+  const efforts = defaultEfforts();
+  const raw = getSetting(EFFORT_SETTING);
+  if (!raw) {
+    persistEfforts(efforts);
+    return efforts;
   }
-  return backend === "claude" ? "Claude (Sonnet 5.5)" : "cloud Gemma";
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    for (const task of MODEL_TASKS) {
+      const value = parsed[task];
+      if (typeof value === "string" && isEffortLevel(value)) {
+        efforts[task] = value;
+      }
+    }
+  } catch {
+    persistEfforts(efforts);
+    return efforts;
+  }
+  return efforts;
+}
+
+export function getTaskEfforts(): TaskEffortMap {
+  return loadEfforts();
+}
+
+export function getTaskEffort(task: ModelTask): EffortLevel {
+  return getTaskEfforts()[task];
+}
+
+export function setTaskEffort(task: ModelTask, effort: EffortLevel): void {
+  const efforts = getTaskEfforts();
+  efforts[task] = effort;
+  persistEfforts(efforts);
+}
+
+export function applyAllEfforts(effort: EffortLevel): void {
+  const efforts = defaultEfforts();
+  for (const task of MODEL_TASKS) {
+    efforts[task] = effort;
+  }
+  persistEfforts(efforts);
+}
+
+/** Effort to send to Anthropic for this task. Gemma has none. */
+export function apiEffortForTask(task: ModelTask): EffortLevel | undefined {
+  if (!supportsEffort(getTaskBackend(task))) {
+    return undefined;
+  }
+  return getTaskEffort(task);
+}
+
+export function formatTaskSetupLine(task: ModelTask): string {
+  const backend = getTaskBackend(task);
+  if (!supportsEffort(backend)) {
+    return `${TASK_LABELS[task]} — Gemma 4 31B (no effort setting)`;
+  }
+  return `${TASK_LABELS[task]} — ${modelDisplayName(backend)} · ${getTaskEffort(task)}`;
+}
+
+export function formatModelSetupText(options?: {
+  updatedTasks?: ModelTask[];
+  gemmaSkippedDrafting?: boolean;
+}): string {
+  const updated = new Set(options?.updatedTasks ?? []);
+  const lines = ["Model setup"];
+  for (const task of MODEL_TASKS) {
+    const suffix = updated.has(task) ? " ✅ updated" : "";
+    lines.push(`${formatTaskSetupLine(task)}${suffix}`);
+  }
+  lines.push("Background scans — Haiku 5.5 (automatic)");
+  if (options?.gemmaSkippedDrafting) {
+    lines.push("Gemma never applies to email drafting.");
+  }
+  return lines.join("\n");
 }
 
 function gemmaNeedsKey(backend: ChatBackend): string | undefined {
@@ -149,6 +265,66 @@ export function applyTaskBackend(
   return {
     switched: true,
     message: `${name}: ${chatBackendLabel(backend)}`,
+  };
+}
+
+export function applyTaskChoice(
+  task: ModelTask,
+  backend: ChatBackend,
+  effort?: EffortLevel,
+): { switched: boolean; message: string } {
+  const result = applyTaskBackend(task, backend);
+  if (!result.switched) {
+    return result;
+  }
+  if (supportsEffort(backend) && effort) {
+    setTaskEffort(task, effort);
+  }
+  return {
+    switched: true,
+    message: formatTaskSetupLine(task),
+  };
+}
+
+export function applyAllChoice(
+  backend: ChatBackend,
+  effort?: EffortLevel,
+): {
+  switched: boolean;
+  message: string;
+  updatedTasks: ModelTask[];
+  gemmaSkippedDrafting: boolean;
+} {
+  const blocked = gemmaNeedsKey(backend);
+  if (blocked) {
+    return {
+      switched: false,
+      message: blocked,
+      updatedTasks: [],
+      gemmaSkippedDrafting: false,
+    };
+  }
+  if (backend === "cloud-gemma") {
+    applyAllTasksExceptDrafting(backend);
+    return {
+      switched: true,
+      message: formatModelSetupText({
+        updatedTasks: MODEL_TASKS.filter((task) => task !== "drafting"),
+        gemmaSkippedDrafting: true,
+      }),
+      updatedTasks: MODEL_TASKS.filter((task) => task !== "drafting"),
+      gemmaSkippedDrafting: true,
+    };
+  }
+  applyAllTasks(backend);
+  if (effort) {
+    applyAllEfforts(effort);
+  }
+  return {
+    switched: true,
+    message: formatModelSetupText({ updatedTasks: [...MODEL_TASKS] }),
+    updatedTasks: [...MODEL_TASKS],
+    gemmaSkippedDrafting: false,
   };
 }
 

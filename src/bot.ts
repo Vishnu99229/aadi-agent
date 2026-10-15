@@ -3,15 +3,9 @@ import { runAgent } from "./agent.js";
 import { findAccountByName } from "./account_logic.js";
 import { decodedAccounts } from "./accounts.js";
 import {
-  applyAllTasks,
-  applyAllTasksExceptDrafting,
-  applyTaskBackend,
-  chatBackendLabel,
   getTaskBackend,
-  getTaskBackends,
-  isChatBackend,
-  TASK_LABELS,
-  type ChatBackend,
+  getTaskEffort,
+  modelDisplayName,
   type ModelTask,
 } from "./chat_backend.js";
 import {
@@ -24,9 +18,14 @@ import { clearMessages, getMeetingBrief, getSetting, setSetting } from "./db.js"
 import { formatCostReport } from "./usage.js";
 import { handler as listBills } from "./tools/list_bills.js";
 import { handler as listTasks } from "./tools/list_tasks.js";
-import { handler as listWaiting } from "./tools/list_waiting.js";
 import { handleBillCallback } from "./bills.js";
-import { runFollowupScan, sendFollowupNudgeSummary } from "./followups.js";
+import { runFollowupScan } from "./followups.js";
+import {
+  handleFollowupCallback,
+  sendActiveFollowupPanel,
+  sendWaitingOnPanel,
+} from "./followup_panel.js";
+import { handleModelCallback, sendModelPanel } from "./model_panel.js";
 import { handleDateWishCallback } from "./important_dates.js";
 import { sendWeeklyReview } from "./weekly.js";
 import { handleReminderCallback } from "./reminders.js";
@@ -144,76 +143,9 @@ function replyKeyboard(): Keyboard {
   return keyboard;
 }
 
-const TASK_BUTTON: Array<{ task: ModelTask; code: string }> = [
-  { task: "chat", code: "chat" },
-  { task: "brief", code: "brief" },
-  { task: "documents", code: "docs" },
-  { task: "meetings", code: "meet" },
-  { task: "drafting", code: "draft" },
-];
-
-const TASK_FROM_CODE: Record<string, ModelTask> = {
-  chat: "chat",
-  brief: "brief",
-  docs: "documents",
-  meet: "meetings",
-  draft: "drafting",
-};
-
-function claudeButtonLabel(selected: boolean): string {
-  return selected ? "• Claude (Sonnet)" : "Claude (Sonnet)";
-}
-
-function fastButtonLabel(selected: boolean): string {
-  return selected ? "• Fast" : "Fast";
-}
-
-function gemmaButtonLabel(task: ModelTask, selected: boolean): string {
-  if (task === "drafting") {
-    return selected ? "• Gemma (not recommended)" : "Gemma (not recommended)";
-  }
-  return selected ? "• Gemma" : "Gemma";
-}
-
-function taskModelKeyboard(): InlineKeyboard {
-  const choices = getTaskBackends();
-  const keyboard = new InlineKeyboard();
-  for (const item of TASK_BUTTON) {
-    const current = choices[item.task];
-    keyboard
-      .text(TASK_LABELS[item.task], "mt:noop")
-      .row()
-      .text(claudeButtonLabel(current === "claude"), `mt:${item.code}:c`)
-      .text(fastButtonLabel(current === "haiku"), `mt:${item.code}:h`)
-      .text(
-        gemmaButtonLabel(item.task, current === "cloud-gemma"),
-        `mt:${item.code}:g`,
-      )
-      .row();
-  }
-  keyboard.text("Background scans: Haiku 5.5 (automatic)", "mt:haiku");
-  return keyboard;
-}
-
-function modelPanelText(): string {
-  return "Fast (Haiku 5.5, low effort) is the default for every task. Claude (Sonnet 5.5) is a manual override. Current choice marked with •.";
-}
-
 function menuKeyboard(): InlineKeyboard {
-  const current = getTaskBackend("chat");
   return new InlineKeyboard()
-    .text(
-      current === "claude" ? "• Model: Claude" : "Model: Claude",
-      "menu:claude",
-    )
-    .text(
-      current === "haiku" ? "• Model: Fast" : "Model: Fast",
-      "menu:haiku",
-    )
-    .text(
-      current === "cloud-gemma" ? "• Model: Gemma" : "Model: Gemma",
-      "menu:gemma",
-    )
+    .text("Model setup", "menu:model")
     .row()
     .text("Morning brief", "menu:brief")
     .row()
@@ -230,7 +162,11 @@ function menuKeyboard(): InlineKeyboard {
 }
 
 function menuCaption(): string {
-  return `Aadi — chat uses ${chatBackendLabel(getTaskBackend("chat"))}.`;
+  const backend = getTaskBackend("chat");
+  if (backend === "cloud-gemma") {
+    return "Aadi — chat uses Gemma 4 31B (no effort setting).";
+  }
+  return `Aadi — chat uses ${modelDisplayName(backend)} · ${getTaskEffort("chat")}.`;
 }
 
 function isAccountOrMeetingQuestion(text: string): boolean {
@@ -242,47 +178,6 @@ function isAccountOrMeetingQuestion(text: string): boolean {
 
 async function sendMenu(ctx: Context): Promise<void> {
   await ctx.reply(menuCaption(), { reply_markup: menuKeyboard() });
-}
-
-function parseRequestedBackend(arg: string): ChatBackend | null {
-  const value = arg.trim().toLowerCase();
-  if (value === "gemma" || value === "cloud-gemma") {
-    return "cloud-gemma";
-  }
-  if (value === "haiku" || value === "fast" || value === "claude-haiku") {
-    return "haiku";
-  }
-  if (value === "claude" || value === "sonnet") {
-    return "claude";
-  }
-  return null;
-}
-
-function formatWaiting(raw: string): string {
-  if (raw === "No matching email follow-ups.") {
-    return raw;
-  }
-  try {
-    const rows = JSON.parse(raw) as Array<{
-      id: number;
-      recipient: string;
-      subject: string;
-      tag: string;
-      status: string;
-      days_waiting: number;
-    }>;
-    if (!Array.isArray(rows) || rows.length === 0) {
-      return "No matching email follow-ups.";
-    }
-    return rows
-      .map(
-        (row) =>
-          `#${row.id} ${row.status} (${row.tag}) ${row.recipient} — ${row.subject} — ${row.days_waiting}d`,
-      )
-      .join("\n");
-  } catch {
-    return "No matching email follow-ups.";
-  }
 }
 
 function formatBills(raw: string, heading: string): string {
@@ -310,10 +205,6 @@ function formatBills(raw: string, heading: string): string {
   } catch {
     return `${heading}\nNone`;
   }
-}
-
-async function sendWaitingList(ctx: Context): Promise<void> {
-  await sendPlainText(ctx, formatWaiting(listWaiting({})));
 }
 
 async function sendUpcomingBills(ctx: Context): Promise<void> {
@@ -369,23 +260,7 @@ bot.command("menu", async (ctx) => {
 });
 
 bot.command("model", async (ctx) => {
-  const arg = typeof ctx.match === "string" ? ctx.match.trim() : "";
-  if (!arg) {
-    await ctx.reply(modelPanelText(), { reply_markup: taskModelKeyboard() });
-    return;
-  }
-  const requested = parseRequestedBackend(arg);
-  if (!requested || !isChatBackend(requested)) {
-    await ctx.reply("Use /model, /model claude, /model fast, or /model gemma.", {
-      reply_markup: taskModelKeyboard(),
-    });
-    return;
-  }
-  const result =
-    requested === "cloud-gemma"
-      ? applyAllTasksExceptDrafting(requested)
-      : applyAllTasks(requested);
-  await ctx.reply(result.message, { reply_markup: taskModelKeyboard() });
+  await sendModelPanel(ctx);
 });
 
 bot.command("showkeyboard", async (ctx) => {
@@ -399,7 +274,7 @@ bot.command("hidekeyboard", async (ctx) => {
 bot.command("followups", async (ctx) => {
   await whileTyping(ctx, async () => {
     await runFollowupScan();
-    await sendFollowupNudgeSummary(ctx.api);
+    await sendActiveFollowupPanel(ctx.api);
   });
 });
 
@@ -539,62 +414,16 @@ bot.callbackQuery(/^meet:(wrap|remind|skip):(\d+)$/, async (ctx) => {
   await handleMeetingCallback(ctx, operation, briefId);
 });
 
-bot.callbackQuery(/^mt:(noop|haiku)$/, async (ctx) => {
-  await ctx.answerCallbackQuery(
-    ctx.match[1] === "haiku"
-      ? "Bill and follow-up classification stays on Haiku 5.5."
-      : undefined,
-  );
+bot.callbackQuery(/^md:/, async (ctx) => {
+  await handleModelCallback(ctx);
 });
 
-bot.callbackQuery(/^mt:(chat|brief|docs|meet|draft):(c|g|h)$/, async (ctx) => {
-  const task = TASK_FROM_CODE[ctx.match[1] ?? ""];
-  const requested =
-    ctx.match[2] === "g"
-      ? "cloud-gemma"
-      : ctx.match[2] === "h"
-        ? "haiku"
-        : "claude";
-  if (!task) {
-    await ctx.answerCallbackQuery();
-    return;
-  }
-  const result = applyTaskBackend(task, requested);
-  await ctx.answerCallbackQuery({ text: result.message.slice(0, 200) });
-  try {
-    await ctx.editMessageText(modelPanelText(), {
-      reply_markup: taskModelKeyboard(),
-    });
-  } catch {
-    await ctx.editMessageReplyMarkup({
-      reply_markup: taskModelKeyboard(),
-    }).catch(() => undefined);
-  }
+bot.callbackQuery(/^fu:/, async (ctx) => {
+  await handleFollowupCallback(ctx);
 });
 
-bot.callbackQuery(/^menu:(claude|gemma|haiku|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {
+bot.callbackQuery(/^menu:(model|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {
   const action = ctx.match[1];
-  if (action === "claude" || action === "gemma" || action === "haiku") {
-    const requested = parseRequestedBackend(action);
-    if (!requested) {
-      await ctx.answerCallbackQuery();
-      return;
-    }
-    const result =
-      requested === "cloud-gemma"
-        ? applyAllTasksExceptDrafting(requested)
-        : applyAllTasks(requested);
-    await ctx.answerCallbackQuery({ text: result.message.slice(0, 200) });
-    try {
-      await ctx.editMessageText(menuCaption(), { reply_markup: menuKeyboard() });
-    } catch {
-      await ctx.editMessageReplyMarkup({ reply_markup: menuKeyboard() }).catch(
-        () => undefined,
-      );
-    }
-    return;
-  }
-
   await ctx.answerCallbackQuery();
   if (action === "keyboard") {
     await setReplyKeyboard(ctx, !replyKeyboardOn());
@@ -607,11 +436,19 @@ bot.callbackQuery(/^menu:(claude|gemma|haiku|brief|waiting|bills|tasks|keyboard)
   }
 
   try {
+    if (action === "model") {
+      await sendModelPanel(ctx);
+      return;
+    }
     if (action === "brief") {
       await whileTyping(ctx, () => sendMorningBrief(ctx.api));
-    } else if (action === "waiting") {
-      await sendWaitingList(ctx);
-    } else if (action === "bills") {
+      return;
+    }
+    if (action === "waiting") {
+      await whileTyping(ctx, () => sendWaitingOnPanel(ctx.api));
+      return;
+    }
+    if (action === "bills") {
       await sendUpcomingBills(ctx);
     } else if (action === "tasks") {
       await sendOpenTasks(ctx);
@@ -843,12 +680,10 @@ bot.on("message:text", async (ctx) => {
       }
       if (text === "Brief") {
         await whileTyping(ctx, () => sendMorningBrief(ctx.api));
-        await sendMenu(ctx);
         return;
       }
       if (text === "Waiting on") {
-        await sendWaitingList(ctx);
-        await sendMenu(ctx);
+        await whileTyping(ctx, () => sendWaitingOnPanel(ctx.api));
         return;
       }
       await sendOpenTasks(ctx);

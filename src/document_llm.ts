@@ -4,7 +4,7 @@ import type {
   ImageBlockParam,
   TextBlockParam,
 } from "@anthropic-ai/sdk/resources/messages/messages";
-import { getTaskBackend } from "./chat_backend.js";
+import { getTaskBackend, getTaskEffort } from "./chat_backend.js";
 import { config } from "./config.js";
 import type { DocumentActionItem, ItemTag } from "./db.js";
 import { estimateLlmCostUsd, isHaiku55Model, logAnthropicUsage } from "./usage.js";
@@ -86,6 +86,20 @@ function documentsModel(): string {
   return getTaskBackend("documents") === "claude"
     ? config.claudeModel
     : config.backgroundModel;
+}
+
+function documentsEffortFields(model: string): {
+  thinking?: { type: "disabled" } | { type: "adaptive" };
+  effort: "low" | "medium" | "high";
+} {
+  const effort = getTaskEffort("documents");
+  if (!isHaiku55Model(model)) {
+    return { effort };
+  }
+  if (effort === "low") {
+    return { thinking: { type: "disabled" }, effort };
+  }
+  return { thinking: { type: "adaptive" }, effort };
 }
 
 function estimateCostUsd(
@@ -171,15 +185,14 @@ async function requestStructuredAnalysis(
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       const model = documentsModel();
+      const effortFields = documentsEffortFields(model);
       const response = await anthropic.messages.create({
         model,
         max_tokens: SUMMARY_MAX_TOKENS,
-        ...(isHaiku55Model(model)
-          ? { thinking: { type: "disabled" as const } }
-          : {}),
+        ...(effortFields.thinking ? { thinking: effortFields.thinking } : {}),
         output_config: {
           format: { type: "json_schema", schema: analysisSchema },
-          ...(isHaiku55Model(model) ? { effort: "low" as const } : {}),
+          effort: effortFields.effort,
         },
         messages: [
           {
@@ -230,15 +243,12 @@ async function requestFallbackSummary(
   usage: DocumentAnalysisUsage,
 ): Promise<{ analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">; usage: DocumentAnalysisUsage }> {
   const model = documentsModel();
+  const effortFields = documentsEffortFields(model);
   const response = await anthropic.messages.create({
     model,
     max_tokens: SUMMARY_MAX_TOKENS,
-    ...(isHaiku55Model(model)
-      ? {
-          thinking: { type: "disabled" as const },
-          output_config: { effort: "low" as const },
-        }
-      : {}),
+    ...(effortFields.thinking ? { thinking: effortFields.thinking } : {}),
+    output_config: { effort: effortFields.effort },
     messages: [
       {
         role: "user",
@@ -336,15 +346,12 @@ async function transcribePdfChunk(
   pagesProcessed: number,
   model: string,
 ): Promise<{ text: string; usage: DocumentAnalysisUsage }> {
+  const effortFields = documentsEffortFields(model);
   const response = await anthropic.messages.create({
     model,
     max_tokens: SUMMARY_MAX_TOKENS,
-    ...(isHaiku55Model(model)
-      ? {
-          thinking: { type: "disabled" as const },
-          output_config: { effort: "low" as const },
-        }
-      : {}),
+    ...(effortFields.thinking ? { thinking: effortFields.thinking } : {}),
+    output_config: { effort: effortFields.effort },
     messages: [
       {
         role: "user",
