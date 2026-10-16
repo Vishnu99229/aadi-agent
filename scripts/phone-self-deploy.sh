@@ -20,6 +20,8 @@ CHAT_ID="$(strip_value "$(dotenv_value OWNER_TELEGRAM_ID)")"
 OWNER="Vishnu99229"
 REPO="aadi-agent"
 LIVE="$ROOT"
+MERGE_JSON="$ROOT/.aadi-merge.json"
+PR_JSON="$ROOT/.aadi-pr.json"
 ROLLBACK="$HOME/aadi-agent.rollback"
 STAGING="$HOME/aadi-agent.staging"
 UNPACK="$HOME/aadi-agent.unpack"
@@ -152,6 +154,8 @@ dist
 .git
 .aadi-heartbeat
 .aadi-deploy-result.json
+.aadi-merge.json
+.aadi-pr.json
 test-fixtures
 whatsapp*
 *session*
@@ -160,7 +164,7 @@ whatsapp*
 EOF
 
 if [ "$PR_NUMBER" != "0" ]; then
-  MERGE_CODE="$(curl -sS -o /tmp/aadi-merge.json -w "%{http_code}" -X PUT \
+  MERGE_CODE="$(curl -sS -o "$MERGE_JSON" -w "%{http_code}" -X PUT \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -168,18 +172,18 @@ if [ "$PR_NUMBER" != "0" ]; then
     "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/merge" \
     -d '{"merge_method":"squash"}')"
   if [ "$MERGE_CODE" != "200" ]; then
-    PR_CODE="$(curl -sS -o /tmp/aadi-pr.json -w "%{http_code}" \
+    PR_CODE="$(curl -sS -o "$PR_JSON" -w "%{http_code}" \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
       "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}")"
-    merged="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync("/tmp/aadi-pr.json","utf8"));process.stdout.write(j.merged===true?"yes":"no")}catch{process.stdout.write("no")}')"
+    merged="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(j.merged===true?"yes":"no")}catch{process.stdout.write("no")}' "$PR_JSON")"
     if [ "$merged" != "yes" ]; then
       fail "Could not squash-merge PR #${PR_NUMBER}."
     fi
   fi
   MERGED=1
-  rm -f /tmp/aadi-merge.json /tmp/aadi-pr.json
+  rm -f "$MERGE_JSON" "$PR_JSON"
 fi
 
 mkdir -p "$BACKUP_DIR"
