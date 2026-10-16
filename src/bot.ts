@@ -47,6 +47,7 @@ import {
   processIncomingPhoto,
 } from "./documents.js";
 import { deliverWrapUp, handleNoteCallback } from "./notes.js";
+import { START_GREETING } from "./start_greeting.js";
 import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
 import { transcribeTelegramVoice } from "./voice.js";
 import {
@@ -234,7 +235,7 @@ async function setReplyKeyboard(ctx: Context, on: boolean): Promise<void> {
 }
 
 bot.command("start", async (ctx) => {
-  await ctx.reply("Hi Vishnu — I'm Aadi. How can I help?");
+  await ctx.reply(START_GREETING);
 });
 
 bot.command("reset", async (ctx) => {
