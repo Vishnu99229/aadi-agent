@@ -11,6 +11,7 @@ import {
   type PendingAction,
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
+import { allowSendDraft } from "./security/send_approval.js";
 
 const PREVIEW_LIMIT = 3800;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
@@ -214,6 +215,11 @@ async function currentPendingAction(
 }
 
 async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
+  allowSendDraft({
+    callbackData: ctx.callbackQuery?.data,
+    actionId: action.id,
+    actionStatus: action.status,
+  });
   try {
     const auth = await getGoogleClientFor(action.google_account);
     const gmail = google.gmail({ version: "v1", auth });

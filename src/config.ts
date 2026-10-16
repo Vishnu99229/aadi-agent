@@ -1,4 +1,9 @@
 import "dotenv/config";
+import {
+  REQUIRED_ENV_VARS,
+  failIfMissingEnv,
+  requireOwnerTelegramId,
+} from "./security/env_guard.js";
 
 export type LlmProvider = "claude" | "cloud-gemma";
 
@@ -13,34 +18,12 @@ function readProvider(): LlmProvider {
 
 const provider = readProvider();
 
-const requiredEnvVars = [
-  "TELEGRAM_BOT_TOKEN",
-  "OWNER_TELEGRAM_ID",
-  "BRIEF_TIME",
-  "ANTHROPIC_API_KEY",
-  "CLAUDE_MODEL",
+failIfMissingEnv([
+  ...REQUIRED_ENV_VARS,
   ...(provider === "cloud-gemma" ? (["OPENROUTER_API_KEY"] as const) : []),
-] as const;
+]);
 
-const missingEnvVars = requiredEnvVars.filter(
-  (name) => !process.env[name]?.trim(),
-);
-
-if (missingEnvVars.length > 0) {
-  console.error(
-    `Missing required environment variables: ${missingEnvVars.join(", ")}. Copy .env.example to .env and fill in each value.`,
-  );
-  process.exit(1);
-}
-
-const ownerTelegramId = Number(process.env.OWNER_TELEGRAM_ID);
-
-if (!Number.isSafeInteger(ownerTelegramId) || ownerTelegramId <= 0) {
-  console.error(
-    "OWNER_TELEGRAM_ID must be a positive integer. Update it in your .env file.",
-  );
-  process.exit(1);
-}
+const ownerTelegramId = requireOwnerTelegramId();
 
 const briefTime = process.env.BRIEF_TIME!;
 const briefTimeMatch = /^(\d{2}):(\d{2})$/.exec(briefTime);

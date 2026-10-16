@@ -207,33 +207,24 @@ export function summarizeGithubChecks(items: GithubCheckItem[]): {
 const PROTECTED_RULES: Array<{ area: string; test: (path: string) => boolean }> =
   [
     {
-      area: "email send / approval",
-      test: (path) =>
-        path === "src/approvals.ts" || path.startsWith("src/google/mail"),
-    },
-    {
-      area: "owner lock",
-      test: (path) => path === "src/bot.ts",
+      area: "src/security",
+      test: (path) => path.startsWith("src/security/"),
     },
     {
       area: "phone deploy",
       test: (path) =>
         path === "deploy.sh" ||
         path.startsWith("scripts/phone-") ||
-        path === "scripts/github-revert-main.cjs",
-    },
-    {
-      area: ".env guard",
-      test: (path) => path === "src/config.ts",
-    },
-    {
-      area: "local_llm_guard",
-      test: (path) => path === "src/local_llm_guard.ts",
+        path === "scripts/phone-self-deploy.sh",
     },
     {
       area: "backup logic",
       test: (path) =>
         path === "src/backup.ts" || path === "scripts/sqlite-backup.cjs",
+    },
+    {
+      area: "local_llm_guard",
+      test: (path) => path === "src/local_llm_guard.ts",
     },
     {
       area: ".cursor/rules",

@@ -14,6 +14,7 @@ import {
 } from "./approvals.js";
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
+import { ownerOnly } from "./security/owner_lock.js";
 import { clearMessages, getMeetingBrief, getSetting, setSetting } from "./db.js";
 import { formatCostReport } from "./usage.js";
 import { handler as listBills } from "./tools/list_bills.js";
@@ -84,13 +85,7 @@ const TYPING_REFRESH_MS = 4_000;
 
 export const bot = new Bot(config.telegramBotToken);
 
-bot.use(async (ctx, next) => {
-  if (ctx.from?.id !== config.ownerTelegramId) {
-    return;
-  }
-
-  await next();
-});
+bot.use(ownerOnly(config.ownerTelegramId));
 
 async function sendPlainText(ctx: Context, text: string): Promise<void> {
   const characters = Array.from(text);

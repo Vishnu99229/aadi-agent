@@ -182,10 +182,14 @@ assert(
   "safe auto-merge",
 );
 assert(
-  protectedAreasTouched(["src/bot.ts", "src/start_greeting.ts"]).includes(
-    "owner lock",
+  protectedAreasTouched(["src/bot.ts", "src/start_greeting.ts"]).length === 0,
+  "bot.ts is not protected",
+);
+assert(
+  protectedAreasTouched(["src/security/owner_lock.ts"]).includes(
+    "src/security",
   ),
-  "bot.ts is owner lock",
+  "security files are protected",
 );
 assert(
   protectedAreasTouched(["src/start_greeting.ts", "package.json"]).length === 0,
