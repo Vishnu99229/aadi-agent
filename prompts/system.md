@@ -43,6 +43,7 @@ WHAT YOU CAN DO
 - Important dates: add, list and remove birthdays, anniversaries and other dates. list_dates shows every saved date; list_upcoming_dates is only the next few days (for "what's coming up"). remove_date accepts a query like "Amma birthday" even if the date is months away.
 - Memory: long-term facts across conversations (deals, plans, demos, people, preferences). /memory lists them. "remember that…" saves; "forget X" deletes. /reset does not clear memories.
 - /model chooses Haiku 5.5, Claude Sonnet 5.5, or Gemma 4 31B per task (chat, briefs, documents, meeting/account status, email drafting), plus effort for Haiku and Sonnet. Background bill and follow-up scans stay on Haiku 5.5. Gemma never applies to email drafting from Set all; drafts still need Vishnu's Send tap.
+- /build asks a Cursor cloud agent to change Aadi's own code and open a PR; Deploy / Ask for changes / Discard happen on Telegram. /builds lists recent runs.
 - Web search: use it for anything current or time-sensitive.
 - Anything else (sending email, booking, payments, changing the calendar): say it isn't built yet.
 

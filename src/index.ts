@@ -12,6 +12,11 @@ import { logGoogleAccounts } from "./google/auth.js";
 import { registerMeetingScan } from "./meetings.js";
 import { registerWeeklyBackup } from "./backup.js";
 import { registerAttachmentAlertScan } from "./attachment_alerts.js";
+import {
+  applyPendingDeployResult,
+  registerBuildPoll,
+} from "./builds.js";
+import { writeHeartbeat } from "./heartbeat.js";
 
 const morningBriefTask = registerMorningBrief(bot.api);
 const billScanTask = registerBillScan(bot.api);
@@ -27,9 +32,13 @@ const documentExpirySweep = startDocumentExpirySweep();
 const meetingScanTask = registerMeetingScan(bot.api);
 const weeklyBackupTask = registerWeeklyBackup(bot.api);
 const attachmentAlertTask = registerAttachmentAlertScan(bot.api);
+const buildPollTask = registerBuildPoll();
+await applyPendingDeployResult();
 const MENU_COMMANDS = [
   { command: "followups", description: "Scan and list emails waiting on a reply" },
   { command: "model", description: "Choose which model handles each task" },
+  { command: "build", description: "Ask a Cursor agent to change Aadi's code" },
+  { command: "builds", description: "List recent code builds" },
   { command: "reset", description: "Clear conversation history" },
 ] as const;
 
@@ -55,6 +64,7 @@ bot.start({
       `Telegram / menu: ${MENU_COMMANDS.map((item) => `/${item.command}`).join(", ")}`,
     );
     console.log("Aadi is running with Telegram long polling.");
+    writeHeartbeat();
   },
 });
 
@@ -67,6 +77,7 @@ process.once("SIGINT", () => {
   meetingScanTask.stop();
   weeklyBackupTask.stop();
   attachmentAlertTask.stop();
+  buildPollTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
@@ -81,6 +92,7 @@ process.once("SIGTERM", () => {
   meetingScanTask.stop();
   weeklyBackupTask.stop();
   attachmentAlertTask.stop();
+  buildPollTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);

@@ -259,4 +259,9 @@ export const config = {
   gemmaCloudCostRates: readCostRates("GEMMA_CLOUD", GEMMA_CLOUD_COST_DEFAULTS),
   localCostRates: ZERO_COST_RATES,
   backupPassword: process.env.BACKUP_PASSWORD?.trim() ?? "",
+  cursorApiKey: process.env.CURSOR_API_KEY?.trim() ?? "",
+  githubToken: process.env.GITHUB_TOKEN?.trim() ?? "",
+  githubOwner: "Vishnu99229",
+  githubRepo: "aadi-agent",
+  cursorApiBase: "https://api.cursor.com",
 } as const;

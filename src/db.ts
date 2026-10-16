@@ -297,6 +297,29 @@ db.exec(`
     value TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS builds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending_confirm'
+      CHECK (status IN (
+        'pending_confirm', 'running', 'review', 'awaiting_followup',
+        'deploying', 'deployed', 'discarded', 'failed', 'rolled_back'
+      )),
+    cursor_agent_id TEXT,
+    cursor_run_id TEXT,
+    cursor_url TEXT,
+    pr_url TEXT,
+    pr_number INTEGER,
+    summary TEXT,
+    files_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_builds_status_updated
+    ON builds (status, updated_at);
+
   CREATE TABLE IF NOT EXISTS meeting_briefs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL,
@@ -1783,4 +1806,96 @@ export function getPendingMemoryConfirm(
 
 export function deletePendingMemoryConfirm(id: number): void {
   db.prepare(`DELETE FROM pending_memory_confirms WHERE id = ?`).run(id);
+}
+
+export type BuildStatus =
+  | "pending_confirm"
+  | "running"
+  | "review"
+  | "awaiting_followup"
+  | "deploying"
+  | "deployed"
+  | "discarded"
+  | "failed"
+  | "rolled_back";
+
+export interface BuildRecord {
+  id: number;
+  task: string;
+  status: BuildStatus;
+  cursor_agent_id: string | null;
+  cursor_run_id: string | null;
+  cursor_url: string | null;
+  pr_url: string | null;
+  pr_number: number | null;
+  summary: string | null;
+  files_json: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+const BUILD_COLUMNS = `id, task, status, cursor_agent_id, cursor_run_id, cursor_url,
+              pr_url, pr_number, summary, files_json, error, created_at, updated_at`;
+
+export function createBuild(task: string): BuildRecord {
+  const result = db
+    .prepare(`INSERT INTO builds (task) VALUES (?)`)
+    .run(task);
+  return getBuild(Number(result.lastInsertRowid))!;
+}
+
+export function getBuild(id: number): BuildRecord | undefined {
+  return db
+    .prepare(`SELECT ${BUILD_COLUMNS} FROM builds WHERE id = ?`)
+    .get(id) as BuildRecord | undefined;
+}
+
+export function listBuilds(limit = 10): BuildRecord[] {
+  return db
+    .prepare(
+      `SELECT ${BUILD_COLUMNS} FROM builds ORDER BY id DESC LIMIT ?`,
+    )
+    .all(limit) as BuildRecord[];
+}
+
+export function listBuildsByStatus(status: BuildStatus): BuildRecord[] {
+  return db
+    .prepare(
+      `SELECT ${BUILD_COLUMNS} FROM builds WHERE status = ? ORDER BY id ASC`,
+    )
+    .all(status) as BuildRecord[];
+}
+
+export function updateBuild(
+  id: number,
+  fields: Partial<
+    Pick<
+      BuildRecord,
+      | "status"
+      | "cursor_agent_id"
+      | "cursor_run_id"
+      | "cursor_url"
+      | "pr_url"
+      | "pr_number"
+      | "summary"
+      | "files_json"
+      | "error"
+    >
+  >,
+): BuildRecord | undefined {
+  const assignments: string[] = ["updated_at = CURRENT_TIMESTAMP"];
+  const values: unknown[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    assignments.push(`${key} = ?`);
+    values.push(value);
+  }
+  if (values.length === 0) {
+    return getBuild(id);
+  }
+  db.prepare(`UPDATE builds SET ${assignments.join(", ")} WHERE id = ?`).run(
+    ...values,
+    id,
+  );
+  return getBuild(id);
 }

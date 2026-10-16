@@ -21,6 +21,7 @@
     "prefix-size": "tsx --env-file=.env scripts/prefix-size.ts",
     "test:haiku-live": "tsx --env-file=.env scripts/test-haiku-background-live.ts",
     "test:documents": "tsx --env-file=.env scripts/test-document-analysis.ts",
+    "test:stage11": "tsx --env-file=.env scripts/test-stage11.ts",
     "bench:models": "tsx --env-file=.env scripts/bench-models.ts"
   },
   "keywords": [],

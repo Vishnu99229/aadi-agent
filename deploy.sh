@@ -67,8 +67,19 @@ snapshot_phone_db() {
   done
 }
 
+cd "$ROOT"
+if ! git fetch origin; then
+  echo "Could not git fetch origin. Nothing was copied."
+  exit 1
+fi
+behind="$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+if [ "$behind" -gt 0 ]; then
+  echo "Mac is behind origin/main — run git pull first"
+  exit 1
+fi
+
 snapshot_phone_db
 
-rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude backups --exclude google-token.json --exclude google-token-work.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
+rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude backups --exclude google-token.json --exclude google-token-work.json --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone --exclude .aadi-heartbeat --exclude .aadi-deploy-result.json -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
 ssh -p "$PHONE_PORT" "$PHONE" 'cd ~/aadi-agent && npm install --no-audit --no-fund && pkill -f "[t]sx src/index.ts" || true'
 echo "Deployed. Aadi restarts on the phone in about 5 seconds."

@@ -9,3 +9,5 @@ google-token-work.json
 test-fixtures/
 .env.bak
 .env.phone
+.aadi-heartbeat
+.aadi-deploy-result.json

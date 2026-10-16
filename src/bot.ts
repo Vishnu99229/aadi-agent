@@ -26,6 +26,16 @@ import {
   sendWaitingOnPanel,
 } from "./followup_panel.js";
 import { handleModelCallback, sendModelPanel } from "./model_panel.js";
+import {
+  consumeBuildFollowup,
+  formatRecentBuilds,
+  handleBuildCallback,
+  handleBuildVoice,
+  notSetupMessage,
+  promptBuild,
+  submitBuildFollowup,
+} from "./builds.js";
+import { isBuildConfigured } from "./build_logic.js";
 import { handleDateWishCallback } from "./important_dates.js";
 import { sendWeeklyReview } from "./weekly.js";
 import { handleReminderCallback } from "./reminders.js";
@@ -263,6 +273,25 @@ bot.command("model", async (ctx) => {
   await sendModelPanel(ctx);
 });
 
+bot.command("build", async (ctx) => {
+  const task = typeof ctx.match === "string" ? ctx.match.trim() : "";
+  try {
+    await promptBuild(ctx, task);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Build command failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
+});
+
+bot.command("builds", async (ctx) => {
+  if (!isBuildConfigured(config.cursorApiKey, config.githubToken)) {
+    await ctx.reply(notSetupMessage());
+    return;
+  }
+  await sendPlainText(ctx, formatRecentBuilds());
+});
+
 bot.command("showkeyboard", async (ctx) => {
   await setReplyKeyboard(ctx, true);
 });
@@ -422,6 +451,10 @@ bot.callbackQuery(/^fu:/, async (ctx) => {
   await handleFollowupCallback(ctx);
 });
 
+bot.callbackQuery(/^build:/, async (ctx) => {
+  await handleBuildCallback(ctx);
+});
+
 bot.callbackQuery(/^menu:(model|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCallbackQuery();
@@ -486,6 +519,12 @@ async function handleUserText(
   userId: number,
   userText: string,
 ): Promise<void> {
+  const buildFollowupId = consumeBuildFollowup(userId);
+  if (buildFollowupId !== undefined) {
+    await submitBuildFollowup(ctx, buildFollowupId, userText);
+    return;
+  }
+
   const edit = await consumeDraftEdit(userId);
   if (edit) {
     const editInstruction = `Revise the existing Gmail draft with ID ${edit.draftId}.
@@ -574,6 +613,14 @@ bot.on("message:voice", async (ctx) => {
 
   try {
     await sendPlainText(ctx, `Heard: ${transcript}`);
+    const buildFollowupId = consumeBuildFollowup(ctx.from.id);
+    if (buildFollowupId !== undefined) {
+      await submitBuildFollowup(ctx, buildFollowupId, transcript);
+      return;
+    }
+    if (await handleBuildVoice(ctx, transcript)) {
+      return;
+    }
     if (await deliverPendingMeetingWrapUp(ctx, transcript)) {
       return;
     }
