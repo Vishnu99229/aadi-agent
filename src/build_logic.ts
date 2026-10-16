@@ -36,12 +36,16 @@ export function formatBuildStatus(status: BuildStatus): string {
       return "waiting to start";
     case "running":
       return "running";
+    case "waiting_checks":
+      return "checks";
+    case "waiting_approval":
     case "review":
-      return "ready to review";
+      return "waiting for approval";
     case "awaiting_followup":
       return "waiting for changes";
+    case "merged":
     case "deploying":
-      return "deploying";
+      return "merged";
     case "deployed":
       return "deployed";
     case "discarded":
@@ -157,6 +161,141 @@ export function shortSummary(text: string | undefined): string {
     return "The agent finished.";
   }
   return cleaned.length > 500 ? `${cleaned.slice(0, 497)}...` : cleaned;
+}
+
+export interface GithubCheckItem {
+  name: string;
+  status: string;
+  conclusion: string | null;
+}
+
+export function summarizeGithubChecks(items: GithubCheckItem[]): {
+  state: "pending" | "passed" | "failed";
+  reason?: string;
+} {
+  if (items.length === 0) {
+    return { state: "passed" };
+  }
+  const failed: string[] = [];
+  let pending = false;
+  for (const item of items) {
+    const status = item.status.trim().toLowerCase();
+    const conclusion = (item.conclusion ?? "").trim().toLowerCase();
+    if (status && status !== "completed") {
+      pending = true;
+      continue;
+    }
+    if (
+      conclusion === "failure" ||
+      conclusion === "cancelled" ||
+      conclusion === "timed_out" ||
+      conclusion === "action_required" ||
+      conclusion === "startup_failure"
+    ) {
+      failed.push(item.name.trim() || "check");
+    }
+  }
+  if (failed.length > 0) {
+    return { state: "failed", reason: failed.slice(0, 4).join(", ") };
+  }
+  if (pending) {
+    return { state: "pending" };
+  }
+  return { state: "passed" };
+}
+
+const PROTECTED_RULES: Array<{ area: string; test: (path: string) => boolean }> =
+  [
+    {
+      area: "email send / approval",
+      test: (path) =>
+        path === "src/approvals.ts" || path.startsWith("src/google/mail"),
+    },
+    {
+      area: "owner lock",
+      test: (path) => path === "src/bot.ts",
+    },
+    {
+      area: "phone deploy",
+      test: (path) =>
+        path === "deploy.sh" ||
+        path.startsWith("scripts/phone-") ||
+        path === "scripts/github-revert-main.cjs",
+    },
+    {
+      area: ".env guard",
+      test: (path) => path === "src/config.ts",
+    },
+    {
+      area: "local_llm_guard",
+      test: (path) => path === "src/local_llm_guard.ts",
+    },
+    {
+      area: "backup logic",
+      test: (path) =>
+        path === "src/backup.ts" || path === "scripts/sqlite-backup.cjs",
+    },
+    {
+      area: ".cursor/rules",
+      test: (path) => path.startsWith(".cursor/rules/"),
+    },
+    {
+      area: ".github/workflows",
+      test: (path) => path.startsWith(".github/workflows/"),
+    },
+  ];
+
+export function protectedAreasTouched(files: string[]): string[] {
+  const areas: string[] = [];
+  for (const rule of PROTECTED_RULES) {
+    if (files.some((file) => rule.test(file.replace(/\\/g, "/")))) {
+      areas.push(rule.area);
+    }
+  }
+  return areas;
+}
+
+export function compactFileList(files: string[]): string {
+  if (files.length === 0) {
+    return "none listed";
+  }
+  const shown = files.slice(0, 12);
+  const extra = files.length > 12 ? `, +${files.length - 12} more` : "";
+  return `${shown.join(", ")}${extra}`;
+}
+
+export function formatDeployedText(params: {
+  summary: string;
+  files: string[];
+  prUrl: string;
+}): string {
+  const summary =
+    params.summary.replace(/\s+/g, " ").trim().slice(0, 140) ||
+    "The agent finished.";
+  const pr = params.prUrl.trim() || "none";
+  return `Deployed: ${summary} Files: ${compactFileList(params.files)}. PR: ${pr}`;
+}
+
+export function failedChecksText(reason: string): string {
+  const short = reason.replace(/\s+/g, " ").trim().slice(0, 140) || "CI failed";
+  return `Build failed checks: ${short}`;
+}
+
+export function shouldAutoMerge(params: {
+  autoDeploy: boolean;
+  protectedAreas: string[];
+  filesVerified: boolean;
+}): boolean {
+  return (
+    params.autoDeploy &&
+    params.filesVerified &&
+    params.protectedAreas.length === 0
+  );
+}
+
+export function needsApprovalText(areas: string[]): string {
+  const labels = areas.length > 0 ? areas.join(", ") : "a protected area";
+  return `Needs your approval: touches ${labels}`;
 }
 
 export function confirmBuildText(task: string): string {

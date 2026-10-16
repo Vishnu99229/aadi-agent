@@ -124,11 +124,22 @@ async function cursorFetch<T>(
   return (await response.json()) as T;
 }
 
+function unwrapRun(data: CursorRun | { run?: CursorRun }): CursorRun {
+  if (data && typeof data === "object" && "run" in data && data.run) {
+    return data.run;
+  }
+  return data as CursorRun;
+}
+
+export function normalizeRunStatus(status: string | undefined): string {
+  return (status ?? "").trim().toUpperCase();
+}
+
 export async function createCloudAgent(prompt: string): Promise<{
   agent: CursorAgent;
   run: CursorRun;
 }> {
-  return cursorFetch<{ agent: CursorAgent; run: CursorRun }>(
+  const created = await cursorFetch<{ agent: CursorAgent; run?: CursorRun }>(
     "POST",
     "/v1/agents",
     {
@@ -143,28 +154,60 @@ export async function createCloudAgent(prompt: string): Promise<{
       skipReviewerRequest: true,
     },
   );
+  const run =
+    created.run ??
+    ({
+      id: created.agent.latestRunId ?? "",
+      agentId: created.agent.id,
+      status: "CREATING",
+    } satisfies CursorRun);
+  return { agent: created.agent, run };
 }
 
 export async function createCloudRun(
   agentId: string,
   prompt: string,
 ): Promise<CursorRun> {
-  const data = await cursorFetch<{ run: CursorRun }>(
+  const data = await cursorFetch<CursorRun | { run: CursorRun }>(
     "POST",
     `/v1/agents/${encodeURIComponent(agentId)}/runs`,
     { prompt: { text: prompt } },
   );
-  return data.run;
+  return unwrapRun(data);
+}
+
+export async function getCloudAgent(agentId: string): Promise<CursorAgent> {
+  return cursorFetch<CursorAgent>(
+    "GET",
+    `/v1/agents/${encodeURIComponent(agentId)}`,
+  );
 }
 
 export async function getCloudRun(
   agentId: string,
   runId: string,
 ): Promise<CursorRun> {
-  return cursorFetch<CursorRun>(
+  const data = await cursorFetch<CursorRun | { run: CursorRun }>(
     "GET",
     `/v1/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}`,
   );
+  return unwrapRun(data);
+}
+
+export async function getLatestCloudRun(agentId: string): Promise<CursorRun> {
+  const agent = await getCloudAgent(agentId);
+  let runId = agent.latestRunId?.trim() ?? "";
+  if (!runId) {
+    const listed = await cursorFetch<{ items?: CursorRun[] }>(
+      "GET",
+      `/v1/agents/${encodeURIComponent(agentId)}/runs?limit=1`,
+    );
+    runId = listed.items?.[0]?.id?.trim() ?? "";
+  }
+  if (!runId) {
+    throw new Error("Cursor agent has no run id.");
+  }
+  return getCloudRun(agentId, runId);
 }
 
 export async function archiveCloudAgent(agentId: string): Promise<void> {
@@ -174,11 +217,12 @@ export async function archiveCloudAgent(agentId: string): Promise<void> {
   );
 }
 
-export function isTerminalRunStatus(status: string): boolean {
+export function isTerminalRunStatus(status: string | undefined): boolean {
+  const normalized = normalizeRunStatus(status);
   return (
-    status === "FINISHED" ||
-    status === "ERROR" ||
-    status === "CANCELLED" ||
-    status === "EXPIRED"
+    normalized === "FINISHED" ||
+    normalized === "ERROR" ||
+    normalized === "CANCELLED" ||
+    normalized === "EXPIRED"
   );
 }

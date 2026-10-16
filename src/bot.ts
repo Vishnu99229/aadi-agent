@@ -28,11 +28,11 @@ import {
 import { handleModelCallback, sendModelPanel } from "./model_panel.js";
 import {
   consumeBuildFollowup,
-  formatRecentBuilds,
   handleBuildCallback,
   handleBuildVoice,
   notSetupMessage,
   promptBuild,
+  sendBuildsPanel,
   submitBuildFollowup,
 } from "./builds.js";
 import { isBuildConfigured } from "./build_logic.js";
@@ -289,7 +289,7 @@ bot.command("builds", async (ctx) => {
     await ctx.reply(notSetupMessage());
     return;
   }
-  await sendPlainText(ctx, formatRecentBuilds());
+  await sendBuildsPanel(ctx);
 });
 
 bot.command("showkeyboard", async (ctx) => {

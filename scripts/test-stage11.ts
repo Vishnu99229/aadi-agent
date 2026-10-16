@@ -20,14 +20,20 @@ const execFileAsync = promisify(execFile);
 
 const {
   confirmBuildText,
+  failedChecksText,
   failedStartText,
   formatBuildsList,
   formatChangedFiles,
   formatCouldNotStart,
+  formatDeployedText,
   isBuildConfigured,
+  needsApprovalText,
   oneLineError,
   parseBuildVoice,
   parsePullNumber,
+  protectedAreasTouched,
+  shouldAutoMerge,
+  summarizeGithubChecks,
   revertCommitMessage,
   rollbackTelegram,
   macFixMainCommand,
@@ -76,7 +82,9 @@ assert(
 assert(parsePullNumber("https://example.com") === undefined, "not a pr");
 
 assert(isTerminalRunStatus("FINISHED") && isTerminalRunStatus("ERROR"), "terminal");
+assert(isTerminalRunStatus("finished") && isTerminalRunStatus("expired"), "terminal case");
 assert(!isTerminalRunStatus("RUNNING") && !isTerminalRunStatus("CREATING"), "active");
+assert(!isTerminalRunStatus("IDLE") && !isTerminalRunStatus("ACTIVE"), "agent status is not a run");
 
 assert(
   confirmBuildText("fix greeting").includes("Build this?"),
@@ -143,11 +151,85 @@ const list = formatBuildsList([
     summary: null,
     files_json: null,
     error: null,
+    merge_sha: null,
     created_at: "",
     updated_at: "",
   },
 ]);
-assert(list.includes("#3 ready to review"), "builds list");
+assert(list.includes("#3 waiting for approval"), "builds list");
+assert(
+  !shouldAutoMerge({
+    autoDeploy: true,
+    protectedAreas: ["owner lock"],
+    filesVerified: true,
+  }),
+  "protected blocks auto-merge",
+);
+assert(
+  !shouldAutoMerge({
+    autoDeploy: true,
+    protectedAreas: [],
+    filesVerified: false,
+  }),
+  "unverified files block auto-merge",
+);
+assert(
+  shouldAutoMerge({
+    autoDeploy: true,
+    protectedAreas: [],
+    filesVerified: true,
+  }),
+  "safe auto-merge",
+);
+assert(
+  protectedAreasTouched(["src/bot.ts", "src/start_greeting.ts"]).includes(
+    "owner lock",
+  ),
+  "bot.ts is owner lock",
+);
+assert(
+  protectedAreasTouched(["src/start_greeting.ts", "package.json"]).length === 0,
+  "greeting helper is not protected",
+);
+assert(
+  protectedAreasTouched([".github/workflows/ci.yml"]).includes(
+    ".github/workflows",
+  ),
+  "workflow files are protected",
+);
+assert(
+  summarizeGithubChecks([]).state === "passed",
+  "no checks means passed",
+);
+assert(
+  summarizeGithubChecks([
+    { name: "CI", status: "in_progress", conclusion: null },
+  ]).state === "pending",
+  "in-progress checks",
+);
+assert(
+  summarizeGithubChecks([
+    { name: "CI", status: "completed", conclusion: "failure" },
+  ]).reason === "CI",
+  "failed check name",
+);
+assert(
+  failedChecksText("CI").startsWith("Build failed checks:"),
+  "failed checks copy",
+);
+assert(
+  needsApprovalText(["owner lock"]) ===
+    "Needs your approval: touches owner lock",
+  "approval copy",
+);
+assert(
+  formatDeployedText({
+    summary: "Changed the greeting.",
+    files: ["src/bot.ts"],
+    prUrl: "https://github.com/Vishnu99229/aadi-agent/pull/1",
+  }).includes("Deployed:"),
+  "deployed copy",
+);
 assert(
   formatChangedFiles(["src/bot.ts", "prompts/system.md"]).includes("src/bot.ts"),
   "file names only",

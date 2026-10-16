@@ -86,7 +86,7 @@ rollback_telegram() {
 
 fail() {
   reason="$1"
-  if [ "$MERGED" = 1 ]; then
+  if [ "$MERGED" = 1 ] && [ "$SKIP_GITHUB_REVERT" != "1" ]; then
     revert_github
     write_result failed "$reason"
     send_tg "$(rollback_telegram "$reason" "Phone was not switched.")"
@@ -100,7 +100,11 @@ fail() {
 rollback_and_exit() {
   reason="$1"
   echo "Rolling back: $reason" >&2
-  revert_github
+  if [ "$SKIP_GITHUB_REVERT" != "1" ]; then
+    revert_github
+  else
+    REVERT_JSON='{"ok":true,"message":"main already reverted"}'
+  fi
   if [ -d "$ROLLBACK" ]; then
     rsync -a --delete --exclude-from="$EXCLUDE_FILE" "$ROLLBACK/" "$LIVE/" || true
     (cd "$LIVE" && node scripts/ensure-allow-scripts.cjs && npm install --no-audit --no-fund) || true
@@ -129,6 +133,10 @@ fi
 if [ -z "$GITHUB_TOKEN" ]; then
   fail "GITHUB_TOKEN is missing."
 fi
+SKIP_GITHUB_REVERT=0
+if [ "$PR_NUMBER" = "0" ]; then
+  SKIP_GITHUB_REVERT=1
+fi
 
 cat > "$EXCLUDE_FILE" <<'EOF'
 .env
@@ -151,26 +159,28 @@ whatsapp*
 .baileys*
 EOF
 
-MERGE_CODE="$(curl -sS -o /tmp/aadi-merge.json -w "%{http_code}" -X PUT \
-  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-  -H "Accept: application/vnd.github+json" \
-  -H "X-GitHub-Api-Version: 2022-11-28" \
-  -H "Content-Type: application/json" \
-  "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/merge" \
-  -d '{"merge_method":"squash"}')"
-if [ "$MERGE_CODE" != "200" ]; then
-  PR_CODE="$(curl -sS -o /tmp/aadi-pr.json -w "%{http_code}" \
+if [ "$PR_NUMBER" != "0" ]; then
+  MERGE_CODE="$(curl -sS -o /tmp/aadi-merge.json -w "%{http_code}" -X PUT \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}")"
-  merged="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync("/tmp/aadi-pr.json","utf8"));process.stdout.write(j.merged===true?"yes":"no")}catch{process.stdout.write("no")}')"
-  if [ "$merged" != "yes" ]; then
-    fail "Could not squash-merge PR #${PR_NUMBER}."
+    -H "Content-Type: application/json" \
+    "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/merge" \
+    -d '{"merge_method":"squash"}')"
+  if [ "$MERGE_CODE" != "200" ]; then
+    PR_CODE="$(curl -sS -o /tmp/aadi-pr.json -w "%{http_code}" \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}")"
+    merged="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync("/tmp/aadi-pr.json","utf8"));process.stdout.write(j.merged===true?"yes":"no")}catch{process.stdout.write("no")}')"
+    if [ "$merged" != "yes" ]; then
+      fail "Could not squash-merge PR #${PR_NUMBER}."
+    fi
   fi
+  MERGED=1
+  rm -f /tmp/aadi-merge.json /tmp/aadi-pr.json
 fi
-MERGED=1
-rm -f /tmp/aadi-merge.json /tmp/aadi-pr.json
 
 mkdir -p "$BACKUP_DIR"
 stamp="$(TZ=Asia/Kolkata date +%Y%m%d-%H%M%S)"
@@ -221,7 +231,6 @@ waited=0
 while [ "$waited" -lt 180 ]; do
   if [ -f "$HEARTBEAT" ]; then
     write_result deployed
-    send_tg "Deployed build #${BUILD_ID}. Aadi is running again."
     exit 0
   fi
   sleep 3

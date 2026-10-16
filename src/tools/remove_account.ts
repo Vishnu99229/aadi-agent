@@ -26,7 +26,7 @@ export function handler(input: unknown): string {
       return JSON.stringify({
         removed: false,
         reason: "not_found",
-        found: decodedAccounts().map(formatAccountListLine),
+        found: decodedAccounts().map((account) => formatAccountListLine(account)),
       });
     }
     removeAccount(values.id);
@@ -44,7 +44,7 @@ export function handler(input: unknown): string {
       removed: false,
       reason: "not_found",
       query,
-      found: decodedAccounts().map(formatAccountListLine),
+      found: decodedAccounts().map((account) => formatAccountListLine(account)),
     });
   }
   if (matches.length > 1) {
@@ -52,7 +52,7 @@ export function handler(input: unknown): string {
       removed: false,
       reason: "ambiguous",
       query,
-      found: matches.map(formatAccountListLine),
+      found: matches.map((account) => formatAccountListLine(account)),
     });
   }
   const id = matches[0]!.id;

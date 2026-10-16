@@ -50,18 +50,24 @@ function decodePartBody(data: string | null | undefined): string {
 function collectPlainText(part: {
   mimeType?: string | null;
   body?: { data?: string | null } | null;
-  parts?: Array<{
-    mimeType?: string | null;
-    body?: { data?: string | null } | null;
-    parts?: unknown[];
-  }> | null;
+  parts?: unknown[] | null;
 }): string {
   const chunks: string[] = [];
   if (part.mimeType?.toLowerCase() === "text/plain" && part.body?.data) {
     chunks.push(decodePartBody(part.body.data));
   }
   for (const child of part.parts ?? []) {
-    chunks.push(collectPlainText(child));
+    if (child && typeof child === "object") {
+      chunks.push(
+        collectPlainText(
+          child as {
+            mimeType?: string | null;
+            body?: { data?: string | null } | null;
+            parts?: unknown[] | null;
+          },
+        ),
+      );
+    }
   }
   return chunks.join("\n");
 }

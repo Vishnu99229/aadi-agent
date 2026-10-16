@@ -26,13 +26,15 @@ export async function handler(input: unknown): Promise<string> {
   }
   const matches = findAccountByName(decodedAccounts(), values.name.trim());
   if (matches.length === 0) {
-    const listed = decodedAccounts().map(formatAccountListLine);
+    const listed = decodedAccounts().map((account) =>
+      formatAccountListLine(account),
+    );
     return listed.length
       ? `No matching account.\n${listed.join("\n")}`
       : "No accounts tracked yet.";
   }
   if (matches.length > 1) {
-    return `Several accounts match. Which one?\n${matches.map(formatAccountListLine).join("\n")}`;
+    return `Several accounts match. Which one?\n${matches.map((account) => formatAccountListLine(account)).join("\n")}`;
   }
   return buildAccountStatus(matches[0]!);
 }

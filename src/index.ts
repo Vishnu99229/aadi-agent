@@ -14,6 +14,7 @@ import { registerWeeklyBackup } from "./backup.js";
 import { registerAttachmentAlertScan } from "./attachment_alerts.js";
 import {
   applyPendingDeployResult,
+  pollRunningBuilds,
   registerBuildPoll,
 } from "./builds.js";
 import { writeHeartbeat } from "./heartbeat.js";
@@ -34,6 +35,7 @@ const weeklyBackupTask = registerWeeklyBackup(bot.api);
 const attachmentAlertTask = registerAttachmentAlertScan(bot.api);
 const buildPollTask = registerBuildPoll();
 await applyPendingDeployResult();
+void pollRunningBuilds();
 const MENU_COMMANDS = [
   { command: "followups", description: "Scan and list emails waiting on a reply" },
   { command: "model", description: "Choose which model handles each task" },

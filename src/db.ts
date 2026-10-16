@@ -302,8 +302,9 @@ db.exec(`
     task TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending_confirm'
       CHECK (status IN (
-        'pending_confirm', 'running', 'review', 'awaiting_followup',
-        'deploying', 'deployed', 'discarded', 'failed', 'rolled_back'
+        'pending_confirm', 'running', 'waiting_checks', 'waiting_approval',
+        'review', 'awaiting_followup', 'merged', 'deploying', 'deployed',
+        'discarded', 'failed', 'rolled_back'
       )),
     cursor_agent_id TEXT,
     cursor_run_id TEXT,
@@ -313,12 +314,64 @@ db.exec(`
     summary TEXT,
     files_json TEXT,
     error TEXT,
+    merge_sha TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
   CREATE INDEX IF NOT EXISTS idx_builds_status_updated
     ON builds (status, updated_at);
+`);
+
+const buildsSchema =
+  (
+    db
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'builds'`,
+      )
+      .get() as { sql: string } | undefined
+  )?.sql ?? "";
+
+if (!buildsSchema.includes("waiting_checks")) {
+  db.exec(`
+    CREATE TABLE builds_migrate (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_confirm'
+        CHECK (status IN (
+          'pending_confirm', 'running', 'waiting_checks', 'waiting_approval',
+          'review', 'awaiting_followup', 'merged', 'deploying', 'deployed',
+          'discarded', 'failed', 'rolled_back'
+        )),
+      cursor_agent_id TEXT,
+      cursor_run_id TEXT,
+      cursor_url TEXT,
+      pr_url TEXT,
+      pr_number INTEGER,
+      summary TEXT,
+      files_json TEXT,
+      error TEXT,
+      merge_sha TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO builds_migrate (
+      id, task, status, cursor_agent_id, cursor_run_id, cursor_url,
+      pr_url, pr_number, summary, files_json, error, created_at, updated_at
+    )
+    SELECT id, task, status, cursor_agent_id, cursor_run_id, cursor_url,
+           pr_url, pr_number, summary, files_json, error, created_at, updated_at
+    FROM builds;
+    DROP TABLE builds;
+    ALTER TABLE builds_migrate RENAME TO builds;
+    CREATE INDEX IF NOT EXISTS idx_builds_status_updated
+      ON builds (status, updated_at);
+  `);
+} else if (!tableHasColumn("builds", "merge_sha")) {
+  db.exec(`ALTER TABLE builds ADD COLUMN merge_sha TEXT`);
+}
+
+db.exec(`
 
   CREATE TABLE IF NOT EXISTS meeting_briefs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1811,8 +1864,11 @@ export function deletePendingMemoryConfirm(id: number): void {
 export type BuildStatus =
   | "pending_confirm"
   | "running"
+  | "waiting_checks"
+  | "waiting_approval"
   | "review"
   | "awaiting_followup"
+  | "merged"
   | "deploying"
   | "deployed"
   | "discarded"
@@ -1831,12 +1887,13 @@ export interface BuildRecord {
   summary: string | null;
   files_json: string | null;
   error: string | null;
+  merge_sha: string | null;
   created_at: string;
   updated_at: string;
 }
 
 const BUILD_COLUMNS = `id, task, status, cursor_agent_id, cursor_run_id, cursor_url,
-              pr_url, pr_number, summary, files_json, error, created_at, updated_at`;
+              pr_url, pr_number, summary, files_json, error, merge_sha, created_at, updated_at`;
 
 export function createBuild(task: string): BuildRecord {
   const result = db
@@ -1867,6 +1924,18 @@ export function listBuildsByStatus(status: BuildStatus): BuildRecord[] {
     .all(status) as BuildRecord[];
 }
 
+export function listBuildsByStatuses(statuses: BuildStatus[]): BuildRecord[] {
+  if (statuses.length === 0) {
+    return [];
+  }
+  const placeholders = statuses.map(() => "?").join(", ");
+  return db
+    .prepare(
+      `SELECT ${BUILD_COLUMNS} FROM builds WHERE status IN (${placeholders}) ORDER BY id ASC`,
+    )
+    .all(...statuses) as BuildRecord[];
+}
+
 export function updateBuild(
   id: number,
   fields: Partial<
@@ -1881,6 +1950,7 @@ export function updateBuild(
       | "summary"
       | "files_json"
       | "error"
+      | "merge_sha"
     >
   >,
 ): BuildRecord | undefined {

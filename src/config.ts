@@ -264,4 +264,7 @@ export const config = {
   githubOwner: "Vishnu99229",
   githubRepo: "aadi-agent",
   cursorApiBase: "https://api.cursor.com",
+  autoDeploy: ["true", "1", "yes"].includes(
+    (process.env.AUTO_DEPLOY?.trim().toLowerCase() ?? ""),
+  ),
 } as const;

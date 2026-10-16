@@ -4,14 +4,20 @@ import { Api, InlineKeyboard, type Context } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
 import {
   confirmBuildText,
+  failedChecksText,
   failedStartText,
   formatBuildsList,
   formatChangedFiles,
   formatCouldNotStart,
+  formatDeployedText,
   isBuildConfigured,
+  needsApprovalText,
   oneLineError,
   parseBuildVoice,
+  protectedAreasTouched,
+  shouldAutoMerge,
   shortSummary,
+  summarizeGithubChecks,
   wrapBuildPrompt,
 } from "./build_logic.js";
 import { config } from "./config.js";
@@ -20,21 +26,26 @@ import {
   createCloudAgent,
   createCloudRun,
   cursorErrorInfo,
-  getCloudRun,
+  getLatestCloudRun,
   isTerminalRunStatus,
+  normalizeRunStatus,
 } from "./cursor_cloud.js";
 import {
   createBuild,
   getBuild,
   listBuilds,
-  listBuildsByStatus,
+  listBuildsByStatuses,
   updateBuild,
   type BuildRecord,
 } from "./db.js";
 import {
   closePull,
+  getPull,
+  listPullCheckRuns,
   listPullFilenames,
+  mergePullSquash,
   pullNumberFromUrl,
+  revertMergedPull,
 } from "./github_api.js";
 import {
   clearDeployResult,
@@ -43,6 +54,13 @@ import {
 
 const TIME_ZONE = "Asia/Kolkata";
 const awaitingFollowup = new Map<number, number>();
+const ACTIVE_POLL_STATUSES = [
+  "running",
+  "waiting_checks",
+  "review",
+  "merged",
+  "deploying",
+] as const;
 
 function buildsReady(): boolean {
   return isBuildConfigured(config.cursorApiKey, config.githubToken);
@@ -71,6 +89,31 @@ function reviewKeyboard(id: number): InlineKeyboard {
     .text("Discard", `build:discard:${id}`);
 }
 
+function failedCheckKeyboard(id: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Ask for changes", `build:ask:${id}`)
+    .row()
+    .text("Discard", `build:discard:${id}`);
+}
+
+function undoKeyboard(id: number): InlineKeyboard {
+  return new InlineKeyboard().text("Undo", `build:undo:${id}`);
+}
+
+function buildsListKeyboard(rows: BuildRecord[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const row of rows) {
+    if (row.status === "running" || row.status === "waiting_checks") {
+      keyboard.text(`Check now #${row.id}`, `build:check:${row.id}`).row();
+    }
+  }
+  return keyboard;
+}
+
+function ownerApi(): Api {
+  return new Api(config.telegramBotToken);
+}
+
 async function editOrReply(
   ctx: Context,
   text: string,
@@ -87,6 +130,31 @@ async function editOrReply(
       })
       .catch(() => undefined);
   }
+}
+
+function parseFiles(build: BuildRecord): string[] {
+  if (!build.files_json) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(build.files_json) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function reviewBody(build: BuildRecord, prefix?: string): string {
+  const files = parseFiles(build);
+  const lines = [
+    prefix,
+    shortSummary(build.summary ?? undefined),
+    formatChangedFiles(files),
+    build.pr_url ? `PR: ${build.pr_url}` : "PR: not opened yet",
+  ].filter((line): line is string => Boolean(line && line.trim()));
+  return lines.join("\n");
 }
 
 export async function promptBuild(ctx: Context, task: string): Promise<void> {
@@ -136,7 +204,10 @@ export async function submitBuildFollowup(
   if (
     !build ||
     !build.cursor_agent_id ||
-    (build.status !== "awaiting_followup" && build.status !== "review")
+    (build.status !== "awaiting_followup" &&
+      build.status !== "review" &&
+      build.status !== "waiting_approval" &&
+      build.status !== "failed")
   ) {
     await ctx.reply("That build is no longer waiting for changes.");
     return;
@@ -170,97 +241,18 @@ export function formatRecentBuilds(): string {
   return formatBuildsList(listBuilds(15));
 }
 
-async function sendReview(api: Api, build: BuildRecord): Promise<void> {
-  const files = build.files_json
-    ? (JSON.parse(build.files_json) as string[])
-    : [];
-  const lines = [
-    shortSummary(build.summary ?? undefined),
-    formatChangedFiles(files),
-    build.pr_url ? `PR: ${build.pr_url}` : "PR: not opened yet",
-  ];
-  await api.sendMessage(config.ownerTelegramId, lines.join("\n"), {
-    reply_markup: reviewKeyboard(build.id),
+export async function sendBuildsPanel(ctx: Context): Promise<void> {
+  const rows = listBuilds(15);
+  await ctx.reply(formatBuildsList(rows), {
+    reply_markup: buildsListKeyboard(rows),
   });
 }
 
-async function finishRun(build: BuildRecord): Promise<void> {
-  if (!build.cursor_agent_id || !build.cursor_run_id) {
-    return;
-  }
-  const run = await getCloudRun(build.cursor_agent_id, build.cursor_run_id);
-  if (!isTerminalRunStatus(run.status)) {
-    return;
-  }
-  if (run.status !== "FINISHED") {
-    const error = oneLineError(run.result);
-    updateBuild(build.id, { status: "failed", error });
-    console.log(`Build ${build.id}: status -> failed`);
-    const telegram = new Api(config.telegramBotToken);
-    await telegram.sendMessage(
-      config.ownerTelegramId,
-      `Build #${build.id} failed: ${error}`,
-    );
-    return;
-  }
-
-  const prUrl = run.git?.branches?.find((item) => item.prUrl)?.prUrl ?? null;
-  const prNumber = pullNumberFromUrl(prUrl) ?? null;
-  let files: string[] = [];
-  if (prNumber) {
-    try {
-      files = await listPullFilenames(prNumber);
-    } catch {
-      console.error(`Build ${build.id}: PR file list failed`);
-    }
-  }
-  const updated = updateBuild(build.id, {
-    status: "review",
-    pr_url: prUrl,
-    pr_number: prNumber,
-    summary: shortSummary(run.result),
-    files_json: JSON.stringify(files),
-    error: null,
-  });
-  console.log(`Build ${build.id}: status -> review pr=${prNumber ?? "none"}`);
-  const telegram = new Api(config.telegramBotToken);
-  if (updated) {
-    await sendReview(telegram, updated);
-  }
-}
-
-export async function pollRunningBuilds(): Promise<void> {
-  if (!buildsReady()) {
-    return;
-  }
-  const running = listBuildsByStatus("running");
-  for (const build of running) {
-    try {
-      await finishRun(build);
-    } catch (error) {
-      const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.error(`Build ${build.id}: poll failed (${errorType})`);
-    }
-  }
-}
-
-export function registerBuildPoll(): ScheduledTask {
-  const task = cron.schedule(
-    "* * * * *",
-    () => {
-      void pollRunningBuilds();
-    },
-    {
-      name: "aadi-build-poll",
-      timezone: TIME_ZONE,
-      noOverlap: true,
-    },
-  );
-  console.log(`Build poll scheduled every minute (${TIME_ZONE}).`);
-  return task;
-}
-
-function spawnDetachedBash(script: string, buildId: number, prNumber: number): void {
+function spawnDetachedBash(
+  script: string,
+  buildId: number,
+  prNumber: number,
+): void {
   const child = spawn("bash", [script, String(buildId), String(prNumber)], {
     detached: true,
     stdio: "ignore",
@@ -295,9 +287,305 @@ function spawnPhoneDeploy(buildId: number, prNumber: number): void {
   console.log(`Build ${buildId}: detached deploy pr=${prNumber}`);
 }
 
+async function startPhoneDeploy(build: BuildRecord): Promise<void> {
+  const prNumber = build.pr_number;
+  if (!prNumber) {
+    return;
+  }
+  updateBuild(build.id, { status: "deploying", error: null });
+  console.log(`Build ${build.id}: status -> deploying pr=${prNumber}`);
+  spawnPhoneDeploy(build.id, prNumber);
+}
+
+async function collectPrFiles(build: BuildRecord): Promise<{
+  files: string[];
+  prUrl: string | null;
+  prNumber: number | null;
+  filesVerified: boolean;
+}> {
+  const prUrl = build.pr_url;
+  const prNumber = build.pr_number ?? pullNumberFromUrl(prUrl);
+  let files = parseFiles(build);
+  let filesVerified = files.length > 0;
+  if (prNumber) {
+    try {
+      files = await listPullFilenames(prNumber);
+      filesVerified = true;
+    } catch {
+      console.error(`Build ${build.id}: PR file list failed`);
+    }
+  }
+  return { files, prUrl, prNumber: prNumber ?? null, filesVerified };
+}
+
+async function finishCursorRun(build: BuildRecord): Promise<void> {
+  if (!build.cursor_agent_id) {
+    return;
+  }
+  const run = await getLatestCloudRun(build.cursor_agent_id);
+  if (run.id && run.id !== build.cursor_run_id) {
+    updateBuild(build.id, { cursor_run_id: run.id });
+  }
+  const status = normalizeRunStatus(run.status);
+  if (!isTerminalRunStatus(status)) {
+    return;
+  }
+  if (status !== "FINISHED") {
+    const error = oneLineError(run.result);
+    updateBuild(build.id, { status: "failed", error });
+    console.log(`Build ${build.id}: status -> failed`);
+    await ownerApi().sendMessage(
+      config.ownerTelegramId,
+      `Build #${build.id} failed: ${error}`,
+    );
+    return;
+  }
+
+  const prUrl = run.git?.branches?.find((item) => item.prUrl)?.prUrl ?? null;
+  const prNumber = pullNumberFromUrl(prUrl) ?? null;
+  let files: string[] = [];
+  if (prNumber) {
+    try {
+      files = await listPullFilenames(prNumber);
+    } catch {
+      console.error(`Build ${build.id}: PR file list failed`);
+    }
+  }
+  updateBuild(build.id, {
+    status: "waiting_checks",
+    cursor_run_id: run.id,
+    pr_url: prUrl,
+    pr_number: prNumber,
+    summary: shortSummary(run.result),
+    files_json: JSON.stringify(files),
+    error: null,
+  });
+  console.log(
+    `Build ${build.id}: status -> waiting_checks pr=${prNumber ?? "none"}`,
+  );
+  const latest = getBuild(build.id);
+  if (latest) {
+    await processChecks(latest);
+  }
+}
+
+async function askForApproval(
+  build: BuildRecord,
+  files: string[],
+  prUrl: string | null,
+  prNumber: number | null,
+  prefix?: string,
+): Promise<void> {
+  const body = reviewBody(
+    {
+      ...build,
+      files_json: JSON.stringify(files),
+      pr_url: prUrl,
+      pr_number: prNumber,
+    },
+    prefix,
+  );
+  await ownerApi().sendMessage(config.ownerTelegramId, body, {
+    reply_markup: reviewKeyboard(build.id),
+  });
+  updateBuild(build.id, {
+    status: "waiting_approval",
+    files_json: JSON.stringify(files),
+    pr_url: prUrl,
+    pr_number: prNumber,
+    error: prefix ?? null,
+  });
+  console.log(
+    `Build ${build.id}: status -> waiting_approval ${prefix ?? ""}`.trim(),
+  );
+}
+
+async function processChecks(build: BuildRecord): Promise<void> {
+  const { files, prUrl, prNumber, filesVerified } = await collectPrFiles(build);
+  if (!prNumber) {
+    updateBuild(build.id, {
+      status: "failed",
+      error: "The agent finished without a pull request.",
+    });
+    await ownerApi().sendMessage(
+      config.ownerTelegramId,
+      `Build #${build.id} failed: The agent finished without a pull request.`,
+    );
+    return;
+  }
+
+  if (build.status === "review" || build.status === "deploying") {
+    updateBuild(build.id, {
+      status: "waiting_checks",
+      files_json: JSON.stringify(files),
+      pr_url: prUrl,
+      pr_number: prNumber,
+    });
+  }
+
+  let pull;
+  try {
+    pull = await getPull(prNumber);
+  } catch {
+    await askForApproval(
+      build,
+      files,
+      prUrl,
+      prNumber,
+      "Needs your approval: GitHub token cannot access this repository",
+    );
+    return;
+  }
+  if (pull.merged) {
+    updateBuild(build.id, {
+      status: "merged",
+      merge_sha: pull.merge_commit_sha,
+      files_json: JSON.stringify(files),
+    });
+    console.log(`Build ${build.id}: status -> merged (already on GitHub)`);
+    await startPhoneDeploy(getBuild(build.id) ?? build);
+    return;
+  }
+
+  const checks = summarizeGithubChecks(await listPullCheckRuns(pull.head.sha));
+  if (checks.state === "pending") {
+    if (build.status !== "waiting_checks") {
+      updateBuild(build.id, { status: "waiting_checks" });
+      console.log(`Build ${build.id}: status -> waiting_checks`);
+    }
+    return;
+  }
+  if (checks.state === "failed") {
+    const text = failedChecksText(checks.reason ?? "CI failed");
+    await ownerApi().sendMessage(config.ownerTelegramId, text, {
+      reply_markup: failedCheckKeyboard(build.id),
+    });
+    updateBuild(build.id, { status: "failed", error: text });
+    console.log(`Build ${build.id}: status -> failed (checks)`);
+    return;
+  }
+
+  const areas = protectedAreasTouched(files);
+  if (
+    !shouldAutoMerge({
+      autoDeploy: config.autoDeploy,
+      protectedAreas: areas,
+      filesVerified,
+    })
+  ) {
+    const prefix = !filesVerified
+      ? "Needs your approval: could not verify changed files on GitHub"
+      : areas.length > 0
+        ? needsApprovalText(areas)
+        : undefined;
+    await askForApproval(build, files, prUrl, prNumber, prefix);
+    return;
+  }
+
+  await autoMergeAndDeploy({
+    ...build,
+    files_json: JSON.stringify(files),
+    pr_url: prUrl,
+    pr_number: prNumber,
+  });
+}
+
+async function autoMergeAndDeploy(build: BuildRecord): Promise<void> {
+  if (!build.pr_number) {
+    return;
+  }
+  try {
+    const sha = await mergePullSquash(build.pr_number);
+    updateBuild(build.id, {
+      status: "merged",
+      merge_sha: sha ?? null,
+      error: null,
+    });
+    console.log(`Build ${build.id}: status -> merged sha=${sha ?? "none"}`);
+    await startPhoneDeploy(getBuild(build.id) ?? build);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Build ${build.id}: merge failed (${errorType})`);
+    const text = "Could not squash-merge the pull request.";
+    updateBuild(build.id, { status: "waiting_approval", error: text });
+    await ownerApi().sendMessage(
+      config.ownerTelegramId,
+      `${text}\n${reviewBody(build)}`,
+      { reply_markup: reviewKeyboard(build.id) },
+    );
+  }
+}
+
+async function processOneBuild(build: BuildRecord): Promise<void> {
+  if (build.status === "running") {
+    await finishCursorRun(build);
+    return;
+  }
+  if (
+    build.status === "waiting_checks" ||
+    build.status === "review"
+  ) {
+    await processChecks(build);
+    return;
+  }
+  if (build.status === "merged") {
+    await startPhoneDeploy(build);
+    return;
+  }
+  if (build.status === "deploying") {
+    if (!build.pr_number) {
+      return;
+    }
+    try {
+      const pull = await getPull(build.pr_number);
+      if (pull.merged) {
+        return;
+      }
+    } catch {
+      // Resume the PR flow; GitHub access is checked in processChecks.
+    }
+    console.log(`Build ${build.id}: deploy did not merge; resume checks`);
+    await processChecks(build);
+  }
+}
+
+export async function pollRunningBuilds(): Promise<void> {
+  if (!buildsReady()) {
+    return;
+  }
+  await applyPendingDeployResult();
+  const active = listBuildsByStatuses([...ACTIVE_POLL_STATUSES]);
+  for (const build of active) {
+    try {
+      await processOneBuild(build);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Build ${build.id}: poll failed (${errorType})`);
+    }
+  }
+}
+
+export function registerBuildPoll(): ScheduledTask {
+  const task = cron.schedule(
+    "* * * * *",
+    () => {
+      void pollRunningBuilds();
+    },
+    {
+      name: "aadi-build-poll",
+      timezone: TIME_ZONE,
+      noOverlap: true,
+    },
+  );
+  console.log(`Build poll scheduled every minute (${TIME_ZONE}).`);
+  return task;
+}
+
 export async function handleBuildCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data ?? "";
-  const match = /^build:(go|no|deploy|ask|discard):(\d+)$/.exec(data);
+  const match = /^build:(go|no|deploy|ask|discard|check|undo):(\d+)$/.exec(
+    data,
+  );
   if (!match) {
     await ctx.answerCallbackQuery();
     return;
@@ -307,6 +595,17 @@ export async function handleBuildCallback(ctx: Context): Promise<void> {
   const build = getBuild(id);
   if (!build) {
     await ctx.answerCallbackQuery({ text: "That build is gone.", show_alert: true });
+    return;
+  }
+
+  if (action === "check") {
+    await ctx.answerCallbackQuery("Checking");
+    try {
+      await processOneBuild(getBuild(id) ?? build);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Build ${id}: check now failed (${errorType})`);
+    }
     return;
   }
 
@@ -331,15 +630,16 @@ export async function handleBuildCallback(ctx: Context): Promise<void> {
     try {
       const created = await createCloudAgent(wrapBuildPrompt(build.task));
       const url = created.agent.url ?? "";
+      const runId = created.run.id || created.agent.latestRunId || "";
       updateBuild(id, {
         status: "running",
         cursor_agent_id: created.agent.id,
-        cursor_run_id: created.run.id,
+        cursor_run_id: runId || null,
         cursor_url: url || null,
         error: null,
       });
       console.log(
-        `Build ${id}: status -> running agent=${created.agent.id} run=${created.run.id}`,
+        `Build ${id}: status -> running agent=${created.agent.id} run=${runId}`,
       );
       await editOrReply(ctx, url ? `Started ${url}` : "Started");
     } catch (error) {
@@ -388,6 +688,36 @@ export async function handleBuildCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  if (action === "undo") {
+    if (build.status !== "deployed" && build.status !== "rolled_back") {
+      await ctx.answerCallbackQuery({
+        text: "Nothing to undo yet.",
+        show_alert: true,
+      });
+      return;
+    }
+    if (!build.pr_number) {
+      await ctx.answerCallbackQuery({
+        text: "No pull request to revert.",
+        show_alert: true,
+      });
+      return;
+    }
+    await ctx.answerCallbackQuery("Undoing");
+    const reverted = await revertMergedPull(build.pr_number);
+    if (!reverted.ok) {
+      await editOrReply(
+        ctx,
+        "Could not revert GitHub main. On the Mac: git pull first, then revert the merge commit.",
+      );
+      return;
+    }
+    updateBuild(id, { status: "deploying", error: "undo" });
+    spawnPhoneDeploy(id, 0);
+    await editOrReply(ctx, "Reverted on GitHub. Deploying main on the phone.");
+    return;
+  }
+
   if (action === "deploy") {
     if (!build.pr_number) {
       await ctx.answerCallbackQuery({
@@ -396,14 +726,28 @@ export async function handleBuildCallback(ctx: Context): Promise<void> {
       });
       return;
     }
-    updateBuild(id, { status: "deploying" });
-    console.log(`Build ${id}: status -> deploying pr=${build.pr_number}`);
     await ctx.answerCallbackQuery("Deploying");
+    try {
+      const sha = await mergePullSquash(build.pr_number);
+      updateBuild(id, {
+        status: "merged",
+        merge_sha: sha ?? null,
+        error: null,
+      });
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Build ${id}: merge failed (${errorType})`);
+      await editOrReply(ctx, "Could not squash-merge the pull request.");
+      return;
+    }
     await editOrReply(
       ctx,
       "Deploying on the phone. I'll message you when it's done.",
     );
-    spawnPhoneDeploy(id, build.pr_number);
+    const latest = getBuild(id);
+    if (latest) {
+      await startPhoneDeploy(latest);
+    }
   }
 }
 
@@ -418,10 +762,20 @@ export async function applyPendingDeployResult(): Promise<void> {
       : result.status === "rolled_back"
         ? "rolled_back"
         : "failed";
-  updateBuild(result.buildId, {
+  const updated = updateBuild(result.buildId, {
     status,
     error: result.error ?? null,
   });
   console.log(`Build ${result.buildId}: status -> ${status} (from deploy result)`);
   await clearDeployResult();
+  if (status === "deployed" && updated) {
+    const text = formatDeployedText({
+      summary: updated.summary ?? "The agent finished.",
+      files: parseFiles(updated),
+      prUrl: updated.pr_url ?? "",
+    });
+    await ownerApi().sendMessage(config.ownerTelegramId, text, {
+      reply_markup: undoKeyboard(updated.id),
+    });
+  }
 }
