@@ -115,9 +115,7 @@ export async function getPull(pullNumber: number): Promise<GithubPull> {
   return data;
 }
 
-export async function listPullCheckRuns(
-  sha: string,
-): Promise<GithubCheckItem[]> {
+async function listCommitCheckRuns(sha: string): Promise<GithubCheckItem[]> {
   const items: GithubCheckItem[] = [];
   let page = 1;
   for (;;) {
@@ -151,6 +149,38 @@ export async function listPullCheckRuns(
     }
   }
   return items;
+}
+
+async function listWorkflowRunsForSha(sha: string): Promise<GithubCheckItem[]> {
+  const { data } = await githubFetch<{
+    workflow_runs?: Array<{
+      name?: string;
+      status?: string;
+      conclusion?: string | null;
+    }>;
+  }>(
+    "GET",
+    `${repoPath()}/actions/runs?head_sha=${encodeURIComponent(sha)}&per_page=20`,
+  );
+  return (data.workflow_runs ?? []).map((run) => ({
+    name: run.name?.trim() || "CI",
+    status: run.status ?? "",
+    conclusion: run.conclusion ?? null,
+  }));
+}
+
+export async function listPullCheckRuns(
+  sha: string,
+): Promise<GithubCheckItem[]> {
+  try {
+    const items = await listCommitCheckRuns(sha);
+    if (items.length > 0) {
+      return items;
+    }
+  } catch {
+    console.error("GitHub check-runs unavailable; falling back to Actions runs");
+  }
+  return listWorkflowRunsForSha(sha);
 }
 
 async function markPullReadyForReview(pull: GithubPull): Promise<void> {
