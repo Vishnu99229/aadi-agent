@@ -26,6 +26,9 @@ const {
   oneLineError,
   parseBuildVoice,
   parsePullNumber,
+  revertCommitMessage,
+  rollbackTelegram,
+  macFixMainCommand,
   shortSummary,
   wrapBuildPrompt,
 } = await import("../src/build_logic.ts");
@@ -101,6 +104,44 @@ assert(list.includes("#3 ready to review"), "builds list");
 assert(
   formatChangedFiles(["src/bot.ts", "prompts/system.md"]).includes("src/bot.ts"),
   "file names only",
+);
+
+assert(
+  revertCommitMessage("Change /start greeting") ===
+    "Revert Change /start greeting — failed health check",
+  "revert message",
+);
+assert(
+  macFixMainCommand("abc123def") ===
+    "git pull && git revert --no-edit abc123def && git push origin main",
+  "mac fix uses merge sha",
+);
+assert(
+  rollbackTelegram({
+    reason: "Aadi did not become healthy in time.",
+    phoneNote: "Rolled back the phone to the previous version.",
+    revert: {
+      ok: true,
+      message: "Revert Change greeting — failed health check",
+    },
+  }).includes("Reverted GitHub main"),
+  "telegram reports revert",
+);
+assert(
+  rollbackTelegram({
+    reason: "Aadi did not become healthy in time.",
+    phoneNote: "Rolled back the phone to the previous version.",
+    revert: { ok: false, mergeSha: "deadbeef" },
+  }).includes("GitHub main is still broken"),
+  "telegram reports broken main",
+);
+assert(
+  rollbackTelegram({
+    reason: "boom",
+    phoneNote: "Rolled back.",
+    revert: { ok: false, mergeSha: "deadbeef" },
+  }).includes("git revert --no-edit deadbeef"),
+  "telegram includes mac fix command",
 );
 
 const dir = await mkdtemp(join(tmpdir(), "aadi-stage11-"));

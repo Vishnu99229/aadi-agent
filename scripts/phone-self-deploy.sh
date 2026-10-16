@@ -28,6 +28,8 @@ HEARTBEAT="$LIVE/.aadi-heartbeat"
 RESULT="$LIVE/.aadi-deploy-result.json"
 BACKUP_DIR="$LIVE/backups"
 EXCLUDE_FILE="$HOME/aadi-rsync-excludes"
+MERGED=0
+REVERT_JSON=""
 
 send_tg() {
   if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
@@ -49,8 +51,47 @@ write_result() {
   ' "$BUILD_ID" "$status" "$err" "$RESULT" || true
 }
 
+revert_github() {
+  REVERT_JSON="$(node "$ROOT/scripts/github-revert-main.cjs" "$PR_NUMBER" 2>/dev/null || true)"
+  if [ -z "$REVERT_JSON" ]; then
+    REVERT_JSON='{"ok":false}'
+  fi
+}
+
+rollback_telegram() {
+  reason="$1"
+  phone_note="$2"
+  printf '%s' "$REVERT_JSON" | node -e '
+    const fs = require("fs");
+    let parsed = {};
+    try { parsed = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch { parsed = {}; }
+    const reason = process.argv[1];
+    const phone = process.argv[2];
+    const prefix = ("Deploy failed: " + reason + " " + phone).replace(/\s+/g, " ").trim();
+    if (parsed.ok && parsed.message) {
+      process.stdout.write(prefix + " Reverted GitHub main (" + parsed.message + ").");
+      return;
+    }
+    const sha = typeof parsed.mergeSha === "string" && /^[0-9a-f]{7,40}$/i.test(parsed.mergeSha)
+      ? parsed.mergeSha
+      : "HEAD";
+    process.stdout.write(
+      prefix +
+        " GitHub main is still broken — the revert failed. On the Mac run: git pull && git revert --no-edit " +
+        sha +
+        " && git push origin main",
+    );
+  ' "$reason" "$phone_note"
+}
+
 fail() {
   reason="$1"
+  if [ "$MERGED" = 1 ]; then
+    revert_github
+    write_result failed "$reason"
+    send_tg "$(rollback_telegram "$reason" "Phone was not switched.")"
+    exit 1
+  fi
   write_result failed "$reason"
   send_tg "Deploy failed: $reason"
   exit 1
@@ -59,6 +100,7 @@ fail() {
 rollback_and_exit() {
   reason="$1"
   echo "Rolling back: $reason" >&2
+  revert_github
   if [ -d "$ROLLBACK" ]; then
     rsync -a --delete --exclude-from="$EXCLUDE_FILE" "$ROLLBACK/" "$LIVE/" || true
     (cd "$LIVE" && node scripts/ensure-allow-scripts.cjs && npm install --no-audit --no-fund) || true
@@ -69,14 +111,14 @@ rollback_and_exit() {
   while [ "$waited" -lt 180 ]; do
     if [ -f "$HEARTBEAT" ]; then
       write_result rolled_back "$reason"
-      send_tg "Deploy failed: $reason Rolled back to the previous version."
+      send_tg "$(rollback_telegram "$reason" "Rolled back the phone to the previous version.")"
       exit 1
     fi
     sleep 3
     waited=$((waited + 3))
   done
   write_result rolled_back "$reason"
-  send_tg "Deploy failed: $reason Rollback restart did not become healthy."
+  send_tg "$(rollback_telegram "$reason" "Phone rollback ran but restart did not become healthy.")"
   exit 1
 }
 
@@ -127,6 +169,7 @@ if [ "$MERGE_CODE" != "200" ]; then
     fail "Could not squash-merge PR #${PR_NUMBER}."
   fi
 fi
+MERGED=1
 rm -f /tmp/aadi-merge.json /tmp/aadi-pr.json
 
 mkdir -p "$BACKUP_DIR"

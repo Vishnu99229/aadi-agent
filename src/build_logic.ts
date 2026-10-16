@@ -94,3 +94,29 @@ export function shortSummary(text: string | undefined): string {
 export function confirmBuildText(task: string): string {
   return `Build this?\n${task.trim()}`;
 }
+
+export function revertCommitMessage(prTitle: string): string {
+  const title = prTitle.replace(/\s+/g, " ").trim() || "merged pull request";
+  return `Revert ${title} — failed health check`;
+}
+
+export function macFixMainCommand(mergeSha?: string): string {
+  const sha =
+    mergeSha && /^[0-9a-f]{7,40}$/i.test(mergeSha) ? mergeSha : "HEAD";
+  return `git pull && git revert --no-edit ${sha} && git push origin main`;
+}
+
+export function rollbackTelegram(params: {
+  reason: string;
+  phoneNote: string;
+  revert:
+    | { ok: true; message: string }
+    | { ok: false; mergeSha?: string };
+}): string {
+  const prefix = `Deploy failed: ${params.reason} ${params.phoneNote}`.trim();
+  if (params.revert.ok) {
+    return `${prefix} Reverted GitHub main (${params.revert.message}).`;
+  }
+  const fix = macFixMainCommand(params.revert.mergeSha);
+  return `${prefix} GitHub main is still broken — the revert failed. On the Mac run: ${fix}`;
+}
