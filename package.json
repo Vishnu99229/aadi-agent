@@ -11,7 +11,7 @@
     "google:auth": "tsx src/google/authorize.ts",
     "google:auth:work": "tsx src/google/authorize.ts --work",
     "google:test": "tsx src/google/test.ts",
-    "test": "npm run test:stage5 && npm run test:stage6 && npm run test:stage7 && npm run test:stage8 && npm run test:stage10 && npm run test:memory && npm run test:usage && npm run test:stage11 && npm run test:security",
+    "test": "npm run test:stage5 && npm run test:stage6 && npm run test:stage7 && npm run test:stage8 && npm run test:stage10 && npm run test:memory && npm run test:usage && npm run test:stage11 && npm run test:security && npm run test:start-greeting",
     "test:security": "tsx scripts/test-security.ts",
     "test:stage5": "tsx scripts/test-stage5.ts",
     "test:stage6": "tsx scripts/test-stage6.ts",
@@ -24,6 +24,7 @@
     "live:haiku": "tsx --env-file=.env scripts/test-haiku-background-live.ts",
     "live:documents": "tsx --env-file=.env scripts/test-document-analysis.ts",
     "test:stage11": "tsx scripts/test-stage11.ts",
+    "test:start-greeting": "tsx scripts/test-start-greeting.ts",
     "bench:models": "tsx --env-file=.env scripts/bench-models.ts"
   },
   "keywords": [],
