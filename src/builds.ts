@@ -4,8 +4,10 @@ import { Api, InlineKeyboard, type Context } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
 import {
   confirmBuildText,
+  failedStartText,
   formatBuildsList,
   formatChangedFiles,
+  formatCouldNotStart,
   isBuildConfigured,
   oneLineError,
   parseBuildVoice,
@@ -17,6 +19,7 @@ import {
   archiveCloudAgent,
   createCloudAgent,
   createCloudRun,
+  cursorErrorInfo,
   getCloudRun,
   isTerminalRunStatus,
 } from "./cursor_cloud.js";
@@ -138,19 +141,29 @@ export async function submitBuildFollowup(
     await ctx.reply("That build is no longer waiting for changes.");
     return;
   }
-  const run = await createCloudRun(
-    build.cursor_agent_id,
-    wrapBuildPrompt(text),
-  );
-  updateBuild(build.id, {
-    status: "running",
-    cursor_run_id: run.id,
-    error: null,
-  });
-  console.log(
-    `Build ${build.id}: status -> running run=${run.id}`,
-  );
-  await ctx.reply("Started a follow-up on that build.");
+  try {
+    const run = await createCloudRun(
+      build.cursor_agent_id,
+      wrapBuildPrompt(text),
+    );
+    updateBuild(build.id, {
+      status: "running",
+      cursor_run_id: run.id,
+      error: null,
+    });
+    console.log(`Build ${build.id}: status -> running run=${run.id}`);
+    await ctx.reply("Started a follow-up on that build.");
+  } catch (error) {
+    const info = cursorErrorInfo(error);
+    const message = formatCouldNotStart(info);
+    updateBuild(build.id, { error: message });
+    console.error(
+      `Build ${build.id}: follow-up failed status=${info.status ?? "?"}` +
+        (info.code ? ` code=${info.code}` : "") +
+        ` ${message}`,
+    );
+    await ctx.reply(message);
+  }
 }
 
 export function formatRecentBuilds(): string {
@@ -323,14 +336,25 @@ export async function handleBuildCallback(ctx: Context): Promise<void> {
         cursor_agent_id: created.agent.id,
         cursor_run_id: created.run.id,
         cursor_url: url || null,
+        error: null,
       });
       console.log(
         `Build ${id}: status -> running agent=${created.agent.id} run=${created.run.id}`,
       );
       await editOrReply(ctx, url ? `Started ${url}` : "Started");
-    } catch {
-      updateBuild(id, { status: "failed", error: "Could not start the Cursor agent." });
-      await editOrReply(ctx, "Could not start the Cursor agent.");
+    } catch (error) {
+      const info = cursorErrorInfo(error);
+      const text = failedStartText(build.task, info);
+      updateBuild(id, {
+        status: "pending_confirm",
+        error: formatCouldNotStart(info),
+      });
+      console.error(
+        `Build ${id}: start failed status=${info.status ?? "?"}` +
+          (info.code ? ` code=${info.code}` : "") +
+          ` ${formatCouldNotStart(info)}`,
+      );
+      await editOrReply(ctx, text, confirmKeyboard(id));
     }
     return;
   }

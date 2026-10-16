@@ -2,6 +2,20 @@ import { config } from "./config.js";
 
 const CURSOR_JSON = "application/json";
 
+export class CursorApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly apiMessage: string;
+
+  constructor(status: number, code: string, apiMessage: string) {
+    super(`Cursor API returned ${status}.`);
+    this.name = "CursorApiError";
+    this.status = status;
+    this.code = code;
+    this.apiMessage = apiMessage;
+  }
+}
+
 export interface CursorAgent {
   id: string;
   name?: string;
@@ -32,6 +46,61 @@ function cursorHeaders(): HeadersInit {
   };
 }
 
+function redactSecrets(text: string): string {
+  return text
+    .replace(/crsr_[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/Bearer\s+\S+/gi, "[redacted]")
+    .replace(/ghp_[A-Za-z0-9]+/g, "[redacted]")
+    .replace(/github_pat_[A-Za-z0-9_]+/g, "[redacted]");
+}
+
+function parseCursorError(status: number, text: string): CursorApiError {
+  let code = "";
+  let message = "";
+  try {
+    const json = JSON.parse(text) as {
+      error?: { code?: unknown; message?: unknown } | string;
+      message?: unknown;
+    };
+    if (typeof json.error === "string") {
+      message = json.error;
+    } else if (json.error && typeof json.error === "object") {
+      code = typeof json.error.code === "string" ? json.error.code : "";
+      message =
+        typeof json.error.message === "string" ? json.error.message : "";
+    }
+    if (!message && typeof json.message === "string") {
+      message = json.message;
+    }
+  } catch {
+    message = text;
+  }
+  return new CursorApiError(
+    status,
+    code,
+    redactSecrets(message).replace(/\s+/g, " ").trim().slice(0, 300),
+  );
+}
+
+export function cursorErrorInfo(error: unknown): {
+  status?: number;
+  code?: string;
+  apiMessage?: string;
+  message?: string;
+} {
+  if (error instanceof CursorApiError) {
+    return {
+      status: error.status,
+      code: error.code,
+      apiMessage: error.apiMessage,
+    };
+  }
+  if (error instanceof Error) {
+    return { message: redactSecrets(error.message) };
+  }
+  return {};
+}
+
 async function cursorFetch<T>(
   method: string,
   path: string,
@@ -43,8 +112,14 @@ async function cursorFetch<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
-    console.error(`Cursor API ${method} ${path}: status=${response.status}`);
-    throw new Error(`Cursor API returned ${response.status}.`);
+    const raw = await response.text();
+    const error = parseCursorError(response.status, raw);
+    console.error(
+      `Cursor API ${method} ${path}: status=${error.status}` +
+        (error.code ? ` code=${error.code}` : "") +
+        (error.apiMessage ? ` message=${error.apiMessage}` : ""),
+    );
+    throw error;
   }
   return (await response.json()) as T;
 }

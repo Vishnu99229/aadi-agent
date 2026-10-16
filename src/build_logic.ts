@@ -83,6 +83,74 @@ export function oneLineError(text: string | undefined): string {
   return cleaned || "The Cursor agent failed.";
 }
 
+export function shortCursorStartReason(error: {
+  status?: number;
+  code?: string;
+  apiMessage?: string;
+  message?: string;
+}): string {
+  const status = error.status;
+  const code = (error.code ?? "").toLowerCase();
+  const raw = `${error.apiMessage ?? ""} ${error.message ?? ""}`
+    .replace(/\s+/g, " ")
+    .trim();
+  const text = raw.toLowerCase();
+
+  if (
+    status === 401 ||
+    /invalid api key|unauthorized|unauthenticated|authentication|api key/.test(
+      text,
+    )
+  ) {
+    return "invalid API key";
+  }
+  if (
+    /storage mode is disabled|enable storage|privacy mode \(legacy\)|legacy privacy/.test(
+      text,
+    )
+  ) {
+    return "storage is disabled in Cursor settings";
+  }
+  if (
+    /repository not accessible|repo(sitory)? (not found|inaccessible)|does not have access to (the )?repo/.test(
+      text,
+    )
+  ) {
+    return "repository not accessible";
+  }
+  if (/usage-based|spend limit|billing|payment required/.test(text)) {
+    return "usage-based pricing is not enabled";
+  }
+  if (
+    code === "feature_unavailable" ||
+    /cloud agents? not (enabled|supported)|not enabled on this plan|not available on your plan/.test(
+      text,
+    )
+  ) {
+    return "cloud agents not enabled on this plan";
+  }
+  if (raw) {
+    const first = raw.split(/(?<=[.!?])\s/)[0] ?? raw;
+    return first.replace(/[.]+$/, "").slice(0, 140);
+  }
+  if (status === 403) {
+    return "cloud agents not enabled on this plan";
+  }
+  if (status) {
+    return `Cursor API returned ${status}`;
+  }
+  return "the Cursor agent could not start";
+}
+
+export function formatCouldNotStart(error: {
+  status?: number;
+  code?: string;
+  apiMessage?: string;
+  message?: string;
+}): string {
+  return `Could not start: ${shortCursorStartReason(error)}`;
+}
+
 export function shortSummary(text: string | undefined): string {
   const cleaned = (text ?? "").replace(/\s+/g, " ").trim();
   if (!cleaned) {
@@ -92,7 +160,19 @@ export function shortSummary(text: string | undefined): string {
 }
 
 export function confirmBuildText(task: string): string {
-  return `Build this?\n${task.trim()}`;
+  return `Build this?\n${task.trim()}\n\nTap Start or Cancel.`;
+}
+
+export function failedStartText(
+  task: string,
+  error: {
+    status?: number;
+    code?: string;
+    apiMessage?: string;
+    message?: string;
+  },
+): string {
+  return `${formatCouldNotStart(error)}\n\n${confirmBuildText(task)}`;
 }
 
 export function revertCommitMessage(prTitle: string): string {

@@ -452,7 +452,14 @@ bot.callbackQuery(/^fu:/, async (ctx) => {
 });
 
 bot.callbackQuery(/^build:/, async (ctx) => {
-  await handleBuildCallback(ctx);
+  try {
+    await handleBuildCallback(ctx);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Build callback failed (${errorType}).`);
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    await ctx.reply(`Something broke: ${shortError(error)}`).catch(() => undefined);
+  }
 });
 
 bot.callbackQuery(/^menu:(model|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {

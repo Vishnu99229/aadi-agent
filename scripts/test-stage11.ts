@@ -20,8 +20,10 @@ const execFileAsync = promisify(execFile);
 
 const {
   confirmBuildText,
+  failedStartText,
   formatBuildsList,
   formatChangedFiles,
+  formatCouldNotStart,
   isBuildConfigured,
   oneLineError,
   parseBuildVoice,
@@ -80,7 +82,52 @@ assert(
   confirmBuildText("fix greeting").includes("Build this?"),
   "confirm text",
 );
+assert(
+  confirmBuildText("fix greeting").includes("Tap Start or Cancel."),
+  "confirm asks for Start",
+);
 assert(oneLineError("  boom \n line  ") === "boom line", "one line error");
+assert(
+  formatCouldNotStart({
+    status: 403,
+    code: "feature_unavailable",
+    apiMessage:
+      "Storage mode is disabled. Please enable storage in your Cursor settings to use agents via API.",
+  }) === "Could not start: storage is disabled in Cursor settings",
+  "storage mode error",
+);
+assert(
+  formatCouldNotStart({ status: 401, apiMessage: "Unauthorized" }) ===
+    "Could not start: invalid API key",
+  "invalid key",
+);
+assert(
+  formatCouldNotStart({
+    status: 403,
+    apiMessage: "repository not accessible",
+  }) === "Could not start: repository not accessible",
+  "repo inaccessible",
+);
+assert(
+  formatCouldNotStart({
+    status: 403,
+    code: "feature_unavailable",
+    apiMessage: "Cloud Agents are not available on your plan.",
+  }) === "Could not start: cloud agents not enabled on this plan",
+  "plan gate",
+);
+assert(
+  !failedStartText("fix greeting", { status: 403 }).includes("crsr_"),
+  "no secrets in start failure",
+);
+assert(
+  failedStartText("fix greeting", {
+    status: 403,
+    code: "feature_unavailable",
+    apiMessage: "Storage mode is disabled.",
+  }).includes("Tap Start or Cancel."),
+  "failed start keeps confirm buttons copy",
+);
 assert(shortSummary("").includes("finished"), "empty summary");
 
 const list = formatBuildsList([
