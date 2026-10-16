@@ -28,6 +28,7 @@ run() {
 
 IP="$(resolve_phone_ip)"
 TARGET="${IP}:${PHONE_ADB_PORT}"
+LAN_IP="$(resolve_lan_ip || true)"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   SERIAL="$(list_usb_serials | awk 'NR==1 { print $1 }' || true)"
@@ -37,20 +38,20 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo "adb -s <usb-serial> tcpip $PHONE_ADB_PORT"
   fi
   run adb connect "$TARGET"
+  if [ -n "${LAN_IP:-}" ] && [ "$LAN_IP" != "$IP" ]; then
+    echo "adb connect ${LAN_IP}:${PHONE_ADB_PORT}"
+  fi
   echo "Network ADB is on. You can unplug the cable now. Run npm run phone:screen to mirror."
   exit 0
-fi
-
-if ! phone_reachable "$IP"; then
-  unreachable_phone_message >&2
-  exit 1
 fi
 
 USB_LIST="$(list_usb_serials)"
 COUNT="$(printf '%s\n' "$USB_LIST" | awk 'NF { c++ } END { print c+0 }')"
 
 if [ "$COUNT" -eq 0 ]; then
-  no_usb_message >&2
+  PHONE_PORT_CMD="adb devices -l (usb:)"
+  PHONE_PORT_ERR="no USB device in state device"
+  print_check_error "$(no_usb_message)"
   exit 1
 fi
 
@@ -58,28 +59,47 @@ if [ "$COUNT" -gt 1 ]; then
   echo "More than one USB device is attached:" >&2
   printf '%s\n' "$USB_LIST" | awk 'NF { print "  " $0 }' >&2
   echo "Unplug the extras and try again." >&2
+  echo "Check failed: adb devices -l (usb:)" >&2
   exit 1
 fi
 
 SERIAL="$(printf '%s\n' "$USB_LIST" | awk 'NF { print $1; exit }')"
+if [ -z "${LAN_IP:-}" ]; then
+  LAN_IP="$(adb -s "$SERIAL" shell ip -f inet addr show wlan0 2>/dev/null \
+    | awk '/inet / { split($2, a, "/"); print a[1]; exit }' || true)"
+fi
+
 run adb -s "$SERIAL" tcpip "$PHONE_ADB_PORT"
 
-opened=0
+opened_ip=""
 waited=0
 while [ "$waited" -lt 15 ]; do
   if network_adb_open "$IP"; then
-    opened=1
+    opened_ip="$IP"
+    break
+  fi
+  if [ -n "${LAN_IP:-}" ] && [ "$LAN_IP" != "$IP" ] && network_adb_open "$LAN_IP"; then
+    opened_ip="$LAN_IP"
     break
   fi
   sleep 1
   waited=$((waited + 1))
 done
 
-if [ "$opened" -ne 1 ]; then
-  echo "Port $PHONE_ADB_PORT on $IP did not open in time." >&2
-  echo "USB tcpip ran, but Tailscale ADB is not reachable yet. Try npm run phone:wifi again." >&2
+if [ -z "$opened_ip" ]; then
+  PHONE_PORT_CMD="nc -4 -z -G 5 $IP $PHONE_ADB_PORT"
+  PHONE_PORT_ERR="port $PHONE_ADB_PORT did not open on $IP within 15s"
+  if [ -n "${LAN_IP:-}" ]; then
+    PHONE_PORT_ERR="${PHONE_PORT_ERR}; also tried ${LAN_IP}:${PHONE_ADB_PORT}"
+  fi
+  print_check_error "USB tcpip ran, but network ADB is not reachable yet. Try npm run phone:wifi again."
   exit 1
 fi
 
+TARGET="${opened_ip}:${PHONE_ADB_PORT}"
 run adb connect "$TARGET"
-echo "Network ADB is on. You can unplug the cable now. Run npm run phone:screen to mirror."
+if [ "$opened_ip" = "$IP" ]; then
+  echo "Network ADB is on via Tailscale ${TARGET}. You can unplug the cable now. Run npm run phone:screen to mirror."
+else
+  echo "Network ADB is on via LAN ${TARGET} (Tailscale ${IP}:${PHONE_ADB_PORT} did not open). You can unplug the cable now. Run npm run phone:screen to mirror."
+fi

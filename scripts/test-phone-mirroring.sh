@@ -21,6 +21,14 @@ assert_contains() {
   esac
 }
 
+assert_not_contains() {
+  haystack="$1"
+  needle="$2"
+  case "$haystack" in
+    *"$needle"*) fail "did not expect: $needle"$'\n'"got:"$'\n'"$haystack" ;;
+  esac
+}
+
 write_exec() {
   path="$1"
   cat > "$path"
@@ -31,6 +39,23 @@ write_exec "$STUB/tailscale" <<'EOF'
 #!/bin/sh
 if [ "$1" = "ip" ] && [ "$2" = "-4" ]; then
   echo "100.79.235.3"
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  if [ "${PHONE_STUB_TS:-up}" = "down" ]; then
+    echo "100.64.36.99  admins-macbook-pro  other-account@  macOS"
+    exit 0
+  fi
+  echo "100.64.36.99  admins-macbook-pro  vishnu.rajan294@  macOS"
+  echo "100.79.235.3  i2301               vishnu.rajan294@  android  active; direct 192.168.1.7:56245"
+  exit 0
+fi
+if [ "$1" = "ping" ]; then
+  if [ "${PHONE_STUB_TS:-up}" = "down" ]; then
+    echo "no matching peer" >&2
+    exit 1
+  fi
+  echo "pong from i2301 (100.79.235.3) via 192.168.1.7:56245 in 20ms"
   exit 0
 fi
 exit 0
@@ -53,8 +78,8 @@ while [ "$i" -le $# ]; do
   i=$((i + 1))
 done
 case ",${PHONE_STUB_OPEN_PORTS:-}," in
-  *",$port,"*) exit 0 ;;
-  *) exit 1 ;;
+  *",$port,"*) echo "Connection to host port $port succeeded!" >&2; exit 0 ;;
+  *) echo "Connection refused" >&2; exit 1 ;;
 esac
 EOF
 
@@ -77,6 +102,14 @@ if [ "$1" = "devices" ]; then
   fi
   exit 0
 fi
+if [ "$1" = "-s" ] && [ "$3" = "shell" ]; then
+  echo "    inet 192.168.1.7/24 brd 192.168.1.255 scope global dynamic wlan0"
+  exit 0
+fi
+if [ "$1" = "connect" ] || [ "$1" = "disconnect" ]; then
+  echo "adb-stub $*"
+  exit 0
+fi
 echo "adb-stub $*" >&2
 exit 0
 EOF
@@ -84,24 +117,41 @@ EOF
 export PATH="$STUB:$PATH"
 
 set +e
-out="$(PHONE_STUB_OPEN_PORTS="" "$SCREEN" 2>&1)"
+out="$(PHONE_STUB_TS=down PHONE_STUB_OPEN_PORTS="" "$SCREEN" 2>&1)"
 status=$?
 set -e
 [ "$status" -ne 0 ] || fail "unreachable should exit 1"
 assert_contains "$out" "Can't reach the phone. Check the Mac's Tailscale is on the PERSONAL account (vishnu.rajan294@gmail.com), not Epicode's."
+assert_contains "$out" "Check failed:"
+assert_contains "$out" "i2301 is not in tailscale status"
 
 set +e
-out="$(PHONE_STUB_OPEN_PORTS="8022" "$SCREEN" 2>&1)"
+out="$(PHONE_STUB_TS=up PHONE_STUB_OPEN_PORTS="" "$SCREEN" 2>&1)"
 status=$?
 set -e
 [ "$status" -ne 0 ] || fail "closed 5555 should exit 1"
 assert_contains "$out" "Phone is up but network ADB is off (it probably rebooted). Plug in USB once and run npm run phone:wifi."
+assert_contains "$out" "Check failed:"
+assert_contains "$out" "Error: Connection refused"
+assert_not_contains "$out" "Can't reach the phone"
 
 set +e
-out="$(PHONE_STUB_OPEN_PORTS="8022" PHONE_STUB_USB="none" "$WIFI" 2>&1)"
+out="$(PHONE_STUB_TS=up PHONE_STUB_OPEN_PORTS="" PHONE_STUB_USB="none" "$WIFI" 2>&1)"
 status=$?
 set -e
 [ "$status" -ne 0 ] || fail "no USB should exit 1"
 assert_contains "$out" "Plug the phone in via USB and try again."
+assert_contains "$out" "Check failed: adb devices -l (usb:)"
+
+# Port 8022 (sshd) closed must not look like the wrong Tailscale account when
+# the peer is up and ADB 5555 is open.
+set +e
+out="$(PHONE_STUB_TS=up PHONE_STUB_OPEN_PORTS="5555" PHONE_STUB_NET="device" "$SCREEN" 2>&1)"
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "open 5555 should not require port 8022"$'\n'"$out"
+assert_contains "$out" "scrcpy-stub --tcpip=100.79.235.3:5555"
+assert_contains "$out" "--force-adb-forward"
+assert_not_contains "$out" "Can't reach the phone"
 
 echo "Phone mirroring mock checks passed."
