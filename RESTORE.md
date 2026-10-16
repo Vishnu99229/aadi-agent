@@ -36,3 +36,14 @@ scp -P "$PHONE_PORT" aadi.db "$PHONE:~/aadi-agent/aadi.db"
 
 3. `npm run phone:resume`
 4. Confirm Aadi is up, then in Telegram send `/accounts`.
+
+## Wireless screen mirroring
+
+From the Mac, Tailscale on the personal account (`vishnu.rajan294@gmail.com`):
+
+```sh
+npm run phone:wifi     # USB cable once — turns on network ADB
+npm run phone:screen   # unplug; mirrors over Tailscale
+```
+
+After a reboot, network ADB is off: plug in USB and run `phone:wifi` again. If the phone is unreachable, the Mac is probably on Epicode's tailnet — switch Tailscale to personal.
