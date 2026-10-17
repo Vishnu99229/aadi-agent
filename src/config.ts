@@ -254,6 +254,17 @@ const meetingHoldsOnPropose = parseBool(
   false,
 );
 const autoBook = parseBool(process.env.AUTO_BOOK, true);
+const meetingModeRaw = (process.env.MEETING_MODE?.trim().toLowerCase() || "auto");
+if (meetingModeRaw !== "auto" && meetingModeRaw !== "assist") {
+  console.error("MEETING_MODE must be auto or assist.");
+  process.exit(1);
+}
+const meetingMode = meetingModeRaw as "auto" | "assist";
+const autoSendDailyCap = parsePositiveNumber(
+  process.env.AUTO_SEND_DAILY_CAP,
+  15,
+  "AUTO_SEND_DAILY_CAP",
+);
 const meetingTestSenders = (process.env.MEETING_TEST_SENDERS ?? "")
   .split(",")
   .map((item) => item.trim().toLowerCase())
@@ -401,8 +412,10 @@ export const config = {
   meetingHorizonDays,
   meetingHoldsOnPropose,
   autoBook,
+  meetingMode,
   autoBookDelayMinutes,
   autoBookDailyCap,
+  autoSendDailyCap,
   autoBookMinConfidence,
   meetingTestSenders,
 } as const;

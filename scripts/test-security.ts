@@ -4,10 +4,12 @@ import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import {
   AutoBookRefusedError,
+  PLAIN_SIGNATURE,
   autoBookConfirm,
   evaluateAutoBookChecks,
   extraToCcAddresses,
   renderBookingConfirmBody,
+  sendSchedulingEmail,
 } from "../src/security/auto_book.ts";
 import {
   DB_PATH,
@@ -378,6 +380,35 @@ await autoBookConfirm({
   },
 });
 assert(sent === 1, "matching template may send");
+assert(template.includes(PLAIN_SIGNATURE), "confirm uses the plain signature");
+
+let capSent = 0;
+try {
+  await sendSchedulingEmail({
+    kind: "confirm",
+    gate: {
+      ...gate,
+      dailySendCount: 15,
+      dailySendCap: 15,
+    },
+    body: template,
+    confirm: {
+      firstName: "Ada",
+      dayDate: "Tuesday, 21 Oct",
+      startTime: "11:00",
+      endTime: "11:30",
+      otherZone: null,
+    },
+    sendImpl: async () => {
+      capSent += 1;
+      return { messageId: "cap" };
+    },
+  });
+  throw new Error("send cap must refuse");
+} catch (error) {
+  assert(error instanceof AutoBookRefusedError, "send cap is refused");
+}
+assert(capSent === 0, "caps must not send");
 
 async function listTsFiles(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true });
@@ -433,8 +464,8 @@ assert(
   "auto-book path requires an open proposal",
 );
 assert(
-  meetingBookSrc.includes("autoBookConfirm"),
-  "confirmation send must go through autoBookConfirm",
+  meetingBookSrc.includes("sendSchedulingEmail"),
+  "confirmation send must go through sendSchedulingEmail",
 );
 assert(
   !meetingBookSrc.includes("messages.send"),
@@ -448,6 +479,8 @@ assert(
 
 const toolsIndex = await readFile(join(root, "src/tools/index.ts"), "utf8");
 assert(!/book_meeting|send_email|create_event/.test(toolsIndex), "no model send/book tools");
+assert(!/sendSchedulingEmail|messages.send/.test(toolsIndex), "model tools have no send");
+assert(!/calendar\.events/.test(toolsIndex), "model tools have no calendar write");
 
 function fakeWorkAccount(): LoadedGoogleAccount {
   return {
@@ -506,11 +539,14 @@ setMeetingTestHooks({
     window_hint: null,
     duration_minutes: 30,
     sender_timezone: null,
+    sender_type: "other",
     confidence: 0.95,
   }),
   mapReply: async () => ({
+    reply_kind: "pick_one",
     verdict: "one",
     slot_index: 0,
+    own_time: null,
     confidence: 0.99,
   }),
   insertEvent: async () => {
@@ -519,6 +555,10 @@ setMeetingTestHooks({
   },
   loadBusy: async () => [],
   slotIsFree: async () => true,
+  sendImpl: async () => {
+    mailSends += 1;
+    return { messageId: "should-not-send" };
+  },
 });
 
 calendarInserts = 0;
@@ -599,6 +639,61 @@ for (const row of [
     `reply on ${row.label} proposal must not create a pending_booking`,
   );
 }
+
+const forgedOwnerSends = { calendar: 0, mail: 0 };
+setMeetingTestHooks({
+  detect: async () => ({
+    kind: "asks_availability",
+    proposed_times: [],
+    window_hint: null,
+    duration_minutes: 30,
+    sender_timezone: null,
+    sender_type: "prospect_enquiry",
+    confidence: 0.95,
+  }),
+  mapReply: async () => ({
+    reply_kind: "pick_one",
+    verdict: "one",
+    slot_index: 0,
+    own_time: null,
+    confidence: 0.99,
+  }),
+  insertEvent: async () => {
+    forgedOwnerSends.calendar += 1;
+    return "forged-event";
+  },
+  loadBusy: async () => [],
+  slotIsFree: async () => true,
+  sendImpl: async () => {
+    forgedOwnerSends.mail += 1;
+    return { messageId: "should-not-send" };
+  },
+});
+createMeetingProposal({
+  threadId: "thread-forged-owner",
+  sentMessageId: "sent-owner-1",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: closedSlots,
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+await processInboundMeetingMessage(
+  silentApi(),
+  work,
+  fakeInbound({
+    messageId: "forged-work-from",
+    threadId: "thread-forged-owner",
+    from: "Vishnu <vishnu.rajan@epicode.in>",
+    subject: "Re: call",
+    body: "Tuesday 11am confirmed",
+    internalDate: String(Date.now() + 60_000),
+  }),
+  new Date(),
+);
+assert(forgedOwnerSends.calendar === 0, "forged work From without SENT must not book");
+assert(forgedOwnerSends.mail === 0, "forged work From without SENT must not send");
 
 resetMeetingTestHooks();
 

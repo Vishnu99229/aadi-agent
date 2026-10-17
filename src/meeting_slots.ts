@@ -307,7 +307,140 @@ export function findSlots(options: SlotFinderOptions): TimeSlot[] {
 
   const spread = spreadAcrossDays(collected, options.timezone);
   const offset = options.offset ?? 0;
-  return spread.slice(offset, offset + options.slotsToOffer);
+  const pool = spread.slice(offset);
+  return pickVariedSlots(pool, options.slotsToOffer, options.timezone);
+}
+
+function clockKey(slot: TimeSlot, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(slot.start);
+  const hour = parts.find((part) => part.type === "hour")?.value ?? "00";
+  const minute = parts.find((part) => part.type === "minute")?.value ?? "00";
+  return `${hour}:${minute}`;
+}
+
+function dayKey(slot: TimeSlot, timezone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(slot.start);
+}
+
+function startMinutesOf(slot: TimeSlot, timezone: string): number {
+  const [hour, minute] = clockKey(slot, timezone).split(":").map(Number);
+  return (hour ?? 0) * 60 + (minute ?? 0);
+}
+
+function isMorningSlot(slot: TimeSlot, timezone: string): boolean {
+  return startMinutesOf(slot, timezone) < 13 * 60;
+}
+
+function isAfternoonSlot(slot: TimeSlot, timezone: string): boolean {
+  return startMinutesOf(slot, timezone) >= 14 * 60;
+}
+
+export function pickVariedSlots(
+  slots: TimeSlot[],
+  count: number,
+  timezone: string,
+): TimeSlot[] {
+  if (count <= 0 || slots.length === 0) {
+    return [];
+  }
+  const picked: TimeSlot[] = [];
+  const usedDays = new Set<string>();
+  const usedClocks = new Set<string>();
+
+  const take = (candidates: TimeSlot[], preferNewDay: boolean): boolean => {
+    const ordered = preferNewDay
+      ? [
+          ...candidates.filter((slot) => !usedDays.has(dayKey(slot, timezone))),
+          ...candidates.filter((slot) => usedDays.has(dayKey(slot, timezone))),
+        ]
+      : candidates;
+    for (const slot of ordered) {
+      if (picked.includes(slot)) {
+        continue;
+      }
+      const clock = clockKey(slot, timezone);
+      if (picked.length === count - 1 && usedClocks.size === 1 && usedClocks.has(clock)) {
+        continue;
+      }
+      picked.push(slot);
+      usedDays.add(dayKey(slot, timezone));
+      usedClocks.add(clock);
+      return true;
+    }
+    return false;
+  };
+
+  take(
+    slots.filter((slot) => isMorningSlot(slot, timezone)),
+    true,
+  );
+  take(
+    slots.filter((slot) => isAfternoonSlot(slot, timezone)),
+    true,
+  );
+  while (picked.length < count) {
+    if (!take(slots, true)) {
+      break;
+    }
+  }
+  if (picked.length < count) {
+    for (const slot of slots) {
+      if (picked.length >= count) {
+        break;
+      }
+      if (!picked.includes(slot)) {
+        picked.push(slot);
+      }
+    }
+  }
+  return picked.slice(0, count);
+}
+
+export function formatOfferSlot(
+  slot: TimeSlot,
+  otherTimeZone?: string | null,
+): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).formatToParts(slot.start);
+  const read = (type: string): string =>
+    parts.find((part) => part.type === type)?.value ?? "";
+  const dayPeriod = read("dayPeriod").toUpperCase();
+  const base = `${read("weekday")} ${read("day")} ${read("month")}, ${read("hour")}:${read("minute")} ${dayPeriod} IST`;
+  if (!otherTimeZone) {
+    return base;
+  }
+  try {
+    const otherParts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: otherTimeZone,
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+      timeZoneName: "short",
+    }).formatToParts(slot.start);
+    const otherRead = (type: string): string =>
+      otherParts.find((part) => part.type === type)?.value ?? "";
+    const zone = `${otherRead("hour")}:${otherRead("minute")} ${otherRead("dayPeriod").toUpperCase()} ${otherRead("timeZoneName")}`;
+    return `${base} (${zone})`;
+  } catch {
+    return base;
+  }
 }
 
 export function formatSlotIst(slot: TimeSlot, otherTimeZone?: string | null): string {
@@ -342,6 +475,27 @@ export function formatSlotIst(slot: TimeSlot, otherTimeZone?: string | null): st
   } catch {
     return `${start}–${end} IST`;
   }
+}
+
+export function istWeekday(date: Date): number {
+  return istParts(date).weekday;
+}
+
+export function fitsWorkingHours(
+  slot: TimeSlot,
+  hours: { startMinutes: number; endMinutes: number },
+  breakMinutes: { startMinutes: number; endMinutes: number },
+): boolean {
+  const weekday = istWeekday(slot.start);
+  if (weekday < 1 || weekday > 5) {
+    return false;
+  }
+  const start = minutesOfDay(istParts(slot.start));
+  const end = minutesOfDay(istParts(slot.end));
+  if (start < hours.startMinutes || end > hours.endMinutes) {
+    return false;
+  }
+  return !blockedByBreak(start, end - start, breakMinutes);
 }
 
 export function formatConfirmDayDate(date: Date): string {

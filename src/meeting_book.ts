@@ -5,6 +5,7 @@ import { google, type gmail_v1 } from "googleapis";
 import { queueDraftApproval } from "./approvals.js";
 import { config } from "./config.js";
 import {
+  countMeetingAutoSendsToday,
   createMeetingPendingBooking,
   createMeetingProposal,
   deleteMeetingCardState,
@@ -15,30 +16,42 @@ import {
   getMeetingPendingBooking,
   getMeetingProposal,
   getLatestMeetingProposalByThread,
+  getMeetingThread,
   getOpenMeetingProposalByThread,
   insertMeetingInbound,
   listDueMeetingPendingBookings,
+  listMeetingAutoSendIds,
   listMeetingPendingBookings,
+  listMeetingThreads,
   listOpenMeetingProposals,
+  recordMeetingAutoSend,
   setMeetingCardState,
   setMeetingInboundProcessedAs,
   setMeetingProposalHolds,
+  setMeetingProposalSlots,
   setMeetingProposalStatus,
   transitionMeetingPendingBooking,
   upsertMeetingDraftIntent,
+  upsertMeetingThread,
   type MeetingProposalRecord,
+  type MeetingThreadStatus,
 } from "./db.js";
 import {
+  AUTO_HANDLE_SENDER_TYPES,
   detectMeetingRequest,
+  draftOpeningLine,
   mapReplyToSlot,
   type MeetingDetection,
   type MeetingKind,
   type MeetingReplyMapping,
+  type SenderType,
 } from "./meeting_detect.js";
 import {
   findSlots,
+  fitsWorkingHours,
   formatConfirmClock,
   formatConfirmDayDate,
+  formatOfferSlot,
   formatOtherZoneRange,
   formatSlotIst,
   parseWindowHint,
@@ -54,11 +67,20 @@ import { createNewEmailDraft, createThreadReplyDraft, gmailClient } from "./goog
 import { messageHeader, senderDisplay } from "./gmail_attachments.js";
 import { isSelfEmail } from "./mom_logic.js";
 import {
-  autoBookConfirm,
+  DEFAULT_SIGNATURE_HTML,
+  TELEGRAM_ONLY_LABELS,
+  containsForbiddenInternal,
   evaluateAutoBookChecks,
+  extraToCcAddresses,
+  htmlFromSchedulingBody,
   normalizeEmail,
+  openingLineOrFallback,
   renderBookingConfirmBody,
+  renderClarifyBody,
+  renderProposalBody,
+  sendSchedulingEmail,
   type AutoBookGateInput,
+  type SchedulingSendGateInput,
 } from "./security/auto_book.js";
 
 export interface MeetingTestHooks {
@@ -73,6 +95,10 @@ export interface MeetingTestHooks {
   ) => Promise<string>;
   loadBusy?: (timeMin: Date, timeMax: Date) => Promise<BusyInterval[]>;
   slotIsFree?: (slot: TimeSlot) => Promise<boolean>;
+  openingLine?: (input: { subject: string; body: string }) => Promise<string>;
+  signatureHtml?: string;
+  sendImpl?: (body: string) => Promise<{ messageId: string }>;
+  clashTitle?: (slot: TimeSlot) => Promise<string>;
 }
 
 let testHooks: MeetingTestHooks = {};
@@ -337,6 +363,43 @@ function parseCard(raw: string | undefined): CardPayload | undefined {
   }
 }
 
+let cachedSignature:
+  | { html: string; fetchedAt: number }
+  | undefined;
+
+export function gmailThreadUrl(threadId: string): string {
+  return `https://mail.google.com/mail/?authuser=${encodeURIComponent(WORK_EMAIL)}#all/${threadId}`;
+}
+
+async function workSignatureHtml(): Promise<string> {
+  if (testHooks.signatureHtml) {
+    return testHooks.signatureHtml;
+  }
+  if (process.env.AADI_DB_PATH === ":memory:") {
+    return DEFAULT_SIGNATURE_HTML;
+  }
+  const now = Date.now();
+  if (cachedSignature && now - cachedSignature.fetchedAt < 60 * 60 * 1000) {
+    return cachedSignature.html;
+  }
+  try {
+    const account = await workAccount();
+    if (!account) {
+      return DEFAULT_SIGNATURE_HTML;
+    }
+    const gmail = gmailClient(account);
+    const sendAs = await gmail.users.settings.sendAs.get({
+      userId: "me",
+      sendAsEmail: WORK_EMAIL,
+    });
+    const html = sendAs.data.signature?.trim() || DEFAULT_SIGNATURE_HTML;
+    cachedSignature = { html, fetchedAt: now };
+    return html;
+  } catch {
+    return DEFAULT_SIGNATURE_HTML;
+  }
+}
+
 function countAutoBooksToday(now: Date): number {
   const today = new Intl.DateTimeFormat("en-CA", {
     timeZone: TIME_ZONE,
@@ -425,6 +488,33 @@ function askKeyboard(proposalId: number, slotCount: number): InlineKeyboard {
   return keyboard;
 }
 
+function vendorFyiKeyboard(inboundId: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Reply with slots", `meet:autoslots:${inboundId}`)
+    .text("Ignore", `meet:ignore:${inboundId}`);
+}
+
+function handoverKeyboard(
+  proposalId: number,
+  slots: TimeSlot[],
+  threadId: string,
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (let index = 0; index < slots.length && index < 3; index += 1) {
+    keyboard
+      .text(formatOfferSlot(slots[index]!).replace(" IST", ""), `meet:book:${proposalId}:${index}`)
+      .row();
+  }
+  keyboard.url("Open thread", gmailThreadUrl(threadId)).text("Ignore", `meet:pignore:${proposalId}`);
+  return keyboard;
+}
+
+function bookedKeyboard(bookingId: number, threadId: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Undo", `meet:undo:${bookingId}`)
+    .url("Open thread", gmailThreadUrl(threadId));
+}
+
 async function sendOwner(api: Api, text: string, markup?: InlineKeyboard): Promise<void> {
   await api.sendMessage(config.ownerTelegramId, text, markup ? { reply_markup: markup } : {});
 }
@@ -490,6 +580,189 @@ async function sendMeetingCard(api: Api, inboundId: number, card: CardPayload): 
   console.log(`Meeting card sent: inbound=${inboundId} kind=${card.kind} slots=${slots.length}`);
 }
 
+function snippet(text: string, limit = 200): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+async function sendVendorFyi(
+  api: Api,
+  inboundId: number,
+  card: CardPayload,
+  senderType: SenderType,
+): Promise<void> {
+  setMeetingCardState(inboundId, JSON.stringify(card));
+  upsertMeetingThread({
+    threadId: card.threadId,
+    recipientEmail: card.fromEmail,
+    recipientName: card.fromName,
+    company: companyFromEmail(card.fromEmail),
+    senderType,
+    status: "handed_over",
+    subject: card.subject,
+  });
+  await sendOwner(
+    api,
+    `${card.fromName} asked for a call (${senderType}). Not replying.`,
+    vendorFyiKeyboard(inboundId),
+  );
+  console.log(`Meeting fyi: inbound=${inboundId} sender_type=${senderType}`);
+}
+
+async function handOverThread(input: {
+  api: Api;
+  proposal: MeetingProposalRecord;
+  reason: string;
+  snippetText?: string;
+  status?: MeetingThreadStatus;
+}): Promise<void> {
+  const slots = parseSlots(input.proposal.slots);
+  const existing = getMeetingThread(input.proposal.thread_id);
+  upsertMeetingThread({
+    threadId: input.proposal.thread_id,
+    recipientEmail: input.proposal.recipient_email,
+    recipientName: input.proposal.recipient_name,
+    company: companyFromEmail(input.proposal.recipient_email),
+    senderType: existing?.sender_type ?? "other",
+    status: input.status ?? "handed_over",
+    autoEmailsSent: existing?.auto_emails_sent ?? 0,
+    lastKind: existing?.last_kind,
+    subject: existing?.subject ?? "",
+    proposalId: input.proposal.id,
+  });
+  const quote = input.snippetText
+    ? `'${snippet(input.snippetText)}'`
+    : input.reason;
+  await sendOwner(
+    input.api,
+    `${input.proposal.recipient_name} replied, needs you: ${quote}`,
+    handoverKeyboard(input.proposal.id, slots, input.proposal.thread_id),
+  );
+  console.log(
+    `Meeting handover: proposal=${input.proposal.id} reason=${input.reason}`,
+  );
+}
+
+async function sendAutoEmail(input: {
+  kind: "proposal" | "clarify";
+  api: Api;
+  card: CardPayload;
+  slots: TimeSlot[];
+  bodySource: { subject: string; body: string };
+  now: Date;
+  threadStatus: MeetingThreadStatus;
+}): Promise<MeetingProposalRecord | undefined> {
+  const thread = getMeetingThread(input.card.threadId);
+  const already = thread?.auto_emails_sent ?? 0;
+  if (already >= 2) {
+    return undefined;
+  }
+  if (countMeetingAutoSendsToday(input.now) >= config.autoSendDailyCap) {
+    return undefined;
+  }
+  const opening =
+    input.kind === "proposal"
+      ? await resolveOpeningLine(input.bodySource.subject, input.bodySource.body)
+      : "";
+  const slotLines = offerSlotLines(input.slots, input.card.senderTimezone);
+  const template =
+    input.kind === "proposal"
+      ? {
+          firstName: firstNameFrom(input.card.fromName, input.card.fromEmail),
+          openingLine: opening,
+          durationMinutes: input.card.durationMinutes,
+          slots: slotLines,
+        }
+      : undefined;
+  const clarify =
+    input.kind === "clarify"
+      ? {
+          firstName: firstNameFrom(input.card.fromName, input.card.fromEmail),
+          slots: slotLines,
+        }
+      : undefined;
+  const body =
+    input.kind === "proposal" && template
+      ? renderProposalBody(template)
+      : renderClarifyBody(clarify!);
+  if (containsForbiddenInternal(body) || TELEGRAM_ONLY_LABELS.some((label) => body.includes(label))) {
+    throw new Error("internal_label");
+  }
+  const signatureHtml = await workSignatureHtml();
+  const html = htmlFromSchedulingBody(body, signatureHtml);
+  const dummyProposal = {
+    recipient_email: input.card.fromEmail,
+    recipient_name: input.card.fromName,
+    cc_emails: JSON.stringify(input.card.ccEmails),
+    id: 0,
+    thread_id: input.card.threadId,
+    sent_message_id: "",
+    slots: JSON.stringify(toSlotJson(input.slots)),
+    duration_minutes: input.card.durationMinutes,
+    sender_timezone: input.card.senderTimezone,
+    hold_event_ids: "[]",
+    status: "open" as const,
+    created_at: input.now.toISOString(),
+  };
+  const sendImpl =
+    testHooks.sendImpl ??
+    (process.env.AADI_DB_PATH === ":memory:"
+      ? async () => ({ messageId: `mem-${randomUUID()}` })
+      : undefined);
+  const sent = await sendSchedulingEmail({
+    kind: input.kind,
+    gate: sendGateFromProposal(
+      dummyProposal,
+      input.card.fromEmail,
+      input.card.ccEmails,
+      input.now,
+    ),
+    body,
+    html,
+    signatureHtml,
+    proposal: template,
+    clarify,
+    sendImpl,
+    account: sendImpl ? undefined : await workAccount(),
+    threadId: input.card.threadId,
+    to: input.card.fromEmail,
+    subject: input.card.subject,
+    inReplyTo: input.card.inReplyTo || `<${input.card.messageId}@mail>`,
+    references: input.card.references,
+  });
+  const proposal = createMeetingProposal({
+    threadId: input.card.threadId,
+    sentMessageId: sent.messageId,
+    recipientEmail: input.card.fromEmail,
+    recipientName: input.card.fromName,
+    ccEmails: input.card.ccEmails,
+    slots: toSlotJson(input.slots),
+    durationMinutes: input.card.durationMinutes,
+    senderTimezone: input.card.senderTimezone,
+  });
+  recordMeetingAutoSend({
+    threadId: input.card.threadId,
+    kind: input.kind,
+    messageId: sent.messageId,
+  });
+  upsertMeetingThread({
+    threadId: input.card.threadId,
+    recipientEmail: input.card.fromEmail,
+    recipientName: input.card.fromName,
+    company: companyFromEmail(input.card.fromEmail),
+    senderType: thread?.sender_type ?? "prospect_enquiry",
+    status: input.threadStatus,
+    autoEmailsSent: already + 1,
+    lastKind: input.kind,
+    subject: input.card.subject,
+    proposalId: proposal.id,
+  });
+  await createHolds(proposal);
+  console.log(
+    `Meeting auto-send: kind=${input.kind} proposal=${proposal.id} thread=${input.card.threadId}`,
+  );
+  return proposal;
+}
+
 function gateFromProposal(
   proposal: MeetingProposalRecord,
   fromEmail: string,
@@ -505,6 +778,30 @@ function gateFromProposal(
     dailyCount: countAutoBooksToday(now),
     dailyCap: config.autoBookDailyCap,
   };
+}
+
+function sendGateFromProposal(
+  proposal: MeetingProposalRecord,
+  fromEmail: string,
+  incomingToCc: string[],
+  now: Date,
+): SchedulingSendGateInput {
+  return {
+    ...gateFromProposal(proposal, fromEmail, incomingToCc, now),
+    dailySendCount: countMeetingAutoSendsToday(now),
+    dailySendCap: config.autoSendDailyCap,
+  };
+}
+
+function offerSlotLines(slots: TimeSlot[], timeZone: string | null): string[] {
+  return slots.map((slot) => formatOfferSlot(slot, timeZone));
+}
+
+async function resolveOpeningLine(subject: string, body: string): Promise<string> {
+  const raw = testHooks.openingLine
+    ? await testHooks.openingLine({ subject, body })
+    : await draftOpeningLine({ subject, body });
+  return openingLineOrFallback(raw);
 }
 
 async function createHolds(proposal: MeetingProposalRecord): Promise<void> {
@@ -685,10 +982,6 @@ async function insertWorkEvent(slot: TimeSlot, proposal: MeetingProposalRecord):
   return eventId;
 }
 
-function fyiKeyboard(bookingId: number): InlineKeyboard {
-  return new InlineKeyboard().text("Undo", `meet:undo:${bookingId}`);
-}
-
 function cancelKeyboard(bookingId: number): InlineKeyboard {
   return new InlineKeyboard().text("Cancel meeting", `meet:cancel:${bookingId}`);
 }
@@ -710,17 +1003,18 @@ async function notifyBooked(
   bookingId: number,
   sendAt: Date,
 ): Promise<void> {
-  const when = formatSlotIst(slot, proposal.sender_timezone);
+  const when = formatOfferSlot(slot, proposal.sender_timezone);
   const sendTime = new Intl.DateTimeFormat("en-GB", {
     timeZone: TIME_ZONE,
-    hour: "2-digit",
+    hour: "numeric",
     minute: "2-digit",
-    hourCycle: "h23",
+    hour12: true,
   }).format(sendAt);
+  const company = companyFromEmail(proposal.recipient_email);
   await sendOwner(
     api,
-    `Booked ${proposal.recipient_name}, ${when} ✅ Invite and confirmation go out at ${sendTime}.`,
-    fyiKeyboard(bookingId),
+    `📅 Booked: ${proposal.recipient_name} (${company}), ${when}. Invite + confirmation go out at ${sendTime}.`,
+    bookedKeyboard(bookingId, proposal.thread_id),
   );
 }
 
@@ -729,6 +1023,7 @@ export async function bookSelectedSlot(input: {
   slotIndex: number;
   api: Api;
   now?: Date;
+  skipConfirm?: boolean;
 }): Promise<number | undefined> {
   const now = input.now ?? new Date();
   const slots = parseSlots(input.proposal.slots);
@@ -744,8 +1039,22 @@ export async function bookSelectedSlot(input: {
     eventId,
     slotIndex: input.slotIndex,
     sendAt: sendAt.toISOString(),
+    skipConfirm: input.skipConfirm,
   });
   setMeetingProposalStatus(input.proposal.id, "booked");
+  const thread = getMeetingThread(input.proposal.thread_id);
+  upsertMeetingThread({
+    threadId: input.proposal.thread_id,
+    recipientEmail: input.proposal.recipient_email,
+    recipientName: input.proposal.recipient_name,
+    company: companyFromEmail(input.proposal.recipient_email),
+    senderType: thread?.sender_type ?? "prospect_enquiry",
+    status: "booked",
+    autoEmailsSent: thread?.auto_emails_sent ?? 0,
+    lastKind: thread?.last_kind,
+    subject: thread?.subject ?? "",
+    proposalId: input.proposal.id,
+  });
   await removeHolds(input.proposal);
   await notifyBooked(input.api, input.proposal, slot, booking.id, sendAt);
   console.log(`Meeting pending booking: id=${booking.id} proposal=${input.proposal.id}`);
@@ -753,6 +1062,46 @@ export async function bookSelectedSlot(input: {
     await processDuePendingBookings({ now: sendAt, api: input.api });
   }
   return booking.id;
+}
+
+function cardFromProposal(
+  proposal: MeetingProposalRecord,
+  extra: Partial<CardPayload> = {},
+): CardPayload {
+  return {
+    fromEmail: proposal.recipient_email,
+    fromName: proposal.recipient_name,
+    subject: extra.subject ?? "Meeting",
+    ccEmails: extra.ccEmails ?? (JSON.parse(proposal.cc_emails) as string[]),
+    kind: extra.kind ?? "asks_availability",
+    windowHint: extra.windowHint ?? null,
+    durationMinutes: proposal.duration_minutes,
+    senderTimezone: proposal.sender_timezone,
+    calendlyUrl: null,
+    slotOffset: extra.slotOffset ?? 0,
+    messageId: extra.messageId ?? proposal.sent_message_id,
+    threadId: proposal.thread_id,
+    inReplyTo: extra.inReplyTo ?? "",
+    references: extra.references ?? "",
+    proposedTimes: extra.proposedTimes ?? [],
+  };
+}
+
+function ownTimeSlot(
+  raw: string | null,
+  durationMinutes: number,
+): TimeSlot | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const start = new Date(raw);
+  if (Number.isNaN(start.getTime())) {
+    return undefined;
+  }
+  return {
+    start,
+    end: new Date(start.getTime() + durationMinutes * 60 * 1000),
+  };
 }
 
 async function processReplyOnProposal(input: {
@@ -766,40 +1115,295 @@ async function processReplyOnProposal(input: {
     ...parseAddressList(messageHeader(input.message, "To")),
     ...parseAddressList(messageHeader(input.message, "Cc")),
   ];
+  const extras = extraToCcAddresses(toCc, proposalEmails(input.proposal));
+  if (extras.length > 0) {
+    await handOverThread({
+      api: input.api,
+      proposal: input.proposal,
+      reason: "new_cc",
+      snippetText: collectPlain(input.message.payload),
+    });
+    return;
+  }
   const body = collectPlain(input.message.payload);
   const mapping = await (testHooks.mapReply ?? mapReplyToSlot)({
     slotCount: parseSlots(input.proposal.slots).length,
     body,
   });
   const slots = parseSlots(input.proposal.slots);
-  const slot = mapping.slot_index !== null ? slots[mapping.slot_index] : undefined;
-  const stillFree = slot ? await slotIsFree(slot) : false;
-  const decision = evaluateAutoBookChecks({
-    ...gateFromProposal(input.proposal, input.fromEmail, toCc, input.now),
-    slotIndex: mapping.slot_index,
-    verdict: mapping.verdict,
-    confidence: mapping.confidence,
-    minConfidence: config.autoBookMinConfidence,
-    slotCount: slots.length,
-    slotStart: slot?.start ?? null,
-    now: input.now,
-    slotStillFree: stillFree,
-  });
-  if (!decision.ok) {
-    console.log(`Auto-book skipped: proposal=${input.proposal.id} reason=${decision.reason}`);
-    await sendOwner(
-      input.api,
-      `${input.proposal.recipient_name} replied to your proposed slots, but I'm not sure which one they picked.`,
-      askKeyboard(input.proposal.id, slots.length),
-    );
+  if (config.meetingMode !== "auto") {
+    const slot = mapping.slot_index !== null ? slots[mapping.slot_index] : undefined;
+    const stillFree = slot ? await slotIsFree(slot) : false;
+    const decision = evaluateAutoBookChecks({
+      ...gateFromProposal(input.proposal, input.fromEmail, toCc, input.now),
+      slotIndex: mapping.slot_index,
+      verdict: mapping.verdict,
+      confidence: mapping.confidence,
+      minConfidence: config.autoBookMinConfidence,
+      slotCount: slots.length,
+      slotStart: slot?.start ?? null,
+      now: input.now,
+      slotStillFree: stillFree,
+    });
+    if (!decision.ok) {
+      console.log(`Auto-book skipped: proposal=${input.proposal.id} reason=${decision.reason}`);
+      await sendOwner(
+        input.api,
+        `${input.proposal.recipient_name} replied to your proposed slots, but I'm not sure which one they picked.`,
+        askKeyboard(input.proposal.id, slots.length),
+      );
+      return;
+    }
+    await bookSelectedSlot({
+      proposal: input.proposal,
+      slotIndex: decision.slotIndex,
+      api: input.api,
+      now: input.now,
+    });
     return;
   }
-  await bookSelectedSlot({
-    proposal: input.proposal,
-    slotIndex: decision.slotIndex,
+
+  const thread = getMeetingThread(input.proposal.thread_id);
+  const autoSent = thread?.auto_emails_sent ?? 0;
+  const sendCapHit = countMeetingAutoSendsToday(input.now) >= config.autoSendDailyCap;
+  const bookCapHit = countAutoBooksToday(input.now) >= config.autoBookDailyCap;
+
+  if (mapping.reply_kind === "pick_one" && mapping.slot_index !== null) {
+    const slot = slots[mapping.slot_index];
+    if (!slot || mapping.confidence < config.autoBookMinConfidence) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: "low_confidence",
+        snippetText: body,
+      });
+      return;
+    }
+    if (bookCapHit) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: "daily_cap",
+        snippetText: body,
+      });
+      return;
+    }
+    const free = await slotIsFree(slot);
+    if (!free) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: "busy",
+        snippetText: body,
+      });
+      return;
+    }
+    await bookSelectedSlot({
+      proposal: input.proposal,
+      slotIndex: mapping.slot_index,
+      api: input.api,
+      now: input.now,
+    });
+    return;
+  }
+
+  if (mapping.reply_kind === "own_time") {
+    const custom = ownTimeSlot(mapping.own_time, input.proposal.duration_minutes);
+    if (
+      custom &&
+      fitsWorkingHours(custom, config.meetingHours, config.meetingBreak) &&
+      (await slotIsFree(custom))
+    ) {
+      if (bookCapHit) {
+        await handOverThread({
+          api: input.api,
+          proposal: input.proposal,
+          reason: "daily_cap",
+          snippetText: body,
+        });
+        return;
+      }
+      setMeetingProposalSlots(input.proposal.id, toSlotJson([custom]));
+      const updated = getMeetingProposal(input.proposal.id) ?? input.proposal;
+      await bookSelectedSlot({
+        proposal: updated,
+        slotIndex: 0,
+        api: input.api,
+        now: input.now,
+      });
+      return;
+    }
+    if (autoSent >= 2 || sendCapHit) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: sendCapHit ? "send_cap" : "max_auto_emails",
+        snippetText: body,
+      });
+      return;
+    }
+    const nearHint = custom ? formatIstDateSafe(custom.start) : null;
+    const card = cardFromProposal(input.proposal, {
+      subject: messageHeader(input.message, "Subject") || "Meeting",
+      messageId: input.message.id ?? input.proposal.sent_message_id,
+      inReplyTo: messageHeader(input.message, "Message-ID"),
+      references: messageHeader(input.message, "References"),
+      windowHint: nearHint,
+    });
+    const nextSlots = await computeSlots(card);
+    if (nextSlots.length === 0) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: "no_slots",
+        snippetText: body,
+      });
+      return;
+    }
+    setMeetingProposalStatus(input.proposal.id, "cancelled");
+    const created = await sendAutoEmail({
+      kind: "proposal",
+      api: input.api,
+      card,
+      slots: nextSlots,
+      bodySource: { subject: card.subject, body },
+      now: input.now,
+      threadStatus: "proposed",
+    });
+    if (!created) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: "send_cap",
+        snippetText: body,
+      });
+    }
+    return;
+  }
+
+  if (mapping.reply_kind === "vague") {
+    if (thread?.last_kind === "clarify" || autoSent >= 2 || sendCapHit) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: autoSent >= 2 ? "max_auto_emails" : "still_vague",
+        snippetText: body,
+      });
+      return;
+    }
+    const card = cardFromProposal(input.proposal, {
+      subject: messageHeader(input.message, "Subject") || "Meeting",
+      messageId: input.message.id ?? input.proposal.sent_message_id,
+      inReplyTo: messageHeader(input.message, "Message-ID"),
+      references: messageHeader(input.message, "References"),
+    });
+    const created = await sendAutoEmail({
+      kind: "clarify",
+      api: input.api,
+      card,
+      slots,
+      bodySource: { subject: card.subject, body },
+      now: input.now,
+      threadStatus: "clarified",
+    });
+    if (!created) {
+      await handOverThread({
+        api: input.api,
+        proposal: input.proposal,
+        reason: "send_cap",
+        snippetText: body,
+      });
+    }
+    return;
+  }
+
+  await handOverThread({
     api: input.api,
-    now: input.now,
+    proposal: input.proposal,
+    reason: "other",
+    snippetText: body,
   });
+}
+
+function formatIstDateSafe(date: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+async function clashTitleFor(slot: TimeSlot): Promise<string> {
+  if (testHooks.clashTitle) {
+    return testHooks.clashTitle(slot);
+  }
+  try {
+    const account = await getGoogleAccount("work");
+    const calendar = google.calendar({ version: "v3", auth: account.client });
+    const listed = await calendar.events.list({
+      calendarId: "primary",
+      timeMin: slot.start.toISOString(),
+      timeMax: slot.end.toISOString(),
+      singleEvents: true,
+      maxResults: 3,
+    });
+    const summary = listed.data.items?.find((item) => item.summary)?.summary;
+    return summary?.trim() || "an existing event";
+  } catch {
+    return "an existing event";
+  }
+}
+
+async function processOwnerSentReply(input: {
+  api: Api;
+  proposal: MeetingProposalRecord;
+  message: gmail_v1.Schema$Message;
+  now: Date;
+}): Promise<void> {
+  const body = collectPlain(input.message.payload);
+  const mapping = await (testHooks.mapReply ?? mapReplyToSlot)({
+    slotCount: parseSlots(input.proposal.slots).length,
+    body,
+  });
+  const slots = parseSlots(input.proposal.slots);
+  if (mapping.reply_kind === "pick_one" && mapping.slot_index !== null) {
+    const slot = slots[mapping.slot_index];
+    if (slot && (await slotIsFree(slot))) {
+      await bookSelectedSlot({
+        proposal: input.proposal,
+        slotIndex: mapping.slot_index,
+        api: input.api,
+        now: input.now,
+        skipConfirm: true,
+      });
+      return;
+    }
+    const title = slot ? await clashTitleFor(slot) : "an existing event";
+    await sendOwner(input.api, `⚠️ clashes with ${title}`);
+    return;
+  }
+  if (mapping.reply_kind === "own_time") {
+    const custom = ownTimeSlot(mapping.own_time, input.proposal.duration_minutes);
+    if (
+      custom &&
+      fitsWorkingHours(custom, config.meetingHours, config.meetingBreak) &&
+      (await slotIsFree(custom))
+    ) {
+      setMeetingProposalSlots(input.proposal.id, toSlotJson([custom]));
+      const updated = getMeetingProposal(input.proposal.id) ?? input.proposal;
+      await bookSelectedSlot({
+        proposal: updated,
+        slotIndex: 0,
+        api: input.api,
+        now: input.now,
+        skipConfirm: true,
+      });
+      return;
+    }
+    const title = custom ? await clashTitleFor(custom) : "an existing event";
+    await sendOwner(input.api, `⚠️ clashes with ${title}`);
+  }
 }
 
 export async function processInboundMeetingMessage(
@@ -825,6 +1429,36 @@ export async function processInboundMeetingMessage(
   const fromHeader = messageHeader(message, "From");
   const fromEmail = parseAddressList(fromHeader)[0] ?? "";
   const subject = messageHeader(message, "Subject");
+  const labels = message.labelIds ?? [];
+  const isOwnerSent =
+    normalizeEmail(fromEmail) === WORK_EMAIL &&
+    labels.includes("SENT") &&
+    !labels.includes("DRAFT");
+  if (isOwnerSent) {
+    const proposal = getOpenMeetingProposalByThread(threadId);
+    if (
+      proposal &&
+      message.id !== proposal.sent_message_id &&
+      !listMeetingAutoSendIds(threadId).includes(messageId)
+    ) {
+      setMeetingInboundProcessedAs(inbound.id, "autobook");
+      console.log(
+        `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=- kind=owner_sent proposal=${proposal.id}`,
+      );
+      await processOwnerSentReply({
+        api,
+        proposal,
+        message,
+        now,
+      });
+      return;
+    }
+    setMeetingInboundProcessedAs(inbound.id, "skip");
+    console.log(
+      `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=internal`,
+    );
+    return;
+  }
   const skipped = inboundSkipReason({
     fromEmail,
     headers: message.payload?.headers,
@@ -882,13 +1516,14 @@ export async function processInboundMeetingMessage(
     );
     return;
   }
+  const bodyText = collectPlain(message.payload);
   const detection = await (testHooks.detect ?? detectMeetingRequest)({
     subject,
-    body: collectPlain(message.payload),
+    body: bodyText,
   });
   setMeetingInboundProcessedAs(inbound.id, "detect");
   console.log(
-    `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=- kind=${detection.kind} confidence=${detection.confidence}`,
+    `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=- kind=${detection.kind} sender_type=${detection.sender_type} confidence=${detection.confidence}`,
   );
   if (detection.kind === "none") {
     return;
@@ -902,7 +1537,7 @@ export async function processInboundMeetingMessage(
     windowHint: detection.window_hint,
     durationMinutes: detection.duration_minutes ?? config.meetingDefaultMinutes,
     senderTimezone: detection.sender_timezone,
-    calendlyUrl: calendlyUrl(collectPlain(message.payload)),
+    calendlyUrl: calendlyUrl(bodyText),
     slotOffset: 0,
     messageId,
     threadId,
@@ -910,6 +1545,43 @@ export async function processInboundMeetingMessage(
     references: messageHeader(message, "References"),
     proposedTimes: detection.proposed_times,
   };
+  const autoHandle =
+    config.meetingMode === "auto" &&
+    AUTO_HANDLE_SENDER_TYPES.has(detection.sender_type) &&
+    detection.confidence >= config.autoBookMinConfidence &&
+    detection.kind !== "calendly_link";
+  if (config.meetingMode === "auto" && !autoHandle) {
+    setMeetingInboundProcessedAs(inbound.id, "ask");
+    await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+    return;
+  }
+  if (autoHandle) {
+    if (countMeetingAutoSendsToday(now) >= config.autoSendDailyCap) {
+      setMeetingInboundProcessedAs(inbound.id, "ask");
+      await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+      return;
+    }
+    const slots = await computeSlots(card);
+    if (slots.length === 0) {
+      setMeetingInboundProcessedAs(inbound.id, "ask");
+      await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+      return;
+    }
+    setMeetingInboundProcessedAs(inbound.id, "card");
+    const created = await sendAutoEmail({
+      kind: "proposal",
+      api,
+      card,
+      slots,
+      bodySource: { subject, body: bodyText },
+      now,
+      threadStatus: "proposed",
+    });
+    if (!created) {
+      await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+    }
+    return;
+  }
   setMeetingInboundProcessedAs(inbound.id, "card");
   await sendMeetingCard(api, inbound.id, card);
 }
@@ -1054,31 +1726,41 @@ export async function processDuePendingBookings(
     const body = renderBookingConfirmBody(template);
     try {
       await (hooks.patchInvite ?? defaultPatchInvite)(booking.event_id);
-      const headers = hooks.confirmSend
-        ? {
-            inReplyTo: "<mock>",
-            references: "",
-            subject: "Re: meeting",
-            to: proposal.recipient_email,
-          }
-        : await latestThreadHeaders(proposal.thread_id);
-      await autoBookConfirm({
-        gate: gateFromProposal(
-          proposal,
-          proposal.recipient_email,
-          JSON.parse(proposal.cc_emails) as string[],
-          now,
-        ),
-        body,
-        template,
-        sendImpl: hooks.confirmSend,
-        account: hooks.confirmSend ? undefined : await workAccount(),
-        threadId: proposal.thread_id,
-        to: headers.to || proposal.recipient_email,
-        subject: headers.subject,
-        inReplyTo: headers.inReplyTo,
-        references: headers.references,
-      });
+      if (!booking.skip_confirm) {
+        const headers = hooks.confirmSend
+          ? {
+              inReplyTo: "<mock>",
+              references: "",
+              subject: "Re: meeting",
+              to: proposal.recipient_email,
+            }
+          : await latestThreadHeaders(proposal.thread_id);
+        const signatureHtml = await workSignatureHtml();
+        await sendSchedulingEmail({
+          kind: "confirm",
+          gate: sendGateFromProposal(
+            proposal,
+            proposal.recipient_email,
+            JSON.parse(proposal.cc_emails) as string[],
+            now,
+          ),
+          body,
+          confirm: template,
+          signatureHtml,
+          sendImpl: hooks.confirmSend ?? testHooks.sendImpl,
+          account: hooks.confirmSend || testHooks.sendImpl ? undefined : await workAccount(),
+          threadId: proposal.thread_id,
+          to: headers.to || proposal.recipient_email,
+          subject: headers.subject,
+          inReplyTo: headers.inReplyTo,
+          references: headers.references,
+        });
+        recordMeetingAutoSend({
+          threadId: proposal.thread_id,
+          kind: "confirm",
+          messageId: `confirm:${booking.id}`,
+        });
+      }
     } catch (error) {
       const reason = error instanceof Error ? error.message : "send_failed";
       console.log(`Pending booking send failed: id=${booking.id} reason=${reason}`);
@@ -1089,7 +1771,7 @@ export async function processDuePendingBookings(
     }
     setMeetingProposalStatus(proposal.id, "booked");
     sent += 1;
-    const text = `Invite sent to ${proposal.recipient_name} ✉️`;
+    const text = `✉️ Invite sent to ${proposal.recipient_name}.`;
     if (hooks.notify) {
       await hooks.notify(text);
     } else if (hooks.api) {
@@ -1147,6 +1829,31 @@ export async function handleMeetingBookCallback(
   const keep = /^meet:keep:(\d+)$/.exec(data);
   if (keep) {
     await ctx.answerCallbackQuery("Kept.");
+    return true;
+  }
+  const autoSlots = /^meet:autoslots:(\d+)$/.exec(data);
+  if (autoSlots) {
+    const inboundId = Number(autoSlots[1]);
+    const card = parseCard(getMeetingCardState(inboundId));
+    if (!card) {
+      await ctx.answerCallbackQuery("That card expired.");
+      return true;
+    }
+    const slots = await computeSlots(card);
+    if (slots.length === 0) {
+      await ctx.answerCallbackQuery("No free slots.");
+      return true;
+    }
+    await sendAutoEmail({
+      kind: "proposal",
+      api: ctx.api,
+      card,
+      slots,
+      bodySource: { subject: card.subject, body: "" },
+      now: new Date(),
+      threadStatus: "proposed",
+    });
+    await ctx.answerCallbackQuery("Slots sent.");
     return true;
   }
   const ignore = /^meet:ignore:(\d+)$/.exec(data);
@@ -1374,6 +2081,36 @@ export async function tryHandleMeetingChat(
   };
   await sendMeetingCard(ctx.api, inbound.id, card);
   return true;
+}
+
+export function formatMeetingsReport(now = new Date()): string {
+  const threads = listMeetingThreads();
+  const startOfToday = new Date(
+    `${new Intl.DateTimeFormat("en-CA", {
+      timeZone: TIME_ZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(now)}T00:00:00+05:30`,
+  );
+  const rows = threads.filter((row) => {
+    const updated = new Date(
+      row.updated_at.includes("T") ? row.updated_at : `${row.updated_at}Z`,
+    );
+    return updated.getTime() >= startOfToday.getTime() - 7 * 24 * 60 * 60 * 1000;
+  });
+  if (rows.length === 0) {
+    return "No auto-handled meeting threads yet.";
+  }
+  const lines = ["Meetings"];
+  for (const row of rows) {
+    lines.push(
+      `${row.recipient_name} — ${row.status} — ${row.auto_emails_sent} auto email(s)${
+        row.last_kind ? ` — last ${row.last_kind}` : ""
+      }`,
+    );
+  }
+  return lines.join("\n");
 }
 
 export function registerMeetingBookingJobs(api: Api): {

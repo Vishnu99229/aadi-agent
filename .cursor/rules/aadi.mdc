@@ -26,7 +26,7 @@ Aadi is Vishnu's personal AI agent. Vishnu talks to it on Telegram. It answers q
 
 ## Hard rules (never break these)
 1. The bot responds ONLY to the Telegram user ID in OWNER_TELEGRAM_ID. Silently ignore everyone else.
-2. Any action that sends, deletes, books, accepts or spends must go through a Telegram approval button. Reading, searching and drafting are allowed freely. Exception: autoBookConfirm in src/security/auto_book.ts may send the fixed booking-confirmation template without a tap, after the undo window, only when all its gate checks pass. Every other send or calendar write still needs my tap.
+2. Any action that sends, deletes, books, accepts or spends must go through a Telegram approval button. Reading, searching and drafting are allowed freely. Exception: sendSchedulingEmail in src/security/ may send the three fixed scheduling templates (proposal, clarify, confirm) with a validated opening line, and create/patch calendar events for booked meetings, without a tap. Every other send still needs my tap.
 3. Secrets come only from .env. Never hardcode or log them. .env must be in .gitignore.
 4. Never log full email bodies or message contents. Log metadata only.
 5. Model name comes from the CLAUDE_MODEL env var, never hardcoded.

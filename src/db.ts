@@ -487,6 +487,30 @@ db.exec(`
     last_attempt_at TEXT NOT NULL,
     last_status TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS meeting_threads (
+    thread_id TEXT PRIMARY KEY,
+    recipient_email TEXT NOT NULL,
+    recipient_name TEXT NOT NULL,
+    company TEXT NOT NULL DEFAULT '',
+    sender_type TEXT NOT NULL,
+    status TEXT NOT NULL
+      CHECK (status IN ('proposed', 'clarified', 'booked', 'handed_over', 'ignored')),
+    auto_emails_sent INTEGER NOT NULL DEFAULT 0,
+    last_kind TEXT,
+    subject TEXT NOT NULL DEFAULT '',
+    proposal_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS meeting_auto_sends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('proposal', 'clarify', 'confirm')),
+    message_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 if (!tableHasColumn("accounts", "relationship")) {
@@ -503,6 +527,11 @@ if (!tableHasColumn("accounts", "people")) {
 
 if (!tableHasColumn("notes", "meeting_json")) {
   db.exec(`ALTER TABLE notes ADD COLUMN meeting_json TEXT`);
+}
+if (!tableHasColumn("meeting_pending_bookings", "skip_confirm")) {
+  db.exec(
+    `ALTER TABLE meeting_pending_bookings ADD COLUMN skip_confirm INTEGER NOT NULL DEFAULT 0`,
+  );
 }
 
 let memoriesFtsReady = false;
@@ -2097,7 +2126,30 @@ export interface MeetingPendingBookingRecord {
   slot_index: number;
   send_at: string;
   status: MeetingPendingBookingStatus;
+  skip_confirm: number;
   created_at: string;
+}
+
+export type MeetingThreadStatus =
+  | "proposed"
+  | "clarified"
+  | "booked"
+  | "handed_over"
+  | "ignored";
+
+export interface MeetingThreadRecord {
+  thread_id: string;
+  recipient_email: string;
+  recipient_name: string;
+  company: string;
+  sender_type: string;
+  status: MeetingThreadStatus;
+  auto_emails_sent: number;
+  last_kind: string | null;
+  subject: string;
+  proposal_id: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface MeetingDraftIntentRecord {
@@ -2115,7 +2167,7 @@ export interface MeetingDraftIntentRecord {
 const MEETING_INBOUND_COLUMNS = `id, google_account, message_id, thread_id, processed_as, created_at`;
 const MEETING_PROPOSAL_COLUMNS = `id, thread_id, sent_message_id, recipient_email, recipient_name,
   cc_emails, slots, duration_minutes, sender_timezone, hold_event_ids, status, created_at`;
-const MEETING_PENDING_COLUMNS = `id, proposal_id, event_id, slot_index, send_at, status, created_at`;
+const MEETING_PENDING_COLUMNS = `id, proposal_id, event_id, slot_index, send_at, status, skip_confirm, created_at`;
 const MEETING_INTENT_COLUMNS = `draft_id, thread_id, recipient_email, recipient_name, cc_emails,
   slots, duration_minutes, sender_timezone, created_at`;
 
@@ -2262,19 +2314,36 @@ export function setMeetingProposalHolds(id: number, holdEventIds: string[]): voi
   );
 }
 
+export function setMeetingProposalSlots(
+  id: number,
+  slots: Array<{ start: string; end: string }>,
+): void {
+  db.prepare(`UPDATE meeting_proposals SET slots = ? WHERE id = ?`).run(
+    JSON.stringify(slots),
+    id,
+  );
+}
+
 export function createMeetingPendingBooking(input: {
   proposalId: number;
   eventId: string;
   slotIndex: number;
   sendAt: string;
+  skipConfirm?: boolean;
 }): MeetingPendingBookingRecord {
   const result = db
     .prepare(
       `INSERT INTO meeting_pending_bookings (
-         proposal_id, event_id, slot_index, send_at
-       ) VALUES (?, ?, ?, ?)`,
+         proposal_id, event_id, slot_index, send_at, skip_confirm
+       ) VALUES (?, ?, ?, ?, ?)`,
     )
-    .run(input.proposalId, input.eventId, input.slotIndex, input.sendAt);
+    .run(
+      input.proposalId,
+      input.eventId,
+      input.slotIndex,
+      input.sendAt,
+      input.skipConfirm ? 1 : 0,
+    );
   return getMeetingPendingBooking(Number(result.lastInsertRowid))!;
 }
 
@@ -2447,4 +2516,113 @@ export function listJobRuns(): JobRunRecord[] {
        FROM job_runs ORDER BY name ASC`,
     )
     .all() as JobRunRecord[];
+}
+
+const MEETING_THREAD_COLUMNS = `thread_id, recipient_email, recipient_name, company, sender_type,
+  status, auto_emails_sent, last_kind, subject, proposal_id, created_at, updated_at`;
+
+export function upsertMeetingThread(input: {
+  threadId: string;
+  recipientEmail: string;
+  recipientName: string;
+  company: string;
+  senderType: string;
+  status: MeetingThreadStatus;
+  autoEmailsSent?: number;
+  lastKind?: string | null;
+  subject: string;
+  proposalId?: number | null;
+}): MeetingThreadRecord {
+  db.prepare(
+    `INSERT INTO meeting_threads (
+       thread_id, recipient_email, recipient_name, company, sender_type,
+       status, auto_emails_sent, last_kind, subject, proposal_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(thread_id) DO UPDATE SET
+       recipient_email = excluded.recipient_email,
+       recipient_name = excluded.recipient_name,
+       company = excluded.company,
+       sender_type = excluded.sender_type,
+       status = excluded.status,
+       auto_emails_sent = excluded.auto_emails_sent,
+       last_kind = excluded.last_kind,
+       subject = excluded.subject,
+       proposal_id = excluded.proposal_id,
+       updated_at = CURRENT_TIMESTAMP`,
+  ).run(
+    input.threadId,
+    input.recipientEmail.toLowerCase(),
+    input.recipientName,
+    input.company,
+    input.senderType,
+    input.status,
+    input.autoEmailsSent ?? 0,
+    input.lastKind ?? null,
+    input.subject,
+    input.proposalId ?? null,
+  );
+  return getMeetingThread(input.threadId)!;
+}
+
+export function getMeetingThread(threadId: string): MeetingThreadRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_THREAD_COLUMNS} FROM meeting_threads WHERE thread_id = ?`,
+    )
+    .get(threadId) as MeetingThreadRecord | undefined;
+}
+
+export function listMeetingThreads(): MeetingThreadRecord[] {
+  return db
+    .prepare(
+      `SELECT ${MEETING_THREAD_COLUMNS}
+       FROM meeting_threads
+       ORDER BY updated_at DESC, created_at DESC`,
+    )
+    .all() as MeetingThreadRecord[];
+}
+
+export function recordMeetingAutoSend(input: {
+  threadId: string;
+  kind: "proposal" | "clarify" | "confirm";
+  messageId: string;
+}): void {
+  db.prepare(
+    `INSERT INTO meeting_auto_sends (thread_id, kind, message_id) VALUES (?, ?, ?)`,
+  ).run(input.threadId, input.kind, input.messageId);
+}
+
+export function countMeetingAutoSendsToday(
+  now: Date,
+  timeZone = "Asia/Kolkata",
+): number {
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+  const rows = db
+    .prepare(`SELECT created_at FROM meeting_auto_sends`)
+    .all() as Array<{ created_at: string }>;
+  return rows.filter((row) => {
+    const created = new Date(
+      row.created_at.includes("T") ? row.created_at : `${row.created_at}Z`,
+    );
+    const day = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(created);
+    return day === today;
+  }).length;
+}
+
+export function listMeetingAutoSendIds(threadId: string): string[] {
+  return (
+    db
+      .prepare(`SELECT message_id FROM meeting_auto_sends WHERE thread_id = ?`)
+      .all(threadId) as Array<{ message_id: string }>
+  ).map((row) => row.message_id);
 }

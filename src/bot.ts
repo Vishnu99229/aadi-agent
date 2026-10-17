@@ -65,6 +65,7 @@ import { sendDatabaseBackup } from "./backup.js";
 import { handleAttachmentAlertCallback } from "./attachment_alerts.js";
 import { formatHealthReport } from "./scheduler.js";
 import {
+  formatMeetingsReport,
   handleMeetingBookCallback,
   tryHandleMeetingChat,
 } from "./meeting_book.js";
@@ -310,6 +311,10 @@ bot.command("followups", async (ctx) => {
 
 bot.command("health", async (ctx) => {
   await sendPlainText(ctx, formatHealthReport());
+});
+
+bot.command("meetings", async (ctx) => {
+  await sendPlainText(ctx, formatMeetingsReport());
 });
 
 bot.command("cost", async (ctx) => {

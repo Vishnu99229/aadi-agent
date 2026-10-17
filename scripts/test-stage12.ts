@@ -1,10 +1,13 @@
 import "dotenv/config";
+import type { Api } from "grammy";
+import type { gmail_v1 } from "googleapis";
 import {
   DB_PATH,
   createMeetingPendingBooking,
   createMeetingProposal,
   getJobRun,
   getMeetingPendingBooking,
+  getMeetingThread,
 } from "../src/db.ts";
 import {
   everyMs,
@@ -15,6 +18,9 @@ import {
 import {
   inboundSkipReason,
   processDuePendingBookings,
+  processInboundMeetingMessage,
+  resetMeetingTestHooks,
+  setMeetingTestHooks,
 } from "../src/meeting_book.ts";
 import {
   parseMeetingDetection,
@@ -25,12 +31,24 @@ import {
 import {
   findSlots,
   formatIstDate,
+  formatOfferSlot,
   istDateTime,
   parseWindowHint,
 } from "../src/meeting_slots.ts";
+import type { LoadedGoogleAccount } from "../src/google/auth.ts";
 import {
+  FALLBACK_OPENING,
+  PLAIN_SIGNATURE,
+  TELEGRAM_ONLY_LABELS,
+  containsForbiddenInternal,
   extraToCcAddresses,
+  htmlFromSchedulingBody,
+  openingLineOrFallback,
   renderBookingConfirmBody,
+  renderClarifyBody,
+  renderProposalBody,
+  sendSchedulingEmail,
+  validateOpeningLine,
 } from "../src/security/auto_book.ts";
 
 function ensureTestEnv(): void {
@@ -92,6 +110,22 @@ assert(
 );
 const days = new Set(weekdaySlots.map((slot) => formatIstDate(slot.start)));
 assert(days.size === 3, "slots spread across different days");
+const clocks = new Set(
+  weekdaySlots.map((slot) => {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Kolkata",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).format(slot.start);
+    return parts;
+  }),
+);
+assert(clocks.size > 1, "offered slots are not all the same clock time");
+assert(
+  formatOfferSlot(weekdaySlots[0]!).includes("IST"),
+  "offer slot format includes IST",
+);
 
 const weekendNow = istDateTime("2026-10-16", "16:00");
 const afterWeekend = findSlots({
@@ -179,8 +213,10 @@ const parsed = parseMeetingDetection({
   window_hint: "next week",
   duration_minutes: 30,
   sender_timezone: "America/New_York",
+  sender_type: "prospect_enquiry",
   confidence: 0.9,
 });
+assert(parsed?.sender_type === "prospect_enquiry", "detection keeps sender_type");
 assert(parsed?.kind === "asks_availability", "detection schema accepts a valid object");
 assert(
   parseMeetingDetection({ kind: "nope" }) === undefined,
@@ -272,7 +308,12 @@ const template = renderBookingConfirmBody({
 });
 assert(template.startsWith("Hi Ada,"), "confirm template greeting");
 assert(template.includes("calendar invite for Tuesday, 21 Oct, 11:00–11:30 IST (01:30 EDT)"), "confirm template time");
-assert(template.trim().endsWith("Vishnu"), "confirm template signature");
+assert(template.includes(PLAIN_SIGNATURE), "confirm template signature");
+assert(!containsForbiddenInternal(template), "confirm body has no internal labels");
+assert(
+  htmlFromSchedulingBody(template, "<div>SIG</div>").includes("<div>SIG</div>"),
+  "HTML signature is present",
+);
 
 const proposal = createMeetingProposal({
   threadId: "stage12-isolated-thread",
@@ -358,6 +399,266 @@ assert(
   getMeetingPendingBooking(missedTick.id)?.status === "sent",
   "missed-tick booking marked sent",
 );
+
+assert(
+  validateOpeningLine("Thanks, see https://evil.test for details") === undefined,
+  "opening line with a URL is rejected",
+);
+assert(validateOpeningLine("Call me on 123") === undefined, "opening line with digits is rejected");
+assert(
+  validateOpeningLine("Email me at ada@acme.com please") === undefined,
+  "opening line with an email is rejected",
+);
+assert(
+  validateOpeningLine(`${"word ".repeat(41).trim()}`) === undefined,
+  "opening line over 40 words is rejected",
+);
+assert(
+  openingLineOrFallback("Meet at https://x.test") === FALLBACK_OPENING,
+  "invalid opening line falls back",
+);
+
+const proposalVars = {
+  firstName: "Ada",
+  openingLine: FALLBACK_OPENING,
+  durationMinutes: 30,
+  slots: ["Mon 19 Oct, 10:00 AM IST", "Tue 20 Oct, 2:30 PM IST", "Wed 21 Oct, 11:00 AM IST"],
+};
+const proposalBody = renderProposalBody(proposalVars);
+assert(!containsForbiddenInternal(proposalBody), "proposal body has no internal labels");
+for (const label of TELEGRAM_ONLY_LABELS) {
+  assert(!proposalBody.includes(label), "proposal body excludes telegram-only labels");
+}
+assert(!/^subject\s*:/im.test(proposalBody), "proposal body has no subject line");
+assert(proposalBody.includes(PLAIN_SIGNATURE), "proposal body has the plain signature");
+assert(
+  htmlFromSchedulingBody(proposalBody, "<b>Vishnu</b>").includes("<b>Vishnu</b>"),
+  "proposal HTML includes the signature",
+);
+
+let badOpeningSent = 0;
+await sendSchedulingEmail({
+  kind: "proposal",
+  gate: {
+    autoBook: true,
+    fromEmail: "ada@acme.com",
+    recipientEmail: "ada@acme.com",
+    incomingToCc: [],
+    proposalEmails: ["ada@acme.com"],
+    dailyCount: 0,
+    dailyCap: 5,
+    dailySendCount: 0,
+    dailySendCap: 15,
+  },
+  body: renderProposalBody({
+    ...proposalVars,
+    openingLine: "Thanks see https://x.test",
+  }),
+  proposal: {
+    ...proposalVars,
+    openingLine: "Thanks see https://x.test",
+  },
+  sendImpl: async (body) => {
+    assert(body.includes(FALLBACK_OPENING), "invalid opening is replaced before send");
+    assert(!body.includes("https://"), "URL opening must not be sent");
+    badOpeningSent += 1;
+    return { messageId: "fallback-1" };
+  },
+});
+assert(badOpeningSent === 1, "fallback opening may send");
+
+function silentApi(): Api {
+  return { sendMessage: async () => ({ message_id: 1 }) } as unknown as Api;
+}
+function fakeWork(): LoadedGoogleAccount {
+  return {
+    id: "work",
+    tag: "work",
+    label: "work",
+    tokenPath: "",
+    tokenFile: "",
+    client: {} as LoadedGoogleAccount["client"],
+  };
+}
+function fakeInbound(input: {
+  messageId: string;
+  threadId: string;
+  from: string;
+  subject: string;
+  body: string;
+  labels?: string[];
+  internalDate?: string;
+}): gmail_v1.Schema$Message {
+  return {
+    id: input.messageId,
+    threadId: input.threadId,
+    labelIds: input.labels,
+    internalDate: input.internalDate ?? String(Date.now()),
+    payload: {
+      mimeType: "text/plain",
+      headers: [
+        { name: "From", value: input.from },
+        { name: "To", value: "vishnu.rajan@epicode.in" },
+        { name: "Subject", value: input.subject },
+        { name: "Message-ID", value: `<${input.messageId}@mail>` },
+      ],
+      body: { data: Buffer.from(input.body, "utf8").toString("base64url") },
+    },
+  };
+}
+
+let vendorSends = 0;
+setMeetingTestHooks({
+  detect: async () => ({
+    kind: "asks_availability",
+    proposed_times: [],
+    window_hint: "next week",
+    duration_minutes: 30,
+    sender_timezone: null,
+    sender_type: "vendor_or_sales_pitch",
+    confidence: 0.99,
+  }),
+  sendImpl: async () => {
+    vendorSends += 1;
+    return { messageId: "vendor" };
+  },
+  loadBusy: async () => [],
+  slotIsFree: async () => true,
+});
+await processInboundMeetingMessage(
+  silentApi(),
+  fakeWork(),
+  fakeInbound({
+    messageId: "vendor-1",
+    threadId: "thread-vendor",
+    from: "Sales <sales@vendor.com>",
+    subject: "Quick call?",
+    body: "Can we hop on a call about our CRM?",
+  }),
+  new Date(),
+);
+assert(vendorSends === 0, "vendor_or_sales_pitch must not get an auto-reply");
+resetMeetingTestHooks();
+
+let recruiterSends = 0;
+setMeetingTestHooks({
+  detect: async () => ({
+    kind: "asks_availability",
+    proposed_times: [],
+    window_hint: null,
+    duration_minutes: 30,
+    sender_timezone: null,
+    sender_type: "recruiter",
+    confidence: 0.99,
+  }),
+  sendImpl: async () => {
+    recruiterSends += 1;
+    return { messageId: "recruiter" };
+  },
+  loadBusy: async () => [],
+});
+await processInboundMeetingMessage(
+  silentApi(),
+  fakeWork(),
+  fakeInbound({
+    messageId: "recruiter-1",
+    threadId: "thread-recruiter",
+    from: "Recruiter <r@hire.com>",
+    subject: "Role",
+    body: "15 minutes to chat?",
+  }),
+  new Date(),
+);
+assert(recruiterSends === 0, "recruiter must not get an auto-reply");
+resetMeetingTestHooks();
+
+const autoBodies: string[] = [];
+let replyKind: "pick_one" | "own_time" | "vague" | "other" = "vague";
+setMeetingTestHooks({
+  detect: async () => ({
+    kind: "asks_availability",
+    proposed_times: [],
+    window_hint: "next week",
+    duration_minutes: 30,
+    sender_timezone: null,
+    sender_type: "prospect_enquiry",
+    confidence: 0.95,
+  }),
+  mapReply: async () => ({
+    reply_kind: replyKind,
+    verdict: replyKind === "pick_one" ? "one" : replyKind === "vague" ? "ambiguous" : "none",
+    slot_index: replyKind === "pick_one" ? 0 : null,
+    own_time: null,
+    confidence: 0.95,
+  }),
+  openingLine: async () => FALLBACK_OPENING,
+  signatureHtml: "<div>SIG</div>",
+  sendImpl: async (body) => {
+    autoBodies.push(body);
+    return { messageId: `auto-${autoBodies.length}` };
+  },
+  loadBusy: async () => [],
+  slotIsFree: async () => true,
+  insertEvent: async () => "evt-auto",
+});
+await processInboundMeetingMessage(
+  silentApi(),
+  fakeWork(),
+  fakeInbound({
+    messageId: "prospect-1",
+    threadId: "thread-auto",
+    from: "Ada <ada@acme.com>",
+    subject: "Telephony platform",
+    body: "Can we set up a call about your telephony platform?",
+  }),
+  new Date(),
+);
+assert(autoBodies.length === 1, "prospect gets a proposal email");
+assert(autoBodies[0]!.includes("Would any of these work"), "first email is a proposal");
+assert(getMeetingThread("thread-auto")?.status === "proposed", "thread status is proposed");
+
+replyKind = "vague";
+await processInboundMeetingMessage(
+  silentApi(),
+  fakeWork(),
+  fakeInbound({
+    messageId: "prospect-2",
+    threadId: "thread-auto",
+    from: "Ada <ada@acme.com>",
+    subject: "Re: Telephony platform",
+    body: "sounds good",
+    internalDate: String(Date.now() + 60_000),
+  }),
+  new Date(Date.now() + 60_000),
+);
+assert(autoBodies.length === 2, "vague reply sends CLARIFY");
+assert(autoBodies[1]!.includes("Which of these suits you best?"), "second email is clarify");
+assert(getMeetingThread("thread-auto")?.status === "clarified", "thread status is clarified");
+
+replyKind = "vague";
+await processInboundMeetingMessage(
+  silentApi(),
+  fakeWork(),
+  fakeInbound({
+    messageId: "prospect-3",
+    threadId: "thread-auto",
+    from: "Ada <ada@acme.com>",
+    subject: "Re: Telephony platform",
+    body: "yeah whatever works",
+    internalDate: String(Date.now() + 120_000),
+  }),
+  new Date(Date.now() + 120_000),
+);
+assert(autoBodies.length === 2, "a third auto email is not sent before booking");
+assert(getMeetingThread("thread-auto")?.status === "handed_over", "still-vague hands over");
+resetMeetingTestHooks();
+
+const clarify = renderClarifyBody({
+  firstName: "Ada",
+  slots: proposalVars.slots,
+});
+assert(clarify.includes(PLAIN_SIGNATURE), "clarify has signature");
+assert(!containsForbiddenInternal(clarify), "clarify has no internal labels");
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 

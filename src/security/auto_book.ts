@@ -9,6 +9,17 @@ export class AutoBookRefusedError extends Error {
   }
 }
 
+export const FALLBACK_OPENING =
+  "Thanks for getting in touch. I'd be glad to set up a call.";
+export const PLAIN_SIGNATURE = "Vishnu Rajan\nGTM, Epicode";
+export const DEFAULT_SIGNATURE_HTML =
+  "<div>Vishnu Rajan<br>GTM, Epicode</div>";
+export const TELEGRAM_ONLY_LABELS = [
+  "Meeting proposal — Send stores the offered slots",
+] as const;
+
+export type SchedulingKind = "proposal" | "clarify" | "confirm";
+
 export interface AutoBookGateInput {
   autoBook: boolean;
   fromEmail: string;
@@ -17,6 +28,11 @@ export interface AutoBookGateInput {
   proposalEmails: string[];
   dailyCount: number;
   dailyCap: number;
+}
+
+export interface SchedulingSendGateInput extends AutoBookGateInput {
+  dailySendCount: number;
+  dailySendCap: number;
 }
 
 export interface AutoBookCheckInput extends AutoBookGateInput {
@@ -36,6 +52,18 @@ export interface BookingConfirmVars {
   startTime: string;
   endTime: string;
   otherZone: string | null;
+}
+
+export interface ProposalBodyVars {
+  firstName: string;
+  openingLine: string;
+  durationMinutes: number;
+  slots: string[];
+}
+
+export interface ClarifyBodyVars {
+  firstName: string;
+  slots: string[];
 }
 
 export type AutoBookDecision =
@@ -102,6 +130,68 @@ export function evaluateAutoBookChecks(input: AutoBookCheckInput): AutoBookDecis
   return { ok: true, slotIndex: input.slotIndex };
 }
 
+export function validateOpeningLine(raw: string | null | undefined): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const line = raw.replace(/\s+/g, " ").trim();
+  if (!line) {
+    return undefined;
+  }
+  const words = line.split(" ").filter(Boolean);
+  if (words.length > 40) {
+    return undefined;
+  }
+  if (/https?:\/\//i.test(line) || /\bwww\./i.test(line)) {
+    return undefined;
+  }
+  if (/@/.test(line) || /\d/.test(line)) {
+    return undefined;
+  }
+  if (/<[^>]+>/.test(line) || /attach/i.test(line)) {
+    return undefined;
+  }
+  if (/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(line)) {
+    return undefined;
+  }
+  return line;
+}
+
+export function openingLineOrFallback(raw: string | null | undefined): string {
+  return validateOpeningLine(raw) ?? FALLBACK_OPENING;
+}
+
+function slotLines(slots: string[]): string {
+  return slots.map((slot) => `• ${slot}`).join("\n");
+}
+
+export function renderProposalBody(vars: ProposalBodyVars): string {
+  const opening = openingLineOrFallback(vars.openingLine);
+  return [
+    `Hi ${vars.firstName},`,
+    "",
+    opening,
+    "",
+    `Would any of these work for a ${vars.durationMinutes}-minute call?`,
+    slotLines(vars.slots),
+    "",
+    "If none of these suit, just share a time that works for you and I'll make it happen.",
+    "",
+    PLAIN_SIGNATURE,
+  ].join("\n");
+}
+
+export function renderClarifyBody(vars: ClarifyBodyVars): string {
+  return [
+    `Hi ${vars.firstName},`,
+    "",
+    "Happy to lock it in. Which of these suits you best?",
+    slotLines(vars.slots),
+    "",
+    PLAIN_SIGNATURE,
+  ].join("\n");
+}
+
 export function renderBookingConfirmBody(vars: BookingConfirmVars): string {
   const zone =
     vars.otherZone && vars.otherZone.trim()
@@ -114,7 +204,7 @@ export function renderBookingConfirmBody(vars: BookingConfirmVars): string {
     "",
     "Looking forward to speaking.",
     "",
-    "Vishnu",
+    PLAIN_SIGNATURE,
   ].join("\n");
 }
 
@@ -133,31 +223,198 @@ function encodeBody(body: string): string {
     .join("\r\n");
 }
 
-function buildReplyRaw(params: {
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+export function htmlFromSchedulingBody(
+  plain: string,
+  signatureHtml = DEFAULT_SIGNATURE_HTML,
+): string {
+  const trimmed = normalizeBody(plain);
+  const withoutSig = trimmed.endsWith(PLAIN_SIGNATURE)
+    ? trimmed.slice(0, trimmed.length - PLAIN_SIGNATURE.length).trimEnd()
+    : trimmed;
+  const blocks = withoutSig.split(/\n{2,}/);
+  const htmlBlocks = blocks.map((block) => {
+    const lines = block.split("\n");
+    const bullets = lines.filter((line) => line.startsWith("• "));
+    if (bullets.length === lines.length && lines.length > 0) {
+      const items = bullets
+        .map((line) => `<li>${escapeHtml(line.slice(2))}</li>`)
+        .join("");
+      return `<ul>${items}</ul>`;
+    }
+    return `<p>${escapeHtml(block).replace(/\n/g, "<br>")}</p>`;
+  });
+  return `<div>${htmlBlocks.join("")}${signatureHtml}</div>`;
+}
+
+export function containsForbiddenInternal(body: string): boolean {
+  const text = body.replace(/\r\n/g, "\n");
+  if (TELEGRAM_ONLY_LABELS.some((label) => text.includes(label))) {
+    return true;
+  }
+  if (/^subject\s*:/im.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function expectedPlain(params: {
+  kind: SchedulingKind;
+  proposal?: ProposalBodyVars;
+  clarify?: ClarifyBodyVars;
+  confirm?: BookingConfirmVars;
+}): string | undefined {
+  if (params.kind === "proposal" && params.proposal) {
+    return renderProposalBody({
+      ...params.proposal,
+      openingLine: openingLineOrFallback(params.proposal.openingLine),
+    });
+  }
+  if (params.kind === "clarify" && params.clarify) {
+    return renderClarifyBody(params.clarify);
+  }
+  if (params.kind === "confirm" && params.confirm) {
+    return renderBookingConfirmBody(params.confirm);
+  }
+  return undefined;
+}
+
+function replySubject(subject: string): string {
+  return /^re\s*:/i.test(subject) ? subject : `Re: ${subject}`;
+}
+
+function buildMultipartRaw(params: {
   to: string;
   subject: string;
   inReplyTo: string;
   references: string;
-  body: string;
+  plain: string;
+  html: string;
 }): string {
-  const subject = /^re\s*:/i.test(params.subject)
-    ? params.subject
-    : `Re: ${params.subject}`;
+  const subject = replySubject(params.subject);
   const references = [params.references, params.inReplyTo]
     .map(safeHeader)
     .filter(Boolean)
     .join(" ");
+  const boundary = `aadi_${Date.now().toString(16)}`;
   return [
     `To: ${safeHeader(params.to)}`,
     `Subject: ${safeHeader(subject)}`,
     `In-Reply-To: ${safeHeader(params.inReplyTo)}`,
     `References: ${references}`,
     "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
     'Content-Type: text/plain; charset="UTF-8"',
     "Content-Transfer-Encoding: base64",
     "",
-    encodeBody(params.body),
+    encodeBody(params.plain),
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeBody(params.html),
+    `--${boundary}--`,
   ].join("\r\n");
+}
+
+export interface SendSchedulingEmailParams {
+  kind: SchedulingKind;
+  gate: SchedulingSendGateInput;
+  body: string;
+  html?: string;
+  signatureHtml?: string;
+  proposal?: ProposalBodyVars;
+  clarify?: ClarifyBodyVars;
+  confirm?: BookingConfirmVars;
+  sendImpl?: (body: string) => Promise<{ messageId: string }>;
+  account?: LoadedGoogleAccount;
+  threadId?: string;
+  to?: string;
+  subject?: string;
+  inReplyTo?: string;
+  references?: string;
+}
+
+function evaluateSendGate(
+  kind: SchedulingKind,
+  gate: SchedulingSendGateInput,
+): { ok: true } | { ok: false; reason: string } {
+  if (gate.dailySendCount >= gate.dailySendCap) {
+    return { ok: false, reason: "send_cap" };
+  }
+  if (kind === "confirm") {
+    return evaluateAddressGate(gate);
+  }
+  if (!gate.autoBook) {
+    return { ok: false, reason: "auto_book_disabled" };
+  }
+  return { ok: true };
+}
+
+export async function sendSchedulingEmail(
+  params: SendSchedulingEmailParams,
+): Promise<{ messageId: string; html: string }> {
+  const gate = evaluateSendGate(params.kind, params.gate);
+  if (!gate.ok) {
+    throw new AutoBookRefusedError(gate.reason);
+  }
+  const expected = expectedPlain(params);
+  if (!expected || normalizeBody(params.body) !== normalizeBody(expected)) {
+    throw new AutoBookRefusedError("template_mismatch");
+  }
+  if (containsForbiddenInternal(params.body)) {
+    throw new AutoBookRefusedError("internal_label");
+  }
+  if (params.kind === "proposal") {
+    const opening = params.proposal?.openingLine ?? "";
+    if (
+      validateOpeningLine(opening) === undefined &&
+      normalizeBody(opening) !== normalizeBody(FALLBACK_OPENING) &&
+      !normalizeBody(params.body).includes(FALLBACK_OPENING)
+    ) {
+      throw new AutoBookRefusedError("opening_line");
+    }
+  }
+  const html =
+    params.html ??
+    htmlFromSchedulingBody(params.body, params.signatureHtml ?? DEFAULT_SIGNATURE_HTML);
+  if (params.sendImpl) {
+    const sent = await params.sendImpl(params.body);
+    return { messageId: sent.messageId, html };
+  }
+  if (!params.account || !params.threadId || !params.to || !params.subject || !params.inReplyTo) {
+    throw new AutoBookRefusedError("missing_send_target");
+  }
+  const gmail = google.gmail({ version: "v1", auth: params.account.client });
+  const raw = buildMultipartRaw({
+    to: params.to,
+    subject: params.subject,
+    inReplyTo: params.inReplyTo,
+    references: params.references ?? "",
+    plain: params.body,
+    html,
+  });
+  const sent = await gmail.users.messages.send({
+    userId: "me",
+    requestBody: {
+      threadId: params.threadId,
+      raw: Buffer.from(raw, "utf8").toString("base64url"),
+    },
+  });
+  const messageId = sent.data.id;
+  if (!messageId) {
+    throw new AutoBookRefusedError("send_missing_id");
+  }
+  return { messageId, html };
 }
 
 export interface AutoBookConfirmParams {
@@ -171,43 +428,29 @@ export interface AutoBookConfirmParams {
   subject?: string;
   inReplyTo?: string;
   references?: string;
+  signatureHtml?: string;
 }
 
 export async function autoBookConfirm(
   params: AutoBookConfirmParams,
 ): Promise<{ messageId: string }> {
-  const gate = evaluateAddressGate(params.gate);
-  if (!gate.ok) {
-    throw new AutoBookRefusedError(gate.reason);
-  }
-  const expected = renderBookingConfirmBody(params.template);
-  if (normalizeBody(params.body) !== normalizeBody(expected)) {
-    throw new AutoBookRefusedError("template_mismatch");
-  }
-  if (params.sendImpl) {
-    return params.sendImpl(params.body);
-  }
-  if (!params.account || !params.threadId || !params.to || !params.subject || !params.inReplyTo) {
-    throw new AutoBookRefusedError("missing_send_target");
-  }
-  const gmail = google.gmail({ version: "v1", auth: params.account.client });
-  const raw = buildReplyRaw({
+  const sent = await sendSchedulingEmail({
+    kind: "confirm",
+    gate: {
+      ...params.gate,
+      dailySendCount: 0,
+      dailySendCap: Number.MAX_SAFE_INTEGER,
+    },
+    body: params.body,
+    confirm: params.template,
+    sendImpl: params.sendImpl,
+    account: params.account,
+    threadId: params.threadId,
     to: params.to,
     subject: params.subject,
     inReplyTo: params.inReplyTo,
-    references: params.references ?? "",
-    body: params.body,
+    references: params.references,
+    signatureHtml: params.signatureHtml,
   });
-  const sent = await gmail.users.messages.send({
-    userId: "me",
-    requestBody: {
-      threadId: params.threadId,
-      raw: Buffer.from(raw, "utf8").toString("base64url"),
-    },
-  });
-  const messageId = sent.data.id;
-  if (!messageId) {
-    throw new AutoBookRefusedError("send_missing_id");
-  }
-  return { messageId };
+  return { messageId: sent.messageId };
 }
