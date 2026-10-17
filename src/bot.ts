@@ -63,6 +63,10 @@ import {
 } from "./accounts.js";
 import { sendDatabaseBackup } from "./backup.js";
 import { handleAttachmentAlertCallback } from "./attachment_alerts.js";
+import {
+  handleMeetingBookCallback,
+  tryHandleMeetingChat,
+} from "./meeting_book.js";
 import { meetingFromBrief } from "./mom.js";
 import {
   askForgetEverything,
@@ -356,6 +360,14 @@ bot.command("wrapup", async (ctx) => {
   }
 });
 
+bot.callbackQuery(/^meet:/, async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  if (data && (await handleMeetingBookCallback(ctx, data))) {
+    return;
+  }
+  await ctx.answerCallbackQuery().catch(() => undefined);
+});
+
 bot.callbackQuery(
   /^approval:(send|edit|discard):(\d+)$/,
   async (ctx) => {
@@ -556,6 +568,9 @@ Call update_draft exactly once with the draft ID above and the complete revised 
     return;
   }
 
+  if (await tryHandleMeetingChat(ctx, userText)) {
+    return;
+  }
   if (await handleExplicitRemember(ctx, userText)) {
     return;
   }

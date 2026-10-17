@@ -21,6 +21,16 @@ const activeActions = new Set<number>();
 const editingActionByUser = new Map<number, number>();
 const sendOnlyActions = new Set<number>();
 
+type AfterDraftSend = (
+  draftId: string,
+  sentMessageId: string,
+) => Promise<void>;
+let afterDraftSend: AfterDraftSend | undefined;
+
+export function setAfterDraftSend(handler: AfterDraftSend): void {
+  afterDraftSend = handler;
+}
+
 export interface DraftApprovalPreview {
   draftId: string;
   threadId: string;
@@ -220,13 +230,15 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     actionId: action.id,
     actionStatus: action.status,
   });
+  let sentMessageId: string | undefined;
   try {
     const auth = await getGoogleClientFor(action.google_account);
     const gmail = google.gmail({ version: "v1", auth });
-    await gmail.users.drafts.send({
+    const sent = await gmail.users.drafts.send({
       userId: "me",
       requestBody: { id: action.draft_id },
     });
+    sentMessageId = sent.data.id ?? undefined;
   } catch {
     console.log(`Approval action ${action.id}: send failed; status -> pending`);
     await ctx.answerCallbackQuery({
@@ -234,6 +246,13 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
       show_alert: true,
     });
     return;
+  }
+  if (sentMessageId && afterDraftSend) {
+    try {
+      await afterDraftSend(action.draft_id, sentMessageId);
+    } catch {
+      console.log(`Approval action ${action.id}: after-send hook failed`);
+    }
   }
 
   if (!transitionPendingAction(action.id, "pending", "sent")) {

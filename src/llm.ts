@@ -118,6 +118,8 @@ export interface CompleteParams {
   /** Prompt-cache TTL. Omitted: 1h for chat-like tasks, 5m for one-burst jobs. */
   cacheTtl?: "5m" | "1h";
   skipUsageLog?: boolean;
+  /** Anthropic output_config.format json_schema for structured background calls. */
+  jsonSchema?: Record<string, unknown>;
 }
 
 export interface CompleteResult {
@@ -231,6 +233,15 @@ function cacheControl(ttl: CacheTtl): {
     : { type: "ephemeral" };
 }
 
+function jsonSchemaFormat(
+  schema: Record<string, unknown> | undefined,
+): { type: "json_schema"; schema: Record<string, unknown> } | undefined {
+  if (!schema) {
+    return undefined;
+  }
+  return { type: "json_schema", schema };
+}
+
 function buildClaudeMessageCreateParams(
   model: string,
   system: LlmSystemPrompt,
@@ -239,6 +250,7 @@ function buildClaudeMessageCreateParams(
   maxTokens: number,
   effort: EffortLevel | undefined,
   cacheTtl: CacheTtl,
+  jsonSchema?: Record<string, unknown>,
 ): MessageCreateParamsNonStreaming {
   const base: MessageCreateParamsNonStreaming = {
     model,
@@ -247,7 +259,8 @@ function buildClaudeMessageCreateParams(
     messages: withLatestMessageCacheBreakpoint(messages),
     tools: withToolsCacheBreakpoint(tools, cacheTtl),
   };
-  if (!isHaiku55Model(model) && !effort) {
+  const format = jsonSchemaFormat(jsonSchema);
+  if (!isHaiku55Model(model) && !effort && !format) {
     return base;
   }
   const haikuEffort = effort ?? "low";
@@ -255,13 +268,21 @@ function buildClaudeMessageCreateParams(
     return {
       ...base,
       thinking: { type: "disabled" },
-      output_config: { effort: "low" },
+      output_config: {
+        effort: "low",
+        ...(format ? { format } : {}),
+      },
     };
   }
   return {
     ...base,
     ...(isHaiku55Model(model) ? { thinking: { type: "adaptive" as const } } : {}),
-    output_config: { effort: effort ?? haikuEffort },
+    output_config: {
+      ...(effort || isHaiku55Model(model)
+        ? { effort: effort ?? haikuEffort }
+        : {}),
+      ...(format ? { format } : {}),
+    },
   };
 }
 
@@ -516,6 +537,7 @@ async function completeWithClaude(
         params.maxTokens ?? MAX_TOKENS,
         effort,
         cacheTtl,
+        params.jsonSchema,
       ),
       params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
     );

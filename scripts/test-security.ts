@@ -1,5 +1,12 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  AutoBookRefusedError,
+  autoBookConfirm,
+  evaluateAutoBookChecks,
+  extraToCcAddresses,
+  renderBookingConfirmBody,
+} from "../src/security/auto_book.ts";
 import {
   isOwner,
   isOwnerTelegramId,
@@ -180,5 +187,240 @@ assert(
   configSrc.includes('from "./security/env_guard.js"'),
   "config.ts must use the env guard",
 );
+
+const template = renderBookingConfirmBody({
+  firstName: "Ada",
+  dayDate: "Tuesday, 21 Oct",
+  startTime: "11:00",
+  endTime: "11:30",
+  otherZone: null,
+});
+const gate = {
+  autoBook: true,
+  fromEmail: "ada@acme.com",
+  recipientEmail: "ada@acme.com",
+  incomingToCc: ["ada@acme.com"],
+  proposalEmails: ["ada@acme.com"],
+  dailyCount: 0,
+  dailyCap: 5,
+};
+const slotStart = new Date(Date.now() + 2 * 60 * 60 * 1000);
+const autoOk = evaluateAutoBookChecks({
+  ...gate,
+  slotIndex: 0,
+  verdict: "one",
+  confidence: 0.9,
+  minConfidence: 0.85,
+  slotCount: 3,
+  slotStart,
+  now: new Date(),
+  slotStillFree: true,
+});
+assert(autoOk.ok, "passing auto-book checks succeed");
+
+assert(
+  !evaluateAutoBookChecks({
+    ...gate,
+    fromEmail: "other@acme.com",
+    slotIndex: 0,
+    verdict: "one",
+    confidence: 0.9,
+    minConfidence: 0.85,
+    slotCount: 3,
+    slotStart,
+    now: new Date(),
+    slotStillFree: true,
+  }).ok,
+  "different From must not auto-book",
+);
+assert(
+  !evaluateAutoBookChecks({
+    ...gate,
+    slotIndex: 0,
+    verdict: "one",
+    confidence: 0.9,
+    minConfidence: 0.85,
+    slotCount: 3,
+    slotStart,
+    now: new Date(),
+    slotStillFree: true,
+    incomingToCc: ["ada@acme.com", "new@other.com"],
+  }).ok,
+  "new Cc must not auto-book",
+);
+assert(
+  extraToCcAddresses(["ada@acme.com", "new@other.com"], ["ada@acme.com"]).length > 0,
+  "new Cc is detected as extra",
+);
+assert(
+  !evaluateAutoBookChecks({
+    ...gate,
+    autoBook: false,
+    slotIndex: 0,
+    verdict: "one",
+    confidence: 0.9,
+    minConfidence: 0.85,
+    slotCount: 3,
+    slotStart,
+    now: new Date(),
+    slotStillFree: true,
+  }).ok,
+  "AUTO_BOOK=false must not auto-book",
+);
+assert(
+  !evaluateAutoBookChecks({
+    ...gate,
+    dailyCount: 5,
+    dailyCap: 5,
+    slotIndex: 0,
+    verdict: "one",
+    confidence: 0.9,
+    minConfidence: 0.85,
+    slotCount: 3,
+    slotStart,
+    now: new Date(),
+    slotStillFree: true,
+  }).ok,
+  "daily cap must block auto-book",
+);
+assert(
+  !evaluateAutoBookChecks({
+    ...gate,
+    slotIndex: 0,
+    verdict: "ambiguous",
+    confidence: 0.99,
+    minConfidence: 0.85,
+    slotCount: 3,
+    slotStart,
+    now: new Date(),
+    slotStillFree: true,
+  }).ok,
+  "ambiguous reply must not auto-book",
+);
+assert(
+  !evaluateAutoBookChecks({
+    ...gate,
+    slotIndex: 0,
+    verdict: "one",
+    confidence: 0.5,
+    minConfidence: 0.85,
+    slotCount: 3,
+    slotStart,
+    now: new Date(),
+    slotStillFree: true,
+  }).ok,
+  "low confidence must not auto-book",
+);
+
+let sent = 0;
+try {
+  await autoBookConfirm({
+    gate,
+    body: "Hi Ada,\n\nSee you then.\n\nVishnu",
+    template: {
+      firstName: "Ada",
+      dayDate: "Tuesday, 21 Oct",
+      startTime: "11:00",
+      endTime: "11:30",
+      otherZone: null,
+    },
+    sendImpl: async () => {
+      sent += 1;
+      return { messageId: "x" };
+    },
+  });
+  throw new Error("mismatched template must not send");
+} catch (error) {
+  assert(error instanceof AutoBookRefusedError, "template mismatch is refused");
+}
+assert(sent === 0, "autoBookConfirm must not send a non-template body");
+
+await autoBookConfirm({
+  gate,
+  body: template,
+  template: {
+    firstName: "Ada",
+    dayDate: "Tuesday, 21 Oct",
+    startTime: "11:00",
+    endTime: "11:30",
+    otherZone: null,
+  },
+  sendImpl: async (body) => {
+    assert(body === template, "confirm send is the rendered template");
+    sent += 1;
+    return { messageId: "ok" };
+  },
+});
+assert(sent === 1, "matching template may send");
+
+async function listTsFiles(dir: string): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await listTsFiles(path)));
+    } else if (entry.name.endsWith(".ts")) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
+const srcFiles = await listTsFiles(join(root, "src"));
+const toolFiles = srcFiles.filter((path) => path.includes("/src/tools/"));
+for (const file of toolFiles) {
+  const src = await readFile(file, "utf8");
+  assert(!src.includes("messages.send"), `${file} must not send mail`);
+  assert(!src.includes("drafts.send"), `${file} must not send drafts`);
+  assert(!src.includes("events.insert"), `${file} must not insert calendar events`);
+  assert(!src.includes("events.patch"), `${file} must not patch calendar events`);
+  assert(!src.includes("events.delete"), `${file} must not delete calendar events`);
+}
+
+const messageSendFiles: string[] = [];
+const draftSendFiles: string[] = [];
+for (const file of srcFiles) {
+  if (file.endsWith("/google/test.ts")) {
+    continue;
+  }
+  const src = await readFile(file, "utf8");
+  if (src.includes("messages.send") || src.includes("users.messages.send")) {
+    messageSendFiles.push(file);
+  }
+  if (src.includes("drafts.send") || src.includes("users.drafts.send")) {
+    draftSendFiles.push(file);
+  }
+}
+assert(
+  messageSendFiles.length === 1 && messageSendFiles[0]!.endsWith("/security/auto_book.ts"),
+  `messages.send only allowed in auto_book.ts, found ${messageSendFiles.join(", ") || "none"}`,
+);
+assert(
+  draftSendFiles.length === 1 && draftSendFiles[0]!.endsWith("/approvals.ts"),
+  `drafts.send only allowed in approvals.ts, found ${draftSendFiles.join(", ") || "none"}`,
+);
+
+const meetingBookSrc = await readFile(join(root, "src/meeting_book.ts"), "utf8");
+assert(
+  meetingBookSrc.includes("getOpenMeetingProposalByThread"),
+  "auto-book path requires an open proposal",
+);
+assert(
+  meetingBookSrc.includes("autoBookConfirm"),
+  "confirmation send must go through autoBookConfirm",
+);
+assert(
+  !meetingBookSrc.includes("messages.send"),
+  "meeting_book must not send mail itself",
+);
+assert(
+  meetingBookSrc.includes("status !== \"pending\"") ||
+    meetingBookSrc.includes('booking.status !== "pending"'),
+  "due processor must skip undone bookings",
+);
+
+const toolsIndex = await readFile(join(root, "src/tools/index.ts"), "utf8");
+assert(!/book_meeting|send_email|create_event/.test(toolsIndex), "no model send/book tools");
 
 console.log("Security gate checks passed.");

@@ -118,6 +118,143 @@ if (!Number.isFinite(preMeetingMinutes) || preMeetingMinutes <= 0) {
   process.exit(1);
 }
 
+function parseClock(raw: string, label: string): number {
+  const match = /^(\d{2}):(\d{2})$/.exec(raw.trim());
+  const hour = Number(match?.[1]);
+  const minute = Number(match?.[2]);
+  if (
+    !match ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59
+  ) {
+    console.error(`${label} must use 24-hour HH:MM format, for example 10:00.`);
+    process.exit(1);
+  }
+  return hour * 60 + minute;
+}
+
+function parseClockRange(
+  raw: string,
+  fallback: string,
+  label: string,
+): { startMinutes: number; endMinutes: number } {
+  const value = raw.trim() || fallback;
+  const match = /^(\d{2}:\d{2})-(\d{2}:\d{2})$/.exec(value);
+  if (!match) {
+    console.error(`${label} must use HH:MM-HH:MM, for example ${fallback}.`);
+    process.exit(1);
+  }
+  const startMinutes = parseClock(match[1]!, label);
+  const endMinutes = parseClock(match[2]!, label);
+  if (endMinutes <= startMinutes) {
+    console.error(`${label} end must be after start.`);
+    process.exit(1);
+  }
+  return { startMinutes, endMinutes };
+}
+
+function parsePositiveNumber(raw: string | undefined, fallback: number, label: string): number {
+  const value = Number(raw?.trim() || String(fallback));
+  if (!Number.isFinite(value) || value <= 0) {
+    console.error(`${label} must be a positive number.`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function parseNonNegativeNumber(
+  raw: string | undefined,
+  fallback: number,
+  label: string,
+): number {
+  const value = Number(raw?.trim() || String(fallback));
+  if (!Number.isFinite(value) || value < 0) {
+    console.error(`${label} must be a non-negative number.`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function parseBool(raw: string | undefined, fallback: boolean): boolean {
+  const value = raw?.trim().toLowerCase();
+  if (!value) {
+    return fallback;
+  }
+  if (value === "true" || value === "1" || value === "yes") {
+    return true;
+  }
+  if (value === "false" || value === "0" || value === "no") {
+    return false;
+  }
+  return fallback;
+}
+
+const meetingHours = parseClockRange(
+  process.env.MEETING_HOURS ?? "",
+  "10:00-18:30",
+  "MEETING_HOURS",
+);
+const meetingBreak = parseClockRange(
+  process.env.MEETING_BREAK ?? "",
+  "13:00-14:00",
+  "MEETING_BREAK",
+);
+const meetingBufferMinutes = parseNonNegativeNumber(
+  process.env.MEETING_BUFFER_MINUTES,
+  15,
+  "MEETING_BUFFER_MINUTES",
+);
+const meetingDefaultMinutes = parsePositiveNumber(
+  process.env.MEETING_DEFAULT_MINUTES,
+  30,
+  "MEETING_DEFAULT_MINUTES",
+);
+const meetingSlotsToOffer = parsePositiveNumber(
+  process.env.MEETING_SLOTS_TO_OFFER,
+  3,
+  "MEETING_SLOTS_TO_OFFER",
+);
+const meetingMinNoticeHours = parseNonNegativeNumber(
+  process.env.MEETING_MIN_NOTICE_HOURS,
+  4,
+  "MEETING_MIN_NOTICE_HOURS",
+);
+const meetingHorizonDays = parsePositiveNumber(
+  process.env.MEETING_HORIZON_DAYS,
+  7,
+  "MEETING_HORIZON_DAYS",
+);
+const autoBookDelayMinutes = parseNonNegativeNumber(
+  process.env.AUTO_BOOK_DELAY_MINUTES,
+  10,
+  "AUTO_BOOK_DELAY_MINUTES",
+);
+const autoBookDailyCap = parsePositiveNumber(
+  process.env.AUTO_BOOK_DAILY_CAP,
+  5,
+  "AUTO_BOOK_DAILY_CAP",
+);
+const autoBookMinConfidence = Number(
+  process.env.AUTO_BOOK_MIN_CONFIDENCE?.trim() || "0.85",
+);
+if (
+  !Number.isFinite(autoBookMinConfidence) ||
+  autoBookMinConfidence < 0 ||
+  autoBookMinConfidence > 1
+) {
+  console.error("AUTO_BOOK_MIN_CONFIDENCE must be between 0 and 1.");
+  process.exit(1);
+}
+const meetingTimezone =
+  process.env.MEETING_TIMEZONE?.trim() || "Asia/Kolkata";
+const meetingHoldsOnPropose = parseBool(
+  process.env.MEETING_HOLDS_ON_PROPOSE,
+  false,
+);
+const autoBook = parseBool(process.env.AUTO_BOOK, true);
+
 export interface ModelCostRates {
   inputCostPerMillion: number;
   outputCostPerMillion: number;
@@ -250,4 +387,17 @@ export const config = {
   autoDeploy: ["true", "1", "yes"].includes(
     (process.env.AUTO_DEPLOY?.trim().toLowerCase() ?? ""),
   ),
+  meetingTimezone,
+  meetingHours,
+  meetingBreak,
+  meetingBufferMinutes,
+  meetingDefaultMinutes,
+  meetingSlotsToOffer,
+  meetingMinNoticeHours,
+  meetingHorizonDays,
+  meetingHoldsOnPropose,
+  autoBook,
+  autoBookDelayMinutes,
+  autoBookDailyCap,
+  autoBookMinConfidence,
 } as const;

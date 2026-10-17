@@ -1,5 +1,5 @@
 import { bot } from "./bot.js";
-import { startApprovalExpirySweep } from "./approvals.js";
+import { setAfterDraftSend, startApprovalExpirySweep } from "./approvals.js";
 import { registerBillScan } from "./bills.js";
 import { registerMorningBrief } from "./brief.js";
 import { sendOverdueFollowupNudge } from "./followup_panel.js";
@@ -18,6 +18,10 @@ import {
   registerBuildPoll,
 } from "./builds.js";
 import { writeHeartbeat } from "./heartbeat.js";
+import {
+  onMeetingDraftSent,
+  registerMeetingBookingJobs,
+} from "./meeting_book.js";
 
 const morningBriefTask = registerMorningBrief(bot.api);
 const billScanTask = registerBillScan(bot.api);
@@ -33,6 +37,8 @@ const documentExpirySweep = startDocumentExpirySweep();
 const meetingScanTask = registerMeetingScan(bot.api);
 const weeklyBackupTask = registerWeeklyBackup(bot.api);
 const attachmentAlertTask = registerAttachmentAlertScan(bot.api);
+const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
+setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
 await applyPendingDeployResult();
 void pollRunningBuilds();
@@ -79,6 +85,9 @@ process.once("SIGINT", () => {
   meetingScanTask.stop();
   weeklyBackupTask.stop();
   attachmentAlertTask.stop();
+  meetingBookingJobs.inbox.stop();
+  meetingBookingJobs.poll.stop();
+  meetingBookingJobs.pending.stop();
   buildPollTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
@@ -94,6 +103,9 @@ process.once("SIGTERM", () => {
   meetingScanTask.stop();
   weeklyBackupTask.stop();
   attachmentAlertTask.stop();
+  meetingBookingJobs.inbox.stop();
+  meetingBookingJobs.poll.stop();
+  meetingBookingJobs.pending.stop();
   buildPollTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);

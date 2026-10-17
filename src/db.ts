@@ -418,6 +418,70 @@ db.exec(`
   );
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS meeting_inbounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    google_account TEXT NOT NULL DEFAULT 'work',
+    message_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    processed_as TEXT NOT NULL DEFAULT 'seen'
+      CHECK (processed_as IN (
+        'seen', 'skip', 'detect', 'card', 'autobook', 'ask', 'ignore'
+      )),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (google_account, message_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS meeting_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    sent_message_id TEXT NOT NULL,
+    recipient_email TEXT NOT NULL,
+    recipient_name TEXT NOT NULL,
+    cc_emails TEXT NOT NULL DEFAULT '[]',
+    slots TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    sender_timezone TEXT,
+    hold_event_ids TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'open'
+      CHECK (status IN ('open', 'booked', 'expired', 'cancelled')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS meeting_pending_bookings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    slot_index INTEGER NOT NULL,
+    send_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'sent', 'cancelled')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS meeting_draft_intents (
+    draft_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    recipient_email TEXT NOT NULL,
+    recipient_name TEXT NOT NULL,
+    cc_emails TEXT NOT NULL DEFAULT '[]',
+    slots TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    sender_timezone TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_meeting_proposals_thread
+    ON meeting_proposals (thread_id, status);
+  CREATE INDEX IF NOT EXISTS idx_meeting_pending_send
+    ON meeting_pending_bookings (status, send_at);
+
+  CREATE TABLE IF NOT EXISTS meeting_card_state (
+    inbound_id INTEGER PRIMARY KEY,
+    payload TEXT NOT NULL
+  );
+`);
+
 if (!tableHasColumn("accounts", "relationship")) {
   db.exec(
     `ALTER TABLE accounts ADD COLUMN relationship TEXT NOT NULL DEFAULT 'partner'`,
@@ -1968,4 +2032,354 @@ export function updateBuild(
     id,
   );
   return getBuild(id);
+}
+
+export type MeetingInboundProcessedAs =
+  | "seen"
+  | "skip"
+  | "detect"
+  | "card"
+  | "autobook"
+  | "ask"
+  | "ignore";
+
+export interface MeetingInboundRecord {
+  id: number;
+  google_account: GoogleAccountId;
+  message_id: string;
+  thread_id: string;
+  processed_as: MeetingInboundProcessedAs;
+  created_at: string;
+}
+
+export type MeetingProposalStatus = "open" | "booked" | "expired" | "cancelled";
+
+export interface MeetingProposalRecord {
+  id: number;
+  thread_id: string;
+  sent_message_id: string;
+  recipient_email: string;
+  recipient_name: string;
+  cc_emails: string;
+  slots: string;
+  duration_minutes: number;
+  sender_timezone: string | null;
+  hold_event_ids: string;
+  status: MeetingProposalStatus;
+  created_at: string;
+}
+
+export interface MeetingProposalInput {
+  threadId: string;
+  sentMessageId: string;
+  recipientEmail: string;
+  recipientName: string;
+  ccEmails: string[];
+  slots: Array<{ start: string; end: string }>;
+  durationMinutes: number;
+  senderTimezone: string | null;
+  holdEventIds?: string[];
+}
+
+export type MeetingPendingBookingStatus = "pending" | "sent" | "cancelled";
+
+export interface MeetingPendingBookingRecord {
+  id: number;
+  proposal_id: number;
+  event_id: string;
+  slot_index: number;
+  send_at: string;
+  status: MeetingPendingBookingStatus;
+  created_at: string;
+}
+
+export interface MeetingDraftIntentRecord {
+  draft_id: string;
+  thread_id: string;
+  recipient_email: string;
+  recipient_name: string;
+  cc_emails: string;
+  slots: string;
+  duration_minutes: number;
+  sender_timezone: string | null;
+  created_at: string;
+}
+
+const MEETING_INBOUND_COLUMNS = `id, google_account, message_id, thread_id, processed_as, created_at`;
+const MEETING_PROPOSAL_COLUMNS = `id, thread_id, sent_message_id, recipient_email, recipient_name,
+  cc_emails, slots, duration_minutes, sender_timezone, hold_event_ids, status, created_at`;
+const MEETING_PENDING_COLUMNS = `id, proposal_id, event_id, slot_index, send_at, status, created_at`;
+const MEETING_INTENT_COLUMNS = `draft_id, thread_id, recipient_email, recipient_name, cc_emails,
+  slots, duration_minutes, sender_timezone, created_at`;
+
+export function insertMeetingInbound(input: {
+  googleAccount?: GoogleAccountId;
+  messageId: string;
+  threadId: string;
+  processedAs?: MeetingInboundProcessedAs;
+}): MeetingInboundRecord | undefined {
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO meeting_inbounds (
+         google_account, message_id, thread_id, processed_as
+       ) VALUES (?, ?, ?, ?)`,
+    )
+    .run(
+      input.googleAccount ?? "work",
+      input.messageId,
+      input.threadId,
+      input.processedAs ?? "seen",
+    );
+  if (result.changes !== 1) {
+    return undefined;
+  }
+  return getMeetingInbound(Number(result.lastInsertRowid));
+}
+
+export function getMeetingInbound(id: number): MeetingInboundRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_INBOUND_COLUMNS} FROM meeting_inbounds WHERE id = ?`,
+    )
+    .get(id) as MeetingInboundRecord | undefined;
+}
+
+export function getMeetingInboundByMessage(
+  googleAccount: GoogleAccountId,
+  messageId: string,
+): MeetingInboundRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_INBOUND_COLUMNS}
+       FROM meeting_inbounds
+       WHERE google_account = ? AND message_id = ?`,
+    )
+    .get(googleAccount, messageId) as MeetingInboundRecord | undefined;
+}
+
+export function setMeetingInboundProcessedAs(
+  id: number,
+  processedAs: MeetingInboundProcessedAs,
+): void {
+  db.prepare(`UPDATE meeting_inbounds SET processed_as = ? WHERE id = ?`).run(
+    processedAs,
+    id,
+  );
+}
+
+export function createMeetingProposal(
+  input: MeetingProposalInput,
+): MeetingProposalRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO meeting_proposals (
+         thread_id, sent_message_id, recipient_email, recipient_name, cc_emails,
+         slots, duration_minutes, sender_timezone, hold_event_ids
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.threadId,
+      input.sentMessageId,
+      input.recipientEmail.toLowerCase(),
+      input.recipientName,
+      JSON.stringify(input.ccEmails.map((email) => email.toLowerCase())),
+      JSON.stringify(input.slots),
+      input.durationMinutes,
+      input.senderTimezone,
+      JSON.stringify(input.holdEventIds ?? []),
+    );
+  return getMeetingProposal(Number(result.lastInsertRowid))!;
+}
+
+export function getMeetingProposal(id: number): MeetingProposalRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PROPOSAL_COLUMNS} FROM meeting_proposals WHERE id = ?`,
+    )
+    .get(id) as MeetingProposalRecord | undefined;
+}
+
+export function getOpenMeetingProposalByThread(
+  threadId: string,
+): MeetingProposalRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PROPOSAL_COLUMNS}
+       FROM meeting_proposals
+       WHERE thread_id = ? AND status = 'open'
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get(threadId) as MeetingProposalRecord | undefined;
+}
+
+export function listOpenMeetingProposals(): MeetingProposalRecord[] {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PROPOSAL_COLUMNS}
+       FROM meeting_proposals
+       WHERE status = 'open'
+       ORDER BY id ASC`,
+    )
+    .all() as MeetingProposalRecord[];
+}
+
+export function setMeetingProposalStatus(
+  id: number,
+  status: MeetingProposalStatus,
+): void {
+  db.prepare(`UPDATE meeting_proposals SET status = ? WHERE id = ?`).run(
+    status,
+    id,
+  );
+}
+
+export function setMeetingProposalHolds(id: number, holdEventIds: string[]): void {
+  db.prepare(`UPDATE meeting_proposals SET hold_event_ids = ? WHERE id = ?`).run(
+    JSON.stringify(holdEventIds),
+    id,
+  );
+}
+
+export function createMeetingPendingBooking(input: {
+  proposalId: number;
+  eventId: string;
+  slotIndex: number;
+  sendAt: string;
+}): MeetingPendingBookingRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO meeting_pending_bookings (
+         proposal_id, event_id, slot_index, send_at
+       ) VALUES (?, ?, ?, ?)`,
+    )
+    .run(input.proposalId, input.eventId, input.slotIndex, input.sendAt);
+  return getMeetingPendingBooking(Number(result.lastInsertRowid))!;
+}
+
+export function getMeetingPendingBooking(
+  id: number,
+): MeetingPendingBookingRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PENDING_COLUMNS} FROM meeting_pending_bookings WHERE id = ?`,
+    )
+    .get(id) as MeetingPendingBookingRecord | undefined;
+}
+
+export function getPendingBookingForProposal(
+  proposalId: number,
+): MeetingPendingBookingRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PENDING_COLUMNS}
+       FROM meeting_pending_bookings
+       WHERE proposal_id = ? AND status = 'pending'
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get(proposalId) as MeetingPendingBookingRecord | undefined;
+}
+
+export function listDueMeetingPendingBookings(
+  nowIso: string,
+): MeetingPendingBookingRecord[] {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PENDING_COLUMNS}
+       FROM meeting_pending_bookings
+       WHERE status = 'pending' AND send_at <= ?
+       ORDER BY send_at ASC`,
+    )
+    .all(nowIso) as MeetingPendingBookingRecord[];
+}
+
+export function listMeetingPendingBookings(): MeetingPendingBookingRecord[] {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PENDING_COLUMNS}
+       FROM meeting_pending_bookings
+       ORDER BY id ASC`,
+    )
+    .all() as MeetingPendingBookingRecord[];
+}
+
+export function transitionMeetingPendingBooking(
+  id: number,
+  from: MeetingPendingBookingStatus,
+  to: MeetingPendingBookingStatus,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE meeting_pending_bookings SET status = ? WHERE id = ? AND status = ?`,
+    )
+    .run(to, id, from);
+  return result.changes === 1;
+}
+
+export function upsertMeetingDraftIntent(input: {
+  draftId: string;
+  threadId: string;
+  recipientEmail: string;
+  recipientName: string;
+  ccEmails: string[];
+  slots: Array<{ start: string; end: string }>;
+  durationMinutes: number;
+  senderTimezone: string | null;
+}): void {
+  db.prepare(
+    `INSERT INTO meeting_draft_intents (
+       draft_id, thread_id, recipient_email, recipient_name, cc_emails,
+       slots, duration_minutes, sender_timezone
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(draft_id) DO UPDATE SET
+       thread_id = excluded.thread_id,
+       recipient_email = excluded.recipient_email,
+       recipient_name = excluded.recipient_name,
+       cc_emails = excluded.cc_emails,
+       slots = excluded.slots,
+       duration_minutes = excluded.duration_minutes,
+       sender_timezone = excluded.sender_timezone`,
+  ).run(
+    input.draftId,
+    input.threadId,
+    input.recipientEmail.toLowerCase(),
+    input.recipientName,
+    JSON.stringify(input.ccEmails.map((email) => email.toLowerCase())),
+    JSON.stringify(input.slots),
+    input.durationMinutes,
+    input.senderTimezone,
+  );
+}
+
+export function getMeetingDraftIntent(
+  draftId: string,
+): MeetingDraftIntentRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_INTENT_COLUMNS} FROM meeting_draft_intents WHERE draft_id = ?`,
+    )
+    .get(draftId) as MeetingDraftIntentRecord | undefined;
+}
+
+export function deleteMeetingDraftIntent(draftId: string): void {
+  db.prepare(`DELETE FROM meeting_draft_intents WHERE draft_id = ?`).run(draftId);
+}
+
+export function setMeetingCardState(inboundId: number, payload: string): void {
+  db.prepare(
+    `INSERT INTO meeting_card_state (inbound_id, payload) VALUES (?, ?)
+     ON CONFLICT(inbound_id) DO UPDATE SET payload = excluded.payload`,
+  ).run(inboundId, payload);
+}
+
+export function getMeetingCardState(inboundId: number): string | undefined {
+  const row = db
+    .prepare(`SELECT payload FROM meeting_card_state WHERE inbound_id = ?`)
+    .get(inboundId) as { payload: string } | undefined;
+  return row?.payload;
+}
+
+export function deleteMeetingCardState(inboundId: number): void {
+  db.prepare(`DELETE FROM meeting_card_state WHERE inbound_id = ?`).run(inboundId);
 }
