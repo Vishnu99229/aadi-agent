@@ -1,12 +1,9 @@
 import "dotenv/config";
 import {
+  DB_PATH,
   createMeetingPendingBooking,
   createMeetingProposal,
   getMeetingPendingBooking,
-  getMeetingProposal,
-  listDueMeetingPendingBookings,
-  setMeetingProposalStatus,
-  transitionMeetingPendingBooking,
 } from "../src/db.ts";
 import {
   inboundSkipReason,
@@ -45,6 +42,11 @@ function assert(condition: boolean, message: string): void {
     throw new Error(message);
   }
 }
+
+assert(
+  DB_PATH === ":memory:",
+  "test:stage12 must use AADI_DB_PATH=:memory:, never aadi.db",
+);
 
 const SLOT_OPTS = {
   durationMinutes: 30,
@@ -239,10 +241,9 @@ assert(template.startsWith("Hi Ada,"), "confirm template greeting");
 assert(template.includes("calendar invite for Tuesday, 21 Oct, 11:00–11:30 IST (01:30 EDT)"), "confirm template time");
 assert(template.trim().endsWith("Vishnu"), "confirm template signature");
 
-const stamp = Date.now();
 const proposal = createMeetingProposal({
-  threadId: `stage12-test-${stamp}`,
-  sentMessageId: `stage12-msg-${stamp}`,
+  threadId: "stage12-isolated-thread",
+  sentMessageId: "stage12-isolated-msg",
   recipientEmail: "ada@acme.com",
   recipientName: "Ada",
   ccEmails: [],
@@ -255,63 +256,13 @@ const proposal = createMeetingProposal({
   durationMinutes: 30,
   senderTimezone: null,
 });
-
-const future = createMeetingPendingBooking({
-  proposalId: proposal.id,
-  eventId: `stage12-event-future-${stamp}`,
-  slotIndex: 0,
-  sendAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-});
-const dueNow = listDueMeetingPendingBookings(new Date().toISOString());
-assert(
-  !dueNow.some((row) => row.id === future.id),
-  "future send_at is not due yet (restart-safe SQLite row)",
-);
-
-let sentBodies: string[] = [];
-const skipped = await processDuePendingBookings({
-  now: new Date(),
-  eventExists: async () => true,
-  patchInvite: async () => {
-    throw new Error("invite must not send before send_at");
-  },
-  confirmSend: async (body) => {
-    sentBodies.push(body);
-    return { messageId: "x" };
-  },
-  notify: async () => undefined,
-});
-assert(skipped === 0, "due processor leaves future bookings untouched");
-assert(sentBodies.length === 0, "undo window does not send email");
-
-assert(
-  transitionMeetingPendingBooking(future.id, "pending", "cancelled"),
-  "undo cancels the pending row",
-);
-setMeetingProposalStatus(proposal.id, "open");
-const afterUndo = await processDuePendingBookings({
-  now: new Date(Date.now() + 15 * 60 * 1000),
-  eventExists: async () => true,
-  patchInvite: async () => {
-    throw new Error("undone booking must not patch");
-  },
-  confirmSend: async (body) => {
-    sentBodies.push(body);
-    return { messageId: "x" };
-  },
-  notify: async () => undefined,
-});
-assert(afterUndo === 0, "cancelled booking is not sent after send_at");
-assert(getMeetingPendingBooking(future.id)?.status === "cancelled", "cancelled status persists");
-assert(getMeetingProposal(proposal.id)?.status === "open", "proposal reopens on undo");
-
 const due = createMeetingPendingBooking({
   proposalId: proposal.id,
-  eventId: `stage12-event-due-${stamp}`,
+  eventId: "stage12-isolated-event",
   slotIndex: 0,
   sendAt: new Date(Date.now() - 60 * 1000).toISOString(),
 });
-sentBodies = [];
+const sentBodies: string[] = [];
 const sent = await processDuePendingBookings({
   now: new Date(),
   eventExists: async () => true,

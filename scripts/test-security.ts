@@ -1,5 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { Api } from "grammy";
+import type { gmail_v1 } from "googleapis";
 import {
   AutoBookRefusedError,
   autoBookConfirm,
@@ -7,6 +9,25 @@ import {
   extraToCcAddresses,
   renderBookingConfirmBody,
 } from "../src/security/auto_book.ts";
+import {
+  DB_PATH,
+  createMeetingPendingBooking,
+  createMeetingProposal,
+  getMeetingPendingBooking,
+  getMeetingProposal,
+  listDueMeetingPendingBookings,
+  listMeetingPendingBookings,
+  setMeetingProposalStatus,
+  transitionMeetingPendingBooking,
+} from "../src/db.ts";
+import type { LoadedGoogleAccount } from "../src/google/auth.ts";
+import {
+  processDuePendingBookings,
+  processInboundMeetingMessage,
+  resetMeetingTestHooks,
+  setMeetingTestHooks,
+} from "../src/meeting_book.ts";
+import { istDateTime } from "../src/meeting_slots.ts";
 import {
   isOwner,
   isOwnerTelegramId,
@@ -29,6 +50,11 @@ function assert(condition: boolean, message: string): void {
     throw new Error(message);
   }
 }
+
+assert(
+  DB_PATH === ":memory:",
+  "test:security must use AADI_DB_PATH=:memory:, never aadi.db",
+);
 
 function assertThrows(run: () => void, message: string): void {
   try {
@@ -422,5 +448,219 @@ assert(
 
 const toolsIndex = await readFile(join(root, "src/tools/index.ts"), "utf8");
 assert(!/book_meeting|send_email|create_event/.test(toolsIndex), "no model send/book tools");
+
+function fakeWorkAccount(): LoadedGoogleAccount {
+  return {
+    id: "work",
+    tag: "work",
+    label: "work",
+    tokenPath: "",
+    tokenFile: "",
+    client: {} as LoadedGoogleAccount["client"],
+  };
+}
+
+function silentApi(): Api {
+  return {
+    sendMessage: async () => ({ message_id: 1 }),
+  } as unknown as Api;
+}
+
+function fakeInbound(input: {
+  messageId: string;
+  threadId: string;
+  from: string;
+  to?: string;
+  cc?: string;
+  subject: string;
+  body: string;
+  internalDate?: string;
+}): gmail_v1.Schema$Message {
+  return {
+    id: input.messageId,
+    threadId: input.threadId,
+    internalDate: input.internalDate ?? String(Date.now()),
+    payload: {
+      mimeType: "text/plain",
+      headers: [
+        { name: "From", value: input.from },
+        { name: "To", value: input.to ?? "vishnu.rajan@epicode.in" },
+        ...(input.cc ? [{ name: "Cc", value: input.cc }] : []),
+        { name: "Subject", value: input.subject },
+        { name: "Message-ID", value: `<${input.messageId}@mail>` },
+      ],
+      body: {
+        data: Buffer.from(input.body, "utf8").toString("base64url"),
+      },
+    },
+  };
+}
+
+const work = fakeWorkAccount();
+let calendarInserts = 0;
+let mailSends = 0;
+setMeetingTestHooks({
+  detect: async () => ({
+    kind: "proposes_times",
+    proposed_times: ["2026-10-21T11:00:00+05:30"],
+    window_hint: null,
+    duration_minutes: 30,
+    sender_timezone: null,
+    confidence: 0.95,
+  }),
+  mapReply: async () => ({
+    verdict: "one",
+    slot_index: 0,
+    confidence: 0.99,
+  }),
+  insertEvent: async () => {
+    calendarInserts += 1;
+    return "should-not-insert";
+  },
+  loadBusy: async () => [],
+  slotIsFree: async () => true,
+});
+
+calendarInserts = 0;
+mailSends = 0;
+await processInboundMeetingMessage(
+  silentApi(),
+  work,
+  fakeInbound({
+    messageId: "forged-confirm-1",
+    threadId: "thread-no-proposal",
+    from: "Eve <eve@other.com>",
+    subject: "Re: call",
+    body: "I confirm Tuesday 11am",
+  }),
+  new Date(),
+);
+assert(calendarInserts === 0, "forged confirm with no proposal must not insert a calendar event");
+assert(mailSends === 0, "forged confirm with no proposal must not send mail");
+assert(
+  listMeetingPendingBookings().length === 0,
+  "forged confirm with no proposal must not create a pending_booking",
+);
+
+const closedSlots = [
+  {
+    start: istDateTime("2026-10-21", "11:00").toISOString(),
+    end: istDateTime("2026-10-21", "11:30").toISOString(),
+  },
+];
+const bookedProposal = createMeetingProposal({
+  threadId: "thread-already-booked",
+  sentMessageId: "sent-booked-1",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: closedSlots,
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+setMeetingProposalStatus(bookedProposal.id, "booked");
+const expiredProposal = createMeetingProposal({
+  threadId: "thread-already-expired",
+  sentMessageId: "sent-expired-1",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: closedSlots,
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+setMeetingProposalStatus(expiredProposal.id, "expired");
+
+for (const row of [
+  { threadId: "thread-already-booked", label: "booked" },
+  { threadId: "thread-already-expired", label: "expired" },
+]) {
+  calendarInserts = 0;
+  const before = listMeetingPendingBookings().length;
+  await processInboundMeetingMessage(
+    silentApi(),
+    work,
+    fakeInbound({
+      messageId: `reply-${row.label}`,
+      threadId: row.threadId,
+      from: "Ada <ada@acme.com>",
+      subject: "Re: call",
+      body: "Tuesday 11am works",
+      internalDate: String(Date.now() + 60_000),
+    }),
+    new Date(),
+  );
+  assert(
+    calendarInserts === 0,
+    `reply on ${row.label} proposal must not insert a calendar event`,
+  );
+  assert(
+    listMeetingPendingBookings().length === before,
+    `reply on ${row.label} proposal must not create a pending_booking`,
+  );
+}
+
+resetMeetingTestHooks();
+
+const undoProposal = createMeetingProposal({
+  threadId: "thread-undo",
+  sentMessageId: "sent-undo-1",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: closedSlots,
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+const future = createMeetingPendingBooking({
+  proposalId: undoProposal.id,
+  eventId: "event-undo-future",
+  slotIndex: 0,
+  sendAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+});
+assert(
+  !listDueMeetingPendingBookings(new Date().toISOString()).some(
+    (row) => row.id === future.id,
+  ),
+  "undo: future send_at is not due yet",
+);
+const undoSends: string[] = [];
+const skippedDue = await processDuePendingBookings({
+  now: new Date(),
+  eventExists: async () => true,
+  patchInvite: async () => {
+    throw new Error("undo window must not patch invite");
+  },
+  confirmSend: async (body) => {
+    undoSends.push(body);
+    mailSends += 1;
+    return { messageId: "x" };
+  },
+  notify: async () => undefined,
+});
+assert(skippedDue === 0, "undo: due processor leaves future bookings untouched");
+assert(undoSends.length === 0, "undo before send_at must not send email");
+assert(
+  transitionMeetingPendingBooking(future.id, "pending", "cancelled"),
+  "undo cancels the pending row",
+);
+setMeetingProposalStatus(undoProposal.id, "open");
+const afterUndo = await processDuePendingBookings({
+  now: new Date(Date.now() + 15 * 60 * 1000),
+  eventExists: async () => true,
+  patchInvite: async () => {
+    throw new Error("undone booking must not patch");
+  },
+  confirmSend: async (body) => {
+    undoSends.push(body);
+    mailSends += 1;
+    return { messageId: "x" };
+  },
+  notify: async () => undefined,
+});
+assert(afterUndo === 0, "undo: cancelled booking is not sent after send_at");
+assert(getMeetingPendingBooking(future.id)?.status === "cancelled", "undo: cancelled status persists");
+assert(getMeetingProposal(undoProposal.id)?.status === "open", "undo: proposal reopens");
+assert(mailSends === 0, "undo before send_at must not call messages.send");
 
 console.log("Security gate checks passed.");

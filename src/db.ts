@@ -83,7 +83,7 @@ export interface FollowupInput {
   nextCheckAt: string;
 }
 
-export const DB_PATH = "./aadi.db";
+export const DB_PATH = process.env.AADI_DB_PATH?.trim() || "./aadi.db";
 
 const db = new Database(DB_PATH);
 
@@ -2197,6 +2197,20 @@ export function getMeetingProposal(id: number): MeetingProposalRecord | undefine
       `SELECT ${MEETING_PROPOSAL_COLUMNS} FROM meeting_proposals WHERE id = ?`,
     )
     .get(id) as MeetingProposalRecord | undefined;
+}
+
+export function getLatestMeetingProposalByThread(
+  threadId: string,
+): MeetingProposalRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${MEETING_PROPOSAL_COLUMNS}
+       FROM meeting_proposals
+       WHERE thread_id = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get(threadId) as MeetingProposalRecord | undefined;
 }
 
 export function getOpenMeetingProposalByThread(

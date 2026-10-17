@@ -14,6 +14,7 @@ import {
   getMeetingInbound,
   getMeetingPendingBooking,
   getMeetingProposal,
+  getLatestMeetingProposalByThread,
   getOpenMeetingProposalByThread,
   insertMeetingInbound,
   listDueMeetingPendingBookings,
@@ -32,6 +33,7 @@ import {
   mapReplyToSlot,
   type MeetingDetection,
   type MeetingKind,
+  type MeetingReplyMapping,
 } from "./meeting_detect.js";
 import {
   findSlots,
@@ -58,6 +60,30 @@ import {
   renderBookingConfirmBody,
   type AutoBookGateInput,
 } from "./security/auto_book.js";
+
+export interface MeetingTestHooks {
+  detect?: (input: { subject: string; body: string }) => Promise<MeetingDetection>;
+  mapReply?: (input: {
+    slotCount: number;
+    body: string;
+  }) => Promise<MeetingReplyMapping>;
+  insertEvent?: (
+    slot: TimeSlot,
+    proposal: MeetingProposalRecord,
+  ) => Promise<string>;
+  loadBusy?: (timeMin: Date, timeMax: Date) => Promise<BusyInterval[]>;
+  slotIsFree?: (slot: TimeSlot) => Promise<boolean>;
+}
+
+let testHooks: MeetingTestHooks = {};
+
+export function setMeetingTestHooks(hooks: MeetingTestHooks): void {
+  testHooks = hooks;
+}
+
+export function resetMeetingTestHooks(): void {
+  testHooks = {};
+}
 
 const TIME_ZONE = "Asia/Kolkata";
 const INBOX_QUERY = "in:inbox newer_than:1d -category:promotions -category:social";
@@ -237,6 +263,9 @@ function finderOptions(now: Date, busy: BusyInterval[], extra: {
 }
 
 async function loadBusy(timeMin: Date, timeMax: Date): Promise<BusyInterval[]> {
+  if (testHooks.loadBusy) {
+    return testHooks.loadBusy(timeMin, timeMax);
+  }
   const accounts = await loadGoogleAccounts();
   const busy: BusyInterval[] = [];
   for (const account of accounts) {
@@ -259,6 +288,9 @@ async function loadBusy(timeMin: Date, timeMax: Date): Promise<BusyInterval[]> {
 }
 
 async function slotIsFree(slot: TimeSlot): Promise<boolean> {
+  if (testHooks.slotIsFree) {
+    return testHooks.slotIsFree(slot);
+  }
   const bufferMs = config.meetingBufferMinutes * 60 * 1000;
   const busy = await loadBusy(
     new Date(slot.start.getTime() - bufferMs),
@@ -611,6 +643,9 @@ async function queueProposalDraft(
 }
 
 async function insertWorkEvent(slot: TimeSlot, proposal: MeetingProposalRecord): Promise<string> {
+  if (testHooks.insertEvent) {
+    return testHooks.insertEvent(slot, proposal);
+  }
   const account = await getGoogleAccount("work");
   const calendar = google.calendar({ version: "v3", auth: account.client });
   const created = await calendar.events.insert({
@@ -722,7 +757,7 @@ async function processReplyOnProposal(input: {
     ...parseAddressList(messageHeader(input.message, "Cc")),
   ];
   const body = collectPlain(input.message.payload);
-  const mapping = await mapReplyToSlot({
+  const mapping = await (testHooks.mapReply ?? mapReplyToSlot)({
     slotCount: parseSlots(input.proposal.slots).length,
     body,
   });
@@ -757,7 +792,7 @@ async function processReplyOnProposal(input: {
   });
 }
 
-async function handleInboundMessage(
+export async function processInboundMeetingMessage(
   api: Api,
   work: LoadedGoogleAccount,
   message: gmail_v1.Schema$Message,
@@ -817,7 +852,20 @@ async function handleInboundMessage(
     });
     return;
   }
-  const detection = await detectMeetingRequest({
+  const closed = getLatestMeetingProposalByThread(threadId);
+  if (
+    closed &&
+    (closed.status === "booked" ||
+      closed.status === "expired" ||
+      closed.status === "cancelled")
+  ) {
+    setMeetingInboundProcessedAs(inbound.id, "skip");
+    console.log(
+      `Meeting inbound skip: id=${inbound.id} reason=proposal_${closed.status}`,
+    );
+    return;
+  }
+  const detection = await (testHooks.detect ?? detectMeetingRequest)({
     subject,
     body: collectPlain(message.payload),
   });
@@ -867,7 +915,7 @@ export async function runMeetingInboxScan(api: Api, now = new Date()): Promise<n
       id: item.id,
       format: "full",
     });
-    await handleInboundMessage(api, work, response.data, now);
+    await processInboundMeetingMessage(api, work, response.data, now);
     seen += 1;
   }
   console.log(`Meeting inbox scan: listed=${seen}`);
@@ -895,7 +943,7 @@ export async function runMeetingProposalPoll(api: Api, now = new Date()): Promis
         if (message.id === proposal.sent_message_id) {
           continue;
         }
-        await handleInboundMessage(api, work, message, now);
+        await processInboundMeetingMessage(api, work, message, now);
       }
     } catch {
       console.log(`Meeting proposal poll skipped: id=${proposal.id}`);
