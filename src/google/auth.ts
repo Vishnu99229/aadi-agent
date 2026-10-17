@@ -11,6 +11,12 @@ export const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/spreadsheets.readonly",
 ] as const;
 
+/** Work account only. calendar.events is the narrowest scope that can insert/patch/delete events. Keep calendar.readonly so freebusy.query still works (that method does not list calendar.events). */
+export const WORK_GOOGLE_SCOPES = [
+  ...GOOGLE_SCOPES,
+  "https://www.googleapis.com/auth/calendar.events",
+] as const;
+
 export const GOOGLE_CREDENTIALS_PATH = fileURLToPath(
   new URL("../../google-credentials.json", import.meta.url),
 );

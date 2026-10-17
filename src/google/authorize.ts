@@ -4,22 +4,26 @@ import type { AddressInfo } from "node:net";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { authenticate } from "@google-cloud/local-auth";
-import { google } from "googleapis";
+import { google, type Auth } from "googleapis";
 import {
   GOOGLE_CREDENTIALS_PATH,
   GOOGLE_SCOPES,
   GOOGLE_TOKEN_PATH,
   GOOGLE_TOKEN_WORK_PATH,
+  WORK_GOOGLE_SCOPES,
   loadDesktopCredentials,
   saveGoogleTokens,
 } from "./auth.js";
+
+const WORK_EMAIL = "vishnu.rajan@epicode.in";
+const PERSONAL_EMAIL = "vishnu.rajan294@gmail.com";
 
 const execFileAsync = promisify(execFile);
 
 const WORKSPACE_ADMIN_HELP = `Epicode Workspace admin needs to allow this OAuth app in Google Admin:
 1. Security → Access and data control → API controls → Manage third-party app access
 2. Add this app as Trusted (or Allowed) for Vishnu's OU. Do not leave it blocked.
-3. Grant Gmail (gmail.readonly, gmail.compose) and Calendar (calendar.readonly).
+3. Grant Gmail (gmail.readonly, gmail.compose) and Calendar (calendar.readonly plus calendar.events for the work account only).
 4. If Google says the app is unverified or blocked: allow unverified third-party apps for that OU, or add this OAuth client ID to the allowlist.
 5. Confirm users can grant those scopes (App access control / internal apps).
 Then run npm run google:auth:work again and pick the Epicode email.`;
@@ -96,6 +100,21 @@ async function openBrowser(url: string): Promise<void> {
   }
 }
 
+async function authorizedEmail(client: unknown): Promise<string> {
+  const gmail = google.gmail({
+    version: "v1",
+    auth: client as Auth.OAuth2Client,
+  });
+  const profile = await gmail.users.getProfile({ userId: "me" });
+  return (profile.data.emailAddress ?? "").trim().toLowerCase();
+}
+
+function refuseWrongAccount(got: string, expected: string): never {
+  throw new Error(
+    `Wrong account (got ${got || "unknown"}). Run again and choose ${expected}.`,
+  );
+}
+
 async function authorizeWork(): Promise<void> {
   const installed = await loadDesktopCredentials();
   const { port, waitForCallback } = await startLoopbackServer();
@@ -108,7 +127,8 @@ async function authorizeWork(): Promise<void> {
   const authUrl = oauthClient.generateAuthUrl({
     access_type: "offline",
     prompt: "select_account consent",
-    scope: [...GOOGLE_SCOPES],
+    login_hint: WORK_EMAIL,
+    scope: [...WORK_GOOGLE_SCOPES],
   });
 
   console.log("Browser step: a Google sign-in window will open now.");
@@ -133,8 +153,16 @@ async function authorizeWork(): Promise<void> {
 
   try {
     const { tokens } = await oauthClient.getToken(result.code);
+    oauthClient.setCredentials(tokens);
+    const email = await authorizedEmail(oauthClient);
+    if (email !== WORK_EMAIL) {
+      refuseWrongAccount(email, WORK_EMAIL);
+    }
     await saveGoogleTokens(tokens, GOOGLE_TOKEN_WORK_PATH);
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Wrong account")) {
+      throw error;
+    }
     const detail = error instanceof Error ? error.message : String(error);
     if (looksLikeWorkspacePolicy(detail)) {
       throw new WorkspacePolicyError(detail);
@@ -153,6 +181,10 @@ async function authorizePersonal(): Promise<void> {
     scopes: [...GOOGLE_SCOPES],
   });
 
+  const email = await authorizedEmail(client);
+  if (email !== PERSONAL_EMAIL) {
+    refuseWrongAccount(email, PERSONAL_EMAIL);
+  }
   await saveGoogleTokens(client.credentials, GOOGLE_TOKEN_PATH);
   console.log("Google authorization complete. Saved google-token.json.");
 }
