@@ -208,6 +208,32 @@ assert(
 );
 assert(
   inboundSkipReason({
+    fromEmail: "vishnu.rajan294@gmail.com",
+    headers: [],
+    subject: "call next week",
+  }) === "internal",
+  "personal gmail is skipped as self by default",
+);
+assert(
+  inboundSkipReason({
+    fromEmail: "vishnu.rajan294@gmail.com",
+    headers: [],
+    subject: "call next week",
+    testSenders: ["vishnu.rajan294@gmail.com"],
+  }) === undefined,
+  "listed MEETING_TEST_SENDERS are treated as external prospects",
+);
+assert(
+  inboundSkipReason({
+    fromEmail: "vishnu.rajan@epicode.in",
+    headers: [],
+    subject: "call next week",
+    testSenders: ["vishnu.rajan@epicode.in", "vishnu.rajan294@gmail.com"],
+  }) === "internal",
+  "work address is still skipped even if listed as a test sender",
+);
+assert(
+  inboundSkipReason({
     fromEmail: "alerts@acme.com",
     headers: [{ name: "List-Unsubscribe", value: "<mailto:x>" }],
     subject: "hello",

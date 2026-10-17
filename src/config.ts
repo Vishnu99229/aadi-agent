@@ -254,6 +254,10 @@ const meetingHoldsOnPropose = parseBool(
   false,
 );
 const autoBook = parseBool(process.env.AUTO_BOOK, true);
+const meetingTestSenders = (process.env.MEETING_TEST_SENDERS ?? "")
+  .split(",")
+  .map((item) => item.trim().toLowerCase())
+  .filter(Boolean);
 
 export interface ModelCostRates {
   inputCostPerMillion: number;
@@ -400,4 +404,5 @@ export const config = {
   autoBookDelayMinutes,
   autoBookDailyCap,
   autoBookMinConfidence,
+  meetingTestSenders,
 } as const;

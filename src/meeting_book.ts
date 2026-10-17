@@ -165,12 +165,22 @@ export function inboundSkipReason(input: {
   headers: gmail_v1.Schema$MessagePartHeader[] | undefined;
   subject: string;
   mimeType?: string | null;
+  testSenders?: readonly string[];
 }): string | undefined {
   const from = normalizeEmail(input.fromEmail);
   if (!from) {
     return "no_from";
   }
-  if (from.endsWith("@epicode.in") || isSelfEmail(from)) {
+  const testSenders = new Set(
+    (input.testSenders ?? []).map((item) => normalizeEmail(item)),
+  );
+  if (from === WORK_EMAIL) {
+    return "internal";
+  }
+  if (from.endsWith("@epicode.in") && !testSenders.has(from)) {
+    return "internal";
+  }
+  if (isSelfEmail(from) && !testSenders.has(from)) {
     return "internal";
   }
   if (/(?:^|[._-])(?:no-?reply|do-?not-?reply|mailer-daemon)(?:[._-]|@)/i.test(from)) {
@@ -809,6 +819,7 @@ export async function processInboundMeetingMessage(
     threadId,
   });
   if (!inbound) {
+    console.log(`Meeting inbound: message=${messageId} status=dup`);
     return;
   }
   const fromHeader = messageHeader(message, "From");
@@ -819,10 +830,13 @@ export async function processInboundMeetingMessage(
     headers: message.payload?.headers,
     subject,
     mimeType: message.payload?.mimeType,
+    testSenders: config.meetingTestSenders,
   });
   if (skipped) {
     setMeetingInboundProcessedAs(inbound.id, "skip");
-    console.log(`Meeting inbound skip: id=${inbound.id} reason=${skipped}`);
+    console.log(
+      `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=${skipped}`,
+    );
     return;
   }
   const proposal = getOpenMeetingProposalByThread(threadId);
@@ -843,6 +857,9 @@ export async function processInboundMeetingMessage(
       return;
     }
     setMeetingInboundProcessedAs(inbound.id, "autobook");
+    console.log(
+      `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=- kind=autobook proposal=${proposal.id}`,
+    );
     await processReplyOnProposal({
       api,
       proposal,
@@ -861,7 +878,7 @@ export async function processInboundMeetingMessage(
   ) {
     setMeetingInboundProcessedAs(inbound.id, "skip");
     console.log(
-      `Meeting inbound skip: id=${inbound.id} reason=proposal_${closed.status}`,
+      `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=proposal_${closed.status}`,
     );
     return;
   }
@@ -870,6 +887,9 @@ export async function processInboundMeetingMessage(
     body: collectPlain(message.payload),
   });
   setMeetingInboundProcessedAs(inbound.id, "detect");
+  console.log(
+    `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=- kind=${detection.kind} confidence=${detection.confidence}`,
+  );
   if (detection.kind === "none") {
     return;
   }
@@ -895,8 +915,10 @@ export async function processInboundMeetingMessage(
 }
 
 export async function runMeetingInboxScan(api: Api, now = new Date()): Promise<number> {
+  console.log("Meeting inbox scan start");
   const work = await workAccount();
   if (!work) {
+    console.log("Meeting inbox scan skipped: no_work_account");
     return 0;
   }
   const gmail = gmailClient(work);
@@ -1397,6 +1419,10 @@ export function registerMeetingBookingJobs(api: Api): {
     { name: "aadi-meeting-pending", timezone: TIME_ZONE, noOverlap: true },
   );
   console.log(`Meeting inbox every 10 min, proposals every 2 min, bookings every 1 min (${TIME_ZONE}).`);
+  void runMeetingInboxScan(api).catch((error) => {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Meeting inbox scan failed (${errorType}).`);
+  });
   return { inbox, poll, pending };
 }
 
