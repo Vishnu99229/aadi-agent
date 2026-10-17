@@ -480,6 +480,13 @@ db.exec(`
     inbound_id INTEGER PRIMARY KEY,
     payload TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS job_runs (
+    name TEXT PRIMARY KEY,
+    last_success_at TEXT,
+    last_attempt_at TEXT NOT NULL,
+    last_status TEXT NOT NULL
+  );
 `);
 
 if (!tableHasColumn("accounts", "relationship")) {
@@ -2396,4 +2403,48 @@ export function getMeetingCardState(inboundId: number): string | undefined {
 
 export function deleteMeetingCardState(inboundId: number): void {
   db.prepare(`DELETE FROM meeting_card_state WHERE inbound_id = ?`).run(inboundId);
+}
+
+export interface JobRunRecord {
+  name: string;
+  last_success_at: string | null;
+  last_attempt_at: string;
+  last_status: string;
+}
+
+export function recordJobRun(
+  name: string,
+  status: "ok" | "error" | "overlap",
+  at = new Date(),
+): void {
+  const iso = at.toISOString();
+  const existing = getJobRun(name);
+  const successAt =
+    status === "ok" ? iso : (existing?.last_success_at ?? null);
+  db.prepare(
+    `INSERT INTO job_runs (name, last_success_at, last_attempt_at, last_status)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(name) DO UPDATE SET
+       last_success_at = excluded.last_success_at,
+       last_attempt_at = excluded.last_attempt_at,
+       last_status = excluded.last_status`,
+  ).run(name, successAt, iso, status);
+}
+
+export function getJobRun(name: string): JobRunRecord | undefined {
+  return db
+    .prepare(
+      `SELECT name, last_success_at, last_attempt_at, last_status
+       FROM job_runs WHERE name = ?`,
+    )
+    .get(name) as JobRunRecord | undefined;
+}
+
+export function listJobRuns(): JobRunRecord[] {
+  return db
+    .prepare(
+      `SELECT name, last_success_at, last_attempt_at, last_status
+       FROM job_runs ORDER BY name ASC`,
+    )
+    .all() as JobRunRecord[];
 }

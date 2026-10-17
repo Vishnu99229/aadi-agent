@@ -1,5 +1,6 @@
 import type { Api } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
+import { wrapClockJob } from "./scheduler.js";
 import { runAgent } from "./agent.js";
 import { config } from "./config.js";
 import { billsForBrief } from "./bills.js";
@@ -189,9 +190,9 @@ export function registerMorningBrief(api: Api): ScheduledTask {
   const expression = `${config.briefMinute} ${config.briefHour} * * *`;
   const task = cron.schedule(
     expression,
-    async () => {
-      await sendMorningBrief(api);
-    },
+    wrapClockJob("morning-brief", config.briefHour, config.briefMinute, () =>
+      sendMorningBrief(api),
+    ),
     {
       name: "aadi-morning-brief",
       timezone: TIME_ZONE,

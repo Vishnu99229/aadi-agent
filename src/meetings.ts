@@ -1,5 +1,5 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
+import { everyMs, type IntervalJob } from "./scheduler.js";
 import { google } from "googleapis";
 import { config } from "./config.js";
 import {
@@ -451,18 +451,12 @@ export function markMeetingWrapped(briefId: number): void {
   updateMeetingNudge(briefId, "wrapped");
 }
 
-export function registerMeetingScan(api: Api): ScheduledTask {
-  const task = cron.schedule(
-    "*/5 * * * *",
-    async () => {
-      try {
-        await runMeetingScan(api);
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Meeting scan failed (${errorType}).`);
-      }
-    },
-    { name: "aadi-meeting-scan", timezone: TIME_ZONE, noOverlap: true },
+export function registerMeetingScan(api: Api): IntervalJob {
+  const task = everyMs(
+    "meeting-prebrief",
+    5 * 60 * 1000,
+    () => runMeetingScan(api),
+    { runImmediately: true },
   );
   console.log(
     `Pre-meeting scan every 5 minutes (${config.preMeetingMinutes} min window, ${TIME_ZONE}).`,

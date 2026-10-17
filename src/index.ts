@@ -14,7 +14,6 @@ import { registerWeeklyBackup } from "./backup.js";
 import { registerAttachmentAlertScan } from "./attachment_alerts.js";
 import {
   applyPendingDeployResult,
-  pollRunningBuilds,
   registerBuildPoll,
 } from "./builds.js";
 import { writeHeartbeat } from "./heartbeat.js";
@@ -41,12 +40,12 @@ const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
 setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
 await applyPendingDeployResult();
-void pollRunningBuilds();
 const MENU_COMMANDS = [
   { command: "followups", description: "Scan and list emails waiting on a reply" },
   { command: "model", description: "Choose which model handles each task" },
   { command: "build", description: "Ask a Cursor agent to change Aadi's code" },
   { command: "builds", description: "List recent code builds" },
+  { command: "health", description: "Show scheduled job last-run times" },
   { command: "reset", description: "Clear conversation history" },
 ] as const;
 

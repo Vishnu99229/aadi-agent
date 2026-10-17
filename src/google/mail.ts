@@ -1,6 +1,7 @@
 import { google, type gmail_v1 } from "googleapis";
 import {
   accountsForFilter,
+  GOOGLE_API_TIMEOUT_MS,
   isGoogleNotFound,
   type GoogleAccountId,
   type LoadedGoogleAccount,
@@ -12,7 +13,11 @@ export interface ResolvedGmailMessage {
 }
 
 export function gmailClient(account: LoadedGoogleAccount): gmail_v1.Gmail {
-  return google.gmail({ version: "v1", auth: account.client });
+  return google.gmail({
+    version: "v1",
+    auth: account.client,
+    timeout: GOOGLE_API_TIMEOUT_MS,
+  });
 }
 
 export async function resolveGmailMessage(

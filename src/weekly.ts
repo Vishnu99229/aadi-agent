@@ -1,5 +1,6 @@
 import type { Api } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
+import { wrapClockJob } from "./scheduler.js";
 import { config } from "./config.js";
 import { getTasks } from "./db.js";
 import { billsForBrief } from "./bills.js";
@@ -95,14 +96,13 @@ export function registerWeeklyReview(api: Api): ScheduledTask {
   const expression = `${config.weeklyReviewMinute} ${config.weeklyReviewHour} * * 0`;
   const task = cron.schedule(
     expression,
-    async () => {
-      try {
-        await sendWeeklyReview(api);
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Weekly review failed (${errorType}).`);
-      }
-    },
+    wrapClockJob(
+      "weekly-review",
+      config.weeklyReviewHour,
+      config.weeklyReviewMinute,
+      () => sendWeeklyReview(api),
+      [0],
+    ),
     { name: "aadi-weekly-review", timezone: TIME_ZONE, noOverlap: true },
   );
   console.log(

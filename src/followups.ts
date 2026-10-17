@@ -1,6 +1,7 @@
 import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import cron, { type ScheduledTask } from "node-cron";
+import { wrapClockJob } from "./scheduler.js";
 import { decodedAccounts } from "./accounts.js";
 import { queueDraftApproval } from "./approvals.js";
 import { config } from "./config.js";
@@ -659,17 +660,18 @@ export function registerFollowupScan(
   const expression = `${config.followupScanMinute} ${config.followupScanHour} * * 1-5`;
   const task = cron.schedule(
     expression,
-    async () => {
-      try {
+    wrapClockJob(
+      "followup-scan",
+      config.followupScanHour,
+      config.followupScanMinute,
+      async () => {
         await runFollowupScan();
         if (afterScan && api) {
           await afterScan(api);
         }
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Follow-up scan failed (${errorType}).`);
-      }
-    },
+      },
+      [1, 2, 3, 4, 5],
+    ),
     {
       name: "aadi-followup-scan",
       timezone: TIME_ZONE,

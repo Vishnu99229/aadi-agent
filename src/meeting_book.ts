@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { InlineKeyboard, type Api, type Context } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
+import { everyMs, type IntervalJob } from "./scheduler.js";
 import { google, type gmail_v1 } from "googleapis";
 import { queueDraftApproval } from "./approvals.js";
 import { config } from "./config.js";
@@ -1377,52 +1377,36 @@ export async function tryHandleMeetingChat(
 }
 
 export function registerMeetingBookingJobs(api: Api): {
-  inbox: ScheduledTask;
-  poll: ScheduledTask;
-  pending: ScheduledTask;
+  inbox: IntervalJob;
+  poll: IntervalJob;
+  pending: IntervalJob;
 } {
-  const inbox = cron.schedule(
-    "*/10 * * * *",
+  const inbox = everyMs(
+    "meeting-inbox",
+    10 * 60 * 1000,
     async () => {
-      try {
-        await runMeetingInboxScan(api);
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Meeting inbox scan failed (${errorType}).`);
-      }
+      await runMeetingInboxScan(api);
     },
-    { name: "aadi-meeting-inbox", timezone: TIME_ZONE, noOverlap: true },
+    { runImmediately: true },
   );
-  const poll = cron.schedule(
-    "*/2 * * * *",
+  const poll = everyMs(
+    "meeting-poll",
+    2 * 60 * 1000,
+    () => runMeetingProposalPoll(api),
+    { runImmediately: true },
+  );
+  const pending = everyMs(
+    "meeting-pending",
+    60 * 1000,
     async () => {
-      try {
-        await runMeetingProposalPoll(api);
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Meeting proposal poll failed (${errorType}).`);
-      }
+      expireOpenProposals();
+      await processDuePendingBookings();
     },
-    { name: "aadi-meeting-poll", timezone: TIME_ZONE, noOverlap: true },
+    { runImmediately: true },
   );
-  const pending = cron.schedule(
-    "* * * * *",
-    async () => {
-      try {
-        expireOpenProposals();
-        await processDuePendingBookings();
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Meeting pending bookings failed (${errorType}).`);
-      }
-    },
-    { name: "aadi-meeting-pending", timezone: TIME_ZONE, noOverlap: true },
+  console.log(
+    `Meeting inbox every 10 min, proposals every 2 min, bookings every 1 min (${TIME_ZONE}).`,
   );
-  console.log(`Meeting inbox every 10 min, proposals every 2 min, bookings every 1 min (${TIME_ZONE}).`);
-  void runMeetingInboxScan(api).catch((error) => {
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Meeting inbox scan failed (${errorType}).`);
-  });
   return { inbox, poll, pending };
 }
 

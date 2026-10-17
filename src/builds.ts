@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { Api, InlineKeyboard, type Context } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
+import { everyMs, type IntervalJob } from "./scheduler.js";
 import {
   confirmBuildText,
   failedChecksText,
@@ -565,17 +565,12 @@ export async function pollRunningBuilds(): Promise<void> {
   }
 }
 
-export function registerBuildPoll(): ScheduledTask {
-  const task = cron.schedule(
-    "* * * * *",
-    () => {
-      void pollRunningBuilds();
-    },
-    {
-      name: "aadi-build-poll",
-      timezone: TIME_ZONE,
-      noOverlap: true,
-    },
+export function registerBuildPoll(): IntervalJob {
+  const task = everyMs(
+    "build-poll",
+    60 * 1000,
+    () => pollRunningBuilds(),
+    { runImmediately: true },
   );
   console.log(`Build poll scheduled every minute (${TIME_ZONE}).`);
   return task;

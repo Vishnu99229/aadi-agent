@@ -1,5 +1,6 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
+import { wrapClockJob } from "./scheduler.js";
 import { config } from "./config.js";
 import { complete } from "./llm.js";
 import {
@@ -169,14 +170,9 @@ export function registerImportantDateReminders(api: Api): ScheduledTask {
   const expression = `0 ${REMINDER_HOUR} * * *`;
   const task = cron.schedule(
     expression,
-    async () => {
-      try {
-        await runImportantDateReminders(api);
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Important date reminders failed (${errorType}).`);
-      }
-    },
+    wrapClockJob("important-dates", REMINDER_HOUR, 0, () =>
+      runImportantDateReminders(api),
+    ),
     { name: "aadi-important-dates", timezone: TIME_ZONE, noOverlap: true },
   );
   console.log(

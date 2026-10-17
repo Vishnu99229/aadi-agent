@@ -1,5 +1,5 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
+import { everyMs, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import {
   createAttachmentAlert,
@@ -184,18 +184,14 @@ export async function handleAttachmentAlertCallback(
   }
 }
 
-export function registerAttachmentAlertScan(api: Api): ScheduledTask {
-  const task = cron.schedule(
-    "*/10 * * * *",
+export function registerAttachmentAlertScan(api: Api): IntervalJob {
+  const task = everyMs(
+    "attachment-alerts",
+    10 * 60 * 1000,
     async () => {
-      try {
-        await runAttachmentAlertScan(api);
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Attachment alert scan failed (${errorType}).`);
-      }
+      await runAttachmentAlertScan(api);
     },
-    { name: "aadi-attachment-alerts", timezone: TIME_ZONE, noOverlap: true },
+    { runImmediately: true },
   );
   console.log(`Work attachment alerts every 10 minutes (${TIME_ZONE}).`);
   return task;

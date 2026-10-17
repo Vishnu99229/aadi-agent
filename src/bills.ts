@@ -2,6 +2,7 @@ import type { gmail_v1 } from "googleapis";
 
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import cron, { type ScheduledTask } from "node-cron";
+import { wrapClockJob } from "./scheduler.js";
 import { config } from "./config.js";
 import {
   createBill,
@@ -257,14 +258,9 @@ export function registerBillScan(api: Api): ScheduledTask {
   const expression = `${config.billScanMinute} ${config.billScanHour} * * *`;
   const task = cron.schedule(
     expression,
-    async () => {
-      try {
-        await runBillScan(api);
-      } catch (error) {
-        const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Bill scan failed (${errorType}).`);
-      }
-    },
+    wrapClockJob("bill-scan", config.billScanHour, config.billScanMinute, () =>
+      runBillScan(api),
+    ),
     { name: "aadi-bill-scan", timezone: TIME_ZONE, noOverlap: true },
   );
   console.log(`Bill scan scheduled daily at ${config.billScanTime} ${TIME_ZONE}.`);

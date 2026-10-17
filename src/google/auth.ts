@@ -2,6 +2,9 @@ import { access, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { google, type Auth } from "googleapis";
 
+export const GOOGLE_API_TIMEOUT_MS = 30_000;
+google.options({ timeout: GOOGLE_API_TIMEOUT_MS });
+
 export type GoogleAccountId = "personal" | "work";
 
 export const GOOGLE_SCOPES = [

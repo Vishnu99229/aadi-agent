@@ -63,6 +63,7 @@ import {
 } from "./accounts.js";
 import { sendDatabaseBackup } from "./backup.js";
 import { handleAttachmentAlertCallback } from "./attachment_alerts.js";
+import { formatHealthReport } from "./scheduler.js";
 import {
   handleMeetingBookCallback,
   tryHandleMeetingChat,
@@ -305,6 +306,10 @@ bot.command("followups", async (ctx) => {
     await runFollowupScan();
     await sendActiveFollowupPanel(ctx.api);
   });
+});
+
+bot.command("health", async (ctx) => {
+  await sendPlainText(ctx, formatHealthReport());
 });
 
 bot.command("cost", async (ctx) => {

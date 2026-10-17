@@ -3,8 +3,15 @@ import {
   DB_PATH,
   createMeetingPendingBooking,
   createMeetingProposal,
+  getJobRun,
   getMeetingPendingBooking,
 } from "../src/db.ts";
+import {
+  everyMs,
+  formatHealthReport,
+  shouldCatchUpClockJob,
+  withTimeout,
+} from "../src/scheduler.ts";
 import {
   inboundSkipReason,
   processDuePendingBookings,
@@ -313,5 +320,106 @@ assert(
   "sent body is the fixed template",
 );
 assert(getMeetingPendingBooking(due.id)?.status === "sent", "booking marked sent");
+
+const missedTickProposal = createMeetingProposal({
+  threadId: "stage12-missed-tick-thread",
+  sentMessageId: "stage12-missed-tick-msg",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: [
+    {
+      start: istDateTime("2026-10-21", "15:00").toISOString(),
+      end: istDateTime("2026-10-21", "15:30").toISOString(),
+    },
+  ],
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+const missedTick = createMeetingPendingBooking({
+  proposalId: missedTickProposal.id,
+  eventId: "stage12-missed-tick-event",
+  slotIndex: 0,
+  sendAt: new Date(Date.now() - 3 * 60 * 1000).toISOString(),
+});
+assert(
+  getMeetingPendingBooking(missedTick.id)?.status === "pending",
+  "booking stays pending across a missed tick",
+);
+const sentAfterMiss = await processDuePendingBookings({
+  now: new Date(),
+  eventExists: async () => true,
+  patchInvite: async () => undefined,
+  confirmSend: async () => ({ messageId: "sent-missed" }),
+  notify: async () => undefined,
+});
+assert(sentAfterMiss === 1, "pending-booking processor sends a due booking after a missed tick");
+assert(
+  getMeetingPendingBooking(missedTick.id)?.status === "sent",
+  "missed-tick booking marked sent",
+);
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const hungStarted = Date.now();
+try {
+  await withTimeout(new Promise(() => undefined), 40, "hung-google");
+  throw new Error("hung Google call should time out");
+} catch (error) {
+  assert(
+    error instanceof Error && error.message === "hung-google",
+    "hung Google call times out",
+  );
+}
+assert(Date.now() - hungStarted < 500, "timeout returns promptly");
+
+let hangCalls = 0;
+const hangJob = everyMs(
+  "hang-google",
+  50,
+  async () => {
+    hangCalls += 1;
+    if (hangCalls === 1) {
+      await new Promise(() => undefined);
+    }
+  },
+  { jobTimeoutMs: 40, runImmediately: true },
+);
+await sleep(180);
+hangJob.stop();
+assert(hangCalls >= 2, "next tick still runs after a hung Google call times out");
+assert(hangJob.stats.failures >= 1, "timed-out tick is recorded as failure");
+assert(hangJob.stats.succeeded >= 1, "later tick succeeds after timeout");
+
+let overlapCalls = 0;
+const overlapJob = everyMs(
+  "overlap-job",
+  40,
+  async () => {
+    overlapCalls += 1;
+    await sleep(160);
+  },
+  { jobTimeoutMs: 400, runImmediately: true },
+);
+await sleep(120);
+overlapJob.stop();
+assert(overlapJob.stats.overlaps >= 1, "overlap is skipped");
+assert(overlapCalls === 1, "in-flight job is not started twice");
+assert(getJobRun("overlap-job")?.last_status === "overlap", "overlap status is recorded");
+
+const justAfterBrief = new Date("2026-10-17T02:40:00.000Z");
+assert(
+  shouldCatchUpClockJob(8, 0, justAfterBrief),
+  "clock job is caught up within the last hour",
+);
+assert(
+  !shouldCatchUpClockJob(8, 0, new Date("2026-10-17T10:00:00.000Z")),
+  "clock job is not caught up after an hour",
+);
+
+const health = formatHealthReport();
+assert(health.includes("meeting-pending: last ran"), "health lists meeting-pending");
+assert(health.includes("meeting-poll: last ran"), "health lists meeting-poll");
+assert(health.startsWith("Aadi health"), "health report title");
 
 console.log("Stage 12 checks passed.");
