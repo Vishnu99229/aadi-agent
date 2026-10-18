@@ -1,7 +1,6 @@
 import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import cron, { type ScheduledTask } from "node-cron";
-import { wrapClockJob } from "./scheduler.js";
+import { everyClock, type IntervalJob } from "./scheduler.js";
 import { decodedAccounts } from "./accounts.js";
 import { queueDraftApproval } from "./approvals.js";
 import { config } from "./config.js";
@@ -656,27 +655,18 @@ export async function trackLatestSentTo(
 export function registerFollowupScan(
   afterScan?: (api: Api) => Promise<void>,
   api?: Api,
-): ScheduledTask {
-  const expression = `${config.followupScanMinute} ${config.followupScanHour} * * 1-5`;
-  const task = cron.schedule(
-    expression,
-    wrapClockJob(
-      "followup-scan",
-      config.followupScanHour,
-      config.followupScanMinute,
-      async () => {
-        await runFollowupScan();
-        if (afterScan && api) {
-          await afterScan(api);
-        }
-      },
-      [1, 2, 3, 4, 5],
-    ),
-    {
-      name: "aadi-followup-scan",
-      timezone: TIME_ZONE,
-      noOverlap: true,
+): IntervalJob {
+  const task = everyClock(
+    "followup-scan",
+    config.followupScanHour,
+    config.followupScanMinute,
+    async () => {
+      await runFollowupScan();
+      if (afterScan && api) {
+        await afterScan(api);
+      }
     },
+    { weekdays: [1, 2, 3, 4, 5], kind: "daily" },
   );
   console.log(
     `Follow-up scan scheduled weekdays at ${config.followupScanTime} ${TIME_ZONE}.`,

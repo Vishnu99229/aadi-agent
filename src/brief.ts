@@ -1,12 +1,13 @@
 import type { Api } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
-import { wrapClockJob } from "./scheduler.js";
+import { everyClock, type IntervalJob } from "./scheduler.js";
 import { runAgent } from "./agent.js";
 import { config } from "./config.js";
 import { billsForBrief } from "./bills.js";
 import {
+  ensureMorningBriefSetting,
   getReminders,
   getTasks,
+  isMorningBriefEnabled,
   saveMessage,
   type ItemTag,
 } from "./db.js";
@@ -186,22 +187,21 @@ export async function sendMorningBrief(api: Api): Promise<void> {
   }
 }
 
-export function registerMorningBrief(api: Api): ScheduledTask {
-  const expression = `${config.briefMinute} ${config.briefHour} * * *`;
-  const task = cron.schedule(
-    expression,
-    wrapClockJob("morning-brief", config.briefHour, config.briefMinute, () =>
-      sendMorningBrief(api),
-    ),
+export function registerMorningBrief(api: Api): IntervalJob {
+  ensureMorningBriefSetting();
+  const task = everyClock(
+    "morning-brief",
+    config.briefHour,
+    config.briefMinute,
+    () => sendMorningBrief(api),
     {
-      name: "aadi-morning-brief",
-      timezone: TIME_ZONE,
-      noOverlap: true,
+      kind: "daily",
+      enabled: isMorningBriefEnabled,
     },
   );
 
   console.log(
-    `Morning brief scheduled daily at ${config.briefTime} ${TIME_ZONE}.`,
+    `Morning brief scheduled daily at ${config.briefTime} ${TIME_ZONE} (setting=${isMorningBriefEnabled() ? "on" : "off"}).`,
   );
   return task;
 }

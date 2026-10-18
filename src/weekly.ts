@@ -1,6 +1,5 @@
 import type { Api } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
-import { wrapClockJob } from "./scheduler.js";
+import { everyClock, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import { getTasks } from "./db.js";
 import { billsForBrief } from "./bills.js";
@@ -92,18 +91,13 @@ export async function sendWeeklyReview(api: Api): Promise<void> {
   await sendLongMessage(api, review);
 }
 
-export function registerWeeklyReview(api: Api): ScheduledTask {
-  const expression = `${config.weeklyReviewMinute} ${config.weeklyReviewHour} * * 0`;
-  const task = cron.schedule(
-    expression,
-    wrapClockJob(
-      "weekly-review",
-      config.weeklyReviewHour,
-      config.weeklyReviewMinute,
-      () => sendWeeklyReview(api),
-      [0],
-    ),
-    { name: "aadi-weekly-review", timezone: TIME_ZONE, noOverlap: true },
+export function registerWeeklyReview(api: Api): IntervalJob {
+  const task = everyClock(
+    "weekly-review",
+    config.weeklyReviewHour,
+    config.weeklyReviewMinute,
+    () => sendWeeklyReview(api),
+    { weekdays: [0], kind: "weekly" },
   );
   console.log(
     `Weekly review scheduled Sundays at ${config.weeklyReviewTime} ${TIME_ZONE}.`,

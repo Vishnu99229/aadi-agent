@@ -1,6 +1,5 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
-import { wrapClockJob } from "./scheduler.js";
+import { everyClock, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import { complete } from "./llm.js";
 import {
@@ -166,14 +165,13 @@ export async function handleDateWishCallback(
   await ctx.reply(`Copy this wish:\n\n${wish}`);
 }
 
-export function registerImportantDateReminders(api: Api): ScheduledTask {
-  const expression = `0 ${REMINDER_HOUR} * * *`;
-  const task = cron.schedule(
-    expression,
-    wrapClockJob("important-dates", REMINDER_HOUR, 0, () =>
-      runImportantDateReminders(api),
-    ),
-    { name: "aadi-important-dates", timezone: TIME_ZONE, noOverlap: true },
+export function registerImportantDateReminders(api: Api): IntervalJob {
+  const task = everyClock(
+    "important-dates",
+    REMINDER_HOUR,
+    0,
+    () => runImportantDateReminders(api),
+    { kind: "daily" },
   );
   console.log(
     `Important date reminders scheduled daily at ${REMINDER_HOUR}:00 ${TIME_ZONE}.`,

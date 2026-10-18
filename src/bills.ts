@@ -1,8 +1,7 @@
 import type { gmail_v1 } from "googleapis";
 
 import { InlineKeyboard, type Api, type Context } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
-import { wrapClockJob } from "./scheduler.js";
+import { everyClock, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import {
   createBill,
@@ -254,14 +253,13 @@ export async function handleBillCallback(
   await ctx.reply("Reminders set for 3 days before and on the due date (personal).");
 }
 
-export function registerBillScan(api: Api): ScheduledTask {
-  const expression = `${config.billScanMinute} ${config.billScanHour} * * *`;
-  const task = cron.schedule(
-    expression,
-    wrapClockJob("bill-scan", config.billScanHour, config.billScanMinute, () =>
-      runBillScan(api),
-    ),
-    { name: "aadi-bill-scan", timezone: TIME_ZONE, noOverlap: true },
+export function registerBillScan(api: Api): IntervalJob {
+  const task = everyClock(
+    "bill-scan",
+    config.billScanHour,
+    config.billScanMinute,
+    () => runBillScan(api),
+    { kind: "daily" },
   );
   console.log(`Bill scan scheduled daily at ${config.billScanTime} ${TIME_ZONE}.`);
   return task;

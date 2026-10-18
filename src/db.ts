@@ -1407,6 +1407,18 @@ export function listUsageLogs(fromIso: string, toIso: string): UsageLogRow[] {
     .all(fromIso, toIso) as UsageLogRow[];
 }
 
+export const MORNING_BRIEF_SETTING = "morning_brief";
+
+export function isMorningBriefEnabled(): boolean {
+  return getSetting(MORNING_BRIEF_SETTING) === "on";
+}
+
+export function ensureMorningBriefSetting(): void {
+  if (getSetting(MORNING_BRIEF_SETTING) === undefined) {
+    setSetting(MORNING_BRIEF_SETTING, "off");
+  }
+}
+
 export function getSetting(key: string): string | undefined {
   const row = db
     .prepare("SELECT value FROM settings WHERE key = ?")

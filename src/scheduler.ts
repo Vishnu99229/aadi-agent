@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { getJobRun, listJobRuns, recordJobRun } from "./db.js";
+import { getJobRun, isMorningBriefEnabled, listJobRuns, recordJobRun } from "./db.js";
 import {
   HEARTBEAT_FILE,
   heartbeatPath,
@@ -8,7 +8,7 @@ import {
 
 export const GOOGLE_API_TIMEOUT_MS = 30_000;
 const JOB_TIMEOUT_MS = 5 * 60 * 1000;
-const CATCH_UP_MS = 60 * 60 * 1000;
+export const CATCH_UP_MS = 4 * 60 * 60 * 1000;
 const TIME_ZONE = "Asia/Kolkata";
 const clockInFlight = new Set<string>();
 
@@ -27,6 +27,8 @@ export const HEALTH_JOBS = [
   "weekly-backup",
 ] as const;
 
+export type ClockJobKind = "daily" | "weekly";
+
 export interface IntervalJob {
   name: string;
   stop: () => void;
@@ -36,6 +38,14 @@ export interface IntervalJob {
     overlaps: number;
     failures: number;
   };
+}
+
+export interface ClockJobOptions {
+  weekdays?: number[];
+  kind?: ClockJobKind;
+  enabled?: () => boolean;
+  jobTimeoutMs?: number;
+  now?: () => Date;
 }
 
 export async function withTimeout<T>(
@@ -56,6 +66,10 @@ export async function withTimeout<T>(
       clearTimeout(timer);
     }
   }
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
 }
 
 function istParts(now: Date): {
@@ -98,16 +112,55 @@ function istParts(now: Date): {
   };
 }
 
+function istDayKey(parts: { year: number; month: number; day: number }): string {
+  return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)}`;
+}
+
+function shiftIstDate(
+  now: Date,
+  days: number,
+): { year: number; month: number; day: number; weekday: number } {
+  const parts = istParts(now);
+  const noon = new Date(
+    `${istDayKey(parts)}T12:00:00+05:30`,
+  );
+  noon.setTime(noon.getTime() + days * 86_400_000);
+  return istParts(noon);
+}
+
 export function clockSlotUtc(
   hour: number,
   minute: number,
   now = new Date(),
 ): Date {
   const parts = istParts(now);
-  const pad = (value: number) => String(value).padStart(2, "0");
   return new Date(
-    `${parts.year}-${pad(parts.month)}-${pad(parts.day)}T${pad(hour)}:${pad(minute)}:00+05:30`,
+    `${istDayKey(parts)}T${pad2(hour)}:${pad2(minute)}:00+05:30`,
   );
+}
+
+export function nextClockSlotUtc(
+  hour: number,
+  minute: number,
+  now = new Date(),
+  weekdays?: number[],
+): Date {
+  const today = clockSlotUtc(hour, minute, now);
+  const todayParts = istParts(now);
+  const weekdayOk = !weekdays || weekdays.includes(todayParts.weekday);
+  if (today.getTime() > now.getTime() && weekdayOk) {
+    return today;
+  }
+  for (let days = 1; days <= 8; days += 1) {
+    const shifted = shiftIstDate(now, days);
+    if (weekdays && !weekdays.includes(shifted.weekday)) {
+      continue;
+    }
+    return new Date(
+      `${istDayKey(shifted)}T${pad2(hour)}:${pad2(minute)}:00+05:30`,
+    );
+  }
+  throw new Error("no Asia/Kolkata clock slot in the next week");
 }
 
 export function shouldCatchUpClockJob(
@@ -115,6 +168,7 @@ export function shouldCatchUpClockJob(
   minute: number,
   now = new Date(),
   weekdays?: number[],
+  kind: ClockJobKind = "daily",
 ): boolean {
   const parts = istParts(now);
   if (weekdays && !weekdays.includes(parts.weekday)) {
@@ -122,7 +176,27 @@ export function shouldCatchUpClockJob(
   }
   const slot = clockSlotUtc(hour, minute, now);
   const elapsed = now.getTime() - slot.getTime();
-  return elapsed > 0 && elapsed <= CATCH_UP_MS;
+  if (elapsed <= 0) {
+    return false;
+  }
+  if (kind === "weekly") {
+    return true;
+  }
+  return elapsed <= CATCH_UP_MS;
+}
+
+export function alreadySucceededThisSlot(
+  name: string,
+  hour: number,
+  minute: number,
+  now = new Date(),
+): boolean {
+  const slot = clockSlotUtc(hour, minute, now);
+  const last = getJobRun(name);
+  if (!last?.last_success_at) {
+    return false;
+  }
+  return new Date(last.last_success_at).getTime() >= slot.getTime();
 }
 
 export function everyMs(
@@ -221,39 +295,101 @@ export async function runTrackedJob(
   }
 }
 
-export function maybeCatchUpClockJob(
+export function everyClock(
   name: string,
   hour: number,
   minute: number,
   fn: () => Promise<void>,
-  weekdays?: number[],
-): void {
-  if (!shouldCatchUpClockJob(hour, minute, new Date(), weekdays)) {
-    return;
-  }
-  const slot = clockSlotUtc(hour, minute);
-  const last = getJobRun(name);
-  if (
-    last?.last_success_at &&
-    new Date(last.last_success_at).getTime() >= slot.getTime()
-  ) {
-    return;
-  }
-  void runTrackedJob(name, async () => {
-    await fn();
-    console.log(`Job ${name}: status=ok catch_up=1`);
-  });
-}
+  options: ClockJobOptions = {},
+): IntervalJob {
+  const stats = {
+    started: 0,
+    succeeded: 0,
+    overlaps: 0,
+    failures: 0,
+  };
+  let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutMs = options.jobTimeoutMs ?? JOB_TIMEOUT_MS;
+  const kind = options.kind ?? (options.weekdays ? "weekly" : "daily");
+  const nowFn = options.now ?? (() => new Date());
+  const enabled = options.enabled ?? (() => true);
 
-export function wrapClockJob(
-  name: string,
-  hour: number,
-  minute: number,
-  fn: () => Promise<void>,
-  weekdays?: number[],
-): () => Promise<void> {
-  maybeCatchUpClockJob(name, hour, minute, fn, weekdays);
-  return () => runTrackedJob(name, fn);
+  const clearTimer = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
+  const armNext = () => {
+    if (stopped) {
+      return;
+    }
+    clearTimer();
+    const now = nowFn();
+    const next = nextClockSlotUtc(hour, minute, now, options.weekdays);
+    const delayMs = Math.max(0, next.getTime() - now.getTime());
+    timer = setTimeout(() => {
+      void runTick("scheduled");
+    }, delayMs);
+  };
+
+  const runTick = async (reason: "scheduled" | "catch_up") => {
+    if (stopped) {
+      return;
+    }
+    const now = nowFn();
+    if (!enabled()) {
+      console.log(`Job ${name}: skip=disabled`);
+      armNext();
+      return;
+    }
+    if (alreadySucceededThisSlot(name, hour, minute, now)) {
+      console.log(`Job ${name}: skip=already`);
+      armNext();
+      return;
+    }
+    stats.started += 1;
+    const startedAt = Date.now();
+    await runTrackedJob(name, () =>
+      withTimeout(fn(), timeoutMs, `job-timeout:${name}`),
+    );
+    if (getJobRun(name)?.last_status === "ok") {
+      stats.succeeded += 1;
+      if (process.env.AADI_DB_PATH !== ":memory:") {
+        writeHeartbeat();
+      }
+      const lag = Date.now() - startedAt;
+      const catchUp = reason === "catch_up" ? " catch_up=1" : "";
+      console.log(`Job ${name}: status=ok lag_ms=${lag}${catchUp}`);
+    } else if (getJobRun(name)?.last_status === "overlap") {
+      stats.overlaps += 1;
+    } else {
+      stats.failures += 1;
+    }
+    armNext();
+  };
+
+  const now = nowFn();
+  if (
+    enabled() &&
+    shouldCatchUpClockJob(hour, minute, now, options.weekdays, kind) &&
+    !alreadySucceededThisSlot(name, hour, minute, now)
+  ) {
+    void runTick("catch_up");
+  } else {
+    armNext();
+  }
+
+  return {
+    name,
+    stats,
+    stop() {
+      stopped = true;
+      clearTimer();
+    },
+  };
 }
 
 function agoLabel(iso: string | null, now: Date): string {
@@ -276,6 +412,27 @@ function agoLabel(iso: string | null, now: Date): string {
   return `${hours}h ago`;
 }
 
+export function lastRanLabel(iso: string | null, now: Date): string {
+  if (!iso) {
+    return "last ran never";
+  }
+  const ran = new Date(iso);
+  if (Number.isNaN(ran.getTime())) {
+    return "last ran never";
+  }
+  const ranParts = istParts(ran);
+  const nowParts = istParts(now);
+  const hhmm = `${pad2(ranParts.hour)}:${pad2(ranParts.minute)}`;
+  if (istDayKey(ranParts) === istDayKey(nowParts)) {
+    return `last ran ${hhmm} today`;
+  }
+  const yesterday = shiftIstDate(now, -1);
+  if (istDayKey(ranParts) === istDayKey(yesterday)) {
+    return `last ran ${hhmm} yesterday`;
+  }
+  return `last ran ${hhmm} ${pad2(ranParts.day)}/${pad2(ranParts.month)}`;
+}
+
 export function formatHealthReport(now = new Date()): string {
   const runs = new Map(listJobRuns().map((row) => [row.name, row]));
   const lines = ["Aadi health"];
@@ -295,10 +452,12 @@ export function formatHealthReport(now = new Date()): string {
     lines.push(`heartbeat: never (${HEARTBEAT_FILE} missing)`);
   }
   for (const name of HEALTH_JOBS) {
+    if (name === "morning-brief" && !isMorningBriefEnabled()) {
+      lines.push(`${name}: off`);
+      continue;
+    }
     const row = runs.get(name);
-    lines.push(
-      `${name}: last ran ${agoLabel(row?.last_success_at ?? null, now)}`,
-    );
+    lines.push(`${name}: ${lastRanLabel(row?.last_success_at ?? null, now)}`);
   }
   return lines.join("\n");
 }

@@ -9,12 +9,18 @@ import {
   getMeetingPendingBooking,
   getMeetingProposal,
   getMeetingThread,
+  isMorningBriefEnabled,
   listMeetingPendingBookings,
+  recordJobRun,
   upsertMeetingThread,
 } from "../src/db.ts";
 import {
+  alreadySucceededThisSlot,
+  clockSlotUtc,
+  everyClock,
   everyMs,
   formatHealthReport,
+  nextClockSlotUtc,
   shouldCatchUpClockJob,
   withTimeout,
 } from "../src/scheduler.ts";
@@ -988,16 +994,135 @@ assert(getJobRun("overlap-job")?.last_status === "overlap", "overlap status is r
 const justAfterBrief = new Date("2026-10-17T02:40:00.000Z");
 assert(
   shouldCatchUpClockJob(8, 0, justAfterBrief),
-  "clock job is caught up within the last hour",
+  "clock job is caught up within 4 hours",
 );
 assert(
-  !shouldCatchUpClockJob(8, 0, new Date("2026-10-17T10:00:00.000Z")),
-  "clock job is not caught up after an hour",
+  shouldCatchUpClockJob(8, 0, new Date("2026-10-17T04:30:00.000Z")),
+  "clock job is caught up 2 hours late",
+);
+assert(
+  !shouldCatchUpClockJob(8, 0, new Date("2026-10-17T07:00:00.000Z")),
+  "clock job is not caught up after 4 hours",
 );
 
-const health = formatHealthReport();
-assert(health.includes("meeting-pending: last ran"), "health lists meeting-pending");
-assert(health.includes("meeting-poll: last ran"), "health lists meeting-poll");
-assert(health.startsWith("Aadi health"), "health report title");
+const tenThirtyFourIst = new Date("2026-10-18T05:04:00.000Z");
+assert(
+  clockSlotUtc(9, 0, tenThirtyFourIst).toISOString() ===
+    "2026-10-18T03:30:00.000Z",
+  "09:00 Asia/Kolkata slot is 03:30 UTC",
+);
+assert(
+  nextClockSlotUtc(9, 0, tenThirtyFourIst).toISOString() ===
+    "2026-10-19T03:30:00.000Z",
+  "next 09:00 Asia/Kolkata after the slot is tomorrow",
+);
+assert(
+  nextClockSlotUtc(10, 0, new Date("2026-10-18T03:00:00.000Z"), [
+    1, 2, 3, 4, 5,
+  ]).toISOString() === "2026-10-19T04:30:00.000Z",
+  "weekday clock job skips Sunday",
+);
+
+const sundayEvening = new Date("2026-10-18T18:00:00.000Z");
+assert(
+  shouldCatchUpClockJob(19, 0, sundayEvening, [0], "weekly"),
+  "weekly job catches up later the same day",
+);
+assert(
+  !shouldCatchUpClockJob(
+    19,
+    0,
+    new Date("2026-10-19T14:00:00.000Z"),
+    [0],
+    "weekly",
+  ),
+  "weekly job does not catch up on a later day",
+);
+
+recordJobRun(
+  "bill-scan",
+  "ok",
+  new Date("2026-10-18T03:30:00.000Z"),
+);
+const healthNow = formatHealthReport(tenThirtyFourIst);
+assert(healthNow.includes("morning-brief: off"), "disabled brief shows off");
+assert(!isMorningBriefEnabled(), "morning brief defaults to off");
+assert(
+  healthNow.includes("bill-scan: last ran 09:00 today"),
+  "health shows Asia/Kolkata last-success time",
+);
+assert(healthNow.includes("meeting-pending: last ran"), "health lists meeting-pending");
+assert(healthNow.includes("meeting-poll: last ran"), "health lists meeting-poll");
+assert(healthNow.startsWith("Aadi health"), "health report title");
+
+let catchUpCalls = 0;
+const catchUpJob = everyClock(
+  "clock-catch-up",
+  9,
+  0,
+  async () => {
+    catchUpCalls += 1;
+  },
+  { kind: "daily", now: () => tenThirtyFourIst },
+);
+await sleep(50);
+catchUpJob.stop();
+assert(catchUpCalls === 1, "enabled daily job catch-up runs within 4 hours");
+assert(getJobRun("clock-catch-up")?.last_status === "ok", "catch-up records success");
+
+let lateCalls = 0;
+const lateJob = everyClock(
+  "clock-too-late",
+  9,
+  0,
+  async () => {
+    lateCalls += 1;
+  },
+  { kind: "daily", now: () => new Date("2026-10-18T08:00:00.000Z") },
+);
+await sleep(50);
+lateJob.stop();
+assert(lateCalls === 0, "daily job does not catch up beyond 4 hours");
+
+let disabledCalls = 0;
+const disabledJob = everyClock(
+  "clock-disabled",
+  8,
+  0,
+  async () => {
+    disabledCalls += 1;
+  },
+  {
+    kind: "daily",
+    enabled: () => false,
+    now: () => justAfterBrief,
+  },
+);
+await sleep(50);
+disabledJob.stop();
+assert(disabledCalls === 0, "disabled jobs never run");
+
+recordJobRun(
+  "clock-restart",
+  "ok",
+  new Date("2026-10-18T03:31:00.000Z"),
+);
+assert(
+  alreadySucceededThisSlot("clock-restart", 9, 0, tenThirtyFourIst),
+  "success after today's slot blocks another run",
+);
+let restartCalls = 0;
+const restartJob = everyClock(
+  "clock-restart",
+  9,
+  0,
+  async () => {
+    restartCalls += 1;
+  },
+  { kind: "daily", now: () => tenThirtyFourIst },
+);
+await sleep(50);
+restartJob.stop();
+assert(restartCalls === 0, "restart does not double-run a clock job");
 
 console.log("Stage 12 checks passed.");

@@ -5,8 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { Api } from "grammy";
 import { InputFile } from "grammy";
-import cron, { type ScheduledTask } from "node-cron";
-import { wrapClockJob } from "./scheduler.js";
+import { everyClock, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import { backupDatabaseTo } from "./db.js";
 
@@ -133,19 +132,15 @@ export async function sendDatabaseBackup(
   }
 }
 
-export function registerWeeklyBackup(api: Api): ScheduledTask {
-  const task = cron.schedule(
-    "0 21 * * 0",
-    wrapClockJob(
-      "weekly-backup",
-      21,
-      0,
-      async () => {
-        await sendDatabaseBackup(api, "weekly");
-      },
-      [0],
-    ),
-    { name: "aadi-weekly-backup", timezone: TIME_ZONE, noOverlap: true },
+export function registerWeeklyBackup(api: Api): IntervalJob {
+  const task = everyClock(
+    "weekly-backup",
+    21,
+    0,
+    async () => {
+      await sendDatabaseBackup(api, "weekly");
+    },
+    { weekdays: [0], kind: "weekly" },
   );
   console.log(`Weekly encrypted backup scheduled Sundays at 21:00 ${TIME_ZONE}.`);
   return task;
