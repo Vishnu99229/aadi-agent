@@ -7,7 +7,10 @@ import {
   createMeetingProposal,
   getJobRun,
   getMeetingPendingBooking,
+  getMeetingProposal,
   getMeetingThread,
+  listMeetingPendingBookings,
+  upsertMeetingThread,
 } from "../src/db.ts";
 import {
   everyMs,
@@ -470,6 +473,29 @@ assert(badOpeningSent === 1, "fallback opening may send");
 function silentApi(): Api {
   return { sendMessage: async () => ({ message_id: 1 }) } as unknown as Api;
 }
+
+function capturingApi(): {
+  api: Api;
+  messages: Array<{ text: string; buttons: string[] }>;
+} {
+  const messages: Array<{ text: string; buttons: string[] }> = [];
+  const api = {
+    sendMessage: async (
+      _chatId: number,
+      text: string,
+      extra?: {
+        reply_markup?: { inline_keyboard?: Array<Array<{ text: string }>> };
+      },
+    ) => {
+      const buttons =
+        extra?.reply_markup?.inline_keyboard?.flat().map((row) => row.text) ??
+        [];
+      messages.push({ text, buttons });
+      return { message_id: messages.length };
+    },
+  } as unknown as Api;
+  return { api, messages };
+}
 function fakeWork(): LoadedGoogleAccount {
   return {
     id: "work",
@@ -659,6 +685,257 @@ const clarify = renderClarifyBody({
 });
 assert(clarify.includes(PLAIN_SIGNATURE), "clarify has signature");
 assert(!containsForbiddenInternal(clarify), "clarify has no internal labels");
+
+const ownerSlots = [
+  {
+    start: istDateTime("2026-10-21", "11:00").toISOString(),
+    end: istDateTime("2026-10-21", "11:30").toISOString(),
+  },
+  {
+    start: istDateTime("2026-10-22", "15:00").toISOString(),
+    end: istDateTime("2026-10-22", "15:30").toISOString(),
+  },
+  {
+    start: istDateTime("2026-10-23", "10:30").toISOString(),
+    end: istDateTime("2026-10-23", "11:00").toISOString(),
+  },
+];
+const ownerSentProposal = createMeetingProposal({
+  threadId: "thread-owner-sent",
+  sentMessageId: "sent-owner-proposal",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: ownerSlots,
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+let ownerCalendar = 0;
+let ownerConfirmMails = 0;
+const ownerCap = capturingApi();
+setMeetingTestHooks({
+  mapReply: async () => ({
+    reply_kind: "pick_one",
+    verdict: "one",
+    slot_index: 0,
+    own_time: null,
+    confidence: 0.99,
+  }),
+  insertEvent: async () => {
+    ownerCalendar += 1;
+    return "evt-owner-sent";
+  },
+  slotIsFree: async () => true,
+  loadBusy: async () => [],
+  sendImpl: async () => {
+    ownerConfirmMails += 1;
+    return { messageId: "should-not-confirm" };
+  },
+});
+await processInboundMeetingMessage(
+  ownerCap.api,
+  fakeWork(),
+  fakeInbound({
+    messageId: "owner-sent-1",
+    threadId: "thread-owner-sent",
+    from: "Vishnu <vishnu.rajan@epicode.in>",
+    subject: "Re: call",
+    body: "Tuesday 11am works",
+    labels: ["SENT"],
+    internalDate: String(Date.now() + 60_000),
+  }),
+  new Date(Date.now() + 60_000),
+);
+const ownerBooking = listMeetingPendingBookings().find(
+  (row) => row.proposal_id === ownerSentProposal.id,
+);
+assert(ownerCalendar === 1, "owner SENT reply creates a calendar event");
+assert(ownerBooking?.skip_confirm === 1, "owner SENT booking skips the confirm email");
+assert(getMeetingProposal(ownerSentProposal.id)?.status === "booked", "owner SENT books the proposal");
+const ownerDue = await processDuePendingBookings({
+  now: new Date(Date.now() + 20 * 60 * 1000),
+  eventExists: async () => true,
+  patchInvite: async () => undefined,
+  confirmSend: async () => {
+    ownerConfirmMails += 1;
+    return { messageId: "confirm-should-not-send" };
+  },
+  notify: async () => undefined,
+});
+assert(ownerDue === 1, "owner SENT invite is patched after the delay");
+assert(ownerConfirmMails === 0, "owner SENT reply books with no confirm email");
+resetMeetingTestHooks();
+
+const clashProposal = createMeetingProposal({
+  threadId: "thread-owner-clash",
+  sentMessageId: "sent-clash-proposal",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: ownerSlots,
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+let clashCalendar = 0;
+const clashCap = capturingApi();
+const clashBefore = listMeetingPendingBookings().length;
+setMeetingTestHooks({
+  mapReply: async () => ({
+    reply_kind: "pick_one",
+    verdict: "one",
+    slot_index: 0,
+    own_time: null,
+    confidence: 0.99,
+  }),
+  insertEvent: async () => {
+    clashCalendar += 1;
+    return "evt-clash";
+  },
+  slotIsFree: async () => false,
+  clashTitle: async () => "Weekly standup",
+  loadBusy: async () => [],
+});
+await processInboundMeetingMessage(
+  clashCap.api,
+  fakeWork(),
+  fakeInbound({
+    messageId: "owner-clash-1",
+    threadId: "thread-owner-clash",
+    from: "Vishnu <vishnu.rajan@epicode.in>",
+    subject: "Re: call",
+    body: "Tuesday 11am works",
+    labels: ["SENT"],
+    internalDate: String(Date.now() + 60_000),
+  }),
+  new Date(Date.now() + 60_000),
+);
+assert(clashCalendar === 0, "owner SENT clash does not insert a calendar event");
+assert(
+  listMeetingPendingBookings().length === clashBefore,
+  "owner SENT clash does not create a pending booking",
+);
+assert(getMeetingProposal(clashProposal.id)?.status === "open", "owner SENT clash leaves the proposal open");
+assert(
+  clashCap.messages.some((row) => row.text.includes("⚠️ clashes with Weekly standup")),
+  "owner SENT reply with a clash → handover, no booking",
+);
+resetMeetingTestHooks();
+
+let doubleCalendar = 0;
+setMeetingTestHooks({
+  mapReply: async () => ({
+    reply_kind: "pick_one",
+    verdict: "one",
+    slot_index: 1,
+    own_time: null,
+    confidence: 0.99,
+  }),
+  insertEvent: async () => {
+    doubleCalendar += 1;
+    return "evt-double";
+  },
+  slotIsFree: async () => true,
+  loadBusy: async () => [],
+});
+const bookedCount = listMeetingPendingBookings().filter(
+  (row) => row.proposal_id === ownerSentProposal.id,
+).length;
+await processInboundMeetingMessage(
+  silentApi(),
+  fakeWork(),
+  fakeInbound({
+    messageId: "owner-sent-2",
+    threadId: "thread-owner-sent",
+    from: "Vishnu <vishnu.rajan@epicode.in>",
+    subject: "Re: call",
+    body: "actually Thursday instead",
+    labels: ["SENT"],
+    internalDate: String(Date.now() + 120_000),
+  }),
+  new Date(Date.now() + 120_000),
+);
+await processInboundMeetingMessage(
+  silentApi(),
+  fakeWork(),
+  fakeInbound({
+    messageId: "ada-after-booked",
+    threadId: "thread-owner-sent",
+    from: "Ada <ada@acme.com>",
+    subject: "Re: call",
+    body: "Thursday 3pm",
+    internalDate: String(Date.now() + 180_000),
+  }),
+  new Date(Date.now() + 180_000),
+);
+assert(doubleCalendar === 0, "no double-booking after an owner-confirmed booking");
+assert(
+  listMeetingPendingBookings().filter((row) => row.proposal_id === ownerSentProposal.id)
+    .length === bookedCount,
+  "no second pending booking after an owner-confirmed booking",
+);
+resetMeetingTestHooks();
+
+const handoffSlots = ownerSlots.map((slot) => ({
+  start: new Date(slot.start),
+  end: new Date(slot.end),
+}));
+const expectedSlotLabels = handoffSlots.map((slot) =>
+  formatOfferSlot(slot).replace(" IST", ""),
+);
+const handoffProposal = createMeetingProposal({
+  threadId: "thread-handoff-buttons",
+  sentMessageId: "sent-handoff",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: ownerSlots,
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+upsertMeetingThread({
+  threadId: "thread-handoff-buttons",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  company: "Acme",
+  senderType: "prospect_enquiry",
+  status: "clarified",
+  autoEmailsSent: 2,
+  lastKind: "clarify",
+  subject: "Re: call",
+  proposalId: handoffProposal.id,
+});
+const handoffCap = capturingApi();
+setMeetingTestHooks({
+  mapReply: async () => ({
+    reply_kind: "vague",
+    verdict: "ambiguous",
+    slot_index: null,
+    own_time: null,
+    confidence: 0.9,
+  }),
+  loadBusy: async () => [],
+  slotIsFree: async () => true,
+});
+await processInboundMeetingMessage(
+  handoffCap.api,
+  fakeWork(),
+  fakeInbound({
+    messageId: "handoff-vague",
+    threadId: "thread-handoff-buttons",
+    from: "Ada <ada@acme.com>",
+    subject: "Re: call",
+    body: "any of those is fine",
+    internalDate: String(Date.now() + 60_000),
+  }),
+  new Date(Date.now() + 60_000),
+);
+const handoffButtons = handoffCap.messages.flatMap((row) => row.buttons);
+assert(
+  expectedSlotLabels.every((label) => handoffButtons.includes(label)) &&
+    !handoffButtons.some((label) => /^Book slot \d+$/i.test(label)),
+  "handover buttons show real slot times",
+);
+resetMeetingTestHooks();
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
