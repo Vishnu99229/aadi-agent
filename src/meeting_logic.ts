@@ -257,22 +257,177 @@ export function callLabel(
   return `${attendees[0]!.name} and ${attendees.length - 1} others`;
 }
 
+export interface LinkableAccount {
+  name: string;
+  aliases: string[];
+  email_domains: string[];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function hasWholeWord(haystack: string, word: string): boolean {
+  const needle = word.trim().toLowerCase();
+  if (needle.length < 3 || needle.includes("@")) {
+    return false;
+  }
+  return new RegExp(
+    `(?<![\\p{L}\\p{N}])${escapeRegExp(needle)}(?![\\p{L}\\p{N}])`,
+    "iu",
+  ).test(haystack);
+}
+
+export function sameInstant(left: string, right: string): boolean {
+  const a = new Date(left).getTime();
+  const b = new Date(right).getTime();
+  return Number.isFinite(a) && a === b;
+}
+
+function emailsIn(text: string): string[] {
+  return [
+    ...text.toLowerCase().matchAll(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/g),
+  ].map((match) => match[0]!);
+}
+
+export function accountsForAttendees(
+  attendees: MeetingAttendee[],
+  accounts: LinkableAccount[],
+): LinkableAccount[] {
+  return accounts.filter((account) =>
+    attendees.some((attendee) => {
+      const domains = account.email_domains.map((domain) => domain.toLowerCase());
+      if (attendee.domain && domains.includes(attendee.domain.toLowerCase())) {
+        return true;
+      }
+      const label = `${attendee.name} ${attendee.company}`;
+      if (hasWholeWord(label, account.name)) {
+        return true;
+      }
+      return account.aliases.some((alias) => hasWholeWord(label, alias));
+    }),
+  );
+}
+
+export function textLinkedToMeeting(
+  haystack: string,
+  attendees: MeetingAttendee[],
+  accounts: LinkableAccount[] = [],
+): boolean {
+  const emails = new Set(emailsIn(haystack));
+  const matched = accountsForAttendees(attendees, accounts);
+  for (const attendee of attendees) {
+    const email = attendee.email.trim().toLowerCase();
+    if (email && emails.has(email)) {
+      return true;
+    }
+    if (hasWholeWord(haystack, attendee.name)) {
+      return true;
+    }
+    const domain = attendee.domain.trim().toLowerCase();
+    if (domain && !CONSUMER_DOMAINS.has(domain)) {
+      for (const found of emails) {
+        if (emailDomain(found) === domain) {
+          return true;
+        }
+      }
+    }
+  }
+  for (const account of matched) {
+    if (hasWholeWord(haystack, account.name)) {
+      return true;
+    }
+    if (account.aliases.some((alias) => hasWholeWord(haystack, alias))) {
+      return true;
+    }
+    for (const domain of account.email_domains) {
+      const normalized = domain.trim().toLowerCase();
+      if (!normalized || CONSUMER_DOMAINS.has(normalized)) {
+        continue;
+      }
+      for (const found of emails) {
+        if (emailDomain(found) === normalized) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 export function matchesAttendees(
   haystack: string,
   attendees: MeetingAttendee[],
 ): boolean {
-  const lower = haystack.toLowerCase();
-  return attendees.some((attendee) => {
-    const needles = [
-      attendee.name,
-      attendee.email,
-      attendee.company,
-      attendee.email.split("@")[0] ?? "",
-    ]
-      .map((value) => value.trim().toLowerCase())
-      .filter((value) => value.length >= 3);
-    return needles.some((needle) => lower.includes(needle));
-  });
+  return textLinkedToMeeting(haystack, attendees, []);
+}
+
+export interface LinkedFollowup {
+  status: string;
+  recipient: string;
+  subject: string;
+}
+
+export interface LinkedTask {
+  status: string;
+  text: string;
+}
+
+export interface LinkedNote {
+  title: string;
+  people: string;
+  content: string;
+}
+
+export function selectLinkedOpenItems(params: {
+  attendees: MeetingAttendee[];
+  accounts?: LinkableAccount[];
+  followups: LinkedFollowup[];
+  tasks: LinkedTask[];
+  notes: LinkedNote[];
+}): OpenItemLine[] {
+  const accounts = params.accounts ?? [];
+  const items: OpenItemLine[] = [];
+  for (const followup of params.followups) {
+    if (followup.status !== "waiting" && followup.status !== "snoozed") {
+      continue;
+    }
+    if (
+      !textLinkedToMeeting(
+        `${followup.recipient} ${followup.subject}`,
+        params.attendees,
+        accounts,
+      )
+    ) {
+      continue;
+    }
+    items.push({
+      kind: "follow-up",
+      text: `${followup.subject} (${followup.recipient})`,
+    });
+  }
+  for (const task of params.tasks) {
+    if (task.status !== "open") {
+      continue;
+    }
+    if (!textLinkedToMeeting(task.text, params.attendees, accounts)) {
+      continue;
+    }
+    items.push({ kind: "task", text: task.text });
+  }
+  const seen = new Set<string>();
+  for (const note of params.notes) {
+    const haystack = `${note.title} ${note.people} ${note.content}`;
+    if (!textLinkedToMeeting(haystack, params.attendees, accounts)) {
+      continue;
+    }
+    if (seen.has(note.title)) {
+      continue;
+    }
+    seen.add(note.title);
+    items.push({ kind: "note", text: note.title });
+  }
+  return items;
 }
 
 export function suggestedGoal(params: {
@@ -295,12 +450,24 @@ export function suggestedGoal(params: {
   if (thread?.subject) {
     return `Suggested goal for this call: continue ${thread.subject}.`;
   }
-  return "Suggested goal for this call: this looks like a first conversation.";
+  return "";
+}
+
+export function formatThreadDate(raw: string): string {
+  const value = raw.trim();
+  if (!value) {
+    return "";
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return value.replace(/\s*(?:GMT|[+-]\d{4})\b/g, "").replace(/\s+/g, " ").trim();
+  }
+  return formatKolkataTime(new Date(parsed).toISOString());
 }
 
 export function formatThreadLine(thread: EmailThreadLine): string {
-  const when = thread.date ? ` — ${thread.date}` : "";
-  return `• ${thread.subject || "(no subject)"}${when}`;
+  const when = thread.date ? formatThreadDate(thread.date) : "";
+  return `• ${thread.subject || "(no subject)"}${when ? ` — ${when}` : ""}`;
 }
 
 export function buildMeetingBriefText(params: {
@@ -330,7 +497,7 @@ export function buildMeetingBriefText(params: {
       ? params.memories.slice(0, 5).map((item) => `• ${item}`).join("\n")
       : "";
 
-  return [
+  const lines = [
     title,
     formatKolkataTime(params.startIso),
     `Attendees: ${attendeeLine}`,
@@ -341,16 +508,81 @@ export function buildMeetingBriefText(params: {
     "Open:",
     open,
     ...(remembered ? ["", "Remembered:", remembered] : []),
-    "",
-    suggestedGoal({
-      threads: params.threads,
-      openItems: params.openItems,
-    }),
-  ].join("\n");
+  ];
+  const goal = suggestedGoal({
+    threads: params.threads,
+    openItems: params.openItems,
+  });
+  if (goal) {
+    lines.push("", goal);
+  }
+  return lines.join("\n");
 }
 
 export function meetingKey(eventId: string, startIso: string): string {
-  return `${eventId}|${startIso}`;
+  const ms = new Date(startIso).getTime();
+  return `${eventId}|${Number.isFinite(ms) ? ms : startIso}`;
+}
+
+export type BriefAction = "send" | "later" | "skip";
+
+export function briefAction(
+  event: CalendarEventLike,
+  now: Date,
+  minutes: number,
+  selfEmail: string,
+  skipInternalRecurring: boolean,
+  alreadySent: boolean,
+): BriefAction {
+  if (skipReason(event, selfEmail, skipInternalRecurring)) {
+    return "skip";
+  }
+  const start = eventStartMs(event);
+  if (!event.id || start === null || start <= now.getTime()) {
+    return "skip";
+  }
+  if (alreadySent) {
+    return "skip";
+  }
+  const sendAt = start - minutes * 60 * 1000;
+  return now.getTime() >= sendAt ? "send" : "later";
+}
+
+export function nextBriefInstant(
+  events: CalendarEventLike[],
+  now: Date,
+  minutes: number,
+  selfEmail: string,
+  skipInternalRecurring: boolean,
+  alreadySent: Set<string>,
+): number | null {
+  let best: number | null = null;
+  for (const event of events) {
+    const startIso = event.start?.dateTime;
+    if (!event.id || !startIso) {
+      continue;
+    }
+    const action = briefAction(
+      event,
+      now,
+      minutes,
+      selfEmail,
+      skipInternalRecurring,
+      alreadySent.has(meetingKey(event.id, startIso)),
+    );
+    if (action !== "later") {
+      continue;
+    }
+    const start = eventStartMs(event);
+    if (start === null) {
+      continue;
+    }
+    const sendAt = start - minutes * 60 * 1000;
+    if (best === null || sendAt < best) {
+      best = sendAt;
+    }
+  }
+  return best;
 }
 
 export function nudgeQuestion(
@@ -369,18 +601,95 @@ export function eventsDueForBrief(
   alreadySent: Set<string>,
 ): CalendarEventLike[] {
   return events.filter((event) => {
-    if (skipReason(event, selfEmail, skipInternalRecurring)) {
-      return false;
-    }
-    if (!startsWithinMinutes(event, now, minutes)) {
-      return false;
-    }
     const startIso = event.start?.dateTime;
-    if (!event.id || !startIso) {
-      return false;
-    }
-    return !alreadySent.has(meetingKey(event.id, startIso));
+    return (
+      briefAction(
+        event,
+        now,
+        minutes,
+        selfEmail,
+        skipInternalRecurring,
+        Boolean(
+          event.id &&
+            startIso &&
+            alreadySent.has(meetingKey(event.id, startIso)),
+        ),
+      ) === "send"
+    );
   });
+}
+
+export interface NudgeSnapshot {
+  start_at: string;
+  end_at: string;
+  nudge_status: string;
+  nudge_at: string | null;
+}
+
+export type NudgePlan =
+  | { action: "skip"; reason: "cancelled" | "missing" }
+  | {
+      action: "reschedule";
+      startAt: string;
+      endAt: string;
+      nudgeAt: string;
+      needsRebrief: boolean;
+    }
+  | { action: "wait" }
+  | { action: "send" };
+
+export function planNudgeRefresh(
+  row: NudgeSnapshot,
+  event: CalendarEventLike | null,
+  now: Date,
+): NudgePlan {
+  if (!event) {
+    return { action: "skip", reason: "missing" };
+  }
+  if (event.status === "cancelled") {
+    return { action: "skip", reason: "cancelled" };
+  }
+  const startRaw = event.start?.dateTime;
+  const endRaw = event.end?.dateTime;
+  if (!startRaw || !endRaw) {
+    return { action: "skip", reason: "missing" };
+  }
+  const startAt = new Date(startRaw).toISOString();
+  const endAt = new Date(endRaw).toISOString();
+  const startMoved = !sameInstant(row.start_at, startAt);
+  const endMoved = !sameInstant(row.end_at, endAt);
+  if (startMoved || endMoved) {
+    const remindMs =
+      row.nudge_status === "remind_scheduled" && row.nudge_at
+        ? new Date(row.nudge_at).getTime()
+        : Number.NaN;
+    const endMs = new Date(endAt).getTime();
+    const nudgeAt =
+      Number.isFinite(remindMs) && remindMs > endMs
+        ? new Date(remindMs).toISOString()
+        : endAt;
+    return {
+      action: "reschedule",
+      startAt,
+      endAt,
+      nudgeAt,
+      needsRebrief: startMoved,
+    };
+  }
+  if (new Date(endAt).getTime() > now.getTime()) {
+    return { action: "wait" };
+  }
+  if (row.nudge_status === "briefed") {
+    return { action: "send" };
+  }
+  if (
+    row.nudge_status === "remind_scheduled" &&
+    row.nudge_at &&
+    new Date(row.nudge_at).getTime() <= now.getTime()
+  ) {
+    return { action: "send" };
+  }
+  return { action: "wait" };
 }
 
 export function nextQualifyingEvent(

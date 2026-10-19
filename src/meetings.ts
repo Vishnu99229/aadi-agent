@@ -3,6 +3,7 @@ import { everyMs, type IntervalJob } from "./scheduler.js";
 import { google } from "googleapis";
 import { config } from "./config.js";
 import {
+  clearMeetingRebrief,
   deleteSetting,
   getFollowups,
   getMeetingBrief,
@@ -11,22 +12,29 @@ import {
   getTasks,
   listMeetingBriefs,
   recordMeetingBrief,
+  rescheduleMeetingBrief,
   searchNotes,
   setSetting,
   updateMeetingNudge,
   type MeetingBriefRecord,
 } from "./db.js";
-import { loadGoogleAccounts, type LoadedGoogleAccount } from "./google/auth.js";
+import { decodedAccounts } from "./accounts.js";
+import {
+  isGoogleNotFound,
+  loadGoogleAccounts,
+  type LoadedGoogleAccount,
+} from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import {
   buildMeetingBriefText,
-  briefsDueForFirstNudge,
-  briefsDueForRemindNudge,
   eventsDueForBrief,
-  matchesAttendees,
   meetingKey,
+  nextBriefInstant,
   nextQualifyingEvent,
   nudgeQuestion,
+  planNudgeRefresh,
+  selectLinkedOpenItems,
+  textLinkedToMeeting,
   toMeetingAttendees,
   type CalendarEventLike,
   type EmailThreadLine,
@@ -38,6 +46,10 @@ import { memoriesMatchingText } from "./memory.js";
 const TIME_ZONE = "Asia/Kolkata";
 const PENDING_WRAPUP_KEY = "pending_meeting_wrapup";
 const SELF_FALLBACK = "vishnu.rajan@epicode.in";
+const BRIEF_LOOKAHEAD_MS = 36 * 60 * 60 * 1000;
+
+let briefTimer: NodeJS.Timeout | undefined;
+let scanInFlight = false;
 
 export interface PendingMeetingWrapUp {
   briefId: number;
@@ -159,6 +171,7 @@ async function searchWorkThreads(
     q: query,
     maxResults: 8,
   });
+  const accounts = linkAccounts();
   const threads = new Map<string, EmailThreadLine>();
   for (const message of listed.data.messages ?? []) {
     if (!message.id) {
@@ -180,59 +193,43 @@ async function searchWorkThreads(
       subject: header(headers, "Subject"),
       date: header(headers, "Date"),
     });
-    if (threads.size >= 3) {
+    if (threads.size >= 8) {
       break;
     }
   }
+  const linked = [...threads.values()].filter((thread) => {
+    if (textLinkedToMeeting(`${thread.from} ${thread.subject}`, attendees, accounts)) {
+      return true;
+    }
+    const from = thread.from.toLowerCase();
+    return from.includes("@epicode.in") || from.includes(SELF_FALLBACK);
+  }).slice(0, 3);
   console.log(
-    `Pre-meeting mail search: attendees=${addresses.length}, threads=${threads.size}`,
+    `Pre-meeting mail search: attendees=${addresses.length}, threads=${linked.length}`,
   );
-  return [...threads.values()];
+  return linked;
+}
+
+function linkAccounts() {
+  return decodedAccounts().map((account) => ({
+    name: account.name,
+    aliases: account.aliases,
+    email_domains: account.email_domains,
+  }));
 }
 
 function openItemsFor(attendees: MeetingAttendee[]): OpenItemLine[] {
-  const items: OpenItemLine[] = [];
-  for (const followup of getFollowups()) {
-    if (
-      followup.status !== "waiting" &&
-      followup.status !== "snoozed"
-    ) {
-      continue;
-    }
-    const haystack = `${followup.recipient} ${followup.subject}`;
-    if (matchesAttendees(haystack, attendees)) {
-      items.push({
-        kind: "follow-up",
-        text: `${followup.subject} (${followup.recipient})`,
-      });
-    }
-  }
-  for (const task of getTasks()) {
-    if (task.status !== "open") {
-      continue;
-    }
-    if (matchesAttendees(task.text, attendees)) {
-      items.push({ kind: "task", text: task.text });
-    }
-  }
-  const queries = [
-    ...new Set(
-      attendees.flatMap((attendee) =>
-        [attendee.company, attendee.name].filter((value) => value.length >= 3),
-      ),
-    ),
-  ];
-  const seenNotes = new Set<number>();
-  for (const query of queries) {
-    for (const note of searchNotes(query)) {
-      if (seenNotes.has(note.id)) {
-        continue;
-      }
-      seenNotes.add(note.id);
-      items.push({ kind: "note", text: note.title });
-    }
-  }
-  return items;
+  return selectLinkedOpenItems({
+    attendees,
+    accounts: linkAccounts(),
+    followups: getFollowups(),
+    tasks: getTasks(),
+    notes: searchNotes("").map((note) => ({
+      title: note.title,
+      people: note.people,
+      content: note.content,
+    })),
+  });
 }
 
 export async function buildBriefForEvent(
@@ -276,23 +273,40 @@ async function sendBrief(
   if (!event.id || !startIso || !endIso) {
     return undefined;
   }
-  const existing = getMeetingBriefByEvent(event.id, startIso);
+  const startKey = new Date(startIso).toISOString();
+  const endKey = new Date(endIso).toISOString();
+  const existing = getMeetingBriefByEvent(event.id, startKey);
+  if (existing && !existing.needs_rebrief) {
+    return existing;
+  }
   const built = await buildBriefForEvent(event, account, self);
   if (!built) {
     return undefined;
   }
   await api.sendMessage(config.ownerTelegramId, built.text);
-  const record =
-    existing ??
-    recordMeetingBrief({
-      eventId: event.id,
-      startAt: startIso,
-      endAt: endIso,
-      title: event.summary?.trim() || "(Untitled event)",
-      attendeesJson: JSON.stringify(built.attendees),
-      nudgeAt: endIso,
-    });
-  console.log(`Pre-meeting brief sent: event=${event.id}`);
+  const title = event.summary?.trim() || "(Untitled event)";
+  const attendeesJson = JSON.stringify(built.attendees);
+  const idealAt =
+    new Date(startKey).getTime() - config.preMeetingMinutes * 60 * 1000;
+  const timing = Date.now() - idealAt > 60_000 ? "short_notice" : "on_time";
+  if (existing) {
+    clearMeetingRebrief(existing.id, endKey, title, attendeesJson);
+    console.log(
+      `Pre-meeting brief sent: event=${event.id} timing=${timing} rebrief=1`,
+    );
+    return getMeetingBrief(existing.id);
+  }
+  const record = recordMeetingBrief({
+    eventId: event.id,
+    startAt: startKey,
+    endAt: endKey,
+    title,
+    attendeesJson,
+    nudgeAt: endKey,
+  });
+  console.log(
+    `Pre-meeting brief sent: event=${event.id} timing=${timing} rebrief=0`,
+  );
   return record;
 }
 
@@ -341,54 +355,192 @@ async function sendNudge(api: Api, brief: MeetingBriefRecord): Promise<void> {
   console.log(`Post-call nudge sent: brief=${brief.id}`);
 }
 
-export async function runMeetingScan(api: Api, now = new Date()): Promise<void> {
-  const account = await loadWorkAccount();
-  if (!account) {
-    console.log("Pre-meeting scan skipped: work calendar not connected.");
+async function fetchWorkEvent(
+  account: LoadedGoogleAccount,
+  eventId: string,
+): Promise<CalendarEventLike | null> {
+  const calendar = google.calendar({ version: "v3", auth: account.client });
+  try {
+    const response = await calendar.events.get({
+      calendarId: "primary",
+      eventId,
+      timeZone: TIME_ZONE,
+    });
+    return response.data;
+  } catch (error) {
+    if (isGoogleNotFound(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function armBriefTimer(api: Api, atMs: number | null, now: Date): void {
+  if (briefTimer) {
+    clearTimeout(briefTimer);
+    briefTimer = undefined;
+  }
+  if (atMs === null) {
     return;
   }
-  const self = await selfEmail(account);
-  const windowEnd = new Date(
-    now.getTime() + config.preMeetingMinutes * 60 * 1000,
-  );
-  const events = await listWorkEvents(account, now, windowEnd);
-  const alreadySent = new Set(
-    listMeetingBriefs().map((row) => meetingKey(row.event_id, row.start_at)),
-  );
-  for (const event of eventsDueForBrief(
-    events,
-    now,
-    config.preMeetingMinutes,
-    self,
-    config.skipInternalRecurring,
-    alreadySent,
-  )) {
-    try {
-      await sendBrief(api, event, account, self);
-    } catch (error) {
-      const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.error(`Pre-meeting brief failed (${errorType}).`);
-    }
+  const delay = atMs - now.getTime();
+  if (delay <= 0 || delay > BRIEF_LOOKAHEAD_MS) {
+    return;
   }
+  briefTimer = setTimeout(() => {
+    briefTimer = undefined;
+    void runMeetingScan(api);
+  }, delay);
+}
 
-  const rows = listMeetingBriefs();
-  for (const brief of briefsDueForFirstNudge(rows, now)) {
+async function refreshNudges(
+  api: Api,
+  account: LoadedGoogleAccount,
+  now: Date,
+): Promise<void> {
+  const active = listMeetingBriefs().filter(
+    (row) =>
+      row.nudge_status === "briefed" || row.nudge_status === "remind_scheduled",
+  );
+  for (const brief of active) {
+    let event: CalendarEventLike | null;
     try {
-      await sendNudge(api, brief);
-      updateMeetingNudge(brief.id, "nudged");
+      event = await fetchWorkEvent(account, brief.event_id);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Post-call nudge refresh failed (${errorType}).`);
+      continue;
+    }
+    const plan = planNudgeRefresh(brief, event, now);
+    if (plan.action === "skip") {
+      updateMeetingNudge(brief.id, "skipped");
+      console.log(
+        `Post-call nudge skipped: brief=${brief.id} reason=${plan.reason}`,
+      );
+      continue;
+    }
+    if (plan.action === "reschedule") {
+      const updated = rescheduleMeetingBrief(
+        brief.id,
+        plan.startAt,
+        plan.endAt,
+        plan.nudgeAt,
+        plan.needsRebrief,
+      );
+      console.log(
+        `Post-call nudge rescheduled: brief=${brief.id} status=${updated ? "rescheduled" : "skipped"}`,
+      );
+      continue;
+    }
+    if (plan.action !== "send") {
+      continue;
+    }
+    try {
+      const current = getMeetingBrief(brief.id);
+      if (!current) {
+        continue;
+      }
+      if (new Date(current.end_at).getTime() > now.getTime()) {
+        console.log(
+          `Post-call nudge skipped: brief=${brief.id} reason=before_end`,
+        );
+        continue;
+      }
+      await sendNudge(api, current);
+      updateMeetingNudge(
+        brief.id,
+        brief.nudge_status === "remind_scheduled" ? "re_nudged" : "nudged",
+      );
     } catch (error) {
       const errorType = error instanceof Error ? error.name : "UnknownError";
       console.error(`Post-call nudge failed (${errorType}).`);
     }
   }
-  for (const brief of briefsDueForRemindNudge(rows, now)) {
-    try {
-      await sendNudge(api, brief);
-      updateMeetingNudge(brief.id, "re_nudged");
-    } catch (error) {
-      const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.error(`Post-call nudge failed (${errorType}).`);
+}
+
+export async function runMeetingScan(api: Api, now = new Date()): Promise<void> {
+  if (scanInFlight) {
+    console.log("Job meeting-prebrief: skip=overlap");
+    return;
+  }
+  scanInFlight = true;
+  try {
+    const account = await loadWorkAccount();
+    if (!account) {
+      console.log("Pre-meeting scan skipped: work calendar not connected.");
+      return;
     }
+    const self = await selfEmail(account);
+    await refreshNudges(api, account, now);
+    const horizon = new Date(now.getTime() + BRIEF_LOOKAHEAD_MS);
+    const events = await listWorkEvents(account, now, horizon);
+    const rows = listMeetingBriefs();
+    const alreadySent = new Set(
+      rows
+        .filter((row) => !row.needs_rebrief)
+        .map((row) => meetingKey(row.event_id, row.start_at)),
+    );
+    for (const event of eventsDueForBrief(
+      events,
+      now,
+      config.preMeetingMinutes,
+      self,
+      config.skipInternalRecurring,
+      alreadySent,
+    )) {
+      if (!event.id) {
+        continue;
+      }
+      try {
+        const fresh = await fetchWorkEvent(account, event.id);
+        if (!fresh || fresh.status === "cancelled" || !fresh.start?.dateTime) {
+          console.log(
+            `Pre-meeting brief skipped: event=${event.id} reason=${fresh?.status === "cancelled" ? "cancelled" : "missing"}`,
+          );
+          continue;
+        }
+        const due = eventsDueForBrief(
+          [fresh],
+          now,
+          config.preMeetingMinutes,
+          self,
+          config.skipInternalRecurring,
+          alreadySent,
+        );
+        if (due.length === 0) {
+          const freshKey = meetingKey(fresh.id ?? event.id, fresh.start.dateTime);
+          const moved =
+            freshKey !== meetingKey(event.id, event.start?.dateTime ?? "");
+          if (moved) {
+            console.log(
+              `Pre-meeting brief skipped: event=${event.id} reason=moved`,
+            );
+          }
+          continue;
+        }
+        const sent = await sendBrief(api, fresh, account, self);
+        if (sent) {
+          alreadySent.add(meetingKey(sent.event_id, sent.start_at));
+        }
+      } catch (error) {
+        const errorType = error instanceof Error ? error.name : "UnknownError";
+        console.error(`Pre-meeting brief failed (${errorType}).`);
+      }
+    }
+    armBriefTimer(
+      api,
+      nextBriefInstant(
+        events,
+        now,
+        config.preMeetingMinutes,
+        self,
+        config.skipInternalRecurring,
+        alreadySent,
+      ),
+      now,
+    );
+  } finally {
+    scanInFlight = false;
   }
 }
 

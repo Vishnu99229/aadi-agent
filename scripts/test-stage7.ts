@@ -9,24 +9,40 @@ function ensureTestEnv(): void {
   process.env.BRIEF_TIME ??= "08:00";
   process.env.PRE_MEETING_MINUTES ??= "15";
   process.env.SKIP_INTERNAL_RECURRING ??= "true";
+  process.env.AADI_DB_PATH ??= ":memory:";
 }
 
 ensureTestEnv();
 
 const {
+  briefAction,
   buildMeetingBriefText,
   briefsDueForFirstNudge,
   briefsDueForRemindNudge,
   callLabel,
   companyFromEmail,
   eventsDueForBrief,
+  formatThreadDate,
   meetingKey,
+  nextBriefInstant,
   nextQualifyingEvent,
   nudgeQuestion,
+  planNudgeRefresh,
+  selectLinkedOpenItems,
   skipReason,
   suggestedGoal,
+  textLinkedToMeeting,
   toMeetingAttendees,
 } = await import("../src/meeting_logic.ts");
+const { shouldForceCalendarTool } = await import("../src/calendar_guard.ts");
+const { calendarAccountIds, istInclusiveRange } = await import(
+  "../src/tools/list_events.ts"
+);
+const { quotedMessageText, withQuotedContext } = await import(
+  "../src/reply_context.ts"
+);
+const { storeOutboundText } = await import("../src/outbound.ts");
+const { clearMessages, getRecentMessages } = await import("../src/db.ts");
 const {
   consumePendingMeetingWrapUp,
   formatWrapUpPrefill,
@@ -195,10 +211,7 @@ function testCompanyAndLabel(): void {
 function testBriefAndGoal(): void {
   const attendees = toMeetingAttendees(timedEvent({}), SELF);
   const first = suggestedGoal({ threads: [], openItems: [] });
-  assert(
-    first.includes("first conversation"),
-    "empty context is first conversation",
-  );
+  assert(first === "", "no suggested goal when nothing relevant is linked");
   const fromThread = suggestedGoal({
     threads: [
       { from: "Priya", subject: "Pricing follow-up", date: "13 Oct" },
@@ -347,10 +360,247 @@ function testPersistOnceAndWrapUp(): void {
   );
 }
 
+function vatsalAttendees() {
+  return toMeetingAttendees(
+    timedEvent({
+      attendees: [
+        { email: SELF, self: true, responseStatus: "accepted" },
+        {
+          email: "vatsal@rumik.ai",
+          displayName: "Vatsal",
+          responseStatus: "accepted",
+        },
+        {
+          email: "art@rumik.ai",
+          displayName: "Art",
+          responseStatus: "accepted",
+        },
+      ],
+    }),
+    SELF,
+  );
+}
+
+function testRescheduleAndCancel(): void {
+  const stored = {
+    start_at: new Date("2026-10-19T15:15:00+05:30").toISOString(),
+    end_at: new Date("2026-10-19T15:30:00+05:30").toISOString(),
+    nudge_status: "briefed",
+    nudge_at: new Date("2026-10-19T15:30:00+05:30").toISOString(),
+  };
+  const now = new Date("2026-10-19T15:31:00+05:30");
+  const moved = {
+    id: "vatsal-evt",
+    status: "confirmed",
+    start: { dateTime: "2026-10-19T16:00:00+05:30" },
+    end: { dateTime: "2026-10-19T16:15:00+05:30" },
+  };
+  const plan = planNudgeRefresh(stored, moved, now);
+  assert(plan.action === "reschedule", "moved event reschedules the nudge");
+  if (plan.action === "reschedule") {
+    assert(
+      new Date(plan.endAt).getTime() > now.getTime(),
+      "rescheduled end is the new end",
+    );
+    assert(plan.needsRebrief, "a new start needs another brief");
+    const again = planNudgeRefresh(
+      {
+        start_at: plan.startAt,
+        end_at: plan.endAt,
+        nudge_status: "briefed",
+        nudge_at: plan.nudgeAt,
+      },
+      moved,
+      now,
+    );
+    assert(again.action === "wait", "no nudge before the current end");
+  }
+  const cancelled = planNudgeRefresh(
+    stored,
+    { ...moved, status: "cancelled" },
+    now,
+  );
+  assert(
+    cancelled.action === "skip" && cancelled.reason === "cancelled",
+    "cancelled event does not nudge",
+  );
+  const onTime = planNudgeRefresh(
+    stored,
+    {
+      status: "confirmed",
+      start: { dateTime: stored.start_at },
+      end: { dateTime: stored.end_at },
+    },
+    now,
+  );
+  assert(onTime.action === "send", "unchanged event nudges after its end");
+}
+
+function testBriefRetimed(): void {
+  const event = {
+    id: "vatsal-evt",
+    status: "confirmed",
+    summary: "Vatsal",
+    start: { dateTime: "2026-10-19T16:00:00+05:30" },
+    end: { dateTime: "2026-10-19T16:15:00+05:30" },
+    attendees: [
+      { email: SELF, self: true },
+      { email: "vatsal@rumik.ai", displayName: "Vatsal" },
+    ],
+  };
+  const early = new Date("2026-10-19T15:20:00+05:30");
+  const shortNotice = new Date("2026-10-19T15:50:00+05:30");
+  const ideal = new Date("2026-10-19T15:45:00+05:30");
+  assert(
+    briefAction(event, early, 15, SELF, true, false) === "later",
+    "brief waits until 15 minutes before",
+  );
+  assert(
+    nextBriefInstant([event], early, 15, SELF, true, new Set()) ===
+      ideal.getTime(),
+    "brief is armed for the 15-minute mark",
+  );
+  assert(
+    briefAction(event, ideal, 15, SELF, true, false) === "send",
+    "brief sends at the 15-minute mark",
+  );
+  assert(
+    briefAction(event, shortNotice, 15, SELF, true, false) === "send",
+    "moved meeting inside the window sends immediately",
+  );
+  assert(
+    briefAction({ ...event, status: "cancelled" }, shortNotice, 15, SELF, true, false) ===
+      "skip",
+    "cancelled meeting does not get a brief",
+  );
+}
+
+function testBriefFiltering(): void {
+  const attendees = vatsalAttendees();
+  const accounts = [
+    {
+      name: "Rumik",
+      aliases: ["Rumik AI"],
+      email_domains: ["rumik.ai"],
+    },
+  ];
+  const eleven = "ElevenLabs follow-up karthik@elevenlabs.io";
+  assert(
+    !textLinkedToMeeting(eleven, attendees, accounts),
+    "elevenlabs follow-up is not linked to a Rumik meeting",
+  );
+  const items = selectLinkedOpenItems({
+    attendees,
+    accounts,
+    followups: [
+      {
+        status: "waiting",
+        recipient: "karthik@elevenlabs.io",
+        subject: "ElevenLabs follow-up",
+      },
+      {
+        status: "waiting",
+        recipient: "alex@rumik.ai",
+        subject: "Rumik pricing",
+      },
+    ],
+    tasks: [
+      { status: "open", text: "Email Karthik at ElevenLabs" },
+      { status: "open", text: "Send Vatsal the deck" },
+    ],
+    notes: [
+      {
+        title: "ElevenLabs intro",
+        people: "Karthik",
+        content: "Follow up with ElevenLabs",
+      },
+      { title: "Rumik sync", people: "Vatsal", content: "Pricing" },
+    ],
+  });
+  const rendered = items.map((item) => item.text).join("\n");
+  assert(!rendered.toLowerCase().includes("elevenlabs"), "unrelated follow-up excluded");
+  assert(!rendered.toLowerCase().includes("karthik"), "unrelated name excluded");
+  assert(rendered.includes("Rumik pricing"), "same-domain follow-up kept");
+  assert(rendered.includes("Send Vatsal the deck"), "attendee name kept as a whole word");
+  assert(rendered.includes("Rumik sync"), "matched account note kept");
+  const goal = suggestedGoal({ threads: [], openItems: items });
+  assert(goal.includes("Rumik pricing"), "goal uses the linked follow-up");
+  assert(!goal.toLowerCase().includes("elevenlabs"), "goal skips the unrelated follow-up");
+  const dated = formatThreadDate("Mon, 19 Oct 2026 09:43:00 +0000");
+  assert(!dated.includes("+0000"), "thread dates are not raw +0000");
+  assert(dated.includes("19"), "thread date keeps the IST day");
+  assert(/3:13|15:13/.test(dated), "09:43 UTC is 15:13 IST");
+  const brief = buildMeetingBriefText({
+    title: "Vatsal",
+    startIso: "2026-10-19T16:00:00+05:30",
+    attendees,
+    threads: [],
+    openItems: [],
+  });
+  assert(!brief.includes("Suggested goal"), "empty brief has no suggested goal");
+}
+
+function testHistoryQuoteAndCalendar(): void {
+  clearMessages();
+  storeOutboundText("How did the call with Vatsal go?");
+  const saved = getRecentMessages(5);
+  assert(
+    saved.some(
+      (message) =>
+        message.role === "assistant" &&
+        message.content === "How did the call with Vatsal go?",
+    ),
+    "proactive nudge is stored as an assistant turn",
+  );
+  storeOutboundText("How did the call with Vatsal go?");
+  assert(
+    getRecentMessages(5).length === saved.length,
+    "the same outbound text is not stored twice in a row",
+  );
+  const quoted = quotedMessageText({
+    text: "How did the call with Vatsal go?",
+  });
+  const modelText = withQuotedContext("It went well", quoted);
+  assert(
+    modelText.includes("How did the call with Vatsal go?"),
+    "reply quotes Aadi's message",
+  );
+  assert(modelText.includes("It went well"), "reply keeps Vishnu's text");
+  assert(
+    calendarAccountIds(undefined).join(",") === "personal,work",
+    "omitted account reads both calendars",
+  );
+  const range = istInclusiveRange("2026-10-19", "2026-10-19");
+  assert(
+    range.timeMin === "2026-10-18T18:30:00.000Z",
+    "today starts at Asia/Kolkata midnight",
+  );
+  assert(
+    range.timeMax === "2026-10-19T18:30:00.000Z",
+    "today ends at the next Asia/Kolkata midnight",
+  );
+  assert(
+    shouldForceCalendarTool("any meetings with Vatsal today?", []),
+    "calendar questions require list_events",
+  );
+  assert(
+    !shouldForceCalendarTool("any meetings with Vatsal today?", ["list_events"]),
+    "list_events satisfies the calendar guard",
+  );
+  assert(
+    !shouldForceCalendarTool("remember to buy milk", []),
+    "unrelated chat does not force the calendar",
+  );
+}
+
 testSkipRules();
 testCompanyAndLabel();
 testBriefAndGoal();
 testWindowAndDedupeSelection();
 testNudgeTiming();
 testPersistOnceAndWrapUp();
+testRescheduleAndCancel();
+testBriefRetimed();
+testBriefFiltering();
+testHistoryQuoteAndCalendar();
 console.log("Stage 7 checks passed.");
