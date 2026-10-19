@@ -533,6 +533,11 @@ if (!tableHasColumn("meeting_pending_bookings", "skip_confirm")) {
     `ALTER TABLE meeting_pending_bookings ADD COLUMN skip_confirm INTEGER NOT NULL DEFAULT 0`,
   );
 }
+if (!tableHasColumn("meeting_briefs", "needs_rebrief")) {
+  db.exec(
+    `ALTER TABLE meeting_briefs ADD COLUMN needs_rebrief INTEGER NOT NULL DEFAULT 0`,
+  );
+}
 
 let memoriesFtsReady = false;
 try {
@@ -1456,10 +1461,26 @@ export interface MeetingBriefRecord {
   briefed_at: string;
   nudge_status: MeetingNudgeStatus;
   nudge_at: string | null;
+  needs_rebrief: number;
 }
 
 const MEETING_BRIEF_COLUMNS = `id, event_id, start_at, end_at, title, attendees_json,
-              briefed_at, nudge_status, nudge_at`;
+              briefed_at, nudge_status, nudge_at, needs_rebrief`;
+
+function sameInstant(left: string, right: string): boolean {
+  const a = new Date(left).getTime();
+  const b = new Date(right).getTime();
+  return Number.isFinite(a) && a === b;
+}
+
+function isUniqueConstraint(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE"
+  );
+}
 
 export function getMeetingBrief(id: number): MeetingBriefRecord | undefined {
   return db
@@ -1473,13 +1494,15 @@ export function getMeetingBriefByEvent(
   eventId: string,
   startAt: string,
 ): MeetingBriefRecord | undefined {
-  return db
+  const rows = db
     .prepare(
       `SELECT ${MEETING_BRIEF_COLUMNS}
        FROM meeting_briefs
-       WHERE event_id = ? AND start_at = ?`,
+       WHERE event_id = ?
+       ORDER BY id ASC`,
     )
-    .get(eventId, startAt) as MeetingBriefRecord | undefined;
+    .all(eventId) as MeetingBriefRecord[];
+  return rows.find((row) => sameInstant(row.start_at, startAt));
 }
 
 export function recordMeetingBrief(input: {
@@ -1519,6 +1542,48 @@ export function listMeetingBriefs(): MeetingBriefRecord[] {
        ORDER BY start_at ASC, id ASC`,
     )
     .all() as MeetingBriefRecord[];
+}
+
+export function rescheduleMeetingBrief(
+  id: number,
+  startAt: string,
+  endAt: string,
+  nudgeAt: string,
+  needsRebrief: boolean,
+): boolean {
+  try {
+    const result = db
+      .prepare(
+        `UPDATE meeting_briefs
+         SET start_at = ?, end_at = ?, nudge_at = ?, needs_rebrief = ?
+         WHERE id = ?`,
+      )
+      .run(startAt, endAt, nudgeAt, needsRebrief ? 1 : 0, id);
+    return result.changes === 1;
+  } catch (error) {
+    if (isUniqueConstraint(error)) {
+      updateMeetingNudge(id, "skipped");
+      return false;
+    }
+    throw error;
+  }
+}
+
+export function clearMeetingRebrief(
+  id: number,
+  endAt: string,
+  title: string,
+  attendeesJson: string,
+): void {
+  db.prepare(
+    `UPDATE meeting_briefs
+     SET needs_rebrief = 0,
+         end_at = ?,
+         title = ?,
+         attendees_json = ?,
+         briefed_at = ?
+     WHERE id = ?`,
+  ).run(endAt, title, attendeesJson, new Date().toISOString(), id);
 }
 
 export function updateMeetingNudge(

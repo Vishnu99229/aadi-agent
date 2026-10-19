@@ -6,6 +6,7 @@ import type {
 } from "./llm.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
+import { shouldForceCalendarTool } from "./calendar_guard.js";
 import { looksLikeDeferredAction } from "./deferred_action.js";
 import {
   CONVERSATION_SUMMARY_KEY,
@@ -102,6 +103,8 @@ export interface RunAgentOptions {
   /** usage_log task. Omitted = derived from task. */
   usageTask?: UsageTask;
   skipHistory?: boolean;
+  /** User's own words, without quoted-message context, for tool guards. */
+  guardText?: string;
 }
 
 async function summariseOlderMessages(
@@ -223,6 +226,9 @@ export async function runAgent(
       ? getTaskEffort(task)
       : undefined;
   let deferredRetryUsed = false;
+  let calendarRetryUsed = false;
+  const toolsUsed = new Set<string>();
+  const guardText = options.guardText ?? userText;
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     const response = await complete({
@@ -240,6 +246,9 @@ export async function runAgent(
     }
 
     const calledTools = response.toolCalls.map((call) => call.name);
+    for (const name of calledTools) {
+      toolsUsed.add(name);
+    }
     const cacheCreationTokens = response.usage.cacheCreationInputTokens ?? 0;
     const cacheReadTokens = response.usage.cacheReadInputTokens ?? 0;
 
@@ -266,6 +275,26 @@ export async function runAgent(
         toolCalls: response.toolCalls,
       });
       messages.push(...toolResults);
+      continue;
+    }
+
+    if (
+      !calendarRetryUsed &&
+      response.toolCalls.length === 0 &&
+      shouldForceCalendarTool(guardText, [...toolsUsed])
+    ) {
+      calendarRetryUsed = true;
+      console.log(`Calendar-tool retry: iteration=${iteration}`);
+      messages.push({
+        role: "assistant",
+        textParts: response.textParts,
+        toolCalls: [],
+      });
+      messages.push({
+        role: "user",
+        content:
+          "This question is about meetings, the schedule, or the calendar. Call list_events now. Use Asia/Kolkata dates (call get_current_time first if you do not yet know today's date). Omit account so both the personal and work calendars are read, unless Vishnu named only one. Answer from the tool result. Do not say there are no meetings unless list_events returned none.",
+      });
       continue;
     }
 

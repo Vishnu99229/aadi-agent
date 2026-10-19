@@ -1029,6 +1029,26 @@ assert(
   "weekly job catches up later the same day",
 );
 assert(
+  shouldCatchUpClockJob(
+    19,
+    0,
+    new Date("2026-10-18T19:17:00.000Z"),
+    [0],
+    "weekly",
+  ),
+  "weekly review still catches up at Monday 00:47 IST",
+);
+assert(
+  shouldCatchUpClockJob(
+    21,
+    0,
+    new Date("2026-10-18T23:27:00.000Z"),
+    [0],
+    "weekly",
+  ),
+  "weekly backup still catches up at Monday 04:57 IST",
+);
+assert(
   !shouldCatchUpClockJob(
     19,
     0,
@@ -1124,5 +1144,26 @@ const restartJob = everyClock(
 await sleep(50);
 restartJob.stop();
 assert(restartCalls === 0, "restart does not double-run a clock job");
+
+let mondayCalls = 0;
+const mondayJob = everyClock(
+  "weekly-monday-catchup",
+  19,
+  0,
+  async () => {
+    mondayCalls += 1;
+  },
+  {
+    weekdays: [0],
+    kind: "weekly",
+    now: () => new Date("2026-10-18T19:17:00.000Z"),
+  },
+);
+await sleep(50);
+mondayJob.stop();
+assert(
+  mondayCalls === 1,
+  "missed Sunday review catches up Monday 00:47 IST",
+);
 
 console.log("Stage 12 checks passed.");

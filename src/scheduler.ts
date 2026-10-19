@@ -9,8 +9,25 @@ import {
 export const GOOGLE_API_TIMEOUT_MS = 30_000;
 const JOB_TIMEOUT_MS = 5 * 60 * 1000;
 export const CATCH_UP_MS = 4 * 60 * 60 * 1000;
+export const WEEKLY_CATCH_UP_MS = 12 * 60 * 60 * 1000;
 const TIME_ZONE = "Asia/Kolkata";
 const clockInFlight = new Set<string>();
+const dueChecks = new Set<() => void>();
+let flushingClockJobs = false;
+
+export function flushDueClockJobs(): void {
+  if (flushingClockJobs) {
+    return;
+  }
+  flushingClockJobs = true;
+  try {
+    for (const check of [...dueChecks]) {
+      check();
+    }
+  } finally {
+    flushingClockJobs = false;
+  }
+}
 
 export const HEALTH_JOBS = [
   "meeting-inbox",
@@ -163,6 +180,27 @@ export function nextClockSlotUtc(
   throw new Error("no Asia/Kolkata clock slot in the next week");
 }
 
+export function lastWeeklySlotUtc(
+  hour: number,
+  minute: number,
+  now: Date,
+  weekdays: number[],
+): Date | null {
+  for (let days = 0; days <= 7; days += 1) {
+    const shifted = days === 0 ? istParts(now) : shiftIstDate(now, -days);
+    if (!weekdays.includes(shifted.weekday)) {
+      continue;
+    }
+    const slot = new Date(
+      `${istDayKey(shifted)}T${pad2(hour)}:${pad2(minute)}:00+05:30`,
+    );
+    if (slot.getTime() <= now.getTime()) {
+      return slot;
+    }
+  }
+  return null;
+}
+
 export function shouldCatchUpClockJob(
   hour: number,
   minute: number,
@@ -170,6 +208,17 @@ export function shouldCatchUpClockJob(
   weekdays?: number[],
   kind: ClockJobKind = "daily",
 ): boolean {
+  if (kind === "weekly") {
+    if (!weekdays || weekdays.length === 0) {
+      return false;
+    }
+    const slot = lastWeeklySlotUtc(hour, minute, now, weekdays);
+    if (!slot) {
+      return false;
+    }
+    const elapsed = now.getTime() - slot.getTime();
+    return elapsed >= 0 && elapsed <= WEEKLY_CATCH_UP_MS;
+  }
   const parts = istParts(now);
   if (weekdays && !weekdays.includes(parts.weekday)) {
     return false;
@@ -179,10 +228,33 @@ export function shouldCatchUpClockJob(
   if (elapsed <= 0) {
     return false;
   }
-  if (kind === "weekly") {
-    return true;
-  }
   return elapsed <= CATCH_UP_MS;
+}
+
+function succeededSince(name: string, slot: Date): boolean {
+  const last = getJobRun(name);
+  if (!last?.last_success_at) {
+    return false;
+  }
+  return new Date(last.last_success_at).getTime() >= slot.getTime();
+}
+
+function alreadyRanCatchUpSlot(
+  name: string,
+  hour: number,
+  minute: number,
+  now: Date,
+  weekdays: number[] | undefined,
+  kind: ClockJobKind,
+): boolean {
+  if (kind === "weekly") {
+    if (!weekdays) {
+      return false;
+    }
+    const slot = lastWeeklySlotUtc(hour, minute, now, weekdays);
+    return slot ? succeededSince(name, slot) : false;
+  }
+  return alreadySucceededThisSlot(name, hour, minute, now);
 }
 
 export function alreadySucceededThisSlot(
@@ -230,6 +302,7 @@ export function everyMs(
       return;
     }
     arm(intervalMs);
+    flushDueClockJobs();
     if (running) {
       stats.overlaps += 1;
       recordJobRun(name, "overlap");
@@ -345,7 +418,7 @@ export function everyClock(
       armNext();
       return;
     }
-    if (alreadySucceededThisSlot(name, hour, minute, now)) {
+    if (alreadyRanCatchUpSlot(name, hour, minute, now, options.weekdays, kind)) {
       console.log(`Job ${name}: skip=already`);
       armNext();
       return;
@@ -369,16 +442,26 @@ export function everyClock(
       stats.failures += 1;
     }
     armNext();
+    flushDueClockJobs();
   };
 
-  const now = nowFn();
-  if (
-    enabled() &&
-    shouldCatchUpClockJob(hour, minute, now, options.weekdays, kind) &&
-    !alreadySucceededThisSlot(name, hour, minute, now)
-  ) {
+  const catchUpIfDue = (): boolean => {
+    if (stopped) {
+      return false;
+    }
+    const now = nowFn();
+    if (
+      !enabled() ||
+      !shouldCatchUpClockJob(hour, minute, now, options.weekdays, kind) ||
+      alreadyRanCatchUpSlot(name, hour, minute, now, options.weekdays, kind)
+    ) {
+      return false;
+    }
     void runTick("catch_up");
-  } else {
+    return true;
+  };
+  dueChecks.add(catchUpIfDue);
+  if (!catchUpIfDue()) {
     armNext();
   }
 
@@ -387,6 +470,7 @@ export function everyClock(
     stats,
     stop() {
       stopped = true;
+      dueChecks.delete(catchUpIfDue);
       clearTimer();
     },
   };

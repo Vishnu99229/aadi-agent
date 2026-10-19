@@ -9,11 +9,34 @@ const TIME_ZONE = "Asia/Kolkata";
 const INDIA_OFFSET = "+05:30";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+export type CalendarAccountId = "personal" | "work";
+
+export function calendarAccountIds(
+  filter: CalendarAccountId | undefined,
+): CalendarAccountId[] {
+  return filter ? [filter] : ["personal", "work"];
+}
+
+export function istInclusiveRange(
+  startDate: string,
+  endDate: string,
+): { timeMin: string; timeMax: string } {
+  const start = startOfDate(startDate, "start_date");
+  const end = startOfDate(endDate, "end_date");
+  if (end < start) {
+    throw new Error("end_date must be on or after start_date.");
+  }
+  return {
+    timeMin: start.toISOString(),
+    timeMax: new Date(end.getTime() + DAY_MS).toISOString(),
+  };
+}
+
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "list_events",
   description:
-    "List calendar events (personal and work) for an inclusive YYYY-MM-DD range in Asia/Kolkata. Omit account to read both calendars.",
+    "List calendar events for an inclusive YYYY-MM-DD range. Each date is a full Asia/Kolkata day, midnight to midnight. Omit account to read both the personal and work calendars. Use this before answering any meeting, schedule, or calendar question.",
   inputSchema: {
     type: "object",
     properties: {
@@ -64,16 +87,15 @@ export async function handler(input: unknown): Promise<string> {
     end_date?: unknown;
     account?: unknown;
   };
-  const start = startOfDate(values.start_date, "start_date");
-  const end = startOfDate(values.end_date, "end_date");
-
-  if (end < start) {
-    throw new Error("end_date must be on or after start_date.");
-  }
-
-  const accounts = await accountsForFilter(
-    parseGoogleAccountFilter(values.account),
+  const filter = parseGoogleAccountFilter(values.account);
+  const ids = calendarAccountIds(filter);
+  const range = istInclusiveRange(
+    String(values.start_date ?? ""),
+    String(values.end_date ?? ""),
   );
+  const accounts = (
+    await accountsForFilter(filter)
+  ).filter((account) => ids.includes(account.id));
   const events: Array<{
     accountLabel: string;
     tag: string;
@@ -91,8 +113,8 @@ export async function handler(input: unknown): Promise<string> {
     do {
       const response = await calendar.events.list({
         calendarId: "primary",
-        timeMin: start.toISOString(),
-        timeMax: new Date(end.getTime() + DAY_MS).toISOString(),
+        timeMin: range.timeMin,
+        timeMax: range.timeMax,
         timeZone: TIME_ZONE,
         singleEvents: true,
         orderBy: "startTime",

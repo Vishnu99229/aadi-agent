@@ -86,6 +86,7 @@ import {
   isForgetEverything,
   parseForgetQuery,
 } from "./memory_logic.js";
+import { quotedMessageText, withQuotedContext } from "./reply_context.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -604,8 +605,11 @@ Call update_draft exactly once with the draft ID above and the complete revised 
     : isAccountOrMeetingQuestion(userText)
       ? "meetings"
       : "chat";
+  const quoted = quotedMessageText(ctx.message?.reply_to_message);
+  const modelText = withQuotedContext(userText, quoted);
   const reply = await whileTyping(ctx, () =>
-    runAgent(userText, {
+    runAgent(modelText, {
+      guardText: userText,
       task,
       usageTask: drafting
         ? "drafting"

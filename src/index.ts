@@ -1,4 +1,5 @@
 import { bot } from "./bot.js";
+import { installOutboundHistory } from "./outbound.js";
 import { setAfterDraftSend, startApprovalExpirySweep } from "./approvals.js";
 import { registerBillScan } from "./bills.js";
 import { registerMorningBrief } from "./brief.js";
@@ -22,6 +23,7 @@ import {
   registerMeetingBookingJobs,
 } from "./meeting_book.js";
 
+installOutboundHistory(bot.api);
 const morningBriefTask = registerMorningBrief(bot.api);
 const billScanTask = registerBillScan(bot.api);
 const importantDateTask = registerImportantDateReminders(bot.api);
