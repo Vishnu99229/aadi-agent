@@ -329,8 +329,17 @@ function readRate(name: string, fallback: number): number {
   return value;
 }
 
+/** DeepSeek Flash off-peak (api-docs.deepseek.com/quick_start/pricing). Peak is 2×. */
+const DEEPSEEK_FLASH_OFFPEAK_DEFAULTS: ModelCostRates = {
+  inputCostPerMillion: 0.15,
+  outputCostPerMillion: 0.6,
+  cacheCreationCostPerMillion: 0,
+  cacheCreation1hCostPerMillion: 0,
+  cacheReadCostPerMillion: 0.003,
+};
+
 function readCostRates(
-  prefix: "LLM" | "BACKGROUND" | "GEMMA_CLOUD",
+  prefix: "LLM" | "BACKGROUND" | "GEMMA_CLOUD" | "DEEPSEEK",
   defaults: ModelCostRates,
 ): ModelCostRates {
   return {
@@ -383,6 +392,12 @@ export const config = {
     process.env.BACKGROUND_MODEL?.trim() || "claude-haiku-5-5",
   openRouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
   openRouterModel: process.env.OPENROUTER_MODEL ?? "",
+  deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() ?? "",
+  // Current DeepSeek API ids (api-docs.deepseek.com). Legacy deepseek-chat /
+  // deepseek-reasoner names are retired; override via env if needed.
+  deepseekModel: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-flash",
+  deepseekReasonerModel:
+    process.env.DEEPSEEK_REASONER_MODEL?.trim() || "deepseek-flash",
   sarvamApiKey: process.env.SARVAM_API_KEY?.trim() ?? "",
   gemmaCloudModel:
     process.env.GEMMA_CLOUD_MODEL?.trim() || "google/gemma-4-31b-it",
@@ -392,6 +407,7 @@ export const config = {
   chatCostRates: readCostRates("LLM", SONNET_55_COST_DEFAULTS),
   backgroundCostRates: readCostRates("BACKGROUND", HAIKU_55_COST_DEFAULTS),
   gemmaCloudCostRates: readCostRates("GEMMA_CLOUD", GEMMA_CLOUD_COST_DEFAULTS),
+  deepseekCostRates: readCostRates("DEEPSEEK", DEEPSEEK_FLASH_OFFPEAK_DEFAULTS),
   localCostRates: ZERO_COST_RATES,
   backupPassword: process.env.BACKUP_PASSWORD?.trim() ?? "",
   cursorApiKey: process.env.CURSOR_API_KEY?.trim() ?? "",

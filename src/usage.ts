@@ -43,6 +43,44 @@ export function isHaiku55Model(model: string): boolean {
   return /haiku-5-5/i.test(model);
 }
 
+export function isDeepSeekModel(model: string): boolean {
+  return /deepseek/i.test(model) || model === config.deepseekModel;
+}
+
+/**
+ * DeepSeek off-peak (api-docs.deepseek.com/quick_start/pricing):
+ * peak is 01:00–04:00 and 06:00–10:00 UTC, Monday–Friday.
+ * All other hours (including weekends) are off-peak (half price).
+ */
+export function isDeepSeekOffPeak(now = new Date()): boolean {
+  const day = now.getUTCDay();
+  if (day === 0 || day === 6) {
+    return true;
+  }
+  const minutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const morningPeak = minutes >= 60 && minutes < 4 * 60;
+  const middayPeak = minutes >= 6 * 60 && minutes < 10 * 60;
+  return !morningPeak && !middayPeak;
+}
+
+/** Milliseconds until the next DeepSeek off-peak instant, or 0 if already off-peak. */
+export function msUntilDeepSeekOffPeak(now = new Date()): number {
+  if (isDeepSeekOffPeak(now)) {
+    return 0;
+  }
+  const endHour = now.getUTCHours() < 4 ? 4 : 10;
+  const end = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    endHour,
+    0,
+    0,
+    0,
+  );
+  return Math.max(0, end - now.getTime());
+}
+
 export function promptLengthTokens(usage: TokenUsage): number {
   const cacheWrite = usage.cacheWriteTokens ?? 0;
   const cacheRead = usage.cacheReadTokens ?? 0;
@@ -65,6 +103,7 @@ function with1hWriteRate(rates: ModelCostRates): ModelCostRates {
 export function ratesForModel(
   model: string,
   promptTokens: number,
+  now = new Date(),
 ): ModelCostRates {
   if (isHaiku55Model(model) || model === config.backgroundModel) {
     const base = with1hWriteRate(config.backgroundCostRates);
@@ -81,6 +120,19 @@ export function ratesForModel(
   }
   if (/gemma/i.test(model) || model === config.gemmaCloudModel) {
     return with1hWriteRate(config.gemmaCloudCostRates);
+  }
+  if (isDeepSeekModel(model)) {
+    const base = with1hWriteRate(config.deepseekCostRates);
+    if (isDeepSeekOffPeak(now)) {
+      return base;
+    }
+    return {
+      inputCostPerMillion: base.inputCostPerMillion * 2,
+      outputCostPerMillion: base.outputCostPerMillion * 2,
+      cacheCreationCostPerMillion: base.cacheCreationCostPerMillion * 2,
+      cacheCreation1hCostPerMillion: base.cacheCreation1hCostPerMillion * 2,
+      cacheReadCostPerMillion: base.cacheReadCostPerMillion * 2,
+    };
   }
   return with1hWriteRate(config.chatCostRates);
 }

@@ -671,7 +671,7 @@ export function registerFollowupScan(
         await afterScan(api);
       }
     },
-    { weekdays: [1, 2, 3, 4, 5], kind: "daily" },
+    { weekdays: [1, 2, 3, 4, 5], kind: "daily", preferDeepSeekOffPeak: true },
   );
   console.log(
     `Follow-up scan scheduled weekdays at ${config.followupScanTime} ${TIME_ZONE}.`,

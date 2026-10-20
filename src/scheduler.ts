@@ -1,5 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { config } from "./config.js";
 import { getJobRun, isMorningBriefEnabled, listJobRuns, recordJobRun } from "./db.js";
+import { msUntilDeepSeekOffPeak } from "./usage.js";
 import {
   HEARTBEAT_FILE,
   heartbeatPath,
@@ -63,6 +65,8 @@ export interface ClockJobOptions {
   enabled?: () => boolean;
   jobTimeoutMs?: number;
   now?: () => Date;
+  /** When DEEPSEEK_API_KEY is set, wait until DeepSeek off-peak (up to 4h). */
+  preferDeepSeekOffPeak?: boolean;
 }
 
 export async function withTimeout<T>(
@@ -417,6 +421,17 @@ export function everyClock(
       console.log(`Job ${name}: skip=disabled`);
       armNext();
       return;
+    }
+    if (options.preferDeepSeekOffPeak && config.deepseekApiKey) {
+      const deferMs = msUntilDeepSeekOffPeak(now);
+      if (deferMs > 0 && deferMs <= CATCH_UP_MS) {
+        console.log(`Job ${name}: defer_ms=${deferMs} reason=deepseek_offpeak`);
+        clearTimer();
+        timer = setTimeout(() => {
+          void runTick(reason);
+        }, deferMs);
+        return;
+      }
     }
     if (alreadyRanCatchUpSlot(name, hour, minute, now, options.weekdays, kind)) {
       console.log(`Job ${name}: skip=already`);

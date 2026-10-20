@@ -27,6 +27,8 @@ import {
 const MAX_TOKENS = 4096;
 const MAX_SERVER_CONTINUATIONS = 8;
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+/** Official OpenAI-compatible base (api-docs.deepseek.com). */
+const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 
 export interface ToolCall {
   id: string;
@@ -97,7 +99,13 @@ export type LlmStopReason =
   | "refusal"
   | "other";
 
-export type LlmBackend = "claude" | "haiku" | "cloud-gemma" | "local-gemma";
+export type LlmBackend =
+  | "claude"
+  | "haiku"
+  | "cloud-gemma"
+  | "local-gemma"
+  | "deepseek"
+  | "deepseek-reasoner";
 
 export interface CompleteParams {
   system: LlmSystemPrompt;
@@ -141,6 +149,13 @@ const openRouter = config.openRouterApiKey
         "HTTP-Referer": "http://localhost",
         "X-OpenRouter-Title": "Aadi",
       },
+    })
+  : undefined;
+
+const deepseek = config.deepseekApiKey
+  ? new OpenAI({
+      apiKey: config.deepseekApiKey,
+      baseURL: DEEPSEEK_BASE_URL,
     })
   : undefined;
 
@@ -715,6 +730,7 @@ async function completeWithOpenAiCompatible(
   params: CompleteParams,
   model: string,
   label: string,
+  options: { thinking?: boolean } = {},
 ): Promise<CompleteResult> {
   const webSearchRequested = params.tools.some(
     (tool) => tool.type === "web_search",
@@ -739,7 +755,15 @@ async function completeWithOpenAiCompatible(
       messages: toOpenRouterMessages(system, params.messages),
       ...(tools.length > 0 ? { tools } : {}),
       max_tokens: params.maxTokens ?? MAX_TOKENS,
-    },
+      ...(options.thinking
+        ? {
+            reasoning_effort: "high" as const,
+            thinking: { type: "enabled" },
+          }
+        : label.startsWith("deepseek")
+          ? { thinking: { type: "disabled" } }
+          : {}),
+    } as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
     params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
   );
   const choice = response.choices[0];
@@ -806,6 +830,25 @@ async function completeWithNamedBackend(
       "cloud-gemma",
     );
   }
+  if (backend === "deepseek" || backend === "deepseek-reasoner") {
+    if (!deepseek) {
+      throw new Error(
+        "deepseek requires DEEPSEEK_API_KEY in .env (add it locally; Aadi never writes .env).",
+      );
+    }
+    const model =
+      params.model ??
+      (backend === "deepseek-reasoner"
+        ? config.deepseekReasonerModel
+        : config.deepseekModel);
+    return completeWithOpenAiCompatible(
+      deepseek,
+      params,
+      model,
+      backend,
+      { thinking: backend === "deepseek-reasoner" },
+    );
+  }
   await assertLocalModelAllowed();
   return completeWithOpenAiCompatible(
     localLlm,
@@ -841,7 +884,15 @@ export async function complete(
 export async function completeBackground(
   params: Omit<CompleteParams, "model" | "backend">,
 ): Promise<CompleteResult> {
-  // Follow-up and bill classification stay on Claude Haiku. Not in the /model panel.
+  if (config.deepseekApiKey) {
+    return complete({
+      ...params,
+      backend: "deepseek",
+      model: config.deepseekModel,
+      task: params.task ?? "classification",
+      effort: params.effort ?? "low",
+    });
+  }
   return complete({
     ...params,
     backend: "claude",

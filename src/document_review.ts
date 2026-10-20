@@ -1,4 +1,5 @@
 import { apiEffortForTask, getTaskBackend } from "./chat_backend.js";
+import { config } from "./config.js";
 import {
   CONTRACT_CLAUSES,
   chunkText,
@@ -39,13 +40,15 @@ async function completeJson(
   user: string,
 ): Promise<Record<string, unknown>> {
   const result = await complete({
-    backend: getTaskBackend("documents"),
+    backend: config.deepseekApiKey
+      ? "deepseek-reasoner"
+      : getTaskBackend("documents"),
     system: { cacheable: system },
     messages: [{ role: "user", content: user }],
     tools: [],
     maxTokens: 4096,
     task: "contract_review",
-    effort: apiEffortForTask("documents"),
+    effort: config.deepseekApiKey ? undefined : apiEffortForTask("documents"),
     cacheTtl: "5m",
   });
   const text = result.textParts.join("\n");

@@ -13,3 +13,4 @@ test-fixtures/
 .aadi-deploy-result.json
 .aadi-merge.json
 .aadi-pr.json
+.aider*

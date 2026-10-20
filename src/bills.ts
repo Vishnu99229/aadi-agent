@@ -259,7 +259,7 @@ export function registerBillScan(api: Api): IntervalJob {
     config.billScanHour,
     config.billScanMinute,
     () => runBillScan(api),
-    { kind: "daily" },
+    { kind: "daily", preferDeepSeekOffPeak: true },
   );
   console.log(`Bill scan scheduled daily at ${config.billScanTime} ${TIME_ZONE}.`);
   return task;

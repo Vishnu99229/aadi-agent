@@ -18,6 +18,8 @@ const {
   costWindows,
   estimateLlmCostUsd,
   formatCostReport,
+  isDeepSeekOffPeak,
+  msUntilDeepSeekOffPeak,
   ratesForModel,
 } = await import("../src/usage.ts");
 const { applyTaskBackend, getTaskBackend } = await import(
@@ -41,6 +43,26 @@ const haikuLong = ratesForModel("claude-haiku-5-5", 100_001);
 assert(haikuLong.inputCostPerMillion === 0.5, "haiku >100K input $0.50");
 assert(haikuLong.outputCostPerMillion === 2.5, "haiku >100K output $2.50");
 assert(haikuLong.cacheReadCostPerMillion === 0.05, "haiku >100K cache read");
+
+const peakTue = new Date("2026-10-20T03:00:00.000Z");
+const offPeakTue = new Date("2026-10-20T05:00:00.000Z");
+const saturday = new Date("2026-10-17T03:00:00.000Z");
+assert(!isDeepSeekOffPeak(peakTue), "weekday 03:00 UTC is DeepSeek peak");
+assert(isDeepSeekOffPeak(offPeakTue), "weekday 05:00 UTC is DeepSeek off-peak");
+assert(isDeepSeekOffPeak(saturday), "weekend is DeepSeek off-peak");
+assert(msUntilDeepSeekOffPeak(offPeakTue) === 0, "off-peak delay is 0");
+assert(
+  msUntilDeepSeekOffPeak(peakTue) === 60 * 60 * 1000,
+  "peak 03:00 UTC waits until 04:00 UTC",
+);
+
+const deepseekOff = ratesForModel("deepseek-flash", 1_000, offPeakTue);
+assert(deepseekOff.inputCostPerMillion === 0.15, "deepseek off-peak input");
+assert(deepseekOff.outputCostPerMillion === 0.6, "deepseek off-peak output");
+assert(deepseekOff.cacheReadCostPerMillion === 0.003, "deepseek cache hit");
+const deepseekPeak = ratesForModel("deepseek-flash", 1_000, peakTue);
+assert(deepseekPeak.inputCostPerMillion === 0.3, "deepseek peak input is 2x");
+assert(deepseekPeak.outputCostPerMillion === 1.2, "deepseek peak output is 2x");
 
 const sonnet = ratesForModel("claude-sonnet-5-5", 8_000);
 assert(sonnet.inputCostPerMillion === 2, "sonnet input");

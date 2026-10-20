@@ -4,6 +4,7 @@ const SECRET_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
   { name: "github", pattern: /ghp_[A-Za-z0-9]+/g },
   { name: "github_pat", pattern: /github_pat_[A-Za-z0-9_]+/g },
   { name: "anthropic", pattern: /sk-ant-[A-Za-z0-9_-]+/g },
+  { name: "deepseek", pattern: /sk-[a-f0-9]{32}/gi },
 ];
 
 export const REQUIRED_ENV_VARS = [

@@ -226,7 +226,11 @@ export function formatModelSetupText(options?: {
     const suffix = updated.has(task) ? " ✅ updated" : "";
     lines.push(`${formatTaskSetupLine(task)}${suffix}`);
   }
-  lines.push("Background scans — Haiku 5.5 (automatic)");
+  lines.push(
+    config.deepseekApiKey
+      ? "Background scans — DeepSeek Flash (automatic)"
+      : "Background scans — Haiku 5.5 (automatic)",
+  );
   if (options?.gemmaSkippedDrafting) {
     lines.push("Gemma never applies to email drafting.");
   }

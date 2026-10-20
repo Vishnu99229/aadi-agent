@@ -181,6 +181,12 @@ assert(
   !redactSecrets("sk-ant-example-value").includes("sk-ant-example"),
   "redacted text drops secret payload",
 );
+assert(
+  redactSecrets("key=sk-0123456789abcdef0123456789abcdef").includes(
+    "[redacted]",
+  ),
+  "deepseek-style keys are redacted",
+);
 
 const root = process.cwd();
 const botSrc = await readFile(join(root, "src/bot.ts"), "utf8");
