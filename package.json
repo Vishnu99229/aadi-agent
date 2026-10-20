@@ -10,6 +10,7 @@
     "phone:resume": "./scripts/phone-resume.sh",
     "phone:wifi": "./scripts/phone-wifi-adb.sh",
     "phone:screen": "./scripts/phone-screen.sh",
+    "phone:install-boot": "./scripts/phone-install-boot.sh",
     "google:auth": "tsx src/google/authorize.ts",
     "google:auth:work": "tsx src/google/authorize.ts --work",
     "google:test": "tsx src/google/test.ts",

@@ -47,3 +47,23 @@ npm run phone:screen   # unplug; mirrors over Tailscale
 ```
 
 After a reboot, network ADB is off: plug in USB and run `phone:wifi` again. If the phone is unreachable, the Mac is probably on Epicode's tailnet — switch Tailscale to personal.
+
+## Phone boot script
+
+`scripts/phone-boot.sh` is the source of truth for `~/.termux/boot/start-aadi.sh`. Termux:Boot runs it on power-up: wake lock, wait ~20s, broadcast Tailscale `CONNECT_VPN` to `com.tailscale.ipn/.IPNReceiver` with a `MainActivity` fallback, a 10-minute reconnect loop, `sshd`, then the Aadi tmux loop (`cd ~/aadi-agent && npm start`). `deploy.sh` and `/build` never install or overwrite this file.
+
+On a fresh phone, after Termux SSH works:
+
+```sh
+npm run phone:install-boot
+```
+
+That shows a diff, backs up the phone copy, then installs the repo script. It only runs when you invoke it.
+
+Phone settings it relies on:
+
+- Termux, Termux:Boot, and Tailscale from the same sources as now
+- Tailscale Always-on VPN **ON**, “Block connections without VPN” **OFF**
+- Battery Unrestricted + Autostart for Termux, Termux:Boot, and Tailscale
+- Wall charger
+- No screen lock
