@@ -131,6 +131,28 @@ async function testAccount(account: LoadedGoogleAccount): Promise<void> {
   console.log(`Calendar events today: ${eventCount}`);
   console.log(`Freebusy windows (next 24h): ${busyCount}`);
 
+  const sendAsEmail = profile.data.emailAddress;
+  if (!sendAsEmail) {
+    throw new Error(`${account.label}: Gmail profile had no email address.`);
+  }
+  try {
+    const sendAs = await gmail.users.settings.sendAs.get({
+      userId: "me",
+      sendAsEmail,
+    });
+    console.log(
+      `Send-as: ${sendAs.data.sendAsEmail ?? sendAsEmail} default=${sendAs.data.isDefault === true ? "yes" : "no"}`,
+    );
+  } catch (error) {
+    const status = googleStatus(error);
+    if (status === 403) {
+      throw new Error(
+        `${account.label}: settings.sendAs.get failed (403). gmail.readonly is required (gmail.compose is not enough). Re-run npm run google:auth${account.id === "work" ? ":work" : ""}.`,
+      );
+    }
+    throw error;
+  }
+
   if (account.id === "work") {
     await checkWorkCalendarWrite(calendar);
     console.log("Work calendar write: insert+delete ok");

@@ -17,6 +17,7 @@ const {
   formatFollowupPanelText,
   formatToLine,
   formatWaitingPhrase,
+  isSelfSentRecipient,
   neededLine,
   parseAddressList,
 } = await import("../src/followup_logic.ts");
@@ -45,6 +46,20 @@ assert(
   formatToLine("Vishnu <vishnu.rajan294@gmail.com>", []) ===
     "To: (sent to yourself)",
   "self-address label",
+);
+assert(
+  isSelfSentRecipient("vishnu.rajan294@gmail.com"),
+  "personal Gmail is a self-sent follow-up",
+);
+assert(
+  isSelfSentRecipient(
+    "Vishnu <vishnu.rajan@epicode.in>, Vishnu <vishnu.rajan294@gmail.com>",
+  ),
+  "work-to-personal test mail is a self-sent follow-up",
+);
+assert(
+  !isSelfSentRecipient("Ada <ada@acme.com>"),
+  "external recipient is not self-sent",
 );
 
 assert(cleanSubjectTitle("Re: Dialler integration proposal") === "Dialler integration proposal", "strip Re");

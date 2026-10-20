@@ -103,10 +103,18 @@ if [ "$1" = "devices" ]; then
   exit 0
 fi
 if [ "$1" = "-s" ] && [ "$3" = "shell" ]; then
-  echo "    inet 192.168.1.7/24 brd 192.168.1.255 scope global dynamic wlan0"
+  echo "    inet 192.168.1.42/24 brd 192.168.1.255 scope global dynamic wlan0"
   exit 0
 fi
-if [ "$1" = "connect" ] || [ "$1" = "disconnect" ]; then
+if [ "$1" = "connect" ]; then
+  if [ "${PHONE_STUB_CONNECT:-ok}" = "fail" ]; then
+    echo "failed to connect to $2: No route to host"
+    exit 0
+  fi
+  echo "connected to $2"
+  exit 0
+fi
+if [ "$1" = "disconnect" ]; then
   echo "adb-stub $*"
   exit 0
 fi
@@ -142,6 +150,25 @@ set -e
 [ "$status" -ne 0 ] || fail "no USB should exit 1"
 assert_contains "$out" "Plug the phone in via USB and try again."
 assert_contains "$out" "Check failed: adb devices -l (usb:)"
+
+set +e
+out="$(PHONE_STUB_TS=up PHONE_STUB_OPEN_PORTS="5555" PHONE_STUB_USB="one" PHONE_STUB_CONNECT="fail" PHONE_WIFI_WAIT_SECS=1 "$WIFI" 2>&1)"
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail "failed adb connect should exit 1"$'\n'"$out"
+assert_contains "$out" "Could not enable network ADB."
+assert_contains "$out" "Tailscale 100.79.235.3:5555"
+assert_contains "$out" "LAN 192.168.1.42:5555"
+assert_contains "$out" "No route to host"
+assert_not_contains "$out" "Network ADB is on"
+
+set +e
+out="$(PHONE_STUB_TS=up PHONE_STUB_OPEN_PORTS="5555" PHONE_STUB_USB="one" PHONE_STUB_CONNECT="ok" PHONE_WIFI_WAIT_SECS=1 "$WIFI" 2>&1)"
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "successful adb connect should exit 0"$'\n'"$out"
+assert_contains "$out" "Network ADB is on via Tailscale 100.79.235.3:5555"
+assert_not_contains "$out" "192.168.1.7"
 
 # Port 8022 (sshd) closed must not look like the wrong Tailscale account when
 # the peer is up and ADB 5555 is open.

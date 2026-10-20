@@ -84,6 +84,14 @@ export function companyFromEmail(
   return titleCaseDomainLabel(domain) || undefined;
 }
 
+export function isSelfSentRecipient(recipientHeader: string): boolean {
+  const mailboxes = parseAddressList(recipientHeader);
+  if (mailboxes.length === 0) {
+    return false;
+  }
+  return mailboxes.every((item) => isSelfEmail(item.email));
+}
+
 export function formatToLine(
   recipientHeader: string,
   accounts: AccountRecord[],
@@ -93,7 +101,7 @@ export function formatToLine(
     const fallback = recipientHeader.trim();
     return fallback ? `To: ${fallback}` : "To: unknown";
   }
-  if (mailboxes.every((item) => isSelfEmail(item.email))) {
+  if (isSelfSentRecipient(recipientHeader)) {
     return "To: (sent to yourself)";
   }
   const parts = mailboxes

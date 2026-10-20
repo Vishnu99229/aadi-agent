@@ -139,3 +139,23 @@ adb_serial_state() {
   serial="$1"
   adb devices | awk -v s="$serial" 'NR > 1 && $1 == s { print $2; found=1 } END { if (!found) print "missing" }'
 }
+
+adb_connect_ok() {
+  # adb connect often exits 0 even when it failed ("No route to host").
+  out="$(adb connect "$1" 2>&1 || true)"
+  printf '%s\n' "$out"
+  case "$out" in
+    *"failed to connect"*) return 1 ;;
+    *"already connected to "*|*"connected to "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+lan_ip_from_serial() {
+  serial="$1"
+  if [ -z "$serial" ]; then
+    return 1
+  fi
+  adb -s "$serial" shell ip -f inet addr show wlan0 2>/dev/null \
+    | awk '/inet / { split($2, a, "/"); print a[1]; exit }'
+}

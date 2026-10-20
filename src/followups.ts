@@ -24,10 +24,12 @@ import {
   formatWaitingPhrase,
   formatToLine,
   followupDraftBody,
+  isSelfSentRecipient,
   neededLine,
   waitingDays,
   type FollowupDisplay,
 } from "./followup_logic.js";
+import { isSelfEmail } from "./mom_logic.js";
 import {
   getGoogleAccount,
   loadGoogleAccounts,
@@ -237,7 +239,10 @@ function isHardExcluded(candidate: SentCandidate, ownAddress: string): boolean {
   const recipientAddresses = addresses(candidate.recipient);
   return (
     recipientAddresses.length === 0 ||
-    recipientAddresses.every((address) => address === ownAddress) ||
+    isSelfSentRecipient(candidate.recipient) ||
+    recipientAddresses.every(
+      (address) => address === ownAddress || isSelfEmail(address),
+    ) ||
     recipientAddresses.every(isNoReplyAddress)
   );
 }
