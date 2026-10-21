@@ -81,5 +81,5 @@ fi
 snapshot_phone_db
 
 rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude backups --exclude 'google-token*.json' --exclude .git --exclude test-fixtures --exclude .env.bak --exclude .env.phone --exclude .aadi-heartbeat --exclude .aadi-deploy-result.json -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
-ssh -p "$PHONE_PORT" "$PHONE" 'cd ~/aadi-agent && npm install --no-audit --no-fund && pkill -f "[t]sx src/index.ts" || true'
+ssh -p "$PHONE_PORT" "$PHONE" 'cd ~/aadi-agent && npm install --no-audit --no-fund; pkill -f "[t]sx" || true; pkill -f "[n]ode.*src/index.ts" || true'
 echo "Deployed. Aadi restarts on the phone in about 5 seconds."

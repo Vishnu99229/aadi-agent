@@ -65,7 +65,7 @@ export interface ClockJobOptions {
   enabled?: () => boolean;
   jobTimeoutMs?: number;
   now?: () => Date;
-  /** When DEEPSEEK_API_KEY is set, wait until DeepSeek off-peak (up to 4h). */
+  /** When DEEPSEEK_API_KEY is set, skip the tick during DeepSeek peak. */
   preferDeepSeekOffPeak?: boolean;
 }
 
@@ -425,11 +425,9 @@ export function everyClock(
     if (options.preferDeepSeekOffPeak && config.deepseekApiKey) {
       const deferMs = msUntilDeepSeekOffPeak(now);
       if (deferMs > 0 && deferMs <= CATCH_UP_MS) {
-        console.log(`Job ${name}: defer_ms=${deferMs} reason=deepseek_offpeak`);
-        clearTimer();
-        timer = setTimeout(() => {
-          void runTick(reason);
-        }, deferMs);
+        recordJobRun(name, "deferred");
+        console.log(`Job ${name}: skip=peak`);
+        armNext();
         return;
       }
     }
@@ -443,7 +441,8 @@ export function everyClock(
     await runTrackedJob(name, () =>
       withTimeout(fn(), timeoutMs, `job-timeout:${name}`),
     );
-    if (getJobRun(name)?.last_status === "ok") {
+    const lastStatus = getJobRun(name)?.last_status;
+    if (lastStatus === "ok") {
       stats.succeeded += 1;
       if (process.env.AADI_DB_PATH !== ":memory:") {
         writeHeartbeat();
@@ -451,17 +450,18 @@ export function everyClock(
       const lag = Date.now() - startedAt;
       const catchUp = reason === "catch_up" ? " catch_up=1" : "";
       console.log(`Job ${name}: status=ok lag_ms=${lag}${catchUp}`);
-    } else if (getJobRun(name)?.last_status === "overlap") {
+    } else if (lastStatus === "overlap") {
       stats.overlaps += 1;
+    } else if (lastStatus === "deferred") {
+      // Peak skip is not a failure; catch-up can retry once off-peak.
     } else {
       stats.failures += 1;
     }
     armNext();
-    flushDueClockJobs();
   };
 
   const catchUpIfDue = (): boolean => {
-    if (stopped) {
+    if (stopped || clockInFlight.has(name)) {
       return false;
     }
     const now = nowFn();

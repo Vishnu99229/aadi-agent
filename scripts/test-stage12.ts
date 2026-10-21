@@ -991,6 +991,14 @@ assert(overlapJob.stats.overlaps >= 1, "overlap is skipped");
 assert(overlapCalls === 1, "in-flight job is not started twice");
 assert(getJobRun("overlap-job")?.last_status === "overlap", "overlap status is recorded");
 
+recordJobRun("defer-job", "ok", new Date("2026-10-18T03:30:00.000Z"));
+recordJobRun("defer-job", "deferred", new Date("2026-10-18T04:00:00.000Z"));
+assert(getJobRun("defer-job")?.last_status === "deferred", "deferred status is recorded");
+assert(
+  getJobRun("defer-job")?.last_success_at === "2026-10-18T03:30:00.000Z",
+  "deferred does not clear last success",
+);
+
 const justAfterBrief = new Date("2026-10-17T02:40:00.000Z");
 assert(
   shouldCatchUpClockJob(8, 0, justAfterBrief),

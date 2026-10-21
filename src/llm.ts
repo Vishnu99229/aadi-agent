@@ -156,6 +156,7 @@ const deepseek = config.deepseekApiKey
   ? new OpenAI({
       apiKey: config.deepseekApiKey,
       baseURL: DEEPSEEK_BASE_URL,
+      timeout: 45_000,
     })
   : undefined;
 

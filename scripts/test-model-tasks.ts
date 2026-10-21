@@ -50,15 +50,15 @@ assert(getTaskBackend("drafting") === "haiku", "default drafting is Haiku");
 resetModelSettings();
 setSetting("llm_backend", "cloud-gemma");
 const migrated = getTaskBackends();
-assert(migrated.chat === "cloud-gemma", "legacy chat migrates");
-assert(migrated.brief === "cloud-gemma", "legacy brief migrates");
-assert(migrated.meetings === "cloud-gemma", "legacy meetings migrate");
+assert(migrated.chat === "haiku", "generation bump wipes legacy Gemma chat");
+assert(migrated.brief === "haiku", "generation bump wipes legacy Gemma brief");
+assert(migrated.meetings === "haiku", "generation bump wipes legacy Gemma meetings");
 assert(migrated.documents === "haiku", "documents use new Haiku default");
 assert(migrated.drafting === "haiku", "drafting uses new Haiku default");
 
 const one = applyTaskBackend("chat", "claude");
 assert(one.switched && getTaskBackend("chat") === "claude", "manual Sonnet override");
-assert(getTaskBackend("brief") === "cloud-gemma", "other tasks unchanged");
+assert(getTaskBackend("brief") === "haiku", "other tasks unchanged");
 
 const shortcut = applyAllTasks("claude");
 assert(shortcut.switched, "claude shortcut switches all");
@@ -85,16 +85,19 @@ resetModelSettings();
 setSetting(
   "llm_task_backends",
   JSON.stringify({
-    chat: "claude",
-    brief: "claude",
-    documents: "claude",
-    meetings: "claude",
-    drafting: "claude",
+    chat: "cloud-gemma",
+    brief: "cloud-gemma",
+    documents: "cloud-gemma",
+    meetings: "cloud-gemma",
+    drafting: "haiku",
   }),
 );
 const flipped = getTaskBackends();
-assert(flipped.chat === "haiku", "old Claude defaults flip to Haiku");
-assert(flipped.drafting === "haiku", "old drafting Claude flips to Haiku");
+assert(flipped.chat === "haiku", "stuck Gemma chat resets to Haiku");
+assert(flipped.brief === "haiku", "stuck Gemma brief resets to Haiku");
+assert(flipped.documents === "haiku", "stuck Gemma documents reset to Haiku");
+assert(flipped.meetings === "haiku", "stuck Gemma meetings reset to Haiku");
+assert(flipped.drafting === "haiku", "drafting stays Haiku");
 
 resetModelSettings();
 assert(getTaskEffort("chat") === "low", "default effort is low");
@@ -126,7 +129,10 @@ assert(allHaiku.switched, "set all haiku medium");
 assert(getTaskBackend("drafting") === "haiku", "drafting is haiku after set all");
 assert(getTaskEffort("documents") === "medium", "set all effort applies");
 assert(
-  formatModelSetupText().includes("Background scans — Haiku 5.5 (automatic)"),
+  formatModelSetupText().includes("Background scans — Haiku 5.5 (automatic)") ||
+    formatModelSetupText().includes(
+      "Background scans — DeepSeek Flash (automatic)",
+    ),
   "background scans line",
 );
 

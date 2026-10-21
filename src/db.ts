@@ -2560,7 +2560,7 @@ export interface JobRunRecord {
 
 export function recordJobRun(
   name: string,
-  status: "ok" | "error" | "overlap",
+  status: "ok" | "error" | "overlap" | "deferred",
   at = new Date(),
 ): void {
   const iso = at.toISOString();

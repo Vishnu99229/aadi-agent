@@ -66,7 +66,7 @@ export function modelDisplayName(backend: ChatBackend): string {
   return backend === "claude" ? "Claude Sonnet 5.5" : "Gemma 4 31B";
 }
 
-const DEFAULTS_GENERATION = "haiku-low-all";
+const DEFAULTS_GENERATION = "deepseek-haiku-v2";
 const GENERATION_SETTING = "llm_task_defaults_generation";
 
 function defaultChoices(): TaskBackendMap {
@@ -108,13 +108,10 @@ function migrateIfNeeded(): TaskBackendMap {
   }
   const generation = getSetting(GENERATION_SETTING);
   if (generation !== DEFAULTS_GENERATION) {
-    // One-time: old implicit default was Claude. Flip remaining Claude
-    // tasks to Haiku. Keep explicit Gemma (or already-Haiku) choices.
-    for (const task of MODEL_TASKS) {
-      if (choices[task] === "claude") {
-        choices[task] = "haiku";
-      }
-    }
+    // One-time: wipe stuck Gemma (and any other saved backends) and restore
+    // Haiku defaults. Background scans / document review still pick DeepSeek
+    // in llm.ts when DEEPSEEK_API_KEY is set.
+    choices = defaultChoices();
     persist(choices);
     setSetting(GENERATION_SETTING, DEFAULTS_GENERATION);
     return choices;
