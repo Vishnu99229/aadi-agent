@@ -6,6 +6,7 @@ import {
   getTaskBackend,
   getTaskEffort,
   modelDisplayName,
+  supportsEffort,
   type ModelTask,
 } from "./chat_backend.js";
 import {
@@ -176,8 +177,10 @@ function menuKeyboard(): InlineKeyboard {
 
 function menuCaption(): string {
   const backend = getTaskBackend("chat");
-  if (backend === "cloud-gemma") {
-    return "Aadi — chat uses Gemma 4 31B (no effort setting).";
+  if (!supportsEffort(backend)) {
+    return backend === "cloud-gemma"
+      ? "Aadi — chat uses Gemma 4 31B (no effort setting)."
+      : `Aadi — chat uses ${modelDisplayName(backend)}.`;
   }
   return `Aadi — chat uses ${modelDisplayName(backend)} · ${getTaskEffort("chat")}.`;
 }

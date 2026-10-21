@@ -44,7 +44,11 @@ export function isHaiku55Model(model: string): boolean {
 }
 
 export function isDeepSeekModel(model: string): boolean {
-  return /deepseek/i.test(model) || model === config.deepseekModel;
+  return (
+    model === "deepseek" ||
+    /deepseek/i.test(model) ||
+    model === config.deepseekModel
+  );
 }
 
 /**

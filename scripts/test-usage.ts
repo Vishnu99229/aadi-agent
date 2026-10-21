@@ -63,6 +63,24 @@ assert(deepseekOff.cacheReadCostPerMillion === 0.003, "deepseek cache hit");
 const deepseekPeak = ratesForModel("deepseek-flash", 1_000, peakTue);
 assert(deepseekPeak.inputCostPerMillion === 0.3, "deepseek peak input is 2x");
 assert(deepseekPeak.outputCostPerMillion === 1.2, "deepseek peak output is 2x");
+const deepseekAlias = ratesForModel("deepseek", 1_000, offPeakTue);
+assert(
+  deepseekAlias.inputCostPerMillion === deepseekOff.inputCostPerMillion,
+  "deepseek alias uses Flash rates",
+);
+assert(
+  Math.abs(
+    estimateLlmCostUsd(
+      { inputTokens: 1_000_000, outputTokens: 0, inputIncludesCacheTokens: true },
+      "deepseek",
+    ) -
+      estimateLlmCostUsd(
+        { inputTokens: 1_000_000, outputTokens: 0, inputIncludesCacheTokens: true },
+        "deepseek-flash",
+      ),
+  ) < 1e-9,
+  "deepseek and deepseek-flash cost the same",
+);
 
 const sonnet = ratesForModel("claude-sonnet-5-5", 8_000);
 assert(sonnet.inputCostPerMillion === 2, "sonnet input");

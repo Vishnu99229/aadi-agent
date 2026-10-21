@@ -6,7 +6,7 @@ const TASK_SETTING = "llm_task_backends";
 const EFFORT_SETTING = "llm_task_efforts";
 const LEGACY_SETTING = "llm_backend";
 
-export type ChatBackend = LlmProvider | "haiku";
+export type ChatBackend = LlmProvider | "haiku" | "deepseek";
 export type ModelTask =
   | "chat"
   | "brief"
@@ -44,7 +44,12 @@ export type TaskBackendMap = Record<ModelTask, ChatBackend>;
 export type TaskEffortMap = Record<ModelTask, EffortLevel>;
 
 export function isChatBackend(value: string): value is ChatBackend {
-  return value === "claude" || value === "haiku" || value === "cloud-gemma";
+  return (
+    value === "claude" ||
+    value === "haiku" ||
+    value === "cloud-gemma" ||
+    value === "deepseek"
+  );
 }
 
 export function isModelTask(value: string): value is ModelTask {
@@ -63,7 +68,13 @@ export function modelDisplayName(backend: ChatBackend): string {
   if (backend === "haiku") {
     return "Haiku 5.5";
   }
-  return backend === "claude" ? "Claude Sonnet 5.5" : "Gemma 4 31B";
+  if (backend === "claude") {
+    return "Claude Sonnet 5.5";
+  }
+  if (backend === "deepseek") {
+    return "DeepSeek Flash";
+  }
+  return "Gemma 4 31B";
 }
 
 const DEFAULTS_GENERATION = "deepseek-haiku-v2";
@@ -208,7 +219,8 @@ export function apiEffortForTask(task: ModelTask): EffortLevel | undefined {
 export function formatTaskSetupLine(task: ModelTask): string {
   const backend = getTaskBackend(task);
   if (!supportsEffort(backend)) {
-    return `${TASK_LABELS[task]} — Gemma 4 31B (no effort setting)`;
+    const extra = backend === "cloud-gemma" ? " (no effort setting)" : "";
+    return `${TASK_LABELS[task]} — ${modelDisplayName(backend)}${extra}`;
   }
   return `${TASK_LABELS[task]} — ${modelDisplayName(backend)} · ${getTaskEffort(task)}`;
 }
@@ -234,9 +246,12 @@ export function formatModelSetupText(options?: {
   return lines.join("\n");
 }
 
-function gemmaNeedsKey(backend: ChatBackend): string | undefined {
+function backendNeedsKey(backend: ChatBackend): string | undefined {
   if (backend === "cloud-gemma" && !config.openRouterApiKey) {
     return "cloud Gemma needs OPENROUTER_API_KEY in .env.";
+  }
+  if (backend === "deepseek" && !config.deepseekApiKey) {
+    return "DeepSeek Flash needs DEEPSEEK_API_KEY in .env.";
   }
   return undefined;
 }
@@ -251,7 +266,7 @@ export function applyTaskBackend(
   task: ModelTask,
   backend: ChatBackend,
 ): { switched: boolean; message: string } {
-  const blocked = gemmaNeedsKey(backend);
+  const blocked = backendNeedsKey(backend);
   if (blocked) {
     return { switched: false, message: blocked };
   }
@@ -296,7 +311,7 @@ export function applyAllChoice(
   updatedTasks: ModelTask[];
   gemmaSkippedDrafting: boolean;
 } {
-  const blocked = gemmaNeedsKey(backend);
+  const blocked = backendNeedsKey(backend);
   if (blocked) {
     return {
       switched: false,
@@ -334,7 +349,7 @@ export function applyAllTasks(backend: ChatBackend): {
   switched: boolean;
   message: string;
 } {
-  const blocked = gemmaNeedsKey(backend);
+  const blocked = backendNeedsKey(backend);
   if (blocked) {
     return { switched: false, message: blocked };
   }
@@ -350,7 +365,9 @@ export function applyAllTasks(backend: ChatBackend): {
         ? "All tasks now use Claude (Sonnet 5.5)."
         : backend === "haiku"
           ? "All tasks now use Fast (Haiku 5.5)."
-          : "All tasks now use cloud Gemma. Drafts still need your Send tap.",
+          : backend === "deepseek"
+            ? "All tasks now use DeepSeek Flash."
+            : "All tasks now use cloud Gemma. Drafts still need your Send tap.",
   };
 }
 
@@ -359,7 +376,7 @@ export function applyAllTasksExceptDrafting(backend: ChatBackend): {
   switched: boolean;
   message: string;
 } {
-  const blocked = gemmaNeedsKey(backend);
+  const blocked = backendNeedsKey(backend);
   if (blocked) {
     return { switched: false, message: blocked };
   }

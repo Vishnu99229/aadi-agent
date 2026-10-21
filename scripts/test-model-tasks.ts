@@ -24,7 +24,9 @@ const {
   getTaskBackend,
   getTaskBackends,
   getTaskEffort,
+  isChatBackend,
   modelDisplayName,
+  supportsEffort,
 } = await import("../src/chat_backend.ts");
 
 function assert(condition: boolean, message: string): void {
@@ -105,6 +107,9 @@ assert(getTaskEffort("drafting") === "low", "drafting effort defaults low");
 assert(modelDisplayName("haiku") === "Haiku 5.5", "haiku display name");
 assert(modelDisplayName("claude") === "Claude Sonnet 5.5", "sonnet display name");
 assert(modelDisplayName("cloud-gemma") === "Gemma 4 31B", "gemma display name");
+assert(modelDisplayName("deepseek") === "DeepSeek Flash", "deepseek display name");
+assert(isChatBackend("deepseek"), "deepseek is a chat backend");
+assert(!supportsEffort("deepseek"), "deepseek has no Anthropic effort");
 
 const saved = applyTaskChoice("chat", "haiku", "medium");
 assert(saved.switched, "chat choice saves");

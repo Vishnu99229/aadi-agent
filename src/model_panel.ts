@@ -34,12 +34,14 @@ const TASK_FROM_CODE: Record<string, ModelTask> = {
 const BACKEND_CODE: Record<ChatBackend, string> = {
   haiku: "h",
   claude: "c",
+  deepseek: "d",
   "cloud-gemma": "g",
 };
 
 const BACKEND_FROM_CODE: Record<string, ChatBackend> = {
   h: "haiku",
   c: "claude",
+  d: "deepseek",
   g: "cloud-gemma",
 };
 
@@ -55,7 +57,7 @@ const EFFORT_FROM_CODE: Record<string, EffortLevel> = {
   h: "high",
 };
 
-const MODEL_ORDER: ChatBackend[] = ["haiku", "claude", "cloud-gemma"];
+const MODEL_ORDER: ChatBackend[] = ["haiku", "claude", "deepseek", "cloud-gemma"];
 const EFFORT_ORDER: EffortLevel[] = ["low", "medium", "high"];
 
 function emptyKeyboard(): InlineKeyboard {
@@ -147,7 +149,9 @@ function taskPickerText(task: ModelTask): string {
 function formatTaskCurrent(task: ModelTask): string {
   const backend = getTaskBackend(task);
   if (!supportsEffort(backend)) {
-    return "Gemma 4 31B (no effort setting)";
+    return backend === "cloud-gemma"
+      ? "Gemma 4 31B (no effort setting)"
+      : modelDisplayName(backend);
   }
   return `${modelDisplayName(backend)} · ${getTaskEffort(task)}`;
 }
@@ -204,7 +208,7 @@ export async function handleModelCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  const backendMatch = /^md:b:(\w+):([chg])$/.exec(data);
+  const backendMatch = /^md:b:(\w+):([chgd])$/.exec(data);
   if (backendMatch) {
     const task = TASK_FROM_CODE[backendMatch[1] ?? ""];
     const backend = BACKEND_FROM_CODE[backendMatch[2] ?? ""];
@@ -257,7 +261,7 @@ export async function handleModelCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  const allBackendMatch = /^md:ab:([chg])$/.exec(data);
+  const allBackendMatch = /^md:ab:([chgd])$/.exec(data);
   if (allBackendMatch) {
     const backend = BACKEND_FROM_CODE[allBackendMatch[1] ?? ""];
     if (!backend) {
