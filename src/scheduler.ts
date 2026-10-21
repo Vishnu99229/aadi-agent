@@ -46,6 +46,26 @@ export const HEALTH_JOBS = [
   "weekly-backup",
 ] as const;
 
+/**
+ * Expected, recoverable job failure (e.g. an LLM returned unusable output).
+ * Recorded as soft_error: logged as a warning, not counted as success, so
+ * catch-up still retries the slot.
+ */
+export class SoftJobError extends Error {
+  override name = "SoftJobError";
+}
+
+function recordJobFailure(name: string, error: unknown): void {
+  if (error instanceof SoftJobError) {
+    recordJobRun(name, "soft_error");
+    console.warn(`Job ${name}: status=soft_error (${error.name}: ${error.message})`);
+    return;
+  }
+  recordJobRun(name, "error");
+  const errorType = error instanceof Error ? error.name : "UnknownError";
+  console.error(`Job ${name} failed (${errorType}).`);
+}
+
 export type ClockJobKind = "daily" | "weekly";
 
 export interface IntervalJob {
@@ -328,9 +348,7 @@ export function everyMs(
       );
     } catch (error) {
       stats.failures += 1;
-      recordJobRun(name, "error");
-      const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.error(`Job ${name} failed (${errorType}).`);
+      recordJobFailure(name, error);
     } finally {
       running = false;
     }
@@ -364,9 +382,7 @@ export async function runTrackedJob(
     await fn();
     recordJobRun(name, "ok");
   } catch (error) {
-    recordJobRun(name, "error");
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Job ${name} failed (${errorType}).`);
+    recordJobFailure(name, error);
   } finally {
     clockInFlight.delete(name);
   }
