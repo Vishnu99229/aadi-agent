@@ -16,7 +16,13 @@ import {
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
 import { ownerOnly } from "./security/owner_lock.js";
-import { clearMessages, getMeetingBrief, getSetting, setSetting } from "./db.js";
+import {
+  clearMessages,
+  deleteMemory,
+  getMeetingBrief,
+  getSetting,
+  setSetting,
+} from "./db.js";
 import { formatCostReport } from "./usage.js";
 import { handler as listBills } from "./tools/list_bills.js";
 import { handler as listTasks } from "./tools/list_tasks.js";
@@ -81,6 +87,7 @@ import {
   handleMemoryConfirmCallback,
   handleMemoryForgetCallback,
   handleMemoryReminderCallback,
+  matchPendingForgetBatch,
   sendMemoryList,
 } from "./memory.js";
 import {
@@ -581,6 +588,26 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   }
 
   if (await tryHandleMeetingChat(ctx, userText)) {
+    return;
+  }
+  // If the last thing Aadi showed was a forget-memory list and Vishnu
+  // replied with an unambiguous batch answer like "both" or "1 and 2",
+  // delete those memories directly. Prevents the agent loop from
+  // mis-reading the reply as a reference to an older email thread.
+  const pendingForget = matchPendingForgetBatch(userText);
+  if (pendingForget) {
+    const removed: number[] = [];
+    for (const memoryId of pendingForget) {
+      if (deleteMemory(memoryId)) {
+        removed.push(memoryId);
+      }
+    }
+    if (removed.length === 0) {
+      await ctx.reply("Those memories are already gone.");
+    } else {
+      const list = removed.map((id) => `#${id}`).join(" and ");
+      await ctx.reply(`Forgotten ${list}.`);
+    }
     return;
   }
   if (await handleExplicitRemember(ctx, userText)) {

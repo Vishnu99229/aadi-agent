@@ -40,7 +40,12 @@ const {
   searchMemories,
   updateMemory,
 } = await import("../src/db.ts");
-const { saveExplicitMemory } = await import("../src/memory.ts");
+const {
+  clearPendingForgetBatch,
+  matchPendingForgetBatch,
+  rememberPendingForgetBatch,
+  saveExplicitMemory,
+} = await import("../src/memory.ts");
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -186,11 +191,56 @@ function testForgetAllCount(): void {
   assert(countMemories() === before, "count restored");
 }
 
+function testPendingForgetBatch(): void {
+  // Nothing pending → always undefined.
+  clearPendingForgetBatch();
+  assert(matchPendingForgetBatch("both") === undefined, "no batch when nothing pending");
+
+  // "both" / "all of them" consume the pending list.
+  rememberPendingForgetBatch([101, 202]);
+  const both = matchPendingForgetBatch("both");
+  assert(JSON.stringify(both) === JSON.stringify([101, 202]), "'both' returns pending ids");
+  assert(matchPendingForgetBatch("both") === undefined, "pending is consumed once");
+
+  rememberPendingForgetBatch([5, 7, 9]);
+  const all = matchPendingForgetBatch("all of them.");
+  assert(JSON.stringify(all) === JSON.stringify([5, 7, 9]), "'all of them' returns everything");
+
+  // Numeric tokens must match pending IDs (not positional). Mismatched
+  // numbers must NOT trigger a batch delete.
+  rememberPendingForgetBatch([5, 7]);
+  assert(matchPendingForgetBatch("1 and 2") === undefined, "positional numbers rejected");
+  rememberPendingForgetBatch([5, 7]);
+  const picked = matchPendingForgetBatch("5 and 7");
+  assert(JSON.stringify(picked) === JSON.stringify([5, 7]), "matching ids via 'X and Y'");
+
+  rememberPendingForgetBatch([12, 13]);
+  assert(
+    JSON.stringify(matchPendingForgetBatch("#12, #13")) === JSON.stringify([12, 13]),
+    "'#12, #13' returns both ids",
+  );
+
+  // Non-matching text leaves pending untouched.
+  rememberPendingForgetBatch([3, 4]);
+  assert(matchPendingForgetBatch("remind me later") === undefined, "unrelated text ignored");
+  assert(
+    JSON.stringify(matchPendingForgetBatch("both")) === JSON.stringify([3, 4]),
+    "pending still live after unrelated text",
+  );
+
+  // Single-id lists aren't registered (there's no batch to disambiguate).
+  rememberPendingForgetBatch([99]);
+  assert(matchPendingForgetBatch("both") === undefined, "single id doesn't arm the batch");
+
+  clearPendingForgetBatch();
+}
+
 testParsingAndSensitive();
 testUpdateScoring();
 testStoreSearchAndReset();
 testExtractedFacts();
 testForgetAllCount();
+testPendingForgetBatch();
 console.log(
   `Memory checks passed. fts5=${isMemoriesFtsReady()} remaining=${countMemories()}`,
 );

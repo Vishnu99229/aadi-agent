@@ -46,6 +46,61 @@ import {
 const SENSITIVE_REFUSAL =
   "I don't store passwords, OTPs, card or account numbers, or health details.";
 
+/** Tracks the forget-memory inline list we last offered Vishnu, so a short
+ *  follow-up like "both" or "1 and 2" can be routed directly to the delete
+ *  path without going through the agent (which has hallucinated names in
+ *  that gap). Single-owner single-process state is fine. */
+const PENDING_FORGET_TTL_MS = 2 * 60 * 1000;
+let pendingForget:
+  | { memoryIds: number[]; expiresAt: number }
+  | undefined;
+
+export function rememberPendingForgetBatch(memoryIds: number[]): void {
+  if (memoryIds.length <= 1) {
+    pendingForget = undefined;
+    return;
+  }
+  pendingForget = {
+    memoryIds: [...memoryIds],
+    expiresAt: Date.now() + PENDING_FORGET_TTL_MS,
+  };
+}
+
+export function clearPendingForgetBatch(): void {
+  pendingForget = undefined;
+}
+
+/** If `text` is an unambiguous "do them all" / "do these specific numbers"
+ *  reply to the last forget-memory list, return the memory IDs to delete and
+ *  clear the pending state. Otherwise return undefined. */
+export function matchPendingForgetBatch(text: string): number[] | undefined {
+  if (!pendingForget || Date.now() > pendingForget.expiresAt) {
+    pendingForget = undefined;
+    return undefined;
+  }
+  const trimmed = text.trim().toLowerCase().replace(/[.!]+$/, "");
+  if (!trimmed) return undefined;
+  const allPhrase =
+    /^(both|both of (them|those)|all|all of (them|those)|all of the above|everything|do all|forget (both|all|them all))$/.test(
+      trimmed,
+    );
+  if (allPhrase) {
+    const ids = pendingForget.memoryIds;
+    pendingForget = undefined;
+    return ids;
+  }
+  // Numeric: "1 and 2", "#1, #2", "1,2", "1 2". Every number must match a
+  // pending ID (not a positional index) so we never delete a surprise row.
+  const numbers = [...trimmed.matchAll(/#?(\d+)/g)].map((m) => Number(m[1]));
+  if (numbers.length < 2) return undefined;
+  if (!/^[#\d\s,and]+$/.test(trimmed)) return undefined;
+  const pendingSet = new Set(pendingForget.memoryIds);
+  if (!numbers.every((n) => pendingSet.has(n))) return undefined;
+  const ids = [...new Set(numbers)];
+  pendingForget = undefined;
+  return ids;
+}
+
 export function memoriesForRequest(userText: string): {
   relevant: MemoryRecord[];
   upcoming: MemoryRecord[];
@@ -339,6 +394,7 @@ export async function handleMemoryForgetCallback(
   memoryId: number,
 ): Promise<void> {
   const existed = deleteMemory(memoryId);
+  clearPendingForgetBatch();
   await ctx.answerCallbackQuery(existed ? "Forgotten" : "Already gone");
   if (existed) {
     await ctx.reply(`Forgotten #${memoryId}.`);
@@ -473,6 +529,7 @@ export async function handleForgetQuery(
   if (matches.length === 1) {
     const memory = matches[0]!;
     deleteMemory(memory.id);
+    clearPendingForgetBatch();
     await ctx.reply(`Forgotten #${memory.id}.`);
     return;
   }
@@ -483,6 +540,7 @@ export async function handleForgetQuery(
     }
     keyboard.text(`Forget #${memory.id}`, `mem:forget:${memory.id}`);
   }
+  rememberPendingForgetBatch(matches.map((item) => item.id));
   await ctx.reply(
     `Several memories matched:\n${matches.map((item) => `#${item.id} ${item.content}`).join("\n")}`,
     { reply_markup: keyboard },
