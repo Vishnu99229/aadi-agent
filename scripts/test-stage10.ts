@@ -379,6 +379,26 @@ function testFollowupReplyHeaders(): void {
   );
   assert(/karthik@elevenlabs\.io/i.test(promoted.to), "External Cc promoted to To");
   assert(/sendhil@epicode\.in/i.test(promoted.cc), "Remaining Cc preserved after promotion");
+
+  // Walk-back case: the latest sent message in the thread was a reminder Vishnu
+  // sent to himself. Simulate the loop in createFollowupDraftForApproval
+  // choosing the first sent message with an external recipient.
+  const sentMessages = [
+    { to: "vishnu.rajan@epicode.in", cc: "" }, // latest
+    { to: "vishnu.rajan@epicode.in", cc: "" },
+    { to: "karthik@elevenlabs.io", cc: "Sendhil <sendhil@epicode.in>" }, // oldest
+  ];
+  let picked: { to: string; cc: string } | undefined;
+  for (const message of sentMessages) {
+    const candidate = selectReplyRecipients(message.to, message.cc);
+    if (candidate.to) {
+      picked = candidate;
+      break;
+    }
+  }
+  assert(picked !== undefined, "walk-back finds an external recipient");
+  assert(/karthik/i.test(picked!.to), "walk-back picks Karthik, not self");
+  assert(/sendhil/i.test(picked!.cc), "walk-back preserves Cc from older message");
 }
 
 testMomDraft();

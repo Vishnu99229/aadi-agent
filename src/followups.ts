@@ -664,24 +664,44 @@ export async function createFollowupDraftForApproval(
   const account = await getGoogleAccount(followup.google_account);
   const gmail = gmailClient(account);
   const thread = await getThread(gmail, followup.thread_id);
-  const latestSent = [...(thread.messages ?? [])]
+  const sentMessages = [...(thread.messages ?? [])]
     .filter((message) => isSent(message) && !message.labelIds?.includes("DRAFT"))
-    .sort((left, right) => messageTime(right) - messageTime(left))[0];
+    .sort((left, right) => messageTime(right) - messageTime(left));
+  const latestSent = sentMessages[0];
   if (!latestSent?.id) {
     throw new Error("Could not find the sent message for that thread.");
   }
-  const headers = latestSent.payload?.headers;
-  const messageId = header(headers, "Message-ID");
-  const { to, cc } = selectReplyRecipients(
-    header(headers, "To"),
-    header(headers, "Cc"),
-  );
+  // Threading always points at the latest sent (Message-ID / References) so
+  // Gmail keeps the reply in-thread. Recipients, though, are picked from the
+  // newest sent that still has an external To/Cc after dropping Vishnu —
+  // handles the case where Vishnu sent himself a reminder in-thread.
+  const latestHeaders = latestSent.payload?.headers;
+  const messageId = header(latestHeaders, "Message-ID");
+  let to = "";
+  let cc = "";
+  let recipientSource = latestSent;
+  for (const message of sentMessages) {
+    const h = message.payload?.headers;
+    const picked = selectReplyRecipients(header(h, "To"), header(h, "Cc"));
+    if (picked.to) {
+      to = picked.to;
+      cc = picked.cc;
+      recipientSource = message;
+      break;
+    }
+  }
   if (!to) {
     throw new Error(
-      "Could not pick a reply recipient from the original send's headers.",
+      "No sent message in this thread has an external recipient after dropping self addresses.",
     );
   }
-  const originalSnippet = latestSent.snippet?.trim() ?? "";
+  if (recipientSource !== latestSent) {
+    console.log(
+      `Follow-up ${id}: latest sent was self-addressed; using recipients from an earlier sent message.`,
+    );
+  }
+  const originalSnippet =
+    recipientSource.snippet?.trim() || latestSent.snippet?.trim() || "";
   const label = recipientLabel(to);
   let body: string;
   try {
@@ -706,7 +726,7 @@ export async function createFollowupDraftForApproval(
     cc: cc || undefined,
     subject,
     inReplyTo: messageId,
-    references: header(headers, "References"),
+    references: header(latestHeaders, "References"),
     body,
   });
   await queueDraftApproval(
