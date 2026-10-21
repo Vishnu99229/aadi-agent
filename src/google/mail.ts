@@ -123,22 +123,24 @@ export async function createNewEmailDraft(params: {
   return { draftId: result.data.id, threadId };
 }
 
-export async function createThreadReplyDraft(params: {
-  account: LoadedGoogleAccount;
-  threadId: string;
+export interface ThreadReplyMimeInput {
   to: string;
+  cc?: string;
   subject: string;
   inReplyTo: string;
   references: string;
   body: string;
-}): Promise<{ draftId: string }> {
-  const gmail = gmailClient(params.account);
+}
+
+export function buildThreadReplyMime(params: ThreadReplyMimeInput): string {
   const references = [params.references, params.inReplyTo]
     .map(safeHeader)
     .filter(Boolean)
     .join(" ");
-  const raw = [
+  const cc = params.cc ? safeHeader(params.cc) : "";
+  return [
     `To: ${safeHeader(params.to)}`,
+    ...(cc ? [`Cc: ${cc}`] : []),
     `Subject: ${safeHeader(params.subject)}`,
     `In-Reply-To: ${safeHeader(params.inReplyTo)}`,
     `References: ${references}`,
@@ -148,6 +150,20 @@ export async function createThreadReplyDraft(params: {
     "",
     encodeBody(params.body),
   ].join("\r\n");
+}
+
+export async function createThreadReplyDraft(params: {
+  account: LoadedGoogleAccount;
+  threadId: string;
+  to: string;
+  cc?: string;
+  subject: string;
+  inReplyTo: string;
+  references: string;
+  body: string;
+}): Promise<{ draftId: string }> {
+  const gmail = gmailClient(params.account);
+  const raw = buildThreadReplyMime(params);
 
   const result = await gmail.users.drafts.create({
     userId: "me",

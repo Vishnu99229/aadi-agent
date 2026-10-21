@@ -50,6 +50,8 @@ const {
   extractSpreadsheetText,
 } = await import("../src/xlsx_text.ts");
 const { createNote, getNote } = await import("../src/db.ts");
+const { selectReplyRecipients } = await import("../src/followups.ts");
+const { buildThreadReplyMime } = await import("../src/google/mail.ts");
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -337,6 +339,48 @@ function testXlsx(): void {
   console.log(`xlsx: chars=${text.length} sheets=2`);
 }
 
+function testFollowupReplyHeaders(): void {
+  // Original send: Vishnu -> Karthik, CC Sendhil. Vishnu also sits on To
+  // (self-copy, which some mail apps add) and on Cc as a reply-all echo.
+  const toHeader = `"Karthik" <karthik@elevenlabs.io>, vishnu.rajan@epicode.in`;
+  const ccHeader = `Sendhil <sendhil@epicode.in>, Vishnu <vishnu.rajan@epicode.in>`;
+  const { to, cc } = selectReplyRecipients(toHeader, ccHeader);
+
+  assert(/karthik@elevenlabs\.io/i.test(to), "To contains Karthik");
+  assert(!/vishnu\.rajan/i.test(to), "Vishnu dropped from To");
+  assert(/sendhil@epicode\.in/i.test(cc), "Cc keeps Sendhil (internal colleague)");
+  assert(!/vishnu\.rajan/i.test(cc), "Vishnu dropped from Cc");
+
+  const mime = buildThreadReplyMime({
+    to,
+    cc,
+    subject: "Re: Partnership follow-up",
+    inReplyTo: "<original-123@mail.epicode.in>",
+    references: "<original-123@mail.epicode.in>",
+    body: "Hi Karthik,\n\nSmall nudge.\n\nThanks,\nVishnu",
+  });
+
+  assert(/^To: .*karthik@elevenlabs\.io/m.test(mime), "MIME To header is Karthik");
+  assert(/^Cc: .*sendhil@epicode\.in/m.test(mime), "MIME Cc header is Sendhil");
+  assert(!/vishnu\.rajan@epicode\.in/i.test(mime.split("\r\n\r\n")[0]!), "Vishnu absent from MIME headers");
+  assert(
+    /^In-Reply-To: <original-123@mail\.epicode\.in>/m.test(mime),
+    "In-Reply-To wires the original Message-ID",
+  );
+  assert(
+    /^References: <original-123@mail\.epicode\.in>/m.test(mime),
+    "References wires the original Message-ID",
+  );
+
+  // Edge case: original send went only to self → promote first external Cc.
+  const promoted = selectReplyRecipients(
+    "vishnu.rajan@epicode.in",
+    "Karthik <karthik@elevenlabs.io>, Sendhil <sendhil@epicode.in>",
+  );
+  assert(/karthik@elevenlabs\.io/i.test(promoted.to), "External Cc promoted to To");
+  assert(/sendhil@epicode\.in/i.test(promoted.cc), "Remaining Cc preserved after promotion");
+}
+
 testMomDraft();
 testNoteParsing();
 testDocumentTypes();
@@ -344,4 +388,5 @@ testReviewMergeAndFormat();
 testGmailPartsAndSize();
 await testLongTextPdf();
 testXlsx();
+testFollowupReplyHeaders();
 console.log("Stage 10 checks passed.");

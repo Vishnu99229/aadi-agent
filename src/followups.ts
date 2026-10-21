@@ -574,6 +574,43 @@ function recipientLabel(recipientHeader: string): string {
   return mailbox?.name || mailbox?.email || "the recipient";
 }
 
+function formatMailbox(name: string, email: string): string {
+  const trimmed = name.trim();
+  if (!trimmed || /@/.test(trimmed) || trimmed.toLowerCase() === email) {
+    return email;
+  }
+  return `${trimmed} <${email}>`;
+}
+
+/** Build the To / Cc fields for a follow-up reply from the original send's
+ *  headers. Vishnu's own addresses are filtered out of both. If every original
+ *  To address is self (e.g. he BCC'd himself), the first external Cc is
+ *  promoted to To so the reply still reaches a human. CC addresses on
+ *  internal domains are kept — the point is only to drop the sender. */
+export function selectReplyRecipients(
+  toHeader: string,
+  ccHeader: string,
+): { to: string; cc: string } {
+  const external = (header: string) =>
+    parseAddressList(header).filter((item) => !isSelfEmail(item.email));
+  let toList = external(toHeader);
+  let ccList = external(ccHeader);
+  if (toList.length === 0 && ccList.length > 0) {
+    toList = [ccList[0]!];
+    ccList = ccList.slice(1);
+  }
+  const seen = new Set<string>();
+  const dedupe = (list: typeof toList) =>
+    list.filter((item) => {
+      if (seen.has(item.email)) return false;
+      seen.add(item.email);
+      return true;
+    });
+  const render = (list: typeof toList) =>
+    list.map((item) => formatMailbox(item.name, item.email)).join(", ");
+  return { to: render(dedupe(toList)), cc: render(dedupe(ccList)) };
+}
+
 async function draftFollowupBody(
   recipientHeader: string,
   subject: string,
@@ -635,7 +672,15 @@ export async function createFollowupDraftForApproval(
   }
   const headers = latestSent.payload?.headers;
   const messageId = header(headers, "Message-ID");
-  const to = followup.recipient || header(headers, "To");
+  const { to, cc } = selectReplyRecipients(
+    header(headers, "To"),
+    header(headers, "Cc"),
+  );
+  if (!to) {
+    throw new Error(
+      "Could not pick a reply recipient from the original send's headers.",
+    );
+  }
   const originalSnippet = latestSent.snippet?.trim() ?? "";
   const label = recipientLabel(to);
   let body: string;
@@ -658,6 +703,7 @@ export async function createFollowupDraftForApproval(
     account,
     threadId: followup.thread_id,
     to,
+    cc: cc || undefined,
     subject,
     inReplyTo: messageId,
     references: header(headers, "References"),
@@ -671,6 +717,7 @@ export async function createFollowupDraftForApproval(
       subject,
       body,
       googleAccount: account.id,
+      extraLines: cc ? [`Cc: ${cc}`] : undefined,
     },
     { sendOnly },
   );
