@@ -7,6 +7,7 @@ function ensureTestEnv(): void {
   process.env.CLAUDE_MODEL ??= "claude-haiku-4-5";
   process.env.ANTHROPIC_API_KEY ??= "test-key";
   process.env.BRIEF_TIME ??= "08:00";
+  process.env.GEMINI_API_KEY ??= "test-key";
 }
 
 ensureTestEnv();
@@ -16,7 +17,6 @@ const { TOOL_ORDER, tools } = await import("../src/tools/index.ts");
 const {
   applyAllChoice,
   applyAllTasks,
-  applyAllTasksExceptDrafting,
   applyTaskBackend,
   applyTaskChoice,
   formatModelSetupText,
@@ -50,11 +50,11 @@ assert(getTaskBackend("meetings") === "haiku", "default meetings is Haiku");
 assert(getTaskBackend("drafting") === "haiku", "default drafting is Haiku");
 
 resetModelSettings();
-setSetting("llm_backend", "cloud-gemma");
+setSetting("llm_backend", "haiku");
 const migrated = getTaskBackends();
-assert(migrated.chat === "haiku", "generation bump wipes legacy Gemma chat");
-assert(migrated.brief === "haiku", "generation bump wipes legacy Gemma brief");
-assert(migrated.meetings === "haiku", "generation bump wipes legacy Gemma meetings");
+assert(migrated.chat === "haiku", "generation bump restores Haiku chat");
+assert(migrated.brief === "haiku", "generation bump restores Haiku brief");
+assert(migrated.meetings === "haiku", "generation bump restores Haiku meetings");
 assert(migrated.documents === "haiku", "documents use new Haiku default");
 assert(migrated.drafting === "haiku", "drafting uses new Haiku default");
 
@@ -71,12 +71,9 @@ assert(getTaskBackend("meetings") === "claude", "shortcut meetings");
 assert(getTaskBackend("drafting") === "claude", "shortcut drafting");
 
 applyTaskBackend("drafting", "haiku");
-applyAllTasksExceptDrafting("cloud-gemma");
-assert(
-  getTaskBackend("drafting") === "haiku",
-  "gemma shortcut does not change drafting",
-);
-assert(getTaskBackend("chat") === "cloud-gemma", "gemma shortcut chat");
+applyAllTasks("gemini");
+assert(getTaskBackend("chat") === "gemini", "gemini shortcut chat");
+assert(getTaskBackend("drafting") === "gemini", "gemini shortcut drafting");
 
 const allFast = applyAllTasks("haiku");
 assert(allFast.switched, "fast shortcut");
@@ -99,14 +96,14 @@ assert(flipped.chat === "haiku", "stuck Gemma chat resets to Haiku");
 assert(flipped.brief === "haiku", "stuck Gemma brief resets to Haiku");
 assert(flipped.documents === "haiku", "stuck Gemma documents reset to Haiku");
 assert(flipped.meetings === "haiku", "stuck Gemma meetings reset to Haiku");
-assert(flipped.drafting === "haiku", "drafting stays Haiku");
+assert(flipped.drafting === "haiku", "drafting resets to Haiku");
 
 resetModelSettings();
 assert(getTaskEffort("chat") === "low", "default effort is low");
 assert(getTaskEffort("drafting") === "low", "drafting effort defaults low");
 assert(modelDisplayName("haiku") === "Haiku 5.5", "haiku display name");
 assert(modelDisplayName("claude") === "Claude Sonnet 5.5", "sonnet display name");
-assert(modelDisplayName("cloud-gemma") === "Gemma 4 31B", "gemma display name");
+assert(modelDisplayName("gemini") === "Gemini 1.5 Flash", "gemini display name");
 assert(modelDisplayName("deepseek") === "DeepSeek Flash", "deepseek display name");
 assert(isChatBackend("deepseek"), "deepseek is a chat backend");
 assert(!supportsEffort("deepseek"), "deepseek has no Anthropic effort");
@@ -119,14 +116,14 @@ assert(
   "chat setup line matches selection",
 );
 
-const allGemma = applyAllChoice("cloud-gemma");
-assert(allGemma.gemmaSkippedDrafting, "set all gemma skips drafting");
-assert(getTaskBackend("drafting") === "haiku", "drafting stays off gemma");
+const allGemini = applyAllChoice("gemini");
+assert(allGemini.switched, "set all gemini applies to every task");
+assert(getTaskBackend("drafting") === "gemini", "drafting uses gemini too");
 assert(
   formatModelSetupText({
     updatedTasks: ["chat"],
-  }).includes("Chat and questions — Gemma 4 31B (no effort setting) ✅ updated"),
-  "updated gemma line",
+  }).includes("Chat and questions — Gemini 1.5 Flash ✅ updated"),
+  "updated gemini line",
 );
 
 const allHaiku = applyAllChoice("haiku", "medium");

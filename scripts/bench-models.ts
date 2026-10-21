@@ -48,7 +48,7 @@ type BenchKind =
   | "sonnet"
   | "haiku-low"
   | "haiku-medium"
-  | "cloud-gemma"
+  | "gemini"
   | "local-gemma";
 
 interface BenchTarget {
@@ -61,7 +61,7 @@ const DEFAULT_TARGETS: BenchTarget[] = [
   { kind: "sonnet", backend: "claude" },
   { kind: "haiku-low", backend: "haiku", effort: "low" },
   { kind: "haiku-medium", backend: "haiku", effort: "medium" },
-  { kind: "cloud-gemma", backend: "cloud-gemma" },
+  { kind: "gemini", backend: "gemini" },
 ];
 
 const TASKS = [
@@ -979,12 +979,12 @@ console.log(
 console.log(
   `Defaults unchanged: LLM_PROVIDER=${config.llmProvider} CLAUDE_MODEL=${config.claudeModel} BACKGROUND_MODEL=${config.backgroundModel}`,
 );
-console.log(`cloud-gemma=${config.gemmaCloudModel}`);
+console.log(`gemini=${config.geminiModel}`);
 
 const needsJpegs = targets.some((target) => !nativePdfBackend(target.backend));
 const jpegParts = needsJpegs ? await renderPdfJpegs(pdfPath) : [];
 if (needsJpegs) {
-  console.log(`Rendered ${jpegParts.length} JPEG pages for Gemma.`);
+  console.log(`Rendered ${jpegParts.length} JPEG pages for OpenAI-compatible backends.`);
 }
 
 const rows: BenchRow[] = [];

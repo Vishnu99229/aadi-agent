@@ -35,14 +35,14 @@ const BACKEND_CODE: Record<ChatBackend, string> = {
   haiku: "h",
   claude: "c",
   deepseek: "d",
-  "cloud-gemma": "g",
+  gemini: "g",
 };
 
 const BACKEND_FROM_CODE: Record<string, ChatBackend> = {
   h: "haiku",
   c: "claude",
   d: "deepseek",
-  g: "cloud-gemma",
+  g: "gemini",
 };
 
 const EFFORT_CODE: Record<EffortLevel, string> = {
@@ -57,7 +57,7 @@ const EFFORT_FROM_CODE: Record<string, EffortLevel> = {
   h: "high",
 };
 
-const MODEL_ORDER: ChatBackend[] = ["haiku", "claude", "deepseek", "cloud-gemma"];
+const MODEL_ORDER: ChatBackend[] = ["haiku", "claude", "deepseek", "gemini"];
 const EFFORT_ORDER: EffortLevel[] = ["low", "medium", "high"];
 
 function emptyKeyboard(): InlineKeyboard {
@@ -149,9 +149,7 @@ function taskPickerText(task: ModelTask): string {
 function formatTaskCurrent(task: ModelTask): string {
   const backend = getTaskBackend(task);
   if (!supportsEffort(backend)) {
-    return backend === "cloud-gemma"
-      ? "Gemma 4 31B (no effort setting)"
-      : modelDisplayName(backend);
+    return modelDisplayName(backend);
   }
   return `${modelDisplayName(backend)} · ${getTaskEffort(task)}`;
 }
@@ -186,7 +184,7 @@ export async function handleModelCallback(ctx: Context): Promise<void> {
     await ctx.answerCallbackQuery();
     await editPanel(
       ctx,
-      "Set all use cases\nGemma never applies to email drafting.\n\nChoose a model.",
+      "Set all use cases\n\nChoose a model.",
       modelsKeyboard(getTaskBackend("chat"), "a"),
     );
     return;
@@ -280,7 +278,6 @@ export async function handleModelCallback(ctx: Context): Promise<void> {
         ctx,
         formatModelSetupText({
           updatedTasks: result.updatedTasks,
-          gemmaSkippedDrafting: result.gemmaSkippedDrafting,
         }),
       );
       return;

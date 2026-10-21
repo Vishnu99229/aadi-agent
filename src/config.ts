@@ -5,23 +5,20 @@ import {
   requireOwnerTelegramId,
 } from "./security/env_guard.js";
 
-export type LlmProvider = "claude" | "cloud-gemma";
+export type LlmProvider = "claude";
 
 function readProvider(): LlmProvider {
   const value = process.env.LLM_PROVIDER?.trim() || "claude";
-  if (value === "claude" || value === "cloud-gemma") {
+  if (value === "claude") {
     return value;
   }
-  console.error('LLM_PROVIDER must be either "claude" or "cloud-gemma".');
+  console.error('LLM_PROVIDER must be "claude".');
   process.exit(1);
 }
 
 const provider = readProvider();
 
-failIfMissingEnv([
-  ...REQUIRED_ENV_VARS,
-  ...(provider === "cloud-gemma" ? (["OPENROUTER_API_KEY"] as const) : []),
-]);
+failIfMissingEnv([...REQUIRED_ENV_VARS]);
 
 const ownerTelegramId = requireOwnerTelegramId();
 
@@ -297,13 +294,13 @@ const HAIKU_55_COST_DEFAULTS: ModelCostRates = {
   cacheReadCostPerMillion: 0.01,
 };
 
-/** OpenRouter google/gemma-4-31b-it — openrouter.ai/google/gemma-4-31b-it */
-const GEMMA_CLOUD_COST_DEFAULTS: ModelCostRates = {
-  inputCostPerMillion: 0.09,
-  outputCostPerMillion: 0.34,
+/** Gemini 1.5 Flash — ai.google.dev/pricing */
+const GEMINI_FLASH_COST_DEFAULTS: ModelCostRates = {
+  inputCostPerMillion: 0.075,
+  outputCostPerMillion: 0.3,
   cacheCreationCostPerMillion: 0,
   cacheCreation1hCostPerMillion: 0,
-  cacheReadCostPerMillion: 0.05,
+  cacheReadCostPerMillion: 0,
 };
 
 const ZERO_COST_RATES: ModelCostRates = {
@@ -339,7 +336,7 @@ const DEEPSEEK_FLASH_OFFPEAK_DEFAULTS: ModelCostRates = {
 };
 
 function readCostRates(
-  prefix: "LLM" | "BACKGROUND" | "GEMMA_CLOUD" | "DEEPSEEK",
+  prefix: "LLM" | "BACKGROUND" | "GEMINI" | "DEEPSEEK",
   defaults: ModelCostRates,
 ): ModelCostRates {
   return {
@@ -390,8 +387,8 @@ export const config = {
   claudeModel: process.env.CLAUDE_MODEL ?? "",
   backgroundModel:
     process.env.BACKGROUND_MODEL?.trim() || "claude-haiku-5-5",
-  openRouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
-  openRouterModel: process.env.OPENROUTER_MODEL ?? "",
+  geminiApiKey: process.env.GEMINI_API_KEY?.trim() ?? "",
+  geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-1.5-flash",
   deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() ?? "",
   // Current DeepSeek API ids (api-docs.deepseek.com). Legacy deepseek-chat /
   // deepseek-reasoner names are retired; override via env if needed.
@@ -399,14 +396,12 @@ export const config = {
   deepseekReasonerModel:
     process.env.DEEPSEEK_REASONER_MODEL?.trim() || "deepseek-flash",
   sarvamApiKey: process.env.SARVAM_API_KEY?.trim() ?? "",
-  gemmaCloudModel:
-    process.env.GEMMA_CLOUD_MODEL?.trim() || "google/gemma-4-31b-it",
   localLlmBaseUrl:
     process.env.LOCAL_LLM_BASE_URL?.trim() || "http://127.0.0.1:11434/v1",
   localLlmModel: process.env.LOCAL_LLM_MODEL?.trim() || "gemma4:e4b",
   chatCostRates: readCostRates("LLM", SONNET_55_COST_DEFAULTS),
   backgroundCostRates: readCostRates("BACKGROUND", HAIKU_55_COST_DEFAULTS),
-  gemmaCloudCostRates: readCostRates("GEMMA_CLOUD", GEMMA_CLOUD_COST_DEFAULTS),
+  geminiCostRates: readCostRates("GEMINI", GEMINI_FLASH_COST_DEFAULTS),
   deepseekCostRates: readCostRates("DEEPSEEK", DEEPSEEK_FLASH_OFFPEAK_DEFAULTS),
   localCostRates: ZERO_COST_RATES,
   backupPassword: process.env.BACKUP_PASSWORD?.trim() ?? "",

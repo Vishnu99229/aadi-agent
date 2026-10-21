@@ -6,7 +6,7 @@ const TASK_SETTING = "llm_task_backends";
 const EFFORT_SETTING = "llm_task_efforts";
 const LEGACY_SETTING = "llm_backend";
 
-export type ChatBackend = LlmProvider | "haiku" | "deepseek";
+export type ChatBackend = LlmProvider | "haiku" | "deepseek" | "gemini";
 export type ModelTask =
   | "chat"
   | "brief"
@@ -47,7 +47,7 @@ export function isChatBackend(value: string): value is ChatBackend {
   return (
     value === "claude" ||
     value === "haiku" ||
-    value === "cloud-gemma" ||
+    value === "gemini" ||
     value === "deepseek"
   );
 }
@@ -74,10 +74,10 @@ export function modelDisplayName(backend: ChatBackend): string {
   if (backend === "deepseek") {
     return "DeepSeek Flash";
   }
-  return "Gemma 4 31B";
+  return "Gemini 1.5 Flash";
 }
 
-const DEFAULTS_GENERATION = "deepseek-haiku-v2";
+const DEFAULTS_GENERATION = "v3-gemini-migration";
 const GENERATION_SETTING = "llm_task_defaults_generation";
 
 function defaultChoices(): TaskBackendMap {
@@ -119,9 +119,8 @@ function migrateIfNeeded(): TaskBackendMap {
   }
   const generation = getSetting(GENERATION_SETTING);
   if (generation !== DEFAULTS_GENERATION) {
-    // One-time: wipe stuck Gemma (and any other saved backends) and restore
-    // Haiku defaults. Background scans / document review still pick DeepSeek
-    // in llm.ts when DEEPSEEK_API_KEY is set.
+    // One-time: wipe stuck cloud-gemma (and any other saved backends) and
+    // restore Haiku defaults so Gemini can be chosen fresh.
     choices = defaultChoices();
     persist(choices);
     setSetting(GENERATION_SETTING, DEFAULTS_GENERATION);
@@ -219,15 +218,13 @@ export function apiEffortForTask(task: ModelTask): EffortLevel | undefined {
 export function formatTaskSetupLine(task: ModelTask): string {
   const backend = getTaskBackend(task);
   if (!supportsEffort(backend)) {
-    const extra = backend === "cloud-gemma" ? " (no effort setting)" : "";
-    return `${TASK_LABELS[task]} — ${modelDisplayName(backend)}${extra}`;
+    return `${TASK_LABELS[task]} — ${modelDisplayName(backend)}`;
   }
   return `${TASK_LABELS[task]} — ${modelDisplayName(backend)} · ${getTaskEffort(task)}`;
 }
 
 export function formatModelSetupText(options?: {
   updatedTasks?: ModelTask[];
-  gemmaSkippedDrafting?: boolean;
 }): string {
   const updated = new Set(options?.updatedTasks ?? []);
   const lines = ["Model setup"];
@@ -240,15 +237,12 @@ export function formatModelSetupText(options?: {
       ? "Background scans — DeepSeek Flash (automatic)"
       : "Background scans — Haiku 5.5 (automatic)",
   );
-  if (options?.gemmaSkippedDrafting) {
-    lines.push("Gemma never applies to email drafting.");
-  }
   return lines.join("\n");
 }
 
 function backendNeedsKey(backend: ChatBackend): string | undefined {
-  if (backend === "cloud-gemma" && !config.openRouterApiKey) {
-    return "cloud Gemma needs OPENROUTER_API_KEY in .env.";
+  if (backend === "gemini" && !config.geminiApiKey) {
+    return "Gemini 1.5 Flash needs GEMINI_API_KEY in .env.";
   }
   if (backend === "deepseek" && !config.deepseekApiKey) {
     return "DeepSeek Flash needs DEEPSEEK_API_KEY in .env.";
@@ -272,12 +266,6 @@ export function applyTaskBackend(
   }
   setTaskBackend(task, backend);
   const name = TASK_LABELS[task];
-  if (task === "drafting" && backend === "cloud-gemma") {
-    return {
-      switched: true,
-      message: `${name}: cloud Gemma (not recommended). Drafts still need your Send tap.`,
-    };
-  }
   return {
     switched: true,
     message: `${name}: ${chatBackendLabel(backend)}`,
@@ -309,7 +297,6 @@ export function applyAllChoice(
   switched: boolean;
   message: string;
   updatedTasks: ModelTask[];
-  gemmaSkippedDrafting: boolean;
 } {
   const blocked = backendNeedsKey(backend);
   if (blocked) {
@@ -317,19 +304,6 @@ export function applyAllChoice(
       switched: false,
       message: blocked,
       updatedTasks: [],
-      gemmaSkippedDrafting: false,
-    };
-  }
-  if (backend === "cloud-gemma") {
-    applyAllTasksExceptDrafting(backend);
-    return {
-      switched: true,
-      message: formatModelSetupText({
-        updatedTasks: MODEL_TASKS.filter((task) => task !== "drafting"),
-        gemmaSkippedDrafting: true,
-      }),
-      updatedTasks: MODEL_TASKS.filter((task) => task !== "drafting"),
-      gemmaSkippedDrafting: true,
     };
   }
   applyAllTasks(backend);
@@ -340,11 +314,10 @@ export function applyAllChoice(
     switched: true,
     message: formatModelSetupText({ updatedTasks: [...MODEL_TASKS] }),
     updatedTasks: [...MODEL_TASKS],
-    gemmaSkippedDrafting: false,
   };
 }
 
-/** /model claude|fast: every task, including drafting. */
+/** /model claude|fast|gemini: every task, including drafting. */
 export function applyAllTasks(backend: ChatBackend): {
   switched: boolean;
   message: string;
@@ -367,29 +340,6 @@ export function applyAllTasks(backend: ChatBackend): {
           ? "All tasks now use Fast (Haiku 5.5)."
           : backend === "deepseek"
             ? "All tasks now use DeepSeek Flash."
-            : "All tasks now use cloud Gemma. Drafts still need your Send tap.",
-  };
-}
-
-/** /model gemma: every task except email drafting. */
-export function applyAllTasksExceptDrafting(backend: ChatBackend): {
-  switched: boolean;
-  message: string;
-} {
-  const blocked = backendNeedsKey(backend);
-  if (blocked) {
-    return { switched: false, message: blocked };
-  }
-  const choices = getTaskBackends();
-  for (const task of MODEL_TASKS) {
-    if (task !== "drafting") {
-      choices[task] = backend;
-    }
-  }
-  persist(choices);
-  return {
-    switched: true,
-    message:
-      "Chat, briefs, documents and meetings now use cloud Gemma. Email drafting is unchanged.",
+            : "All tasks now use Gemini 1.5 Flash.",
   };
 }

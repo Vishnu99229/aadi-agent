@@ -26,9 +26,10 @@ import {
 
 const MAX_TOKENS = 4096;
 const MAX_SERVER_CONTINUATIONS = 8;
-const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 /** Official OpenAI-compatible base (api-docs.deepseek.com). */
 const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+/** Google Gemini's OpenAI-compatible endpoint. */
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
 
 export interface ToolCall {
   id: string;
@@ -102,7 +103,7 @@ export type LlmStopReason =
 export type LlmBackend =
   | "claude"
   | "haiku"
-  | "cloud-gemma"
+  | "gemini"
   | "local-gemma"
   | "deepseek"
   | "deepseek-reasoner";
@@ -141,14 +142,10 @@ const anthropic = config.anthropicApiKey
   ? new Anthropic({ apiKey: config.anthropicApiKey })
   : undefined;
 
-const openRouter = config.openRouterApiKey
+const gemini = config.geminiApiKey
   ? new OpenAI({
-      apiKey: config.openRouterApiKey,
-      baseURL: OPENROUTER_BASE_URL,
-      defaultHeaders: {
-        "HTTP-Referer": "http://localhost",
-        "X-OpenRouter-Title": "Aadi",
-      },
+      apiKey: config.geminiApiKey,
+      baseURL: GEMINI_BASE_URL,
     })
   : undefined;
 
@@ -166,7 +163,7 @@ const localLlm = new OpenAI({
   timeout: 15 * 60 * 1000,
 });
 
-let loggedOpenRouterWebSearchDisabled = false;
+let loggedOpenAiWebSearchDisabled = false;
 
 function withEstimatedCost(
   usage: Omit<LlmUsage, "estimatedCostUsd">,
@@ -711,7 +708,7 @@ function parseToolInput(argumentsText: string): unknown {
   }
 }
 
-function openRouterStopReason(reason: string | null): LlmStopReason {
+function openAiStopReason(reason: string | null): LlmStopReason {
   switch (reason) {
     case "stop":
       return "end_turn";
@@ -736,11 +733,11 @@ async function completeWithOpenAiCompatible(
   const webSearchRequested = params.tools.some(
     (tool) => tool.type === "web_search",
   );
-  if (webSearchRequested && !loggedOpenRouterWebSearchDisabled) {
+  if (webSearchRequested && !loggedOpenAiWebSearchDisabled) {
     console.log(
       `Web search disabled for ${label}: Anthropic server-side web search is unavailable and no paid search API is configured.`,
     );
-    loggedOpenRouterWebSearchDisabled = true;
+    loggedOpenAiWebSearchDisabled = true;
   }
 
   const tools = toOpenRouterTools(params.tools);
@@ -804,7 +801,7 @@ async function completeWithOpenAiCompatible(
           execution: "client" as const,
         })) ?? [],
     usage,
-    stopReason: openRouterStopReason(choice.finish_reason),
+    stopReason: openAiStopReason(choice.finish_reason),
   };
 }
 
@@ -818,17 +815,17 @@ async function completeWithNamedBackend(
       (backend === "haiku" ? config.backgroundModel : config.claudeModel);
     return completeWithClaude({ ...params, model });
   }
-  if (backend === "cloud-gemma") {
-    if (!openRouter) {
+  if (backend === "gemini") {
+    if (!gemini) {
       throw new Error(
-        "cloud-gemma requires OPENROUTER_API_KEY. It is unused unless a call sets backend=cloud-gemma.",
+        "gemini requires GEMINI_API_KEY in .env (add it locally; Aadi never writes .env).",
       );
     }
     return completeWithOpenAiCompatible(
-      openRouter,
+      gemini,
       params,
-      config.gemmaCloudModel,
-      "cloud-gemma",
+      config.geminiModel,
+      "gemini",
     );
   }
   if (backend === "deepseek" || backend === "deepseek-reasoner") {

@@ -312,12 +312,6 @@ async function analyzeContent(
   truncated: boolean,
   logLabel: string,
 ): Promise<DocumentAnalysis> {
-  const backend = getTaskBackend("documents");
-  if (backend === "cloud-gemma") {
-    console.error(
-      `Document analysis (${logLabel}) on cloud-gemma is not supported; using ${documentsModel()}.`,
-    );
-  }
   try {
     const result = await requestStructuredAnalysis(content, promptExtra);
     console.log(

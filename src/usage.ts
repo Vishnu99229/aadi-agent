@@ -122,8 +122,8 @@ export function ratesForModel(
       cacheReadCostPerMillion: base.cacheReadCostPerMillion * 5,
     };
   }
-  if (/gemma/i.test(model) || model === config.gemmaCloudModel) {
-    return with1hWriteRate(config.gemmaCloudCostRates);
+  if (/gemini/i.test(model) || model === config.geminiModel) {
+    return with1hWriteRate(config.geminiCostRates);
   }
   if (isDeepSeekModel(model)) {
     const base = with1hWriteRate(config.deepseekCostRates);
