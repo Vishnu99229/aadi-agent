@@ -29,6 +29,8 @@ const { handler: removeDate } = await import("../src/tools/remove_date.ts");
 const { handler: listBills } = await import("../src/tools/list_bills.ts");
 const { handler: markBillPaid } = await import("../src/tools/mark_bill_paid.ts");
 const { buildWeeklyReview } = await import("../src/weekly.ts");
+const { runTrackedJob, SoftJobError } = await import("../src/scheduler.ts");
+const { getJobRun } = await import("../src/db.ts");
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -53,6 +55,31 @@ function testBillClassificationParse(): void {
   const parsed = parseBillClassifications(sample, 2);
   assert(parsed[0]?.biller === "Airtel", "first bill parsed");
   assert(parsed[1]?.is_bill === false, "non-bill skipped");
+}
+
+function testBillClassificationFencedPartial(): void {
+  const fenced =
+    '```json\n[\n  {"candidate_id":2,"is_bill":false,"biller":"Zerodha","amount":null,"currency":"INR","due_date":"2026-10-31"},\n  {"candidate_id":13,"is_bill":true,"biller":"YouTube Premium","amount":null,"currency":"INR","due_date":"2026-11-20"},\n  {"candidate_id":13,"is_bill":true,"biller":"Dup","amount":null,"currency":"INR","due_date":"2026-11-20"},\n  {"candidate_id":99,"is_bill":true,"biller":"Out of range","amount":null,"currency":"INR","due_date":"2026-11-20"}\n]\n```';
+  const parsed = parseBillClassifications(fenced, 23);
+  assert(parsed.length === 2, "partial fenced output keeps valid rows only");
+  assert(parsed[1]?.biller === "YouTube Premium", "first of duplicate ids kept");
+  let threw = false;
+  try {
+    parseBillClassifications("Sorry, I cannot help with that.", 3);
+  } catch (error) {
+    threw = error instanceof SoftJobError;
+  }
+  assert(threw, "no JSON array throws a soft job error");
+}
+
+async function testSoftJobFailure(): Promise<void> {
+  const name = `test-soft-${Date.now()}`;
+  await runTrackedJob(name, async () => {
+    throw new SoftJobError("classifier output unusable");
+  });
+  const row = getJobRun(name);
+  assert(row?.last_status === "soft_error", "soft failure recorded as soft_error");
+  assert(row?.last_success_at === null, "soft failure is not a success");
 }
 
 function testBillDedupeAndTools(): void {
@@ -124,6 +151,8 @@ function testWeeklyReview(): void {
 
 testStripSensitive();
 testBillClassificationParse();
+testBillClassificationFencedPartial();
+await testSoftJobFailure();
 testBillDedupeAndTools();
 testImportantDates();
 testWeeklyReview();
