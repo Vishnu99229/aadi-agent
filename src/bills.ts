@@ -152,7 +152,16 @@ Use your best estimate for due_date when only relative wording appears. Fields a
   console.log(
     `Bill scan classification: candidates=${candidates.length}, input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}, cache_creation_input_tokens=${response.usage.cacheCreationInputTokens ?? 0}, cache_read_input_tokens=${response.usage.cacheReadInputTokens ?? 0}, estimated_cost_usd=${response.usage.estimatedCostUsd.toFixed(6)}`,
   );
-  return parseBillClassifications(response.textParts.join("\n"), candidates.length);
+  const raw = response.textParts.join("\n");
+  try {
+    return parseBillClassifications(raw, candidates.length);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      `Bill scan parse failed: ${message} stop_reason=${response.stopReason} raw_length=${raw.length} raw=${JSON.stringify(raw.slice(0, 600))}`,
+    );
+    throw error;
+  }
 }
 
 function formatBillLine(bill: BillRecord): string {

@@ -31,7 +31,8 @@
     "live:documents": "tsx --env-file=.env scripts/test-document-analysis.ts",
     "test:stage11": "tsx scripts/test-stage11.ts",
     "test:start-greeting": "tsx scripts/test-start-greeting.ts",
-    "bench:models": "tsx --env-file=.env scripts/bench-models.ts"
+    "bill-scan:manual": "AADI_DB_PATH=:memory: tsx --env-file=.env scripts/run-bill-scan.ts",
+    "bench:models":"tsx --env-file=.env scripts/bench-models.ts"
   },
   "keywords": [],
   "author": "",
