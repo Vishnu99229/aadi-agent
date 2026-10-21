@@ -51,7 +51,9 @@ const {
 } = await import("../src/xlsx_text.ts");
 const { createNote, getNote } = await import("../src/db.ts");
 const { selectReplyRecipients } = await import("../src/followups.ts");
-const { buildThreadReplyMime } = await import("../src/google/mail.ts");
+const { buildThreadReplyMime, mimeHeaderBlock } = await import(
+  "../src/google/mail.ts"
+);
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -399,6 +401,38 @@ function testFollowupReplyHeaders(): void {
   assert(picked !== undefined, "walk-back finds an external recipient");
   assert(/karthik/i.test(picked!.to), "walk-back picks Karthik, not self");
   assert(/sendhil/i.test(picked!.cc), "walk-back preserves Cc from older message");
+
+  // Hard throw: buildThreadReplyMime must refuse an empty To rather than let
+  // Gmail silently fall back to the authenticated user.
+  let threw = false;
+  try {
+    buildThreadReplyMime({
+      to: "",
+      subject: "Re: anything",
+      inReplyTo: "<x@example.com>",
+      references: "<x@example.com>",
+      body: "hi",
+    });
+  } catch (error) {
+    threw = /Missing To header for draft/.test(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  assert(threw, "buildThreadReplyMime throws on empty To");
+
+  // LLM-dropped Cc: when the follow-up planner picks To=Karthik and Cc=[],
+  // the final MIME must contain no Cc: header line.
+  const mimeNoCc = buildThreadReplyMime({
+    to: "Karthik <karthik@elevenlabs.io>",
+    cc: undefined,
+    subject: "Re: Partnership follow-up",
+    inReplyTo: "<original-123@mail.epicode.in>",
+    references: "<original-123@mail.epicode.in>",
+    body: "Hi Karthik,\n\nSmall nudge.\n\nThanks,\nVishnu",
+  });
+  const headersNoCc = mimeHeaderBlock(mimeNoCc);
+  assert(!/^Cc:/m.test(headersNoCc), "no Cc header when LLM drops all Cc");
+  assert(/^To: .*karthik@elevenlabs\.io/m.test(headersNoCc), "To is Karthik");
 }
 
 testMomDraft();

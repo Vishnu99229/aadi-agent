@@ -2,7 +2,14 @@ import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { queueDraftApproval } from "../approvals.js";
 import { parseGoogleAccountFilter } from "../google/auth.js";
-import { gmailClient, resolveGmailMessage } from "../google/mail.js";
+import {
+  buildThreadReplyMime,
+  gmailClient,
+  mimeHeaderBlock,
+  resolveGmailMessage,
+} from "../google/mail.js";
+import { parseAddressList } from "../followup_logic.js";
+import { isSelfEmail } from "../mom_logic.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -28,6 +35,22 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         description:
           "Mailbox the original email is in. Use the account field from search_emails when present.",
       },
+      to: {
+        description:
+          "Optional explicit recipients. One or more email addresses (strings) or RFC headers. Required when the original message's From is Vishnu himself (e.g. a thread Vishnu started); otherwise defaults to the original sender.",
+        oneOf: [
+          { type: "string" },
+          { type: "array", items: { type: "string" } },
+        ],
+      },
+      cc: {
+        description:
+          "Optional Cc recipients. One or more email addresses (strings) or RFC headers. Omit to send without any Cc.",
+        oneOf: [
+          { type: "string" },
+          { type: "array", items: { type: "string" } },
+        ],
+      },
     },
     required: ["email_id", "body"],
   },
@@ -43,45 +66,34 @@ function header(
   );
 }
 
-function safeHeader(value: string): string {
-  return value.replace(/[\r\n]+/g, " ").trim();
-}
-
 function replySubject(subject: string): string {
-  const normalized = safeHeader(subject) || "(no subject)";
+  const normalized = subject.replace(/[\r\n]+/g, " ").trim() || "(no subject)";
   return /^re\s*:/i.test(normalized) ? normalized : `Re: ${normalized}`;
 }
 
-function encodeBody(body: string): string {
-  return Buffer.from(body, "utf8")
-    .toString("base64")
-    .match(/.{1,76}/g)!
-    .join("\r\n");
+function toAddressList(value: unknown): string[] {
+  if (value === undefined || value === null) return [];
+  if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+  if (Array.isArray(value)) {
+    return value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
 }
 
-function buildReplyMessage(params: {
-  to: string;
-  subject: string;
-  messageId: string;
-  references: string;
-  body: string;
-}): string {
-  const references = [params.references, params.messageId]
-    .map(safeHeader)
-    .filter(Boolean)
-    .join(" ");
-
-  return [
-    `To: ${safeHeader(params.to)}`,
-    `Subject: ${replySubject(params.subject)}`,
-    `In-Reply-To: ${safeHeader(params.messageId)}`,
-    `References: ${references}`,
-    "MIME-Version: 1.0",
-    'Content-Type: text/plain; charset="UTF-8"',
-    "Content-Transfer-Encoding: base64",
-    "",
-    encodeBody(params.body),
-  ].join("\r\n");
+function dropSelf(header: string): string {
+  const kept = parseAddressList(header).filter(
+    (item) => !isSelfEmail(item.email),
+  );
+  return kept
+    .map((item) =>
+      item.name && !item.name.includes("@") && item.name.toLowerCase() !== item.email
+        ? `${item.name} <${item.email}>`
+        : item.email,
+    )
+    .join(", ");
 }
 
 export async function handler(input: unknown): Promise<string> {
@@ -89,6 +101,8 @@ export async function handler(input: unknown): Promise<string> {
     email_id?: unknown;
     body?: unknown;
     account?: unknown;
+    to?: unknown;
+    cc?: unknown;
   };
   if (typeof values.email_id !== "string" || !values.email_id.trim()) {
     throw new Error("email_id must be a non-empty Gmail message ID.");
@@ -101,7 +115,7 @@ export async function handler(input: unknown): Promise<string> {
     values.email_id.trim(),
     parseGoogleAccountFilter(values.account),
     "metadata",
-    ["From", "Subject", "Message-ID", "References"],
+    ["From", "To", "Cc", "Subject", "Message-ID", "References"],
   );
   const gmail = gmailClient(account);
   const headers = original.payload?.headers;
@@ -115,14 +129,41 @@ export async function handler(input: unknown): Promise<string> {
     );
   }
 
+  const explicitTo = toAddressList(values.to).join(", ");
+  const explicitCc = toAddressList(values.cc).join(", ");
+  const fromIsSelf = parseAddressList(from).every((item) =>
+    isSelfEmail(item.email),
+  );
+
+  // Pick recipients: prefer the agent's explicit `to`; otherwise reply to the
+  // original sender. If the original is Vishnu-to-Vishnu and the agent did
+  // not supply `to`, there's no safe default — refuse rather than send to
+  // self or let Gmail quietly address the owner.
+  let to = dropSelf(explicitTo || from);
+  if (!to && fromIsSelf) {
+    throw new Error(
+      "draft_reply: original From is the owner; agent must pass an explicit `to`.",
+    );
+  }
+  if (!to) {
+    throw new Error(
+      "draft_reply: no external recipient after dropping self from the chosen To.",
+    );
+  }
+  const cc = dropSelf(explicitCc);
+
   const subject = replySubject(header(headers, "Subject"));
-  const raw = buildReplyMessage({
-    to: from,
+  const raw = buildThreadReplyMime({
+    to,
+    cc: cc || undefined,
     subject,
-    messageId,
+    inReplyTo: messageId,
     references: header(headers, "References"),
     body: values.body,
   });
+  console.log(
+    `Draft MIME headers (body redacted):\n${mimeHeaderBlock(raw)}`,
+  );
   const result = await gmail.users.drafts.create({
     userId: "me",
     requestBody: {
@@ -140,15 +181,18 @@ export async function handler(input: unknown): Promise<string> {
   await queueDraftApproval({
     draftId: result.data.id,
     threadId,
-    to: safeHeader(from),
+    to,
     subject,
     body: values.body,
     googleAccount: account.id,
+    extraLines: cc ? [`Cc: ${cc}`] : undefined,
   });
 
   return JSON.stringify({
     draft_id: result.data.id,
     account: account.id,
     tag: account.tag,
+    to,
+    cc: cc || null,
   });
 }

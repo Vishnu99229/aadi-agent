@@ -97,8 +97,12 @@ export async function createNewEmailDraft(params: {
   body: string;
 }): Promise<{ draftId: string; threadId: string }> {
   const gmail = gmailClient(params.account);
+  const toHeader = params.to.map(safeHeader).filter(Boolean).join(", ");
+  if (!toHeader) {
+    throw new Error("Missing To header for draft");
+  }
   const raw = [
-    `To: ${params.to.map(safeHeader).join(", ")}`,
+    `To: ${toHeader}`,
     `Subject: ${safeHeader(params.subject)}`,
     "MIME-Version: 1.0",
     'Content-Type: text/plain; charset="UTF-8"',
@@ -106,6 +110,9 @@ export async function createNewEmailDraft(params: {
     "",
     encodeBody(params.body),
   ].join("\r\n");
+  console.log(
+    `Draft MIME headers (body redacted):\n${mimeHeaderBlock(raw)}`,
+  );
 
   const result = await gmail.users.drafts.create({
     userId: "me",
@@ -133,13 +140,19 @@ export interface ThreadReplyMimeInput {
 }
 
 export function buildThreadReplyMime(params: ThreadReplyMimeInput): string {
+  const to = safeHeader(params.to ?? "");
+  if (!to) {
+    // Hard safeguard: Gmail defaults to the authenticated user when the raw
+    // MIME has no To. Refuse rather than silently addressing the owner.
+    throw new Error("Missing To header for draft");
+  }
   const references = [params.references, params.inReplyTo]
     .map(safeHeader)
     .filter(Boolean)
     .join(" ");
   const cc = params.cc ? safeHeader(params.cc) : "";
   return [
-    `To: ${safeHeader(params.to)}`,
+    `To: ${to}`,
     ...(cc ? [`Cc: ${cc}`] : []),
     `Subject: ${safeHeader(params.subject)}`,
     `In-Reply-To: ${safeHeader(params.inReplyTo)}`,
@@ -150,6 +163,12 @@ export function buildThreadReplyMime(params: ThreadReplyMimeInput): string {
     "",
     encodeBody(params.body),
   ].join("\r\n");
+}
+
+/** The MIME header block only, used for logging before `drafts.create` so we
+ *  can see exactly what Gmail receives without leaking the body. */
+export function mimeHeaderBlock(raw: string): string {
+  return raw.split("\r\n\r\n")[0] ?? raw;
 }
 
 export async function createThreadReplyDraft(params: {
@@ -164,6 +183,9 @@ export async function createThreadReplyDraft(params: {
 }): Promise<{ draftId: string }> {
   const gmail = gmailClient(params.account);
   const raw = buildThreadReplyMime(params);
+  console.log(
+    `Draft MIME headers (body redacted):\n${mimeHeaderBlock(raw)}`,
+  );
 
   const result = await gmail.users.drafts.create({
     userId: "me",
