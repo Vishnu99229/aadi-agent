@@ -10,6 +10,7 @@ import {
   activeFollowups,
   createFollowupDraftForApproval,
   displaysForFollowups,
+  FollowupDraftLlmError,
   overdueFollowups,
   snoozeFollowupThreeDays,
   stopTrackingFollowup,
@@ -215,6 +216,19 @@ export async function handleFollowupCallback(ctx: Context): Promise<void> {
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Follow-up action failed (${errorType})`);
+    if (error instanceof FollowupDraftLlmError) {
+      // Row stays in `waiting`, so the next scheduled scan or a retap retries.
+      if (answered) {
+        await ctx.reply(error.message);
+      } else {
+        await ctx.answerCallbackQuery({
+          text: "Drafting failed. See chat for details.",
+          show_alert: true,
+        });
+        await ctx.reply(error.message);
+      }
+      return;
+    }
     if (answered) {
       await ctx.reply("That action failed. Try again.");
       return;

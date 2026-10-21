@@ -194,17 +194,6 @@ export function firstNameFromRecipient(recipientHeader: string): string {
   return first && first !== "(sent" ? first : "there";
 }
 
-export function followupDraftBody(recipientHeader: string): string {
-  return [
-    `Hi ${firstNameFromRecipient(recipientHeader)},`,
-    "",
-    "Just following up on this — did you get a chance to look?",
-    "",
-    "Thanks,",
-    "Vishnu",
-  ].join("\n");
-}
-
 export interface FollowupDisplay {
   id: number;
   title: string;

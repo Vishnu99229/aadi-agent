@@ -24,9 +24,9 @@ import {
   formatSnoozeUntil,
   formatWaitingPhrase,
   formatToLine,
-  followupDraftBody,
   isSelfSentRecipient,
   neededLine,
+  parseAddressList,
   waitingDays,
   type FollowupDisplay,
 } from "./followup_logic.js";
@@ -550,6 +550,30 @@ function replySubject(subject: string): string {
   return /^re\s*:/i.test(normalized) ? normalized : `Re: ${normalized}`;
 }
 
+/** Thrown when both DeepSeek and the Claude fallback inside `complete()` fail
+ *  (or return empty). Carries a Telegram-ready message so the caller can
+ *  alert Vishnu by name; the follow-up row stays in `waiting` for a retry. */
+export class FollowupDraftLlmError extends Error {
+  constructor(
+    message: string,
+    readonly recipientLabel: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message);
+    this.name = "FollowupDraftLlmError";
+    if (options?.cause !== undefined) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+function recipientLabel(recipientHeader: string): string {
+  const mailbox = parseAddressList(recipientHeader).find(
+    (item) => !isSelfEmail(item.email),
+  );
+  return mailbox?.name || mailbox?.email || "the recipient";
+}
+
 async function draftFollowupBody(
   recipientHeader: string,
   subject: string,
@@ -613,6 +637,7 @@ export async function createFollowupDraftForApproval(
   const messageId = header(headers, "Message-ID");
   const to = followup.recipient || header(headers, "To");
   const originalSnippet = latestSent.snippet?.trim() ?? "";
+  const label = recipientLabel(to);
   let body: string;
   try {
     body = await draftFollowupBody(to, followup.subject, originalSnippet);
@@ -620,9 +645,13 @@ export async function createFollowupDraftForApproval(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(
-      `Follow-up ${id}: LLM body failed (${errorType}); using template.`,
+      `Follow-up ${id}: LLM draft failed (${errorType}); row stays waiting`,
     );
-    body = followupDraftBody(to);
+    throw new FollowupDraftLlmError(
+      `I couldn't draft the follow-up for ${label} because the LLM API failed. Please check the logs or try again manually.`,
+      label,
+      { cause: error },
+    );
   }
   const subject = replySubject(followup.subject);
   const { draftId } = await createThreadReplyDraft({
