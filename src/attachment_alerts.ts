@@ -3,6 +3,7 @@ import { everyMs, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import {
   createAttachmentAlert,
+  expireOldPendingAttachmentAlerts,
   getAttachmentAlert,
   transitionAttachmentAlert,
 } from "./db.js";
@@ -23,7 +24,10 @@ import {
 import { isSelfEmail } from "./mom_logic.js";
 
 const TIME_ZONE = "Asia/Kolkata";
+// Only look at mail from the last 24 hours. Older mail that never got
+// a Review/Ignore tap gets flipped to 'ignored' by the age sweep below.
 const LOOKBACK = "in:inbox has:attachment newer_than:1d";
+const AUTO_IGNORE_AFTER_HOURS = 48;
 
 function alertKeyboard(alertId: number): InlineKeyboard {
   return new InlineKeyboard()
@@ -41,6 +45,13 @@ export async function runAttachmentAlertScan(api: Api): Promise<number> {
   const work = accounts.find((account) => account.id === "work");
   if (!work) {
     return 0;
+  }
+  // Age sweep first so old pending rows don't come back to haunt us.
+  const expired = expireOldPendingAttachmentAlerts(AUTO_IGNORE_AFTER_HOURS);
+  if (expired > 0) {
+    console.log(
+      `Attachment alerts: auto-ignored ${expired} row(s) older than ${AUTO_IGNORE_AFTER_HOURS}h.`,
+    );
   }
   const gmail = gmailClient(work);
   const listed = await gmail.users.messages.list({
@@ -81,9 +92,11 @@ export async function runAttachmentAlertScan(api: Api): Promise<number> {
         attachment.filename,
         subject,
       );
-      // INSERT OR IGNORE on UNIQUE(google_account, message_id, attachment_id):
-      // returns the new row on first scan, undefined on every subsequent scan.
-      // Must stay the sole gatekeeper so one email doesn't ping Telegram twice.
+      // INSERT OR IGNORE is the sole gatekeeper. UNIQUE on
+      // (google_account, message_id, file_name) catches duplicates even
+      // when Gmail returns a different attachmentId for the same file
+      // across scans. On a hit, createAttachmentAlert returns undefined;
+      // we MUST continue without touching Telegram.
       const row = createAttachmentAlert({
         messageId: message.id!,
         googleAccount: "work",
@@ -95,6 +108,9 @@ export async function runAttachmentAlertScan(api: Api): Promise<number> {
         guessedType: guessed,
       });
       if (!row) {
+        console.log(
+          "Skipping duplicate attachment alert for: " + attachment.filename,
+        );
         continue;
       }
       const text = `${guessed} from ${sender}: ${attachment.filename}`;

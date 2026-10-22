@@ -556,6 +556,29 @@ if (!tableHasColumn("meeting_briefs", "thresholds_sent")) {
   );
 }
 
+// Attachment-alert dedup: Gmail may return a different attachmentId for
+// the same file across scans, so the old UNIQUE(account, message_id,
+// attachment_id) lets dupe rows slip in and the scanner then pings the
+// user again every 10 minutes. Enforce a stricter dedup on
+// (account, message_id, file_name). Must dedupe existing rows first,
+// since the UNIQUE INDEX will otherwise refuse to create.
+try {
+  db.exec(`
+    DELETE FROM attachment_alerts
+    WHERE id NOT IN (
+      SELECT MIN(id) FROM attachment_alerts
+      GROUP BY google_account, message_id, file_name
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_attachment_alerts_dedupe
+      ON attachment_alerts (google_account, message_id, file_name);
+  `);
+} catch (error) {
+  const errorType = error instanceof Error ? error.name : "UnknownError";
+  console.error(
+    `Attachment alert dedupe migration failed (${errorType}); duplicates may still slip through.`,
+  );
+}
+
 let memoriesFtsReady = false;
 try {
   db.exec(`
@@ -1304,6 +1327,31 @@ export function transitionAttachmentAlert(
     )
     .run(to, id, from);
   return result.changes === 1;
+}
+
+// Test-only: backdate a row's created_at by N hours. Used to exercise
+// the age sweep without a 48-hour wait. Not called from production code.
+export function __setAttachmentAlertAgeForTests(id: number, hoursAgo: number): void {
+  db.prepare(
+    `UPDATE attachment_alerts
+     SET created_at = datetime('now', '-' || ? || ' hours')
+     WHERE id = ?`,
+  ).run(Math.max(0, Math.floor(hoursAgo)), id);
+}
+
+// Flip pending rows older than `hours` to 'ignored' so old emails don't
+// clog the table and the scan loop. Returns how many rows were touched.
+export function expireOldPendingAttachmentAlerts(hours: number): number {
+  const safeHours = Math.max(1, Math.floor(hours));
+  const result = db
+    .prepare(
+      `UPDATE attachment_alerts
+       SET status = 'ignored'
+       WHERE status = 'pending'
+         AND created_at <= datetime('now', '-' || ? || ' hours')`,
+    )
+    .run(safeHours);
+  return result.changes;
 }
 
 export type BillStatus = "upcoming" | "paid" | "ignored";

@@ -16,6 +16,9 @@ import {
   countQaBankEntries,
   createAttachmentAlert,
   createMeetingPendingBooking,
+  __setAttachmentAlertAgeForTests,
+  expireOldPendingAttachmentAlerts,
+  getAttachmentAlert,
   createMeetingProposal,
   createQaBankEntry,
   getMeetingPendingBooking,
@@ -838,6 +841,59 @@ const sameMsgDifferentAttachment = createAttachmentAlert({
 assert(
   !!sameMsgDifferentAttachment,
   "different attachment on same message inserts a new row",
+);
+
+// Gmail sometimes returns a different attachmentId for the same file
+// across scans. The new UNIQUE on (account, message_id, file_name)
+// must still dedupe, or the user gets spammed with the same NDA every
+// scan cycle.
+const dupAfterAttachmentIdFlip = createAttachmentAlert({
+  messageId: "m-dedup-1",
+  googleAccount: "work",
+  attachmentId: "att-1-FLIPPED",
+  fileName: "msa.pdf",
+  mimeType: "application/pdf",
+  sender: "Ada",
+  subject: "MSA v2",
+  guessedType: "Contract",
+});
+assert(
+  dupAfterAttachmentIdFlip === undefined,
+  "same file name on same message is a duplicate even if attachment_id changed",
+);
+
+// Age sweep: pending rows older than N hours flip to 'ignored'.
+const freshAlert = createAttachmentAlert({
+  messageId: "m-age-fresh",
+  googleAccount: "work",
+  attachmentId: "att-fresh",
+  fileName: "fresh.pdf",
+  mimeType: "application/pdf",
+  sender: "Ada",
+  subject: "fresh",
+  guessedType: "Contract",
+});
+const oldAlert = createAttachmentAlert({
+  messageId: "m-age-old",
+  googleAccount: "work",
+  attachmentId: "att-old",
+  fileName: "old.pdf",
+  mimeType: "application/pdf",
+  sender: "Ada",
+  subject: "old",
+  guessedType: "Contract",
+});
+// Age the second row by 72 hours.
+__setAttachmentAlertAgeForTests(oldAlert!.id, 72);
+const expired = expireOldPendingAttachmentAlerts(48);
+assert(expired === 1, "48h sweep flips exactly the 72h-old pending row");
+assert(
+  getAttachmentAlert(oldAlert!.id)?.status === "ignored",
+  "old pending alert ended up ignored",
+);
+assert(
+  getAttachmentAlert(freshAlert!.id)?.status === "pending",
+  "fresh pending alert is left alone",
 );
 
 // Pre-meeting brief threshold tracking: each threshold fires once per
