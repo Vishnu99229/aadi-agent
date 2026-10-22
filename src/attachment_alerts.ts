@@ -81,6 +81,9 @@ export async function runAttachmentAlertScan(api: Api): Promise<number> {
         attachment.filename,
         subject,
       );
+      // INSERT OR IGNORE on UNIQUE(google_account, message_id, attachment_id):
+      // returns the new row on first scan, undefined on every subsequent scan.
+      // Must stay the sole gatekeeper so one email doesn't ping Telegram twice.
       const row = createAttachmentAlert({
         messageId: message.id!,
         googleAccount: "work",

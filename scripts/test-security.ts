@@ -13,12 +13,16 @@ import {
 } from "../src/security/auto_book.ts";
 import {
   DB_PATH,
+  createAttachmentAlert,
   createMeetingPendingBooking,
   createMeetingProposal,
   getMeetingPendingBooking,
   getMeetingProposal,
   listDueMeetingPendingBookings,
   listMeetingPendingBookings,
+  parseThresholdsSent,
+  recordMeetingBrief,
+  recordMeetingBriefThreshold,
   setMeetingProposalStatus,
   transitionMeetingPendingBooking,
 } from "../src/db.ts";
@@ -788,5 +792,76 @@ assert(afterUndo === 0, "undo: cancelled booking is not sent after send_at");
 assert(getMeetingPendingBooking(future.id)?.status === "cancelled", "undo: cancelled status persists");
 assert(getMeetingProposal(undoProposal.id)?.status === "open", "undo: proposal reopens");
 assert(mailSends === 0, "undo before send_at must not call messages.send");
+
+// Attachment alert dedup: INSERT OR IGNORE on UNIQUE
+// (google_account, message_id, attachment_id) must return the row the
+// first time and undefined on every repeat. The scanner relies on this
+// to avoid spamming Telegram when the email stays in the inbox.
+const firstAlert = createAttachmentAlert({
+  messageId: "m-dedup-1",
+  googleAccount: "work",
+  attachmentId: "att-1",
+  fileName: "msa.pdf",
+  mimeType: "application/pdf",
+  sender: "Ada",
+  subject: "MSA v2",
+  guessedType: "Contract",
+});
+assert(!!firstAlert, "first attachment alert insert returns a row");
+const dupAlert = createAttachmentAlert({
+  messageId: "m-dedup-1",
+  googleAccount: "work",
+  attachmentId: "att-1",
+  fileName: "msa.pdf",
+  mimeType: "application/pdf",
+  sender: "Ada",
+  subject: "MSA v2",
+  guessedType: "Contract",
+});
+assert(
+  dupAlert === undefined,
+  "duplicate attachment alert insert returns undefined",
+);
+const sameMsgDifferentAttachment = createAttachmentAlert({
+  messageId: "m-dedup-1",
+  googleAccount: "work",
+  attachmentId: "att-2",
+  fileName: "annex.pdf",
+  mimeType: "application/pdf",
+  sender: "Ada",
+  subject: "MSA v2",
+  guessedType: "Contract",
+});
+assert(
+  !!sameMsgDifferentAttachment,
+  "different attachment on same message inserts a new row",
+);
+
+// Pre-meeting brief threshold tracking: each threshold fires once per
+// (event, start). Second fire of the same threshold must no-op.
+const briefRow = recordMeetingBrief({
+  eventId: "evt-threshold-1",
+  startAt: "2026-10-25T10:00:00.000Z",
+  endAt: "2026-10-25T10:30:00.000Z",
+  title: "Threshold check",
+  attendeesJson: "[]",
+  nudgeAt: "2026-10-25T10:30:00.000Z",
+});
+assert(
+  parseThresholdsSent(briefRow.thresholds_sent).length === 0,
+  "new brief row has no thresholds fired",
+);
+assert(
+  recordMeetingBriefThreshold(briefRow.id, 15) === true,
+  "first 15-min threshold records",
+);
+assert(
+  recordMeetingBriefThreshold(briefRow.id, 15) === false,
+  "second 15-min threshold is a no-op",
+);
+assert(
+  recordMeetingBriefThreshold(briefRow.id, 10) === true,
+  "10-min threshold records independently",
+);
 
 console.log("Security gate checks passed.");

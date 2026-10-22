@@ -21,10 +21,12 @@ const {
   briefsDueForRemindNudge,
   callLabel,
   companyFromEmail,
+  dueThresholdsForEvent,
   eventsDueForBrief,
   formatThreadDate,
   meetingKey,
   nextBriefInstant,
+  nextThresholdInstantAcross,
   nextQualifyingEvent,
   nudgeQuestion,
   planNudgeRefresh,
@@ -228,20 +230,26 @@ function testBriefAndGoal(): void {
     title: "Acme pricing call",
     startIso: new Date(NOW.getTime() + 10 * 60 * 1000).toISOString(),
     attendees,
-    threads: [
-      { from: "Priya", subject: "Pricing follow-up", date: "13 Oct 2026" },
-    ],
-    openItems: [
-      { kind: "follow-up", text: "Pricing follow-up (priya@acme.com)" },
-      { kind: "task", text: "Send Acme proposal" },
-      { kind: "note", text: "Acme intro" },
-    ],
   });
   assert(text.includes("Acme pricing call"), "title in brief");
   assert(text.includes("Priya Sharma (Acme)"), "attendee in brief");
-  assert(text.includes("Pricing follow-up"), "thread in brief");
-  assert(text.includes("follow-up:"), "open follow-up");
-  assert(text.includes("Suggested goal for this call"), "goal line");
+  // Clutter must be gone.
+  assert(!text.includes("Recent threads"), "no Recent threads section");
+  assert(!text.includes("Open:"), "no Open section");
+  assert(!text.includes("Remembered"), "no Remembered section");
+  assert(!text.includes("Suggested goal"), "no Suggested goal line");
+
+  const withCountdown = buildMeetingBriefText({
+    title: "Acme pricing call",
+    startIso: new Date(NOW.getTime() + 10 * 60 * 1000).toISOString(),
+    attendees,
+    minutesUntil: 10,
+  });
+  assert(
+    withCountdown.startsWith("In 10 minutes:"),
+    "countdown header on reminder",
+  );
+
   assert(
     nudgeQuestion("Acme pricing call", attendees).includes("Priya Sharma (Acme)"),
     "nudge names the person",
@@ -436,6 +444,90 @@ function testRescheduleAndCancel(): void {
   assert(onTime.action === "send", "unchanged event nudges after its end");
 }
 
+function testMultiThresholdReminders(): void {
+  const event = {
+    id: "multi-evt",
+    status: "confirmed",
+    summary: "Multi",
+    start: { dateTime: "2026-10-19T16:00:00+05:30" },
+    end: { dateTime: "2026-10-19T16:30:00+05:30" },
+    attendees: [
+      { email: SELF, self: true },
+      { email: "guest@example.com", displayName: "Guest" },
+    ],
+  };
+  const thresholds = [15, 10, 5] as const;
+  const before = new Date("2026-10-19T15:30:00+05:30");
+  const atFifteen = new Date("2026-10-19T15:45:00+05:30");
+  const atTen = new Date("2026-10-19T15:50:00+05:30");
+  const atFive = new Date("2026-10-19T15:55:00+05:30");
+
+  assert(
+    dueThresholdsForEvent(event, before, thresholds, SELF, true, []).length === 0,
+    "no thresholds due 30 min before",
+  );
+
+  // At the 15-min mark: 15 is due, 10 and 5 are not.
+  const dueAt15 = dueThresholdsForEvent(event, atFifteen, thresholds, SELF, true, []);
+  assert(JSON.stringify(dueAt15) === JSON.stringify([15]), "only 15 due at 15");
+
+  // At the 10-min mark with 15 already fired: only 10 is due.
+  const dueAt10 = dueThresholdsForEvent(event, atTen, thresholds, SELF, true, [15]);
+  assert(JSON.stringify(dueAt10) === JSON.stringify([10]), "only 10 due after 15 fired");
+
+  // At the 5-min mark, if scanner missed the 10-min slot (e.g. phone off):
+  // both 10 and 5 fire now, descending.
+  const dueAt5Missed10 = dueThresholdsForEvent(event, atFive, thresholds, SELF, true, [15]);
+  assert(
+    JSON.stringify(dueAt5Missed10) === JSON.stringify([10, 5]),
+    "catches up on missed thresholds, largest first",
+  );
+
+  // Already fired at a threshold: never re-fires.
+  const dueAfterAll = dueThresholdsForEvent(event, atFive, thresholds, SELF, true, [15, 10, 5]);
+  assert(dueAfterAll.length === 0, "no re-fire once all fired");
+
+  // Cancelled meeting: nothing fires.
+  const cancelled = dueThresholdsForEvent(
+    { ...event, status: "cancelled" },
+    atFifteen,
+    thresholds,
+    SELF,
+    true,
+    [],
+  );
+  assert(cancelled.length === 0, "cancelled event skipped");
+
+  // nextThresholdInstantAcross picks the earliest remaining threshold.
+  const firedByKey = new Map<string, number[]>();
+  const nextMs = nextThresholdInstantAcross(
+    [event],
+    before,
+    thresholds,
+    SELF,
+    true,
+    firedByKey,
+  );
+  assert(
+    nextMs === new Date("2026-10-19T15:45:00+05:30").getTime(),
+    "next instant is the 15-min mark when nothing fired",
+  );
+
+  firedByKey.set(meetingKey(event.id, event.start.dateTime!), [15]);
+  const nextAfter15 = nextThresholdInstantAcross(
+    [event],
+    atFifteen,
+    thresholds,
+    SELF,
+    true,
+    firedByKey,
+  );
+  assert(
+    nextAfter15 === new Date("2026-10-19T15:50:00+05:30").getTime(),
+    "next instant moves to the 10-min mark after 15 fired",
+  );
+}
+
 function testBriefRetimed(): void {
   const event = {
     id: "vatsal-evt",
@@ -534,8 +626,6 @@ function testBriefFiltering(): void {
     title: "Vatsal",
     startIso: "2026-10-19T16:00:00+05:30",
     attendees,
-    threads: [],
-    openItems: [],
   });
   assert(!brief.includes("Suggested goal"), "empty brief has no suggested goal");
 }
@@ -601,6 +691,7 @@ testNudgeTiming();
 testPersistOnceAndWrapUp();
 testRescheduleAndCancel();
 testBriefRetimed();
+testMultiThresholdReminders();
 testBriefFiltering();
 testHistoryQuoteAndCalendar();
 console.log("Stage 7 checks passed.");

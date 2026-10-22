@@ -474,48 +474,20 @@ export function buildMeetingBriefText(params: {
   title: string;
   startIso: string;
   attendees: MeetingAttendee[];
-  threads: EmailThreadLine[];
-  openItems: OpenItemLine[];
-  memories?: string[];
+  minutesUntil?: number;
 }): string {
   const title = params.title.trim() || "(Untitled event)";
   const attendeeLine = formatAttendeeLine(params.attendees) || "None";
-  const threads =
-    params.threads.length > 0
-      ? params.threads.slice(0, 3).map(formatThreadLine).join("\n")
-      : "• None";
-  const open =
-    params.openItems.length > 0
-      ? params.openItems
-          .slice(0, 6)
-          .map((item) => `• ${item.kind}: ${item.text}`)
-          .join("\n")
-      : "• None";
-
-  const remembered =
-    params.memories && params.memories.length > 0
-      ? params.memories.slice(0, 5).map((item) => `• ${item}`).join("\n")
-      : "";
-
+  const header =
+    typeof params.minutesUntil === "number" && params.minutesUntil > 0
+      ? `In ${params.minutesUntil} minutes:`
+      : undefined;
   const lines = [
+    ...(header ? [header, ""] : []),
     title,
     formatKolkataTime(params.startIso),
     `Attendees: ${attendeeLine}`,
-    "",
-    "Recent threads:",
-    threads,
-    "",
-    "Open:",
-    open,
-    ...(remembered ? ["", "Remembered:", remembered] : []),
   ];
-  const goal = suggestedGoal({
-    threads: params.threads,
-    openItems: params.openItems,
-  });
-  if (goal) {
-    lines.push("", goal);
-  }
   return lines.join("\n");
 }
 
@@ -580,6 +552,87 @@ export function nextBriefInstant(
     const sendAt = start - minutes * 60 * 1000;
     if (best === null || sendAt < best) {
       best = sendAt;
+    }
+  }
+  return best;
+}
+
+// Composite key per (event, start, threshold). Used so the per-threshold
+// scheduler can dedupe within one run.
+export function meetingBriefKey(
+  eventId: string,
+  startIso: string,
+  minutes: number,
+): string {
+  return `${meetingKey(eventId, startIso)}|${minutes}`;
+}
+
+// Thresholds that are due to fire now (sendAt <= now) and haven't fired yet.
+// Returned descending (largest minutes first), matching how we iterate.
+export function dueThresholdsForEvent(
+  event: CalendarEventLike,
+  now: Date,
+  thresholds: readonly number[],
+  selfEmail: string,
+  skipInternalRecurring: boolean,
+  alreadyFired: readonly number[],
+): number[] {
+  if (skipReason(event, selfEmail, skipInternalRecurring)) {
+    return [];
+  }
+  const start = eventStartMs(event);
+  if (!event.id || start === null || start <= now.getTime()) {
+    return [];
+  }
+  const fired = new Set(alreadyFired);
+  const due: number[] = [];
+  for (const minutes of thresholds) {
+    if (fired.has(minutes)) {
+      continue;
+    }
+    const sendAt = start - minutes * 60 * 1000;
+    if (now.getTime() >= sendAt) {
+      due.push(minutes);
+    }
+  }
+  return due.sort((a, b) => b - a);
+}
+
+// Next fire instant across all events × thresholds that are still pending.
+// `firedByKey` maps meetingKey(eventId, startIso) → thresholds already fired.
+export function nextThresholdInstantAcross(
+  events: CalendarEventLike[],
+  now: Date,
+  thresholds: readonly number[],
+  selfEmail: string,
+  skipInternalRecurring: boolean,
+  firedByKey: Map<string, readonly number[]>,
+): number | null {
+  let best: number | null = null;
+  for (const event of events) {
+    const startIso = event.start?.dateTime;
+    if (!event.id || !startIso) {
+      continue;
+    }
+    if (skipReason(event, selfEmail, skipInternalRecurring)) {
+      continue;
+    }
+    const start = eventStartMs(event);
+    if (start === null || start <= now.getTime()) {
+      continue;
+    }
+    const fired = new Set(firedByKey.get(meetingKey(event.id, startIso)) ?? []);
+    for (const minutes of thresholds) {
+      if (fired.has(minutes)) {
+        continue;
+      }
+      const sendAt = start - minutes * 60 * 1000;
+      if (sendAt <= now.getTime()) {
+        continue;
+      }
+      if (best === null || sendAt < best) {
+        best = sendAt;
+      }
     }
   }
   return best;

@@ -42,9 +42,25 @@ const weeklyReviewTime = process.env.WEEKLY_REVIEW_TIME?.trim() || "19:00";
 const weeklyReviewTimeMatch = /^(\d{2}):(\d{2})$/.exec(weeklyReviewTime);
 const weeklyReviewHour = Number(weeklyReviewTimeMatch?.[1]);
 const weeklyReviewMinute = Number(weeklyReviewTimeMatch?.[2]);
-const preMeetingMinutes = Number(
-  process.env.PRE_MEETING_MINUTES?.trim() || "15",
-);
+const preMeetingMinutes = (() => {
+  const raw = (process.env.PRE_MEETING_MINUTES?.trim() || "15,10,5")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const parsed = raw.map((part) => Number(part));
+  if (parsed.some((value) => !Number.isFinite(value) || value <= 0)) {
+    console.error(
+      "PRE_MEETING_MINUTES must be a comma-separated list of positive numbers, for example 15,10,5.",
+    );
+    process.exit(1);
+  }
+  const unique = Array.from(new Set(parsed)).sort((a, b) => b - a);
+  if (unique.length === 0) {
+    console.error("PRE_MEETING_MINUTES must contain at least one value.");
+    process.exit(1);
+  }
+  return unique;
+})();
 const skipInternalRaw =
   process.env.SKIP_INTERNAL_RECURRING?.trim().toLowerCase() ?? "";
 const skipInternalRecurring =
@@ -107,11 +123,6 @@ if (
   console.error(
     "WEEKLY_REVIEW_TIME must use 24-hour HH:MM format, for example 19:00.",
   );
-  process.exit(1);
-}
-
-if (!Number.isFinite(preMeetingMinutes) || preMeetingMinutes <= 0) {
-  console.error("PRE_MEETING_MINUTES must be a positive number.");
   process.exit(1);
 }
 

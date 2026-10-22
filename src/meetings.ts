@@ -5,20 +5,18 @@ import { config } from "./config.js";
 import {
   clearMeetingRebrief,
   deleteSetting,
-  getFollowups,
   getMeetingBrief,
   getMeetingBriefByEvent,
   getSetting,
-  getTasks,
   listMeetingBriefs,
+  parseThresholdsSent,
   recordMeetingBrief,
+  recordMeetingBriefThreshold,
   rescheduleMeetingBrief,
-  searchNotes,
   setSetting,
   updateMeetingNudge,
   type MeetingBriefRecord,
 } from "./db.js";
-import { decodedAccounts } from "./accounts.js";
 import {
   isGoogleNotFound,
   loadGoogleAccounts,
@@ -27,21 +25,16 @@ import {
 import { gmailClient } from "./google/mail.js";
 import {
   buildMeetingBriefText,
-  eventsDueForBrief,
+  dueThresholdsForEvent,
   meetingKey,
-  nextBriefInstant,
+  nextThresholdInstantAcross,
   nextQualifyingEvent,
   nudgeQuestion,
   planNudgeRefresh,
-  selectLinkedOpenItems,
-  textLinkedToMeeting,
   toMeetingAttendees,
   type CalendarEventLike,
-  type EmailThreadLine,
   type MeetingAttendee,
-  type OpenItemLine,
 } from "./meeting_logic.js";
-import { memoriesMatchingText } from "./memory.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const PENDING_WRAPUP_KEY = "pending_meeting_wrapup";
@@ -55,16 +48,6 @@ export interface PendingMeetingWrapUp {
   briefId: number;
   title: string;
   attendeeLine: string;
-}
-
-function header(
-  headers: Array<{ name?: string | null; value?: string | null }> | undefined,
-  name: string,
-): string {
-  return (
-    headers?.find((item) => item.name?.toLowerCase() === name.toLowerCase())
-      ?.value ?? ""
-  );
 }
 
 function nudgeKeyboard(briefId: number): InlineKeyboard {
@@ -152,121 +135,34 @@ async function listWorkEvents(
   return events;
 }
 
-async function searchWorkThreads(
-  account: LoadedGoogleAccount,
-  attendees: MeetingAttendee[],
-): Promise<EmailThreadLine[]> {
-  const addresses = attendees
-    .map((item) => item.email)
-    .filter((email) => email.includes("@"));
-  if (addresses.length === 0) {
-    return [];
-  }
-  const query = addresses
-    .map((email) => `from:${email} OR to:${email}`)
-    .join(" OR ");
-  const gmail = gmailClient(account);
-  const listed = await gmail.users.messages.list({
-    userId: "me",
-    q: query,
-    maxResults: 8,
-  });
-  const accounts = linkAccounts();
-  const threads = new Map<string, EmailThreadLine>();
-  for (const message of listed.data.messages ?? []) {
-    if (!message.id) {
-      continue;
-    }
-    const response = await gmail.users.messages.get({
-      userId: "me",
-      id: message.id,
-      format: "metadata",
-      metadataHeaders: ["From", "Subject", "Date"],
-    });
-    const threadId = response.data.threadId ?? message.id;
-    if (threads.has(threadId)) {
-      continue;
-    }
-    const headers = response.data.payload?.headers;
-    threads.set(threadId, {
-      from: header(headers, "From"),
-      subject: header(headers, "Subject"),
-      date: header(headers, "Date"),
-    });
-    if (threads.size >= 8) {
-      break;
-    }
-  }
-  const linked = [...threads.values()].filter((thread) => {
-    if (textLinkedToMeeting(`${thread.from} ${thread.subject}`, attendees, accounts)) {
-      return true;
-    }
-    const from = thread.from.toLowerCase();
-    return from.includes("@epicode.in") || from.includes(SELF_FALLBACK);
-  }).slice(0, 3);
-  console.log(
-    `Pre-meeting mail search: attendees=${addresses.length}, threads=${linked.length}`,
-  );
-  return linked;
-}
-
-function linkAccounts() {
-  return decodedAccounts().map((account) => ({
-    name: account.name,
-    aliases: account.aliases,
-    email_domains: account.email_domains,
-  }));
-}
-
-function openItemsFor(attendees: MeetingAttendee[]): OpenItemLine[] {
-  return selectLinkedOpenItems({
-    attendees,
-    accounts: linkAccounts(),
-    followups: getFollowups(),
-    tasks: getTasks(),
-    notes: searchNotes("").map((note) => ({
-      title: note.title,
-      people: note.people,
-      content: note.content,
-    })),
-  });
-}
-
-export async function buildBriefForEvent(
+export function buildBriefForEvent(
   event: CalendarEventLike,
-  account: LoadedGoogleAccount,
+  _account: LoadedGoogleAccount,
   self: string,
-): Promise<{ text: string; attendees: MeetingAttendee[] } | undefined> {
+  options: { minutesUntil?: number } = {},
+): { text: string; attendees: MeetingAttendee[] } | undefined {
   const startIso = event.start?.dateTime;
   if (!event.id || !startIso) {
     return undefined;
   }
   const attendees = toMeetingAttendees(event, self);
-  const threads = await searchWorkThreads(account, attendees);
-  const openItems = openItemsFor(attendees);
-  const memoryHay = [
-    event.summary ?? "",
-    ...attendees.map((item) => `${item.name} ${item.company}`),
-  ].join(" ");
-  const memories = memoriesMatchingText(memoryHay).map((item) => item.content);
   return {
     attendees,
     text: buildMeetingBriefText({
       title: event.summary ?? "(Untitled event)",
       startIso,
       attendees,
-      threads,
-      openItems,
-      memories,
+      minutesUntil: options.minutesUntil,
     }),
   };
 }
 
-async function sendBrief(
+async function sendBriefAtThreshold(
   api: Api,
   event: CalendarEventLike,
   account: LoadedGoogleAccount,
   self: string,
+  thresholdMinutes: number,
 ): Promise<MeetingBriefRecord | undefined> {
   const startIso = event.start?.dateTime;
   const endIso = event.end?.dateTime;
@@ -275,39 +171,43 @@ async function sendBrief(
   }
   const startKey = new Date(startIso).toISOString();
   const endKey = new Date(endIso).toISOString();
-  const existing = getMeetingBriefByEvent(event.id, startKey);
-  if (existing && !existing.needs_rebrief) {
-    return existing;
-  }
-  const built = await buildBriefForEvent(event, account, self);
+  const title = event.summary?.trim() || "(Untitled event)";
+
+  const built = buildBriefForEvent(event, account, self, {
+    minutesUntil: thresholdMinutes,
+  });
   if (!built) {
     return undefined;
   }
-  await api.sendMessage(config.ownerTelegramId, built.text);
-  const title = event.summary?.trim() || "(Untitled event)";
   const attendeesJson = JSON.stringify(built.attendees);
-  const idealAt =
-    new Date(startKey).getTime() - config.preMeetingMinutes * 60 * 1000;
-  const timing = Date.now() - idealAt > 60_000 ? "short_notice" : "on_time";
-  if (existing) {
-    clearMeetingRebrief(existing.id, endKey, title, attendeesJson);
-    console.log(
-      `Pre-meeting brief sent: event=${event.id} timing=${timing} rebrief=1`,
-    );
-    return getMeetingBrief(existing.id);
+
+  // Ensure a row exists (create if first threshold for this meeting, or
+  // clear needs_rebrief on a rescheduled one).
+  let row = getMeetingBriefByEvent(event.id, startKey);
+  if (row && row.needs_rebrief) {
+    clearMeetingRebrief(row.id, endKey, title, attendeesJson);
+    row = getMeetingBrief(row.id);
   }
-  const record = recordMeetingBrief({
-    eventId: event.id,
-    startAt: startKey,
-    endAt: endKey,
-    title,
-    attendeesJson,
-    nudgeAt: endKey,
-  });
+  if (!row) {
+    row = recordMeetingBrief({
+      eventId: event.id,
+      startAt: startKey,
+      endAt: endKey,
+      title,
+      attendeesJson,
+      nudgeAt: endKey,
+    });
+  }
+
+  await api.sendMessage(config.ownerTelegramId, built.text);
+  recordMeetingBriefThreshold(row.id, thresholdMinutes);
+  const idealAt =
+    new Date(startKey).getTime() - thresholdMinutes * 60 * 1000;
+  const timing = Date.now() - idealAt > 60_000 ? "short_notice" : "on_time";
   console.log(
-    `Pre-meeting brief sent: event=${event.id} timing=${timing} rebrief=0`,
+    `Pre-meeting brief sent: event=${event.id} threshold=${thresholdMinutes} timing=${timing}`,
   );
-  return record;
+  return getMeetingBrief(row.id);
 }
 
 export async function sendNextMeetingBrief(api: Api): Promise<string> {
@@ -328,7 +228,7 @@ export async function sendNextMeetingBrief(api: Api): Promise<string> {
   if (!next) {
     return "No upcoming work meetings.";
   }
-  const built = await buildBriefForEvent(next, account, self);
+  const built = buildBriefForEvent(next, account, self);
   if (!built || !next.id || !next.start?.dateTime || !next.end?.dateTime) {
     return "No upcoming work meetings.";
   }
@@ -458,6 +358,21 @@ async function refreshNudges(
   }
 }
 
+function buildFiredByKey(
+  rows: MeetingBriefRecord[],
+): Map<string, number[]> {
+  const map = new Map<string, number[]>();
+  for (const row of rows) {
+    // A rescheduled row waits for a rebrief: treat as unfired so new
+    // thresholds fire on the new start time.
+    const fired = row.needs_rebrief
+      ? []
+      : parseThresholdsSent(row.thresholds_sent);
+    map.set(meetingKey(row.event_id, row.start_at), fired);
+  }
+  return map;
+}
+
 export async function runMeetingScan(api: Api, now = new Date()): Promise<void> {
   if (scanInFlight) {
     console.log("Job meeting-prebrief: skip=overlap");
@@ -475,20 +390,23 @@ export async function runMeetingScan(api: Api, now = new Date()): Promise<void> 
     const horizon = new Date(now.getTime() + BRIEF_LOOKAHEAD_MS);
     const events = await listWorkEvents(account, now, horizon);
     const rows = listMeetingBriefs();
-    const alreadySent = new Set(
-      rows
-        .filter((row) => !row.needs_rebrief)
-        .map((row) => meetingKey(row.event_id, row.start_at)),
-    );
-    for (const event of eventsDueForBrief(
-      events,
-      now,
-      config.preMeetingMinutes,
-      self,
-      config.skipInternalRecurring,
-      alreadySent,
-    )) {
-      if (!event.id) {
+    const firedByKey = buildFiredByKey(rows);
+
+    for (const event of events) {
+      if (!event.id || !event.start?.dateTime) {
+        continue;
+      }
+      const key = meetingKey(event.id, event.start.dateTime);
+      const alreadyFired = firedByKey.get(key) ?? [];
+      const due = dueThresholdsForEvent(
+        event,
+        now,
+        config.preMeetingMinutes,
+        self,
+        config.skipInternalRecurring,
+        alreadyFired,
+      );
+      if (due.length === 0) {
         continue;
       }
       try {
@@ -499,28 +417,40 @@ export async function runMeetingScan(api: Api, now = new Date()): Promise<void> 
           );
           continue;
         }
-        const due = eventsDueForBrief(
-          [fresh],
+        const freshKey = meetingKey(fresh.id ?? event.id, fresh.start.dateTime);
+        if (freshKey !== key) {
+          console.log(
+            `Pre-meeting brief skipped: event=${event.id} reason=moved`,
+          );
+          continue;
+        }
+        const freshFired = firedByKey.get(freshKey) ?? [];
+        const freshDue = dueThresholdsForEvent(
+          fresh,
           now,
           config.preMeetingMinutes,
           self,
           config.skipInternalRecurring,
-          alreadySent,
+          freshFired,
         );
-        if (due.length === 0) {
-          const freshKey = meetingKey(fresh.id ?? event.id, fresh.start.dateTime);
-          const moved =
-            freshKey !== meetingKey(event.id, event.start?.dateTime ?? "");
-          if (moved) {
-            console.log(
-              `Pre-meeting brief skipped: event=${event.id} reason=moved`,
-            );
-          }
+        if (freshDue.length === 0) {
           continue;
         }
-        const sent = await sendBrief(api, fresh, account, self);
-        if (sent) {
-          alreadySent.add(meetingKey(sent.event_id, sent.start_at));
+        for (const threshold of freshDue) {
+          const sent = await sendBriefAtThreshold(
+            api,
+            fresh,
+            account,
+            self,
+            threshold,
+          );
+          if (sent) {
+            const list = firedByKey.get(freshKey) ?? [];
+            if (!list.includes(threshold)) {
+              list.push(threshold);
+              firedByKey.set(freshKey, list);
+            }
+          }
         }
       } catch (error) {
         const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -529,13 +459,13 @@ export async function runMeetingScan(api: Api, now = new Date()): Promise<void> 
     }
     armBriefTimer(
       api,
-      nextBriefInstant(
+      nextThresholdInstantAcross(
         events,
         now,
         config.preMeetingMinutes,
         self,
         config.skipInternalRecurring,
-        alreadySent,
+        firedByKey,
       ),
       now,
     );
@@ -611,7 +541,7 @@ export function registerMeetingScan(api: Api): IntervalJob {
     { runImmediately: true },
   );
   console.log(
-    `Pre-meeting scan every 5 minutes (${config.preMeetingMinutes} min window, ${TIME_ZONE}).`,
+    `Pre-meeting scan every 5 minutes (thresholds: ${config.preMeetingMinutes.join(", ")} min, ${TIME_ZONE}).`,
   );
   return task;
 }

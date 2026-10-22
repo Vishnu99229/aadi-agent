@@ -387,6 +387,7 @@ db.exec(`
         'skipped', 'wrapping', 'wrapped'
       )),
     nudge_at TEXT,
+    thresholds_sent TEXT NOT NULL DEFAULT '[]',
     UNIQUE (event_id, start_at)
   );
 
@@ -536,6 +537,11 @@ if (!tableHasColumn("meeting_pending_bookings", "skip_confirm")) {
 if (!tableHasColumn("meeting_briefs", "needs_rebrief")) {
   db.exec(
     `ALTER TABLE meeting_briefs ADD COLUMN needs_rebrief INTEGER NOT NULL DEFAULT 0`,
+  );
+}
+if (!tableHasColumn("meeting_briefs", "thresholds_sent")) {
+  db.exec(
+    `ALTER TABLE meeting_briefs ADD COLUMN thresholds_sent TEXT NOT NULL DEFAULT '[]'`,
   );
 }
 
@@ -1475,10 +1481,47 @@ export interface MeetingBriefRecord {
   nudge_status: MeetingNudgeStatus;
   nudge_at: string | null;
   needs_rebrief: number;
+  thresholds_sent: string;
 }
 
 const MEETING_BRIEF_COLUMNS = `id, event_id, start_at, end_at, title, attendees_json,
-              briefed_at, nudge_status, nudge_at, needs_rebrief`;
+              briefed_at, nudge_status, nudge_at, needs_rebrief, thresholds_sent`;
+
+export function parseThresholdsSent(raw: string): number[] {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+  } catch {
+    return [];
+  }
+}
+
+export function recordMeetingBriefThreshold(
+  id: number,
+  minutes: number,
+): boolean {
+  const row = db
+    .prepare(`SELECT thresholds_sent FROM meeting_briefs WHERE id = ?`)
+    .get(id) as { thresholds_sent?: string } | undefined;
+  if (!row) {
+    return false;
+  }
+  const current = new Set(parseThresholdsSent(row.thresholds_sent ?? "[]"));
+  if (current.has(minutes)) {
+    return false;
+  }
+  current.add(minutes);
+  const next = JSON.stringify([...current].sort((a, b) => b - a));
+  const result = db
+    .prepare(`UPDATE meeting_briefs SET thresholds_sent = ? WHERE id = ?`)
+    .run(next, id);
+  return result.changes === 1;
+}
 
 function sameInstant(left: string, right: string): boolean {
   const a = new Date(left).getTime();
@@ -1568,7 +1611,8 @@ export function rescheduleMeetingBrief(
     const result = db
       .prepare(
         `UPDATE meeting_briefs
-         SET start_at = ?, end_at = ?, nudge_at = ?, needs_rebrief = ?
+         SET start_at = ?, end_at = ?, nudge_at = ?, needs_rebrief = ?,
+             thresholds_sent = '[]'
          WHERE id = ?`,
       )
       .run(startAt, endAt, nudgeAt, needsRebrief ? 1 : 0, id);
