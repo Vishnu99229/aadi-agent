@@ -13,9 +13,11 @@ import {
 } from "../src/security/auto_book.ts";
 import {
   DB_PATH,
+  countQaBankEntries,
   createAttachmentAlert,
   createMeetingPendingBooking,
   createMeetingProposal,
+  createQaBankEntry,
   getMeetingPendingBooking,
   getMeetingProposal,
   listDueMeetingPendingBookings,
@@ -23,6 +25,7 @@ import {
   parseThresholdsSent,
   recordMeetingBrief,
   recordMeetingBriefThreshold,
+  searchQaBank,
   setMeetingProposalStatus,
   transitionMeetingPendingBooking,
 } from "../src/db.ts";
@@ -863,5 +866,38 @@ assert(
   recordMeetingBriefThreshold(briefRow.id, 10) === true,
   "10-min threshold records independently",
 );
+
+// Q&A bank: create, FTS search by keyword, empty-query returns recents.
+assert(countQaBankEntries() === 0, "qa_bank starts empty");
+const qa1 = createQaBankEntry({
+  question: "What is your SOC 2 compliance status?",
+  answer: "We completed SOC 2 Type II audit in Q2 2026 (auditor: Prescient Security).",
+  sourceDoc: "acme-security-review-2026.pdf",
+});
+assert(qa1.id > 0 && qa1.answer.includes("Type II"), "qa_bank entry created");
+createQaBankEntry({
+  question: "Do you support SAML single sign-on?",
+  answer: "Yes, Epicode supports SAML 2.0 SSO via Okta, Azure AD and Google Workspace.",
+  sourceDoc: "acme-security-review-2026.pdf",
+});
+createQaBankEntry({
+  question: "Where is customer data hosted?",
+  answer: "Customer data is hosted on AWS Mumbai (ap-south-1).",
+  sourceDoc: "bigco-rfp-sept-2026.pdf",
+});
+assert(countQaBankEntries() === 3, "qa_bank has three entries");
+
+const soc2Hits = searchQaBank("SOC 2 compliance", 3);
+assert(soc2Hits.length >= 1, "SOC 2 search returns a hit");
+assert(soc2Hits[0]!.question.includes("SOC 2"), "top hit matches on question");
+
+const ssoHits = searchQaBank("single sign on");
+assert(ssoHits.some((row) => row.question.includes("SAML")), "SSO query matches SAML question");
+
+const recent = searchQaBank("", 10);
+assert(recent.length === 3, "empty query returns everything");
+
+const missHits = searchQaBank("quantum teleportation uplink");
+assert(missHits.length === 0, "no match returns empty");
 
 console.log("Security gate checks passed.");

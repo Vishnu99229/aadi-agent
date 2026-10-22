@@ -182,6 +182,17 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_documents_created
     ON documents (created_at);
 
+  CREATE TABLE IF NOT EXISTS qa_bank (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    source_doc TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_qa_bank_created
+    ON qa_bank (created_at);
+
   CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -571,6 +582,34 @@ try {
 } catch (error) {
   const errorType = error instanceof Error ? error.name : "UnknownError";
   console.error(`Memory FTS5 unavailable (${errorType}); search will use LIKE.`);
+}
+
+let qaBankFtsReady = false;
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS qa_bank_fts USING fts5(
+      question,
+      content='qa_bank',
+      content_rowid='id',
+      tokenize='porter'
+    );
+    CREATE TRIGGER IF NOT EXISTS qa_bank_ai AFTER INSERT ON qa_bank BEGIN
+      INSERT INTO qa_bank_fts(rowid, question) VALUES (new.id, new.question);
+    END;
+    CREATE TRIGGER IF NOT EXISTS qa_bank_ad AFTER DELETE ON qa_bank BEGIN
+      INSERT INTO qa_bank_fts(qa_bank_fts, rowid, question)
+        VALUES('delete', old.id, old.question);
+    END;
+    CREATE TRIGGER IF NOT EXISTS qa_bank_au AFTER UPDATE OF question ON qa_bank BEGIN
+      INSERT INTO qa_bank_fts(qa_bank_fts, rowid, question)
+        VALUES('delete', old.id, old.question);
+      INSERT INTO qa_bank_fts(rowid, question) VALUES (new.id, new.question);
+    END;
+  `);
+  qaBankFtsReady = true;
+} catch (error) {
+  const errorType = error instanceof Error ? error.name : "UnknownError";
+  console.error(`qa_bank FTS5 unavailable (${errorType}); search will use LIKE.`);
 }
 
 if (!tableHasColumn("pending_actions", "google_account")) {
@@ -2040,6 +2079,90 @@ export function searchMemories(query: string, limit = 15): MemoryRecord[] {
        LIMIT ?`,
     )
     .all(pattern, safeLimit) as MemoryRecord[];
+}
+
+export interface QaBankRecord {
+  id: number;
+  question: string;
+  answer: string;
+  source_doc: string | null;
+  created_at: string;
+}
+
+const QA_BANK_COLUMNS = `id, question, answer, source_doc, created_at`;
+
+export function isQaBankFtsReady(): boolean {
+  return qaBankFtsReady;
+}
+
+export function createQaBankEntry(input: {
+  question: string;
+  answer: string;
+  sourceDoc?: string | null;
+}): QaBankRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO qa_bank (question, answer, source_doc)
+       VALUES (?, ?, ?)`,
+    )
+    .run(input.question, input.answer, input.sourceDoc ?? null);
+  return getQaBankEntry(Number(result.lastInsertRowid))!;
+}
+
+export function getQaBankEntry(id: number): QaBankRecord | undefined {
+  return db
+    .prepare(`SELECT ${QA_BANK_COLUMNS} FROM qa_bank WHERE id = ?`)
+    .get(id) as QaBankRecord | undefined;
+}
+
+export function countQaBankEntries(): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM qa_bank`)
+    .get() as { n: number };
+  return row.n;
+}
+
+export function searchQaBank(query: string, limit = 3): QaBankRecord[] {
+  const safeLimit = Math.max(1, Math.min(20, Math.floor(limit)));
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return db
+      .prepare(
+        `SELECT ${QA_BANK_COLUMNS} FROM qa_bank
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(safeLimit) as QaBankRecord[];
+  }
+  const match = ftsMatchQuery(trimmed);
+  if (qaBankFtsReady && match) {
+    try {
+      const rows = db
+        .prepare(
+          `SELECT ${QA_BANK_COLUMNS.split(", ").map((c) => `q.${c}`).join(", ")}
+           FROM qa_bank q
+           JOIN qa_bank_fts f ON f.rowid = q.id
+           WHERE qa_bank_fts MATCH ?
+           ORDER BY bm25(qa_bank_fts), q.created_at DESC, q.id DESC
+           LIMIT ?`,
+        )
+        .all(match, safeLimit) as QaBankRecord[];
+      if (rows.length > 0) {
+        return rows;
+      }
+    } catch {
+      // fall through to LIKE
+    }
+  }
+  const pattern = `%${trimmed.replace(/[%_]/g, " ").trim()}%`;
+  return db
+    .prepare(
+      `SELECT ${QA_BANK_COLUMNS} FROM qa_bank
+       WHERE question LIKE ? OR answer LIKE ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(pattern, pattern, safeLimit) as QaBankRecord[];
 }
 
 export function memoriesWithEventDateBetween(

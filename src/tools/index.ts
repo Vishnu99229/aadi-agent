@@ -20,10 +20,12 @@ import * as listDates from "./list_dates.js";
 import * as listUpcomingDates from "./list_upcoming_dates.js";
 import * as listReminders from "./list_reminders.js";
 import * as listTasks from "./list_tasks.js";
+import * as learnQa from "./learn_qa.js";
 import * as listMemories from "./list_memories.js";
 import * as listWaiting from "./list_waiting.js";
 import * as remember from "./remember.js";
 import * as searchMemories from "./search_memories.js";
+import * as searchQa from "./search_qa.js";
 import * as updateMemory from "./update_memory.js";
 import * as readDocument from "./read_document.js";
 import * as removeAccount from "./remove_account.js";
@@ -53,6 +55,7 @@ const modules = {
   forget_memory: forgetMemory,
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
+  learn_qa_bank: learnQa,
   list_accounts: listAccounts,
   list_attachments: listAttachments,
   list_bills: listBills,
@@ -74,6 +77,7 @@ const modules = {
   search_emails: searchEmails,
   search_memories: searchMemories,
   search_notes: searchNotes,
+  search_qa_bank: searchQa,
   set_reminder: setReminder,
   stop_tracking: stopTracking,
   track_thread: trackThread,
@@ -94,6 +98,7 @@ export const TOOL_ORDER = [
   "forget_memory",
   "draft_reply",
   "get_current_time",
+  "learn_qa_bank",
   "list_accounts",
   "list_attachments",
   "list_bills",
@@ -115,6 +120,7 @@ export const TOOL_ORDER = [
   "search_emails",
   "search_memories",
   "search_notes",
+  "search_qa_bank",
   "set_reminder",
   "stop_tracking",
   "track_thread",
