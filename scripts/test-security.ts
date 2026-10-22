@@ -20,8 +20,10 @@ import {
   expireOldPendingAttachmentAlerts,
   getAttachmentAlert,
   createMeetingProposal,
+  createPendingEventAction,
   createQaBankEntry,
   getMeetingPendingBooking,
+  getPendingAction,
   getMeetingProposal,
   listDueMeetingPendingBookings,
   listMeetingPendingBookings,
@@ -47,8 +49,11 @@ import {
   ownerOnly,
 } from "../src/security/owner_lock.ts";
 import {
+  EventNotApprovedError,
   SendNotApprovedError,
+  allowCreateEvent,
   allowSendDraft,
+  parseCreateEventApprovalCallback,
   parseSendApprovalCallback,
 } from "../src/security/send_approval.ts";
 import {
@@ -171,6 +176,72 @@ assertThrows(
       actionStatus: "pending",
     }),
   "mismatched action id must not send",
+);
+
+// Create-event approval gate: approval:create:<id> is the ONLY callback
+// that may trigger events.insert. The send/discard tokens must not.
+assert(parseCreateEventApprovalCallback("approval:create:21") === 21, "create callback");
+assert(
+  parseCreateEventApprovalCallback("approval:send:21") === undefined,
+  "send callback is not a create approval",
+);
+allowCreateEvent({
+  callbackData: "approval:create:21",
+  actionId: 21,
+  actionStatus: "pending",
+  actionType: "create_event",
+});
+
+function assertThrowsEvent(run: () => void, message: string): void {
+  try {
+    run();
+  } catch (error) {
+    if (error instanceof EventNotApprovedError) {
+      return;
+    }
+    throw error;
+  }
+  throw new Error(message);
+}
+assertThrowsEvent(
+  () =>
+    allowCreateEvent({
+      callbackData: undefined,
+      actionId: 21,
+      actionStatus: "pending",
+      actionType: "create_event",
+    }),
+  "create without approval callback must fail",
+);
+assertThrowsEvent(
+  () =>
+    allowCreateEvent({
+      callbackData: "approval:send:21",
+      actionId: 21,
+      actionStatus: "pending",
+      actionType: "create_event",
+    }),
+  "send callback must not create event",
+);
+assertThrowsEvent(
+  () =>
+    allowCreateEvent({
+      callbackData: "approval:create:21",
+      actionId: 21,
+      actionStatus: "pending",
+      actionType: "send_draft",
+    }),
+  "a draft row must not be creatable through the event gate",
+);
+assertThrowsEvent(
+  () =>
+    allowCreateEvent({
+      callbackData: "approval:create:21",
+      actionId: 21,
+      actionStatus: "created",
+      actionType: "create_event",
+    }),
+  "already-created row must not re-insert",
 );
 
 assert(
@@ -478,6 +549,7 @@ for (const file of toolFiles) {
 
 const messageSendFiles: string[] = [];
 const draftSendFiles: string[] = [];
+const eventInsertFiles: string[] = [];
 for (const file of srcFiles) {
   if (file.endsWith("/google/test.ts")) {
     continue;
@@ -489,6 +561,9 @@ for (const file of srcFiles) {
   if (src.includes("drafts.send") || src.includes("users.drafts.send")) {
     draftSendFiles.push(file);
   }
+  if (src.includes("events.insert")) {
+    eventInsertFiles.push(file);
+  }
 }
 assert(
   messageSendFiles.length === 1 && messageSendFiles[0]!.endsWith("/security/auto_book.ts"),
@@ -497,6 +572,13 @@ assert(
 assert(
   draftSendFiles.length === 1 && draftSendFiles[0]!.endsWith("/approvals.ts"),
   `drafts.send only allowed in approvals.ts, found ${draftSendFiles.join(", ") || "none"}`,
+);
+const eventInsertAllowed = eventInsertFiles.every(
+  (file) => file.endsWith("/meeting_book.ts") || file.endsWith("/approvals.ts"),
+);
+assert(
+  eventInsertAllowed && eventInsertFiles.length <= 2,
+  `events.insert only allowed in meeting_book.ts (auto-book) and approvals.ts (approved create_event), found ${eventInsertFiles.join(", ") || "none"}`,
 );
 
 const meetingBookSrc = await readFile(join(root, "src/meeting_book.ts"), "utf8");
@@ -921,6 +1003,25 @@ assert(
 assert(
   recordMeetingBriefThreshold(briefRow.id, 10) === true,
   "10-min threshold records independently",
+);
+
+// pending_actions can now hold create_event rows alongside drafts.
+const eventRow = createPendingEventAction({
+  title: "Pricing with Ada",
+  startIso: "2026-10-24T10:00:00+05:30",
+  endIso: "2026-10-24T10:30:00+05:30",
+  attendees: ["ada@acme.com"],
+  description: "Walk through Enterprise pricing.",
+  googleAccount: "work",
+});
+assert(eventRow.type === "create_event", "pending event row has create_event type");
+assert(eventRow.status === "pending", "pending event row starts pending");
+assert(eventRow.draft_id === null, "pending event row has no draft_id");
+const fetched = getPendingAction(eventRow.id);
+assert(
+  fetched?.event_title === "Pricing with Ada" &&
+    JSON.parse(fetched?.event_attendees ?? "[]")[0] === "ada@acme.com",
+  "event fields round-trip through the DB",
 );
 
 // Q&A bank: create, FTS search by keyword, empty-query returns recents.

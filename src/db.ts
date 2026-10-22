@@ -13,18 +13,27 @@ export type PendingActionStatus =
   | "pending"
   | "sent"
   | "discarded"
-  | "expired";
+  | "expired"
+  | "created"
+  | "cancelled";
+
+export type PendingActionType = "send_draft" | "create_event";
 
 export type GoogleAccountId = "personal" | "work";
 
 export interface PendingAction {
   id: number;
-  type: "send_draft";
-  draft_id: string;
-  thread_id: string;
+  type: PendingActionType;
+  draft_id: string | null;
+  thread_id: string | null;
   google_account: GoogleAccountId;
   status: PendingActionStatus;
   telegram_message_id: number | null;
+  event_title: string | null;
+  event_start: string | null;
+  event_end: string | null;
+  event_attendees: string | null;
+  event_description: string | null;
   created_at: string;
 }
 
@@ -108,14 +117,22 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL CHECK (type = 'send_draft'),
-    draft_id TEXT NOT NULL,
-    thread_id TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('send_draft', 'create_event')),
+    draft_id TEXT,
+    thread_id TEXT,
     google_account TEXT NOT NULL DEFAULT 'personal'
       CHECK (google_account IN ('personal', 'work')),
     status TEXT NOT NULL DEFAULT 'pending'
-      CHECK (status IN ('pending', 'sent', 'discarded', 'expired')),
+      CHECK (status IN (
+        'pending', 'sent', 'discarded', 'expired',
+        'created', 'cancelled'
+      )),
     telegram_message_id INTEGER,
+    event_title TEXT,
+    event_start TEXT,
+    event_end TEXT,
+    event_attendees TEXT,
+    event_description TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -641,6 +658,47 @@ if (!tableHasColumn("pending_actions", "google_account")) {
   );
 }
 
+// pending_actions used to be draft-only (CHECK (type = 'send_draft'),
+// draft_id/thread_id NOT NULL). To support calendar event approvals
+// we need a wider CHECK and new event_* columns; SQLite can't ALTER a
+// CHECK, so rebuild the table and copy rows forward. Idempotent: the
+// column probe skips the rebuild once the new schema is in place.
+if (!tableHasColumn("pending_actions", "event_title")) {
+  db.exec(`
+    CREATE TABLE pending_actions_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL CHECK (type IN ('send_draft', 'create_event')),
+      draft_id TEXT,
+      thread_id TEXT,
+      google_account TEXT NOT NULL DEFAULT 'personal'
+        CHECK (google_account IN ('personal', 'work')),
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN (
+          'pending', 'sent', 'discarded', 'expired',
+          'created', 'cancelled'
+        )),
+      telegram_message_id INTEGER,
+      event_title TEXT,
+      event_start TEXT,
+      event_end TEXT,
+      event_attendees TEXT,
+      event_description TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO pending_actions_new
+      (id, type, draft_id, thread_id, google_account, status,
+       telegram_message_id, created_at)
+      SELECT id, type, draft_id, thread_id, google_account, status,
+             telegram_message_id, created_at
+      FROM pending_actions;
+    DROP TABLE pending_actions;
+    ALTER TABLE pending_actions_new RENAME TO pending_actions;
+    CREATE INDEX IF NOT EXISTS idx_pending_actions_draft_status
+      ON pending_actions (draft_id, status);
+  `);
+  console.log("pending_actions migrated to support create_event rows.");
+}
+
 const followupsSchema =
   (
     db
@@ -722,7 +780,8 @@ export function clearMessages(): void {
 }
 
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
-              telegram_message_id, created_at`;
+              telegram_message_id, event_title, event_start, event_end,
+              event_attendees, event_description, created_at`;
 
 export function createPendingAction(
   draftId: string,
@@ -736,6 +795,36 @@ export function createPendingAction(
     )
     .run(draftId, threadId, googleAccount);
 
+  return getPendingAction(Number(result.lastInsertRowid))!;
+}
+
+export interface PendingEventInput {
+  title: string;
+  startIso: string;
+  endIso: string;
+  attendees: string[];
+  description?: string;
+  googleAccount?: GoogleAccountId;
+}
+
+export function createPendingEventAction(
+  input: PendingEventInput,
+): PendingAction {
+  const result = db
+    .prepare(
+      `INSERT INTO pending_actions (
+         type, google_account, event_title, event_start, event_end,
+         event_attendees, event_description
+       ) VALUES ('create_event', ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.googleAccount ?? "work",
+      input.title,
+      input.startIso,
+      input.endIso,
+      JSON.stringify(input.attendees),
+      input.description ?? null,
+    );
   return getPendingAction(Number(result.lastInsertRowid))!;
 }
 

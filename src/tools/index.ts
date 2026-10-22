@@ -23,6 +23,7 @@ import * as listTasks from "./list_tasks.js";
 import * as learnQa from "./learn_qa.js";
 import * as listMemories from "./list_memories.js";
 import * as listWaiting from "./list_waiting.js";
+import * as proposeCalendarEvent from "./propose_calendar_event.js";
 import * as remember from "./remember.js";
 import * as searchMemories from "./search_memories.js";
 import * as searchQa from "./search_qa.js";
@@ -67,6 +68,7 @@ const modules = {
   list_memories: listMemories,
   list_waiting: listWaiting,
   mark_bill_paid: markBillPaid,
+  propose_calendar_event: proposeCalendarEvent,
   read_attachment: readAttachment,
   read_document: readDocument,
   remove_account: removeAccount,
@@ -110,6 +112,7 @@ export const TOOL_ORDER = [
   "list_memories",
   "list_waiting",
   "mark_bill_paid",
+  "propose_calendar_event",
   "read_attachment",
   "read_document",
   "remove_account",

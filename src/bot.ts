@@ -390,9 +390,14 @@ bot.callbackQuery(/^meet:/, async (ctx) => {
 });
 
 bot.callbackQuery(
-  /^approval:(send|edit|discard):(\d+)$/,
+  /^approval:(send|edit|discard|create|cancel):(\d+)$/,
   async (ctx) => {
-    const operation = ctx.match[1] as "send" | "edit" | "discard";
+    const operation = ctx.match[1] as
+      | "send"
+      | "edit"
+      | "discard"
+      | "create"
+      | "cancel";
     const actionId = Number(ctx.match[2]);
     await handleApprovalCallback(ctx, operation, actionId);
   },

@@ -3,15 +3,20 @@ import { google, type gmail_v1 } from "googleapis";
 import { config } from "./config.js";
 import {
   createPendingAction,
+  createPendingEventAction,
   getExpiredPendingActions,
   getPendingAction,
   getPendingActionForDraft,
   setPendingActionTelegramMessage,
   transitionPendingAction,
   type PendingAction,
+  type PendingEventInput,
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
-import { allowSendDraft } from "./security/send_approval.js";
+import {
+  allowCreateEvent,
+  allowSendDraft,
+} from "./security/send_approval.js";
 import { parseAddressList } from "./followup_logic.js";
 
 const PREVIEW_LIMIT = 3800;
@@ -96,17 +101,80 @@ function isExpired(action: PendingAction): boolean {
 function callbackMessageText(ctx: Context): string {
   const message = ctx.callbackQuery?.message;
   return message && "text" in message
-    ? (message.text ?? "Draft approval")
-    : "Draft approval";
+    ? (message.text ?? "Approval")
+    : "Approval";
 }
 
 async function showStatus(
   ctx: Context,
-  status: "Sent" | "Discarded" | "Expired",
+  status: "Sent" | "Discarded" | "Expired" | "Cancelled" | "Created",
+  trailer?: string,
 ): Promise<void> {
-  await ctx.editMessageText(`${callbackMessageText(ctx)}\n\nStatus: ${status}`, {
-    reply_markup: new InlineKeyboard(),
+  const base = `${callbackMessageText(ctx)}\n\nStatus: ${status}`;
+  const text = trailer ? `${base}\n${trailer}` : base;
+  await ctx.editMessageText(text, { reply_markup: new InlineKeyboard() });
+}
+
+function eventKeyboard(actionId: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Create Event", `approval:create:${actionId}`)
+    .text("Cancel", `approval:cancel:${actionId}`);
+}
+
+function formatEventPreviewTime(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) {
+    return iso;
+  }
+  return parsed.toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
   });
+}
+
+function parseEventAttendees(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string");
+  } catch {
+    return [];
+  }
+}
+
+function eventPreviewText(input: {
+  title: string;
+  startIso: string;
+  endIso: string;
+  attendees: string[];
+  description?: string;
+  googleAccount: "personal" | "work";
+}): string {
+  const mailbox =
+    input.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
+  const attendeeLine = input.attendees.length
+    ? input.attendees.join(", ")
+    : "None";
+  const lines = [
+    "Event waiting for approval",
+    "",
+    `Calendar: ${mailbox}`,
+    `Title: ${input.title}`,
+    `Start: ${formatEventPreviewTime(input.startIso)}`,
+    `End: ${formatEventPreviewTime(input.endIso)}`,
+    `Attendees: ${attendeeLine}`,
+  ];
+  if (input.description && input.description.trim()) {
+    lines.push("", input.description.trim());
+  }
+  return lines.join("\n");
 }
 
 async function expireAction(action: PendingAction): Promise<boolean> {
@@ -138,6 +206,26 @@ async function expireAction(action: PendingAction): Promise<boolean> {
   }
 
   return true;
+}
+
+export async function queueEventApproval(
+  input: PendingEventInput,
+): Promise<number> {
+  const action = createPendingEventAction(input);
+  const text = eventPreviewText({
+    title: input.title,
+    startIso: input.startIso,
+    endIso: input.endIso,
+    attendees: input.attendees,
+    description: input.description,
+    googleAccount: input.googleAccount ?? "work",
+  });
+  const message = await telegram.sendMessage(config.ownerTelegramId, text, {
+    reply_markup: eventKeyboard(action.id),
+  });
+  setPendingActionTelegramMessage(action.id, message.message_id);
+  console.log(`Approval action ${action.id}: event preview sent`);
+  return action.id;
 }
 
 export async function queueDraftApproval(
@@ -211,12 +299,14 @@ async function currentPendingAction(
   }
 
   if (action.status !== "pending") {
-    const status =
-      action.status === "sent"
-        ? "Sent"
-        : action.status === "discarded"
-          ? "Discarded"
-          : "Expired";
+    const statusMap = {
+      sent: "Sent",
+      discarded: "Discarded",
+      expired: "Expired",
+      created: "Created",
+      cancelled: "Cancelled",
+    } as const;
+    const status = statusMap[action.status];
     await showStatus(ctx, status).catch(() => undefined);
     await ctx.answerCallbackQuery(`Already ${status.toLowerCase()}.`);
     return undefined;
@@ -230,13 +320,17 @@ type SendOutcome =
   | { ok: false; reason: "send_failed" | "status_update_failed" };
 
 async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
+  const draftId = action.draft_id;
+  if (!draftId) {
+    return { ok: false, reason: "send_failed" };
+  }
   let sentMessageId: string | undefined;
   try {
     const auth = await getGoogleClientFor(action.google_account);
     const gmail = google.gmail({ version: "v1", auth });
     const sent = await gmail.users.drafts.send({
       userId: "me",
-      requestBody: { id: action.draft_id },
+      requestBody: { id: draftId },
     });
     sentMessageId = sent.data.id ?? undefined;
   } catch {
@@ -245,7 +339,7 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
   }
   if (sentMessageId && afterDraftSend) {
     try {
-      await afterDraftSend(action.draft_id, sentMessageId);
+      await afterDraftSend(draftId, sentMessageId);
     } catch {
       console.log(`Approval action ${action.id}: after-send hook failed`);
     }
@@ -256,6 +350,94 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
   }
   console.log(`Approval action ${action.id}: status -> sent`);
   return { ok: true };
+}
+
+type EventOutcome =
+  | { ok: true; htmlLink: string | undefined }
+  | { ok: false; reason: "insert_failed" | "status_update_failed" | "missing_fields" };
+
+async function performEventInsert(action: PendingAction): Promise<EventOutcome> {
+  if (
+    !action.event_title ||
+    !action.event_start ||
+    !action.event_end
+  ) {
+    return { ok: false, reason: "missing_fields" };
+  }
+  let htmlLink: string | undefined;
+  try {
+    const auth = await getGoogleClientFor(action.google_account);
+    const calendar = google.calendar({ version: "v3", auth });
+    const attendees = parseEventAttendees(action.event_attendees).map(
+      (email) => ({ email }),
+    );
+    const created = await calendar.events.insert({
+      calendarId: "primary",
+      requestBody: {
+        summary: action.event_title,
+        description: action.event_description ?? undefined,
+        start: { dateTime: action.event_start, timeZone: "Asia/Kolkata" },
+        end: { dateTime: action.event_end, timeZone: "Asia/Kolkata" },
+        attendees: attendees.length ? attendees : undefined,
+      },
+      sendUpdates: attendees.length ? "all" : "none",
+    });
+    htmlLink = created.data.htmlLink ?? undefined;
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(
+      `Approval action ${action.id}: event insert failed (${errorType})`,
+    );
+    return { ok: false, reason: "insert_failed" };
+  }
+  if (!transitionPendingAction(action.id, "pending", "created")) {
+    console.log(
+      `Approval action ${action.id}: event created but status update failed`,
+    );
+    return { ok: false, reason: "status_update_failed" };
+  }
+  console.log(`Approval action ${action.id}: status -> created`);
+  return { ok: true, htmlLink };
+}
+
+async function createEvent(ctx: Context, action: PendingAction): Promise<void> {
+  allowCreateEvent({
+    callbackData: ctx.callbackQuery?.data,
+    actionId: action.id,
+    actionStatus: action.status,
+    actionType: action.type,
+  });
+  const outcome = await performEventInsert(action);
+  if (!outcome.ok) {
+    const message =
+      outcome.reason === "insert_failed"
+        ? "Could not create the event. The approval is still pending; try again."
+        : outcome.reason === "status_update_failed"
+          ? "The event was created, but its approval status could not be updated."
+          : "Event data is incomplete; cannot create.";
+    await ctx.answerCallbackQuery({ text: message, show_alert: true });
+    return;
+  }
+  const trailer = outcome.htmlLink ? `Link: ${outcome.htmlLink}` : undefined;
+  await showStatus(ctx, "Created", trailer).catch(() => {
+    console.log(`Approval action ${action.id}: created preview update failed`);
+  });
+  await ctx.answerCallbackQuery("Created").catch(() => undefined);
+}
+
+async function cancelEvent(ctx: Context, action: PendingAction): Promise<void> {
+  if (!transitionPendingAction(action.id, "pending", "cancelled")) {
+    await ctx.answerCallbackQuery({
+      text: "Could not update the approval status.",
+      show_alert: true,
+    });
+    return;
+  }
+  console.log(`Approval action ${action.id}: status -> cancelled`);
+  await showStatus(ctx, "Cancelled").catch(() => {
+    console.log(`Approval action ${action.id}: cancelled preview update failed`);
+  });
+  await ctx.answerCallbackQuery("Cancelled").catch(() => undefined);
 }
 
 async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
@@ -282,6 +464,9 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
 async function fetchDraftRecipientLabel(
   action: PendingAction,
 ): Promise<string> {
+  if (!action.draft_id) {
+    return "the recipient";
+  }
   try {
     const auth = await getGoogleClientFor(action.google_account);
     const gmail = google.gmail({ version: "v1", auth });
@@ -366,12 +551,20 @@ async function discardDraft(
   ctx: Context,
   action: PendingAction,
 ): Promise<void> {
+  const draftId = action.draft_id;
+  if (!draftId) {
+    await ctx.answerCallbackQuery({
+      text: "This approval has no draft to discard.",
+      show_alert: true,
+    });
+    return;
+  }
   try {
     const auth = await getGoogleClientFor(action.google_account);
     const gmail = google.gmail({ version: "v1", auth });
     await gmail.users.drafts.delete({
       userId: "me",
-      id: action.draft_id,
+      id: draftId,
     });
   } catch {
     console.log(
@@ -400,9 +593,16 @@ async function discardDraft(
   await ctx.answerCallbackQuery("Discarded").catch(() => undefined);
 }
 
+export type ApprovalOperation =
+  | "send"
+  | "edit"
+  | "discard"
+  | "create"
+  | "cancel";
+
 export async function handleApprovalCallback(
   ctx: Context,
-  operation: "send" | "edit" | "discard",
+  operation: ApprovalOperation,
   actionId: number,
 ): Promise<void> {
   const action = await currentPendingAction(ctx, actionId);
@@ -410,11 +610,42 @@ export async function handleApprovalCallback(
     return;
   }
 
+  // Draft-only operations.
   if (operation === "edit") {
+    if (action.type !== "send_draft") {
+      await ctx.answerCallbackQuery({
+        text: "Edit only applies to drafts.",
+        show_alert: true,
+      });
+      return;
+    }
     editingActionByUser.set(config.ownerTelegramId, action.id);
     console.log(`Approval action ${action.id}: awaiting edit instructions`);
     await ctx.answerCallbackQuery("Send your edit instructions.");
     await ctx.reply("What would you like to change in this draft?");
+    return;
+  }
+
+  // Reject cross-type button taps so a stale draft keyboard can't
+  // trigger an event action and vice versa.
+  if (
+    (operation === "send" || operation === "discard") &&
+    action.type !== "send_draft"
+  ) {
+    await ctx.answerCallbackQuery({
+      text: "That approval is for an event, not a draft.",
+      show_alert: true,
+    });
+    return;
+  }
+  if (
+    (operation === "create" || operation === "cancel") &&
+    action.type !== "create_event"
+  ) {
+    await ctx.answerCallbackQuery({
+      text: "That approval is for a draft, not an event.",
+      show_alert: true,
+    });
     return;
   }
 
@@ -427,8 +658,12 @@ export async function handleApprovalCallback(
   try {
     if (operation === "send") {
       await sendDraft(ctx, action);
-    } else {
+    } else if (operation === "discard") {
       await discardDraft(ctx, action);
+    } else if (operation === "create") {
+      await createEvent(ctx, action);
+    } else if (operation === "cancel") {
+      await cancelEvent(ctx, action);
     }
   } finally {
     activeActions.delete(action.id);
@@ -463,24 +698,31 @@ export async function consumeDraftEdit(
   editingActionByUser.delete(userId);
 
   const action = getPendingAction(actionId);
-  if (!action || action.status !== "pending" || isExpired(action)) {
+  if (
+    !action ||
+    action.type !== "send_draft" ||
+    !action.draft_id ||
+    action.status !== "pending" ||
+    isExpired(action)
+  ) {
     if (action?.status === "pending") {
       await expireAction(action);
     }
     return undefined;
   }
+  const draftId = action.draft_id;
 
   const auth = await getGoogleClientFor(action.google_account);
   const gmail = google.gmail({ version: "v1", auth });
   const draft = await gmail.users.drafts.get({
     userId: "me",
-    id: action.draft_id,
+    id: draftId,
     format: "full",
   });
 
   return {
     actionId: action.id,
-    draftId: action.draft_id,
+    draftId,
     body: plainTextBody(draft.data.message?.payload),
   };
 }
