@@ -12,6 +12,7 @@ import {
 import {
   consumeDraftEdit,
   handleApprovalCallback,
+  sendPendingDraftByText,
 } from "./approvals.js";
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
@@ -19,6 +20,7 @@ import { ownerOnly } from "./security/owner_lock.js";
 import {
   clearMessages,
   deleteMemory,
+  getLatestPendingSendAction,
   getMeetingBrief,
   getSetting,
   setSetting,
@@ -588,6 +590,20 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   }
 
   if (await tryHandleMeetingChat(ctx, userText)) {
+    return;
+  }
+  // Short-circuit "send it" / "send the email" / "send" so Vishnu can
+  // dispatch the most recent pending draft without tapping the inline
+  // Send button. Runs before the LLM so no agent path can forge it;
+  // ownerOnly middleware above already fenced the chat.
+  if (/^(send it|send the email|send this|send)[.!?]*\s*$/i.test(userText.trim())) {
+    const latest = getLatestPendingSendAction();
+    if (!latest) {
+      await ctx.reply("You don't have any pending drafts waiting for approval.");
+      return;
+    }
+    const result = await sendPendingDraftByText(latest);
+    await ctx.reply(result.message);
     return;
   }
   // If the last thing Aadi showed was a forget-memory list and Vishnu

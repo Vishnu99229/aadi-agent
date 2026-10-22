@@ -206,14 +206,39 @@ assert(
   "approvals.ts must import the send gate",
 );
 const sendFnStart = approvalsSrc.indexOf("async function sendDraft");
-const sendFnEnd = approvalsSrc.indexOf("async function discardDraft");
+const sendFnEnd = approvalsSrc.indexOf("async function fetchDraftRecipientLabel");
 assert(sendFnStart >= 0 && sendFnEnd > sendFnStart, "sendDraft is present");
 const sendFn = approvalsSrc.slice(sendFnStart, sendFnEnd);
 assert(sendFn.includes("allowSendDraft"), "sendDraft must call allowSendDraft");
-assert(sendFn.includes("drafts.send"), "sendDraft still sends the draft");
 assert(
-  sendFn.indexOf("allowSendDraft") < sendFn.indexOf("drafts.send"),
-  "send gate must run before drafts.send",
+  sendFn.includes("performDraftSend"),
+  "sendDraft must delegate to performDraftSend",
+);
+assert(
+  sendFn.indexOf("allowSendDraft") < sendFn.indexOf("performDraftSend"),
+  "send gate must run before performDraftSend",
+);
+
+const performStart = approvalsSrc.indexOf("async function performDraftSend");
+const performEnd = approvalsSrc.indexOf("async function sendDraft");
+assert(
+  performStart >= 0 && performEnd > performStart,
+  "performDraftSend is present and precedes sendDraft",
+);
+const performFn = approvalsSrc.slice(performStart, performEnd);
+assert(performFn.includes("drafts.send"), "performDraftSend still sends the draft");
+
+const textSendStart = approvalsSrc.indexOf("export async function sendPendingDraftByText");
+assert(textSendStart >= 0, "sendPendingDraftByText entrypoint exists");
+const textSendEnd = approvalsSrc.indexOf("async function discardDraft");
+const textSendFn = approvalsSrc.slice(textSendStart, textSendEnd);
+assert(
+  !textSendFn.includes("drafts.send"),
+  "sendPendingDraftByText must not call drafts.send directly; it must go through performDraftSend",
+);
+assert(
+  textSendFn.includes("performDraftSend"),
+  "sendPendingDraftByText must delegate to performDraftSend",
 );
 
 const configSrc = await readFile(join(root, "src/config.ts"), "utf8");

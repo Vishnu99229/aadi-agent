@@ -695,6 +695,19 @@ export function getPendingActionForDraft(
     .get(draftId) as PendingAction | undefined;
 }
 
+export function getLatestPendingSendAction(): PendingAction | undefined {
+  return db
+    .prepare(
+      `SELECT ${PENDING_ACTION_COLUMNS}
+       FROM pending_actions
+       WHERE status = 'pending'
+         AND telegram_message_id IS NOT NULL
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get() as PendingAction | undefined;
+}
+
 export function setPendingActionTelegramMessage(
   id: number,
   telegramMessageId: number,

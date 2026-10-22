@@ -12,6 +12,7 @@ import {
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import { allowSendDraft } from "./security/send_approval.js";
+import { parseAddressList } from "./followup_logic.js";
 
 const PREVIEW_LIMIT = 3800;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
@@ -224,12 +225,11 @@ async function currentPendingAction(
   return action;
 }
 
-async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
-  allowSendDraft({
-    callbackData: ctx.callbackQuery?.data,
-    actionId: action.id,
-    actionStatus: action.status,
-  });
+type SendOutcome =
+  | { ok: true }
+  | { ok: false; reason: "send_failed" | "status_update_failed" };
+
+async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
   let sentMessageId: string | undefined;
   try {
     const auth = await getGoogleClientFor(action.google_account);
@@ -241,11 +241,7 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     sentMessageId = sent.data.id ?? undefined;
   } catch {
     console.log(`Approval action ${action.id}: send failed; status -> pending`);
-    await ctx.answerCallbackQuery({
-      text: "Sending failed. The draft is still pending; please try again.",
-      show_alert: true,
-    });
-    return;
+    return { ok: false, reason: "send_failed" };
   }
   if (sentMessageId && afterDraftSend) {
     try {
@@ -254,21 +250,116 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
       console.log(`Approval action ${action.id}: after-send hook failed`);
     }
   }
-
   if (!transitionPendingAction(action.id, "pending", "sent")) {
     console.log(`Approval action ${action.id}: sent; status update failed`);
-    await ctx.answerCallbackQuery({
-      text: "The draft was sent, but its approval status could not be updated.",
-      show_alert: true,
-    });
+    return { ok: false, reason: "status_update_failed" };
+  }
+  console.log(`Approval action ${action.id}: status -> sent`);
+  return { ok: true };
+}
+
+async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
+  allowSendDraft({
+    callbackData: ctx.callbackQuery?.data,
+    actionId: action.id,
+    actionStatus: action.status,
+  });
+  const outcome = await performDraftSend(action);
+  if (!outcome.ok) {
+    const text =
+      outcome.reason === "send_failed"
+        ? "Sending failed. The draft is still pending; please try again."
+        : "The draft was sent, but its approval status could not be updated.";
+    await ctx.answerCallbackQuery({ text, show_alert: true });
     return;
   }
-
-  console.log(`Approval action ${action.id}: status -> sent`);
   await showStatus(ctx, "Sent").catch(() => {
     console.log(`Approval action ${action.id}: sent preview update failed`);
   });
   await ctx.answerCallbackQuery("Sent").catch(() => undefined);
+}
+
+async function fetchDraftRecipientLabel(
+  action: PendingAction,
+): Promise<string> {
+  try {
+    const auth = await getGoogleClientFor(action.google_account);
+    const gmail = google.gmail({ version: "v1", auth });
+    const draft = await gmail.users.drafts.get({
+      userId: "me",
+      id: action.draft_id,
+      format: "metadata",
+    });
+    const header =
+      draft.data.message?.payload?.headers?.find(
+        (item: { name?: string | null; value?: string | null }) =>
+          (item.name ?? "").toLowerCase() === "to",
+      )?.value ?? "";
+    const addresses = parseAddressList(header);
+    if (addresses.length === 0) {
+      return "the recipient";
+    }
+    const first = addresses[0]!;
+    return first.name || first.email;
+  } catch {
+    return "the recipient";
+  }
+}
+
+export interface TextSendDraftResult {
+  ok: boolean;
+  message: string;
+}
+
+// Owner-authorized send via typed command. Runs before the LLM so no
+// agent path can trigger it; owner-lock already fenced the chat.
+export async function sendPendingDraftByText(
+  action: PendingAction,
+): Promise<TextSendDraftResult> {
+  if (action.status === "pending" && isExpired(action)) {
+    await expireAction(action);
+    return {
+      ok: false,
+      message: "That draft expired. Draft it again if you still want to send.",
+    };
+  }
+  if (action.status !== "pending") {
+    return { ok: false, message: `That draft is already ${action.status}.` };
+  }
+  if (activeActions.has(action.id)) {
+    return { ok: false, message: "That draft is already being sent." };
+  }
+  activeActions.add(action.id);
+  try {
+    const recipient = await fetchDraftRecipientLabel(action);
+    const outcome = await performDraftSend(action);
+    if (!outcome.ok) {
+      return {
+        ok: false,
+        message:
+          outcome.reason === "send_failed"
+            ? "Sending failed. The draft is still pending; please try again."
+            : "The draft was sent, but its approval status could not be updated.",
+      };
+    }
+    if (action.telegram_message_id) {
+      try {
+        await telegram.editMessageText(
+          config.ownerTelegramId,
+          action.telegram_message_id,
+          "Draft approval\n\nStatus: Sent",
+          { reply_markup: new InlineKeyboard() },
+        );
+      } catch {
+        console.log(
+          `Approval action ${action.id}: text-send preview update failed`,
+        );
+      }
+    }
+    return { ok: true, message: `Sending the draft to ${recipient}...` };
+  } finally {
+    activeActions.delete(action.id);
+  }
 }
 
 async function discardDraft(
