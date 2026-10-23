@@ -52,9 +52,16 @@ import { handleReminderCallback } from "./reminders.js";
 import {
   DOCUMENT_READ_ERROR,
   handleDocumentCallback,
+  ingestDocumentBytes,
+  ingestDocumentText,
   processIncomingDocument,
   processIncomingPhoto,
 } from "./documents.js";
+import {
+  allDriveFileIds,
+  fetchDriveFile,
+  hasDriveLink,
+} from "./google/drive.js";
 import { deliverWrapUp, handleNoteCallback } from "./notes.js";
 import { START_GREETING } from "./start_greeting.js";
 import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
@@ -555,6 +562,56 @@ async function deliverPendingMeetingWrapUp(
   return true;
 }
 
+/** Download every Drive / Docs / Sheets / Slides URL in `text`, ingest each
+ *  through the document pipeline, and reply with one line per file naming
+ *  the stored document id. The LLM is not called here; follow-up questions
+ *  go through the usual agent loop with `read_document` on the id. */
+async function ingestDriveLinks(ctx: Context, text: string): Promise<void> {
+  const ids = allDriveFileIds(text);
+  if (ids.length === 0) {
+    return;
+  }
+  for (const fileId of ids) {
+    try {
+      const fetched = await fetchDriveFile(fileId);
+      let documentId: number;
+      if (fetched.text !== undefined) {
+        const ingested = await ingestDocumentText({
+          fileName: fetched.fileName,
+          text: fetched.text,
+          tag: "work",
+          hint: `Google Drive (${fetched.mimeType})`,
+        });
+        documentId = ingested.documentId;
+      } else if (fetched.bytes && fetched.bytes.byteLength > 0) {
+        const ingested = await ingestDocumentBytes({
+          fileName: fetched.fileName,
+          mimeType: fetched.ingestMimeType,
+          bytes: fetched.bytes,
+          tag: "work",
+          hint: `Google Drive (${fetched.mimeType})`,
+        });
+        documentId = ingested.documentId;
+      } else {
+        await ctx.reply(
+          `I couldn't read ${fetched.fileName} from Drive — it returned no content.`,
+        );
+        continue;
+      }
+      await ctx.reply(
+        `I've read the document from Drive: ${fetched.fileName} (id ${documentId}). What would you like to know?`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "unknown error";
+      console.error(
+        `Drive ingest failed for ${fileId}: ${message}`,
+      );
+      await ctx.reply(`I couldn't read that Drive link: ${message}`);
+    }
+  }
+}
+
 async function handleUserText(
   ctx: Context,
   userId: number,
@@ -563,6 +620,11 @@ async function handleUserText(
   const buildFollowupId = consumeBuildFollowup(userId);
   if (buildFollowupId !== undefined) {
     await submitBuildFollowup(ctx, buildFollowupId, userText);
+    return;
+  }
+
+  if (hasDriveLink(userText)) {
+    await whileTyping(ctx, () => ingestDriveLinks(ctx, userText));
     return;
   }
 

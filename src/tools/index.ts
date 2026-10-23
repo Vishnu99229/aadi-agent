@@ -29,9 +29,11 @@ import * as searchMemories from "./search_memories.js";
 import * as searchQa from "./search_qa.js";
 import * as updateMemory from "./update_memory.js";
 import * as readDocument from "./read_document.js";
+import * as readDriveFile from "./read_drive_file.js";
 import * as removeAccount from "./remove_account.js";
 import * as readEmail from "./read_email.js";
 import * as readSheet from "./read_sheet.js";
+import * as searchDrive from "./search_drive.js";
 import * as searchEmails from "./search_emails.js";
 import * as searchNotes from "./search_notes.js";
 import * as setReminder from "./set_reminder.js";
@@ -71,11 +73,13 @@ const modules = {
   propose_calendar_event: proposeCalendarEvent,
   read_attachment: readAttachment,
   read_document: readDocument,
+  read_drive_file: readDriveFile,
   remove_account: removeAccount,
   remove_date: removeDate,
   read_email: readEmail,
   remember,
   read_sheet: readSheet,
+  search_drive: searchDrive,
   search_emails: searchEmails,
   search_memories: searchMemories,
   search_notes: searchNotes,
@@ -115,11 +119,13 @@ export const TOOL_ORDER = [
   "propose_calendar_event",
   "read_attachment",
   "read_document",
+  "read_drive_file",
   "remove_account",
   "remove_date",
   "read_email",
   "remember",
   "read_sheet",
+  "search_drive",
   "search_emails",
   "search_memories",
   "search_notes",

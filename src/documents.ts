@@ -279,6 +279,86 @@ export async function ingestDocumentBytes(params: {
   }
 }
 
+/** Ingest already-extracted text (e.g. a Google Doc exported as text/plain)
+ *  through the same type-detection + analysis pipeline as `ingestDocumentBytes`.
+ *  Writes a row to `documents` and returns the id plus a Telegram-ready reply. */
+export async function ingestDocumentText(params: {
+  fileName: string;
+  text: string;
+  tag: ItemTag;
+  hint?: string;
+}): Promise<{
+  documentId: number;
+  reply: string;
+  pendingActionItems: DocumentActionItem[] | null;
+}> {
+  if (!params.text.trim()) {
+    throw new Error("That Drive file exported no text to analyse.");
+  }
+  const record = createDocument(params.fileName, params.tag, "", null);
+  console.log(`Document ${record.id}: placeholder stored (drive text)`);
+  recordRecentUpload(record.id, params.fileName, "drive");
+
+  const storedText = params.text;
+  updateDocument(record.id, {
+    tag: params.tag,
+    extractedText: storedText,
+    pendingActionItems: null,
+  });
+
+  const detected = detectDocumentKind(
+    params.fileName,
+    params.hint ?? "",
+    storedText,
+  );
+  let analysis: DocumentAnalysis;
+  let reply: string;
+  if (detected !== "other") {
+    const typed = await reviewTypedDocument(detected, storedText, record.id);
+    analysis = {
+      tag: params.tag,
+      document_type: detected,
+      summary_bullets: typed.review.summary,
+      dates: [],
+      money: [],
+      risks:
+        typed.review.kind === "contract"
+          ? typed.review.pushback
+          : typed.review.kind === "rfp"
+            ? typed.review.check_with_team
+            : [],
+      action_items: [],
+      extracted_text: storedText,
+      pages_processed: 1,
+      truncated: false,
+      fallback_summary: false,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        estimatedCostUsd: 0,
+      },
+    };
+    reply = typed.reply;
+  } else {
+    const forAnalysis =
+      storedText.length > 24_000 ? storedText.slice(0, 24_000) : storedText;
+    analysis = await analyzeText(
+      forAnalysis,
+      params.hint || "document",
+      1,
+      storedText.length > 24_000,
+    );
+    reply = formatDocumentReply(record.id, analysis);
+  }
+  persistAnalysis(record.id, analysis, storedText);
+  return {
+    documentId: record.id,
+    reply,
+    pendingActionItems:
+      analysis.action_items.length > 0 ? analysis.action_items : null,
+  };
+}
+
 export async function processIncomingDocument(
   ctx: Context,
   fileName: string,

@@ -12,6 +12,7 @@ export const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/gmail.compose",
   "https://www.googleapis.com/auth/calendar.readonly",
   "https://www.googleapis.com/auth/spreadsheets.readonly",
+  "https://www.googleapis.com/auth/drive.readonly",
 ] as const;
 
 /** Work account only. calendar.events is the narrowest scope that can insert/patch/delete events. Keep calendar.readonly so freebusy.query still works (that method does not list calendar.events). */
