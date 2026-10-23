@@ -68,6 +68,8 @@ export type FollowupStatus =
   | "snoozed"
   | "dismissed";
 
+export type FollowupImportance = "high" | "medium" | "low";
+
 export interface FollowupRecord {
   id: number;
   thread_id: string;
@@ -79,6 +81,9 @@ export interface FollowupRecord {
   status: FollowupStatus;
   nudge_count: number;
   next_check_at: string;
+  reason_for_followup: string | null;
+  importance: FollowupImportance;
+  last_notified_at: string | null;
   created_at: string;
 }
 
@@ -90,6 +95,8 @@ export interface FollowupInput {
   googleAccount: GoogleAccountId;
   lastSentAt: string;
   nextCheckAt: string;
+  reasonForFollowup?: string | null;
+  importance?: FollowupImportance;
 }
 
 export const DB_PATH = process.env.AADI_DB_PATH?.trim() || "./aadi.db";
@@ -180,6 +187,10 @@ db.exec(`
       CHECK (status IN ('waiting', 'replied', 'snoozed', 'dismissed')),
     nudge_count INTEGER NOT NULL DEFAULT 0,
     next_check_at TEXT NOT NULL,
+    reason_for_followup TEXT,
+    importance TEXT NOT NULL DEFAULT 'medium'
+      CHECK (importance IN ('high', 'medium', 'low')),
+    last_notified_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (google_account, thread_id)
   );
@@ -714,6 +725,25 @@ if (!tableHasColumn("followups", "google_account")) {
   );
 }
 
+if (!tableHasColumn("followups", "reason_for_followup")) {
+  db.exec(`ALTER TABLE followups ADD COLUMN reason_for_followup TEXT`);
+}
+if (!tableHasColumn("followups", "importance")) {
+  db.exec(
+    `ALTER TABLE followups ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'
+       CHECK (importance IN ('high', 'medium', 'low'))`,
+  );
+  // Existing rows get 'medium' by default; the DEFAULT clause above already
+  // backfills them, but set it explicitly for clarity and to repair any
+  // legacy row that somehow holds NULL.
+  db.exec(
+    `UPDATE followups SET importance = 'medium' WHERE importance IS NULL OR importance = ''`,
+  );
+}
+if (!tableHasColumn("followups", "last_notified_at")) {
+  db.exec(`ALTER TABLE followups ADD COLUMN last_notified_at TEXT`);
+}
+
 if (followupsSchema.includes("thread_id TEXT NOT NULL UNIQUE")) {
   db.exec(`
     CREATE TABLE followups_migrate (
@@ -729,15 +759,21 @@ if (followupsSchema.includes("thread_id TEXT NOT NULL UNIQUE")) {
         CHECK (status IN ('waiting', 'replied', 'snoozed', 'dismissed')),
       nudge_count INTEGER NOT NULL DEFAULT 0,
       next_check_at TEXT NOT NULL,
+      reason_for_followup TEXT,
+      importance TEXT NOT NULL DEFAULT 'medium'
+        CHECK (importance IN ('high', 'medium', 'low')),
+      last_notified_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE (google_account, thread_id)
     );
     INSERT INTO followups_migrate (
       id, thread_id, recipient, subject, tag, google_account, last_sent_at,
-      status, nudge_count, next_check_at, created_at
+      status, nudge_count, next_check_at, reason_for_followup, importance,
+      last_notified_at, created_at
     )
     SELECT id, thread_id, recipient, subject, tag, google_account, last_sent_at,
-           status, nudge_count, next_check_at, created_at
+           status, nudge_count, next_check_at, reason_for_followup, importance,
+           last_notified_at, created_at
     FROM followups;
     DROP TABLE followups;
     ALTER TABLE followups_migrate RENAME TO followups;
@@ -1017,7 +1053,8 @@ export function transitionReminderStatus(
 }
 
 const FOLLOWUP_COLUMNS = `id, thread_id, recipient, subject, tag, google_account,
-              last_sent_at, status, nudge_count, next_check_at, created_at`;
+              last_sent_at, status, nudge_count, next_check_at,
+              reason_for_followup, importance, last_notified_at, created_at`;
 
 export function getFollowup(id: number): FollowupRecord | undefined {
   return db
@@ -1057,8 +1094,9 @@ export function createFollowup(input: FollowupInput): FollowupRecord {
     .prepare(
       `INSERT INTO followups (
          thread_id, recipient, subject, tag, google_account,
-         last_sent_at, next_check_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         last_sent_at, next_check_at,
+         reason_for_followup, importance
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.threadId,
@@ -1068,6 +1106,8 @@ export function createFollowup(input: FollowupInput): FollowupRecord {
       input.googleAccount,
       input.lastSentAt,
       input.nextCheckAt,
+      input.reasonForFollowup ?? null,
+      input.importance ?? "medium",
     );
 
   return getFollowup(Number(result.lastInsertRowid))!;
@@ -1086,7 +1126,10 @@ export function restartFollowup(
          last_sent_at = ?,
          status = 'waiting',
          nudge_count = 0,
-         next_check_at = ?
+         next_check_at = ?,
+         reason_for_followup = ?,
+         importance = ?,
+         last_notified_at = NULL
      WHERE id = ?`,
   ).run(
     input.recipient,
@@ -1095,10 +1138,38 @@ export function restartFollowup(
     input.googleAccount,
     input.lastSentAt,
     input.nextCheckAt,
+    input.reasonForFollowup ?? null,
+    input.importance ?? "medium",
     id,
   );
 
   return getFollowup(id)!;
+}
+
+export function getDueFollowups(nowIso: string): FollowupRecord[] {
+  return db
+    .prepare(
+      `SELECT ${FOLLOWUP_COLUMNS}
+       FROM followups
+       WHERE status = 'waiting' AND next_check_at <= ?
+       ORDER BY importance = 'high' DESC, next_check_at ASC, id ASC`,
+    )
+    .all(nowIso) as FollowupRecord[];
+}
+
+export function recordFollowupNudge(
+  id: number,
+  lastNotifiedAt: string,
+  nudgeCount: number,
+  nextCheckAt: string,
+): void {
+  db.prepare(
+    `UPDATE followups
+     SET last_notified_at = ?,
+         nudge_count = ?,
+         next_check_at = ?
+     WHERE id = ?`,
+  ).run(lastNotifiedAt, nudgeCount, nextCheckAt, id);
 }
 
 export function refreshFollowupSentMessage(

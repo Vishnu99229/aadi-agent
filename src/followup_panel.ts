@@ -1,17 +1,21 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
+import { decodedAccounts } from "./accounts.js";
 import { config } from "./config.js";
 import type { FollowupRecord } from "./db.js";
 import {
   formatFollowupPanelText,
   formatSnoozeUntil,
+  formatToLine,
   type FollowupDisplay,
 } from "./followup_logic.js";
 import {
   activeFollowups,
+  buildNudgeMessage,
   createFollowupDraftForApproval,
   displaysForFollowups,
+  dueFollowupsNow,
   FollowupDraftLlmError,
-  overdueFollowups,
+  markFollowupNudged,
   snoozeFollowupThreeDays,
   stopTrackingFollowup,
 } from "./followups.js";
@@ -114,12 +118,41 @@ export async function sendActiveFollowupPanel(
   await sendPanel(api, activeFollowups(), heading);
 }
 
+/** Phase 4 dispatcher: pure-SQL due check, then one contextual Telegram
+ *  message per due follow-up, each with a single [Draft Follow-up] inline
+ *  button. Advances the backoff after each send so the row won't fire again
+ *  until the next scheduled check. */
 export async function sendOverdueFollowupNudge(api: Api): Promise<void> {
-  const overdue = overdueFollowups();
-  if (overdue.length === 0) {
+  const due = dueFollowupsNow();
+  if (due.length === 0) {
     return;
   }
-  await sendPanel(api, overdue, "Waiting on replies");
+  const accounts = decodedAccounts();
+  let sent = 0;
+  for (const followup of due) {
+    const recipientLabel = formatToLine(followup.recipient, accounts).replace(
+      /^To:\s*/,
+      "",
+    );
+    const text = buildNudgeMessage(followup, recipientLabel);
+    const keyboard = new InlineKeyboard().text(
+      "Draft follow-up",
+      `fu:d:${followup.id}`,
+    );
+    try {
+      await api.sendMessage(config.ownerTelegramId, text, {
+        reply_markup: keyboard,
+      });
+      markFollowupNudged(followup);
+      sent += 1;
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(
+        `Follow-up ${followup.id}: nudge send failed (${errorType})`,
+      );
+    }
+  }
+  console.log(`Follow-up nudges dispatched: due=${due.length}, sent=${sent}`);
 }
 
 export async function sendWaitingOnPanel(api: Api): Promise<void> {
