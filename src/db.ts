@@ -47,6 +47,12 @@ export interface TaskRecord {
   due_at: string | null;
   status: TaskStatus;
   created_at: string;
+  kind: "task" | "promise";
+  source_thread_id: string | null;
+  source_message_id: string | null;
+  promise_context: string | null;
+  deadline: string | null;
+  recipient: string | null;
 }
 
 export type ReminderRecurrence = "none" | "daily" | "weekly" | "weekdays";
@@ -60,6 +66,7 @@ export interface ReminderRecord {
   recurrence: ReminderRecurrence;
   status: ReminderStatus;
   created_at: string;
+  related_task_id: number | null;
 }
 
 export type FollowupStatus =
@@ -553,6 +560,41 @@ db.exec(`
   );
 `);
 
+// Promises tracker (Part 1): extend tasks with promise-specific columns.
+// All additive and nullable so existing rows stay valid.
+if (!tableHasColumn("tasks", "kind")) {
+  db.exec(
+    `ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'
+       CHECK (kind IN ('task', 'promise'))`,
+  );
+}
+if (!tableHasColumn("tasks", "source_thread_id")) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN source_thread_id TEXT`);
+}
+if (!tableHasColumn("tasks", "source_message_id")) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN source_message_id TEXT`);
+}
+if (!tableHasColumn("tasks", "promise_context")) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN promise_context TEXT`);
+}
+if (!tableHasColumn("tasks", "deadline")) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN deadline TEXT`);
+}
+if (!tableHasColumn("tasks", "recipient")) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN recipient TEXT`);
+}
+db.exec(
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_message
+     ON tasks (source_message_id)
+     WHERE source_message_id IS NOT NULL`,
+);
+
+// Reminders can now carry a task link so "Done" on a promise reminder
+// also closes the task and cancels sibling reminders for the same task.
+if (!tableHasColumn("reminders", "related_task_id")) {
+  db.exec(`ALTER TABLE reminders ADD COLUMN related_task_id INTEGER`);
+}
+
 if (!tableHasColumn("accounts", "relationship")) {
   db.exec(
     `ALTER TABLE accounts ADD COLUMN relationship TEXT NOT NULL DEFAULT 'partner'`,
@@ -939,6 +981,9 @@ export function getExpiredPendingActions(): PendingAction[] {
     .all() as PendingAction[];
 }
 
+const TASK_COLUMNS = `id, text, tag, due_at, status, created_at, kind,
+  source_thread_id, source_message_id, promise_context, deadline, recipient`;
+
 export function createTask(
   text: string,
   tag: ItemTag,
@@ -954,10 +999,58 @@ export function createTask(
   return getTask(Number(result.lastInsertRowid))!;
 }
 
+export interface PromiseTaskInput {
+  promise: string;           // short noun phrase, no "Promise:" prefix
+  recipient: string;         // raw "Name <addr@host>" or just address
+  threadId: string;
+  messageId: string;
+  deadline: string | null;   // YYYY-MM-DD or null
+  dueAt: string | null;      // ISO datetime for reminder scheduling, or null
+}
+
+export function createPromiseTask(
+  input: PromiseTaskInput,
+): TaskRecord | undefined {
+  const text = `Promise: ${input.promise}`;
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO tasks (
+         text, tag, due_at, status, kind,
+         source_thread_id, source_message_id, promise_context,
+         deadline, recipient
+       ) VALUES (?, 'work', ?, 'open', 'promise', ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      text,
+      input.dueAt,
+      input.threadId,
+      input.messageId,
+      input.promise,
+      input.deadline,
+      input.recipient,
+    );
+  if (result.changes === 0) {
+    return undefined;
+  }
+  return getTask(Number(result.lastInsertRowid));
+}
+
+export function getPromiseByMessageId(
+  messageId: string,
+): TaskRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${TASK_COLUMNS}
+       FROM tasks
+       WHERE source_message_id = ?`,
+    )
+    .get(messageId) as TaskRecord | undefined;
+}
+
 export function getTask(id: number): TaskRecord | undefined {
   return db
     .prepare(
-      `SELECT id, text, tag, due_at, status, created_at
+      `SELECT ${TASK_COLUMNS}
        FROM tasks
        WHERE id = ?`,
     )
@@ -967,7 +1060,7 @@ export function getTask(id: number): TaskRecord | undefined {
 export function getTasks(): TaskRecord[] {
   return db
     .prepare(
-      `SELECT id, text, tag, due_at, status, created_at
+      `SELECT ${TASK_COLUMNS}
        FROM tasks
        ORDER BY
          CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
@@ -989,18 +1082,22 @@ export function markTaskDone(id: number): boolean {
   return result.changes === 1;
 }
 
+const REMINDER_COLUMNS = `id, text, tag, remind_at, recurrence, status,
+  created_at, related_task_id`;
+
 export function createReminder(
   text: string,
   tag: ItemTag,
   remindAt: string,
   recurrence: ReminderRecurrence,
+  relatedTaskId: number | null = null,
 ): ReminderRecord {
   const result = db
     .prepare(
-      `INSERT INTO reminders (text, tag, remind_at, recurrence)
-       VALUES (?, ?, ?, ?)`,
+      `INSERT INTO reminders (text, tag, remind_at, recurrence, related_task_id)
+       VALUES (?, ?, ?, ?, ?)`,
     )
-    .run(text, tag, remindAt, recurrence);
+    .run(text, tag, remindAt, recurrence, relatedTaskId);
 
   return getReminder(Number(result.lastInsertRowid))!;
 }
@@ -1008,7 +1105,7 @@ export function createReminder(
 export function getReminder(id: number): ReminderRecord | undefined {
   return db
     .prepare(
-      `SELECT id, text, tag, remind_at, recurrence, status, created_at
+      `SELECT ${REMINDER_COLUMNS}
        FROM reminders
        WHERE id = ?`,
     )
@@ -1018,7 +1115,7 @@ export function getReminder(id: number): ReminderRecord | undefined {
 export function getReminders(): ReminderRecord[] {
   return db
     .prepare(
-      `SELECT id, text, tag, remind_at, recurrence, status, created_at
+      `SELECT ${REMINDER_COLUMNS}
        FROM reminders
        ORDER BY remind_at ASC, id ASC`,
     )
@@ -1028,12 +1125,25 @@ export function getReminders(): ReminderRecord[] {
 export function getDueReminders(now: string): ReminderRecord[] {
   return db
     .prepare(
-      `SELECT id, text, tag, remind_at, recurrence, status, created_at
+      `SELECT ${REMINDER_COLUMNS}
        FROM reminders
        WHERE status = 'pending' AND remind_at <= ?
        ORDER BY remind_at ASC, id ASC`,
     )
     .all(now) as ReminderRecord[];
+}
+
+/** When a promise task is marked done, cancel its pending reminders so the
+ *  user isn't pinged twice. Returns how many rows were cancelled. */
+export function cancelPendingRemindersForTask(taskId: number): number {
+  const result = db
+    .prepare(
+      `UPDATE reminders
+       SET status = 'cancelled'
+       WHERE related_task_id = ? AND status = 'pending'`,
+    )
+    .run(taskId);
+  return result.changes;
 }
 
 export function transitionReminderStatus(

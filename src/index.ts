@@ -6,6 +6,7 @@ import { registerMorningBrief } from "./brief.js";
 import { sendOverdueFollowupNudge } from "./followup_panel.js";
 import { registerFollowupScan } from "./followups.js";
 import { registerImportantDateReminders } from "./important_dates.js";
+import { registerPromiseScan } from "./promises.js";
 import { registerWeeklyReview } from "./weekly.js";
 import { startDocumentExpirySweep } from "./documents.js";
 import { registerReminderScheduler } from "./reminders.js";
@@ -32,6 +33,7 @@ const followupScanTask = registerFollowupScan(
   sendOverdueFollowupNudge,
   bot.api,
 );
+const promiseScanTask = registerPromiseScan();
 const approvalExpirySweep = startApprovalExpirySweep();
 const reminderScheduler = await registerReminderScheduler(bot.api);
 const documentExpirySweep = startDocumentExpirySweep();
@@ -84,6 +86,7 @@ process.once("SIGINT", () => {
   importantDateTask.stop();
   weeklyReviewTask.stop();
   followupScanTask.stop();
+  promiseScanTask.stop();
   meetingScanTask.stop();
   weeklyBackupTask.stop();
   attachmentAlertTask.stop();
@@ -102,6 +105,7 @@ process.once("SIGTERM", () => {
   importantDateTask.stop();
   weeklyReviewTask.stop();
   followupScanTask.stop();
+  promiseScanTask.stop();
   meetingScanTask.stop();
   weeklyBackupTask.stop();
   attachmentAlertTask.stop();

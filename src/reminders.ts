@@ -1,9 +1,11 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import { config } from "./config.js";
 import {
+  cancelPendingRemindersForTask,
   createReminder,
   getDueReminders,
   getReminder,
+  markTaskDone,
   transitionReminderStatus,
   type ReminderRecord,
 } from "./db.js";
@@ -199,6 +201,18 @@ export async function handleReminderCallback(
     await ctx.answerCallbackQuery();
 
     if (operation === "done") {
+      // If this reminder is tied to a promise/task, close the task and
+      // cancel any sibling reminders (e.g. a promise's T-24h and morning-of).
+      if (reminder.related_task_id !== null) {
+        const taskClosed = markTaskDone(reminder.related_task_id);
+        const siblings = cancelPendingRemindersForTask(
+          reminder.related_task_id,
+        );
+        console.log(
+          `Reminder ${reminderId}: linked task ${reminder.related_task_id} ` +
+            `closed=${taskClosed} siblings_cancelled=${siblings}`,
+        );
+      }
       await editHandledMessage(ctx, "Done");
       handledButtons.add(reminderId);
       console.log(`Reminder ${reminderId}: button -> done`);
