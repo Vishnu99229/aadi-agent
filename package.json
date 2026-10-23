@@ -14,8 +14,9 @@
     "google:auth": "tsx src/google/authorize.ts",
     "google:auth:work": "tsx src/google/authorize.ts --work",
     "google:test": "tsx src/google/test.ts",
-    "test": "npm run test:stage5 && npm run test:stage6 && npm run test:stage7 && npm run test:stage8 && npm run test:stage10 && npm run test:memory && npm run test:usage && npm run test:stage11 && npm run test:security && npm run test:stage12 && npm run test:start-greeting && npm run test:phone-mirroring && npm run test:panels && npm run test:promises",
+    "test": "npm run test:stage5 && npm run test:stage6 && npm run test:stage7 && npm run test:stage8 && npm run test:stage10 && npm run test:memory && npm run test:usage && npm run test:stage11 && npm run test:security && npm run test:stage12 && npm run test:start-greeting && npm run test:phone-mirroring && npm run test:panels && npm run test:promises && npm run test:bill-extract",
     "test:promises": "AADI_DB_PATH=:memory: tsx scripts/test-promises.ts",
+    "test:bill-extract": "tsx scripts/test-bill-extract.ts",
     "test:panels": "tsx scripts/test-panels.ts",
     "test:stage12": "AADI_DB_PATH=:memory: tsx scripts/test-stage12.ts",
     "test:phone-mirroring": "bash scripts/test-phone-mirroring.sh",
@@ -33,7 +34,7 @@
     "test:stage11": "tsx scripts/test-stage11.ts",
     "test:start-greeting": "tsx scripts/test-start-greeting.ts",
     "bill-scan:manual": "AADI_DB_PATH=:memory: tsx --env-file=.env scripts/run-bill-scan.ts",
-    "bench:models":"tsx --env-file=.env scripts/bench-models.ts"
+    "bench:models": "tsx --env-file=.env scripts/bench-models.ts"
   },
   "keywords": [],
   "author": "",
@@ -44,6 +45,7 @@
     "@anthropic-ai/sdk": "^0.132.1",
     "@google-cloud/local-auth": "^3.0.1",
     "better-sqlite3": "^12.11.1",
+    "chrono-node": "^2.7.7",
     "dotenv": "^18.0.6",
     "googleapis": "^185.0.0",
     "grammy": "^1.46.0",

@@ -15,6 +15,7 @@ import { loadGoogleAccounts } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
 import { stripSensitive } from "./sensitive.js";
+import { extractBillDeterministic } from "./bill_extract.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const SCAN_QUERY =
@@ -29,6 +30,7 @@ interface BillCandidate {
   threadId: string;
   subject: string;
   snippet: string;
+  fromHeader: string;
 }
 
 interface BillClassification {
@@ -123,7 +125,7 @@ async function listBillCandidates(): Promise<BillCandidate[]> {
             userId: "me",
             id: message.id!,
             format: "metadata",
-            metadataHeaders: ["Subject"],
+            metadataHeaders: ["Subject", "From"],
           }),
         );
       } catch (error) {
@@ -140,6 +142,7 @@ async function listBillCandidates(): Promise<BillCandidate[]> {
         threadId,
         subject: header(response.data.payload?.headers, "Subject"),
         snippet: stripSensitive(response.data.snippet ?? ""),
+        fromHeader: header(response.data.payload?.headers, "From"),
       });
     }
   }
@@ -254,30 +257,78 @@ export async function runBillScan(api: Api): Promise<void> {
     console.log("Bill scan complete: candidates=0, tracked=0");
     return;
   }
-  const classifications = await classifyBills(candidates);
+  // Regex-first: anything with amount + due_date + biller findable from the
+  // metadata skips the LLM entirely. Only the leftovers (image receipts,
+  // unusual phrasings) go to DeepSeek.
+  const direct: Array<{ candidate: BillCandidate; biller: string;
+    amount: number; currency: string; dueDate: string }> = [];
+  const needsLlm: BillCandidate[] = [];
+  for (const candidate of candidates) {
+    const extracted = extractBillDeterministic({
+      fromHeader: candidate.fromHeader,
+      subject: candidate.subject,
+      snippet: candidate.snippet,
+    });
+    if (extracted) {
+      direct.push({
+        candidate,
+        biller: extracted.biller,
+        amount: extracted.amount,
+        currency: extracted.currency,
+        dueDate: extracted.due_date,
+      });
+    } else {
+      needsLlm.push(candidate);
+    }
+  }
+  console.log(
+    `Bill scan partition: direct=${direct.length}, llm=${needsLlm.length} (saved ${direct.length} LLM calls)`,
+  );
+
   let tracked = 0;
-  for (const item of classifications) {
-    if (!item.is_bill || typeof item.biller !== "string" || !item.biller.trim() || !/^\d{4}-\d{2}-\d{2}$/.test(item.due_date)) {
-      continue;
-    }
-    const candidate = candidates[item.candidate_id - 1]!;
-    const biller = item.biller.trim();
-    const currency =
-      (typeof item.currency === "string" && item.currency.trim()) || "INR";
+  for (const item of direct) {
     const bill = createBill(
-      biller,
+      item.biller,
       item.amount,
-      currency,
-      item.due_date,
-      candidate.threadId,
+      item.currency,
+      item.dueDate,
+      item.candidate.threadId,
     );
-    if (!bill) {
-      continue;
-    }
-    console.log(`Bill ${bill.id}: status -> upcoming`);
+    if (!bill) continue;
+    console.log(`Bill ${bill.id}: status -> upcoming (deterministic)`);
     await notifyNewBill(api, bill);
     tracked += 1;
   }
+
+  if (needsLlm.length > 0) {
+    const classifications = await classifyBills(needsLlm);
+    for (const item of classifications) {
+      if (
+        !item.is_bill ||
+        typeof item.biller !== "string" ||
+        !item.biller.trim() ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(item.due_date)
+      ) {
+        continue;
+      }
+      const candidate = needsLlm[item.candidate_id - 1]!;
+      const biller = item.biller.trim();
+      const currency =
+        (typeof item.currency === "string" && item.currency.trim()) || "INR";
+      const bill = createBill(
+        biller,
+        item.amount,
+        currency,
+        item.due_date,
+        candidate.threadId,
+      );
+      if (!bill) continue;
+      console.log(`Bill ${bill.id}: status -> upcoming (llm)`);
+      await notifyNewBill(api, bill);
+      tracked += 1;
+    }
+  }
+
   console.log(
     `Bill scan complete: candidates=${candidates.length}, tracked=${tracked}`,
   );

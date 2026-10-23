@@ -130,11 +130,11 @@ export function isAlgorithmicallyExcluded(
 
 /** Backoff schedule for the deterministic nudge dispatcher.
  *  nudge_count is the count AFTER the ping we are about to send:
- *    1 → next check in 3 days
- *    2 → next check in 5 days
- *    ≥3 → next check in 7 days */
+ *    1 → next check in 2 days
+ *    2 → next check in 3 days
+ *    ≥3 → next check in 5 days */
 export function nextCheckAfterNudge(nudgeCount: number, nowMs: number): string {
-  const days = nudgeCount <= 1 ? 3 : nudgeCount === 2 ? 5 : 7;
+  const days = nudgeCount <= 1 ? 2 : nudgeCount === 2 ? 3 : 5;
   return new Date(nowMs + days * DAY_MS).toISOString();
 }
 
