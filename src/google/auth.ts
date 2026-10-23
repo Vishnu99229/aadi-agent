@@ -200,6 +200,10 @@ async function loadGoogleAccountsUncached(): Promise<LoadedGoogleAccount[]> {
         console.log(
           "Google work account skipped: google-token-work.json not found.",
         );
+      } else if (config.id === "personal") {
+        console.warn(
+          "Personal Google account not authenticated. Drive links will default to the work account.",
+        );
       }
       continue;
     }

@@ -30,6 +30,12 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         description:
           'Which bucket the stored document falls under. Default "work".',
       },
+      account: {
+        type: "string",
+        enum: ["work", "personal"],
+        description:
+          'Which Google account to fetch the file with. Default "work" — Vishnu only authenticates the work account for Drive.',
+      },
     },
   },
 };
@@ -39,10 +45,12 @@ export async function handler(input: unknown): Promise<string> {
     file_url?: unknown;
     file_id?: unknown;
     tag?: unknown;
+    account?: unknown;
   };
   const url = typeof values.file_url === "string" ? values.file_url : "";
   const rawId = typeof values.file_id === "string" ? values.file_id : "";
   const tag = values.tag === "personal" ? "personal" : "work";
+  const account = values.account === "personal" ? "personal" : "work";
 
   const fileId = url
     ? extractDriveFileId(url)
@@ -57,7 +65,7 @@ export async function handler(input: unknown): Promise<string> {
 
   let fetched: DriveFetchResult;
   try {
-    fetched = await fetchDriveFile(fileId);
+    fetched = await fetchDriveFile(fileId, account);
   } catch (error) {
     const err = error as { code?: number; status?: number; message?: string };
     const code = err.code ?? err.status;

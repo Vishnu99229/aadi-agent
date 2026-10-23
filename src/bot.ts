@@ -573,7 +573,7 @@ async function ingestDriveLinks(ctx: Context, text: string): Promise<void> {
   }
   for (const fileId of ids) {
     try {
-      const fetched = await fetchDriveFile(fileId);
+      const fetched = await fetchDriveFile(fileId, "work");
       let documentId: number;
       if (fetched.text !== undefined) {
         const ingested = await ingestDocumentText({

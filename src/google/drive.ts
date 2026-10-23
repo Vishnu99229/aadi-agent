@@ -1,5 +1,5 @@
 import { google, type drive_v3 } from "googleapis";
-import { getGoogleClient } from "./auth.js";
+import { getGoogleClientFor, type GoogleAccountId } from "./auth.js";
 
 /** Google editor mime types that must be exported, not downloaded. */
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
@@ -74,17 +74,22 @@ function driveClient(): drive_v3.Drive {
   return google.drive({ version: "v3" });
 }
 
-async function getAuthedDrive(): Promise<drive_v3.Drive> {
-  const auth = await getGoogleClient();
+async function getAuthedDrive(
+  account: GoogleAccountId = "work",
+): Promise<drive_v3.Drive> {
+  const auth = await getGoogleClientFor(account);
   return google.drive({ version: "v3", auth });
 }
 
 /** Fetch a Drive file's metadata + content. Google editor files are exported
  *  as UTF-8 text (Docs/Slides → text/plain, Sheets → text/csv). Everything
  *  else is downloaded via alt=media as an octet-stream buffer. */
-export async function fetchDriveFile(fileId: string): Promise<DriveFetchResult> {
+export async function fetchDriveFile(
+  fileId: string,
+  account: GoogleAccountId = "work",
+): Promise<DriveFetchResult> {
   void driveClient; // keep the lazy constructor exported-for-tests sibling
-  const drive = await getAuthedDrive();
+  const drive = await getAuthedDrive(account);
   const metaResponse = await drive.files.get({
     fileId,
     fields: "id, name, mimeType, size, webViewLink",
@@ -165,8 +170,9 @@ export interface DriveSearchHit {
 export async function searchDriveFiles(
   query: string,
   limit = 5,
+  account: GoogleAccountId = "work",
 ): Promise<DriveSearchHit[]> {
-  const drive = await getAuthedDrive();
+  const drive = await getAuthedDrive(account);
   const safe = query.replace(/'/g, "\\'").replace(/\\/g, "\\\\");
   const response = await drive.files.list({
     q: `name contains '${safe}' and trashed = false`,
