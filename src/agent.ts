@@ -115,7 +115,7 @@ async function summariseOlderMessages(
     (message) => `${message.role}: ${message.content.slice(0, 400)}`,
   );
   const result = await complete({
-    backend: "haiku",
+    backend: getTaskBackend("chat"),
     effort: "low",
     cacheTtl: "5m",
     task: "other",
