@@ -885,6 +885,26 @@ async function completeWithNamedBackend(
   );
 }
 
+function backendFailureName(backend: LlmBackend): string {
+  switch (backend) {
+    case "claude":
+      return "Claude";
+    case "haiku":
+      return "Haiku";
+    case "gemini":
+      return "Gemini";
+    case "deepseek":
+    case "deepseek-reasoner":
+      return "DeepSeek";
+    case "local-gemma":
+      return "Local Gemma";
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export async function complete(
   params: CompleteParams,
 ): Promise<CompleteResult> {
@@ -899,12 +919,18 @@ export async function complete(
     console.error(
       `Backend ${backend} failed (${errorType}); retrying on Claude.`,
     );
-    return completeWithNamedBackend("claude", {
-      ...params,
-      backend: "claude",
-      model: config.claudeModel,
-      effort: undefined,
-    });
+    try {
+      return await completeWithNamedBackend("claude", {
+        ...params,
+        backend: "claude",
+        model: config.claudeModel,
+        effort: undefined,
+      });
+    } catch (fallbackError) {
+      throw new Error(
+        `Primary (${backendFailureName(backend)}) failed: ${errorText(error)}. Fallback (Claude) failed: ${errorText(fallbackError)}.`,
+      );
+    }
   }
 }
 
@@ -922,8 +948,8 @@ export async function completeBackground(
   }
   return complete({
     ...params,
-    backend: "claude",
-    model: config.backgroundModel,
+    backend: getTaskBackend("brief"),
+    model: undefined,
     task: params.task ?? "classification",
     effort: params.effort ?? "low",
   });

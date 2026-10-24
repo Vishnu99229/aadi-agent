@@ -1,5 +1,6 @@
-import { config } from "./config.js";
 import { parsePullNumber } from "./build_logic.js";
+import { config } from "./config.js";
+import { redactSecrets } from "./security/env_guard.js";
 
 const GITHUB_API = "https://api.github.com";
 const API_VERSION = "2022-11-28";
@@ -39,20 +40,35 @@ async function githubFetch<T>(
     }
   }
   if (!response.ok) {
-    const hint =
-      data && typeof data === "object" && "message" in data
-        ? String((data as { message?: unknown }).message ?? "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 80)
-        : "";
+    const message = readGithubError(data);
+    const hint = message.slice(0, 80);
     console.error(
       `GitHub API ${method} ${path}: status=${response.status}` +
         (hint ? ` message=${hint}` : ""),
     );
-    throw new Error(`GitHub API returned ${response.status}.`);
+    throw new Error(message || `GitHub API returned ${response.status}.`);
   }
   return { status: response.status, data };
+}
+
+function readGithubError(data: unknown): string {
+  if (!data || typeof data !== "object") {
+    return "";
+  }
+  const record = data as {
+    message?: unknown;
+    errors?: Array<{ message?: unknown }>;
+  };
+  if (typeof record.message === "string" && record.message.trim()) {
+    return redactSecrets(record.message.replace(/\s+/g, " ").trim());
+  }
+  const nested = record.errors?.find(
+    (item) => typeof item?.message === "string" && item.message.trim(),
+  );
+  if (nested && typeof nested.message === "string") {
+    return redactSecrets(nested.message.replace(/\s+/g, " ").trim());
+  }
+  return "";
 }
 
 export function pullNumberFromUrl(prUrl: string | null | undefined): number | undefined {
@@ -97,6 +113,7 @@ export interface GithubPull {
   draft: boolean;
   merged: boolean;
   mergeable: boolean | null;
+  mergeable_state?: string | null;
   head: { sha: string };
   merge_commit_sha: string | null;
 }
@@ -183,33 +200,120 @@ export async function listPullCheckRuns(
   return listWorkflowRunsForSha(sha);
 }
 
+const MERGE_STATE_ATTEMPTS = 3;
+const MERGE_STATE_DELAY_MS = 2000;
+
+export class PullMergeError extends Error {
+  readonly kind: "conflict" | "blocked";
+
+  constructor(kind: "conflict" | "blocked") {
+    super(
+      kind === "conflict"
+        ? "mergeable_state is dirty (merge conflict)"
+        : "mergeable_state is blocked",
+    );
+    this.name = "PullMergeError";
+    this.kind = kind;
+  }
+}
+
+export function isPullConflict(error: unknown): boolean {
+  if (error instanceof PullMergeError) {
+    return error.kind === "conflict";
+  }
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  return (
+    message.includes("merge conflict") ||
+    message.includes("mergeable_state is dirty")
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function mergeableState(pull: GithubPull): string {
+  const raw = pull.mergeable_state;
+  if (typeof raw !== "string") {
+    return "unknown";
+  }
+  const state = raw.trim().toLowerCase();
+  return state || "unknown";
+}
+
 async function markPullReadyForReview(pull: GithubPull): Promise<void> {
   if (!pull.draft) {
     return;
   }
+  if (!pull.node_id) {
+    throw new Error("Could not mark the pull request ready for review.");
+  }
   const { data } = await githubFetch<{
-    data?: { markPullRequestReadyForReview?: { pullRequest?: { isDraft?: boolean } } };
+    data?: {
+      markPullRequestReadyForReview?: { pullRequest?: { isDraft?: boolean } };
+    };
     errors?: Array<{ message?: string }>;
   }>("POST", "/graphql", {
     query:
       "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }",
     variables: { id: pull.node_id },
   });
-  const message = data.errors?.[0]?.message;
-  if (message) {
-    console.error(`GitHub GraphQL markReady: ${message}`);
-    throw new Error("Could not mark the pull request ready for review.");
+  const message = readGithubError(data);
+  if (data.errors && data.errors.length > 0) {
+    console.error(
+      `GitHub GraphQL markReady: ${(message || "request failed").slice(0, 80)}`,
+    );
+    throw new Error(
+      message || "Could not mark the pull request ready for review.",
+    );
+  }
+  if (data.data?.markPullRequestReadyForReview?.pullRequest?.isDraft === true) {
+    throw new Error("Pull request is still a draft.");
   }
 }
 
 export async function mergePullSquash(
   pullNumber: number,
+  options?: { pollDelayMs?: number },
 ): Promise<string | undefined> {
-  const pull = await getPull(pullNumber);
+  const delayMs = options?.pollDelayMs ?? MERGE_STATE_DELAY_MS;
+  let pull = await getPull(pullNumber);
   if (pull.merged) {
     return pull.merge_commit_sha ?? undefined;
   }
   await markPullReadyForReview(pull);
+  const refreshFirst = pull.draft === true;
+
+  // GitHub reports mergeable_state as unknown until it finishes calculating.
+  for (let attempt = 1; attempt <= MERGE_STATE_ATTEMPTS; attempt += 1) {
+    if (attempt > 1 || refreshFirst) {
+      pull = await getPull(pullNumber);
+      if (pull.merged) {
+        return pull.merge_commit_sha ?? undefined;
+      }
+    }
+    const state = mergeableState(pull);
+    if (state === "dirty") {
+      throw new PullMergeError("conflict");
+    }
+    if (state === "blocked") {
+      throw new PullMergeError("blocked");
+    }
+    if (state === "unknown" || state === "draft") {
+      if (attempt < MERGE_STATE_ATTEMPTS) {
+        await sleep(delayMs);
+        continue;
+      }
+      if (state === "draft") {
+        throw new Error("Pull request is still a draft.");
+      }
+      break;
+    }
+    break;
+  }
+
   try {
     const { data } = await githubFetch<{ sha?: string }>(
       "PUT",
@@ -218,9 +322,13 @@ export async function mergePullSquash(
     );
     return data.sha;
   } catch (error) {
-    const latest = await getPull(pullNumber);
-    if (latest.merged === true) {
-      return latest.merge_commit_sha ?? undefined;
+    try {
+      const latest = await getPull(pullNumber);
+      if (latest.merged === true) {
+        return latest.merge_commit_sha ?? undefined;
+      }
+    } catch {
+      // Keep the original merge error for the Telegram card.
     }
     throw error;
   }
