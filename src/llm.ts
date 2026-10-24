@@ -641,44 +641,73 @@ function toOpenAiUserContent(
   });
 }
 
-function toOpenRouterMessages(
+function toOpenRouterAssistantMessage(
+  message: Extract<LlmMessage, { role: "assistant" }>,
+): ChatCompletionMessageParam | undefined {
+  const text = message.textParts.join("\n");
+  const hasText = text.trim().length > 0;
+  const hasToolCalls = message.toolCalls.length > 0;
+  // Strict OpenAI-compatible APIs (DeepSeek, Gemini) reject tool_calls: [].
+  // An assistant turn with neither text nor a call is not a valid message.
+  if (!hasText && !hasToolCalls) {
+    return undefined;
+  }
+
+  return {
+    role: "assistant",
+    content: hasText ? text : null,
+    ...(hasToolCalls
+      ? {
+          tool_calls: message.toolCalls.map((toolCall) => ({
+            type: "function" as const,
+            id: toolCall.id,
+            function: {
+              name: toolCall.name,
+              arguments: JSON.stringify(toolCall.input),
+            },
+          })),
+        }
+      : {}),
+  };
+}
+
+export function toOpenRouterMessages(
   system: LlmSystemPrompt,
   messages: LlmMessage[],
 ): ChatCompletionMessageParam[] {
+  const history: ChatCompletionMessageParam[] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      history.push({
+        role: "user",
+        content: toOpenAiUserContent(message.content),
+      });
+      continue;
+    }
+
+    if (message.role === "tool") {
+      history.push({
+        role: "tool",
+        tool_call_id: message.toolCallId,
+        content: message.isError
+          ? `Tool error: ${message.content}`
+          : message.content,
+      });
+      continue;
+    }
+
+    const assistant = toOpenRouterAssistantMessage(message);
+    if (assistant) {
+      history.push(assistant);
+    }
+  }
+
   return [
     { role: "system", content: system.cacheable },
     ...(system.dynamic
       ? ([{ role: "system", content: system.dynamic }] satisfies ChatCompletionMessageParam[])
       : []),
-    ...messages.map((message): ChatCompletionMessageParam => {
-      if (message.role === "user") {
-        return { role: "user", content: toOpenAiUserContent(message.content) };
-      }
-
-      if (message.role === "tool") {
-        return {
-          role: "tool",
-          tool_call_id: message.toolCallId,
-          content: message.isError
-            ? `Tool error: ${message.content}`
-            : message.content,
-        };
-      }
-
-      return {
-        role: "assistant",
-        content:
-          message.textParts.length > 0 ? message.textParts.join("\n") : null,
-        tool_calls: message.toolCalls.map((toolCall) => ({
-          type: "function",
-          id: toolCall.id,
-          function: {
-            name: toolCall.name,
-            arguments: JSON.stringify(toolCall.input),
-          },
-        })),
-      };
-    }),
+    ...history,
   ];
 }
 
