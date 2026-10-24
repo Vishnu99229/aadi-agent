@@ -41,6 +41,7 @@ import {
 import {
   closePull,
   getPull,
+  isPullConflict,
   listPullCheckRuns,
   listPullFilenames,
   mergePullSquash,
@@ -490,6 +491,60 @@ async function processChecks(build: BuildRecord): Promise<void> {
   });
 }
 
+function mergeErrorDetail(error: unknown): string {
+  const raw = error instanceof Error ? error.message : "";
+  const detail = raw.replace(/\s+/g, " ").trim().slice(0, 500);
+  return detail || "GitHub merge failed.";
+}
+
+function squashMergeFailureText(error: unknown): string {
+  return `Could not squash-merge the pull request. ${mergeErrorDetail(error)}`;
+}
+
+async function notifyMergeNeedsApproval(
+  build: BuildRecord,
+  error: unknown,
+): Promise<void> {
+  const errorType = error instanceof Error ? error.name : "UnknownError";
+  console.error(`Build ${build.id}: merge failed (${errorType})`);
+  const prefix = squashMergeFailureText(error);
+  try {
+    await askForApproval(
+      build,
+      parseFiles(build),
+      build.pr_url,
+      build.pr_number,
+      prefix,
+    );
+  } catch (sendError) {
+    const sendType =
+      sendError instanceof Error ? sendError.name : "UnknownError";
+    console.error(`Build ${build.id}: approval card failed (${sendType})`);
+    await ownerApi().sendMessage(config.ownerTelegramId, prefix, {
+      reply_markup: reviewKeyboard(build.id),
+    });
+    updateBuild(build.id, {
+      status: "waiting_approval",
+      error: prefix,
+    });
+  }
+}
+
+async function mergePullSquashRetry(
+  buildId: number,
+  pullNumber: number,
+): Promise<string | undefined> {
+  try {
+    return await mergePullSquash(pullNumber);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(
+      `Build ${buildId}: merge failed (${errorType}); retrying once`,
+    );
+    return mergePullSquash(pullNumber);
+  }
+}
+
 async function autoMergeAndDeploy(build: BuildRecord): Promise<void> {
   if (!build.pr_number) {
     return;
@@ -504,15 +559,7 @@ async function autoMergeAndDeploy(build: BuildRecord): Promise<void> {
     console.log(`Build ${build.id}: status -> merged sha=${sha ?? "none"}`);
     await startPhoneDeploy(getBuild(build.id) ?? build);
   } catch (error) {
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Build ${build.id}: merge failed (${errorType})`);
-    const text = "Could not squash-merge the pull request.";
-    updateBuild(build.id, { status: "waiting_approval", error: text });
-    await ownerApi().sendMessage(
-      config.ownerTelegramId,
-      `${text}\n${reviewBody(build)}`,
-      { reply_markup: reviewKeyboard(build.id) },
-    );
+    await notifyMergeNeedsApproval(build, error);
   }
 }
 
@@ -723,7 +770,7 @@ export async function handleBuildCallback(ctx: Context): Promise<void> {
     }
     await ctx.answerCallbackQuery("Deploying");
     try {
-      const sha = await mergePullSquash(build.pr_number);
+      const sha = await mergePullSquashRetry(id, build.pr_number);
       updateBuild(id, {
         status: "merged",
         merge_sha: sha ?? null,
@@ -731,8 +778,15 @@ export async function handleBuildCallback(ctx: Context): Promise<void> {
       });
     } catch (error) {
       const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.error(`Build ${id}: merge failed (${errorType})`);
-      await editOrReply(ctx, "Could not squash-merge the pull request.");
+      const detail = mergeErrorDetail(error);
+      console.error(
+        `Build ${id}: merge failed (${errorType}) ${detail.slice(0, 180)}`,
+      );
+      const text = isPullConflict(error)
+        ? `${squashMergeFailureText(error)} Resolve the conflict on GitHub.`
+        : squashMergeFailureText(error);
+      updateBuild(id, { error: text });
+      await editOrReply(ctx, text, reviewKeyboard(id));
       return;
     }
     await editOrReply(
