@@ -28,7 +28,11 @@ import {
 import { formatCostReport } from "./usage.js";
 import { handler as listBills } from "./tools/list_bills.js";
 import { handler as listTasks } from "./tools/list_tasks.js";
-import { handleBillCallback } from "./bills.js";
+import {
+  handleBillCallback,
+  handleBillDuplicateCallback,
+} from "./bills.js";
+import { handlePromiseDuplicateCallback } from "./promises.js";
 import { runFollowupScan } from "./followups.js";
 import {
   handleFollowupCallback,
@@ -429,6 +433,18 @@ bot.callbackQuery(/^bill:(paid|remind|ignore):(\d+)$/, async (ctx) => {
   const operation = ctx.match[1] as "paid" | "remind" | "ignore";
   const billId = Number(ctx.match[2]);
   await handleBillCallback(ctx, operation, billId);
+});
+
+bot.callbackQuery(/^billdup:(keep|remove):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "keep" | "remove";
+  const billId = Number(ctx.match[2]);
+  await handleBillDuplicateCallback(ctx, operation, billId);
+});
+
+bot.callbackQuery(/^promisedup:(keep|remove):(\d+)$/, async (ctx) => {
+  const operation = ctx.match[1] as "keep" | "remove";
+  const taskId = Number(ctx.match[2]);
+  await handlePromiseDuplicateCallback(ctx, operation, taskId);
 });
 
 bot.callbackQuery(/^date:wish:(\d+)$/, async (ctx) => {

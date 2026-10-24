@@ -1,6 +1,7 @@
 import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { queueDraftApproval } from "../approvals.js";
+import { buildAutonomyFacts } from "../autonomy_facts.js";
 import { parseGoogleAccountFilter } from "../google/auth.js";
 import {
   buildThreadReplyMime,
@@ -186,6 +187,13 @@ export async function handler(input: unknown): Promise<string> {
     body: values.body,
     googleAccount: account.id,
     extraLines: cc ? [`Cc: ${cc}`] : undefined,
+    // draft_reply is always text-only (createThreadReplyDraft never
+    // attaches files), so has_attachment is a hard false here. If that
+    // ever changes, flip this to a real check against the Gmail draft.
+    autonomyFacts: buildAutonomyFacts({
+      toHeader: to,
+      hasAttachment: false,
+    }),
   });
 
   return JSON.stringify({

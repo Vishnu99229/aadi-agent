@@ -1,6 +1,10 @@
 import { bot } from "./bot.js";
 import { installOutboundHistory } from "./outbound.js";
-import { setAfterDraftSend, startApprovalExpirySweep } from "./approvals.js";
+import {
+  setAfterDraftSend,
+  startApprovalExpirySweep,
+  startAutoSendDispatcher,
+} from "./approvals.js";
 import { registerBillScan } from "./bills.js";
 import { registerMorningBrief } from "./brief.js";
 import { sendOverdueFollowupNudge } from "./followup_panel.js";
@@ -33,8 +37,9 @@ const followupScanTask = registerFollowupScan(
   sendOverdueFollowupNudge,
   bot.api,
 );
-const promiseScanTask = registerPromiseScan();
+const promiseScanTask = registerPromiseScan(bot.api);
 const approvalExpirySweep = startApprovalExpirySweep();
+const autoSendDispatcher = startAutoSendDispatcher();
 const reminderScheduler = await registerReminderScheduler(bot.api);
 const documentExpirySweep = startDocumentExpirySweep();
 const meetingScanTask = registerMeetingScan(bot.api);
@@ -95,6 +100,7 @@ process.once("SIGINT", () => {
   meetingBookingJobs.pending.stop();
   buildPollTask.stop();
   clearInterval(approvalExpirySweep);
+  clearInterval(autoSendDispatcher);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
   bot.stop();
@@ -114,6 +120,7 @@ process.once("SIGTERM", () => {
   meetingBookingJobs.pending.stop();
   buildPollTask.stop();
   clearInterval(approvalExpirySweep);
+  clearInterval(autoSendDispatcher);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
   bot.stop();

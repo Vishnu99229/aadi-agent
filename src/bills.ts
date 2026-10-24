@@ -9,9 +9,12 @@ import {
   createReminder,
   getBill,
   getBills,
+  getRecentBills,
+  markBillSuspectedDuplicate,
   transitionBillStatus,
   type BillRecord,
 } from "./db.js";
+import { findNearDuplicate } from "./dedupe.js";
 import { loadGoogleAccounts } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
@@ -253,6 +256,99 @@ async function notifyNewBill(api: Api, bill: BillRecord): Promise<void> {
   });
 }
 
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const DUPLICATE_THRESHOLD = 0.95;
+
+function dupeKeyboard(billId: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Keep Both", `billdup:keep:${billId}`)
+    .text("Mark as Duplicate", `billdup:remove:${billId}`);
+}
+
+function dupeFingerprint(input: {
+  biller: string;
+  amount: number | null;
+  currency: string;
+  dueDate: string;
+  snippet: string;
+}): string {
+  const amount = input.amount === null ? "" : `${input.currency} ${input.amount}`;
+  // The MinHash signature is dominated by whichever string is longer;
+  // we concatenate the stable biller/amount/due_date with the snippet.
+  return [input.biller, amount, input.dueDate, input.snippet].join(" ");
+}
+
+/** Returns the matched existing bill id if the new bill looks like a
+ *  near-duplicate of one from the last 7 days, else null. */
+export function detectDuplicateBill(input: {
+  biller: string;
+  amount: number | null;
+  currency: string;
+  dueDate: string;
+  snippet: string;
+}): BillRecord | null {
+  const since = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
+  const recent = getRecentBills(since).filter(
+    (row) => row.status === "upcoming" || row.status === "paid",
+  );
+  const newText = dupeFingerprint(input);
+  const match = findNearDuplicate(
+    newText,
+    recent.map((row) => ({
+      text: dupeFingerprint({
+        biller: row.biller,
+        amount: row.amount,
+        currency: row.currency,
+        dueDate: row.due_date,
+        snippet: row.source_text ?? "",
+      }),
+      record: row,
+    })),
+    DUPLICATE_THRESHOLD,
+  );
+  return match?.record ?? null;
+}
+
+async function sendDuplicateAlert(
+  api: Api,
+  newBill: BillRecord,
+  existing: BillRecord,
+): Promise<void> {
+  const line = (bill: BillRecord) => formatBillLine(bill);
+  const text =
+    `I found a bill that looks ${Math.round(DUPLICATE_THRESHOLD * 100)}%+ similar to one from the last 7 days. Is this a duplicate charge?\n\n` +
+    `New (#${newBill.id}): ${line(newBill)}\n` +
+    `Existing (#${existing.id}): ${line(existing)}`;
+  await api.sendMessage(config.ownerTelegramId, text, {
+    reply_markup: dupeKeyboard(newBill.id),
+  });
+}
+
+export async function handleBillDuplicateCallback(
+  ctx: Context,
+  operation: "keep" | "remove",
+  billId: number,
+): Promise<void> {
+  await ctx.answerCallbackQuery();
+  const bill = getBill(billId);
+  if (!bill) {
+    await ctx.reply("That bill is no longer available.");
+    return;
+  }
+  if (operation === "keep") {
+    markBillSuspectedDuplicate(bill.id, null);
+    console.log(`Bill ${bill.id}: duplicate flag cleared (keep both)`);
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
+    return;
+  }
+  // Mark as duplicate: cancel this bill's reminders and set status 'ignored'.
+  cancelPendingRemindersForBill(bill.id);
+  if (transitionBillStatus(bill.id, ["upcoming", "paid"], "ignored")) {
+    console.log(`Bill ${bill.id}: status -> ignored (marked as duplicate)`);
+  }
+  await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
+}
+
 export async function runBillScan(api: Api): Promise<void> {
   const candidates = await listBillCandidates();
   if (candidates.length === 0) {
@@ -289,17 +385,30 @@ export async function runBillScan(api: Api): Promise<void> {
 
   let tracked = 0;
   for (const item of direct) {
+    const existing = detectDuplicateBill({
+      biller: item.biller,
+      amount: item.amount,
+      currency: item.currency,
+      dueDate: item.dueDate,
+      snippet: item.candidate.snippet,
+    });
     const bill = createBill(
       item.biller,
       item.amount,
       item.currency,
       item.dueDate,
       item.candidate.threadId,
+      item.candidate.snippet,
+      existing?.id ?? null,
     );
     if (!bill) continue;
-    console.log(`Bill ${bill.id}: status -> upcoming (deterministic)`);
+    console.log(
+      `Bill ${bill.id}: status -> upcoming (deterministic)` +
+        (existing ? ` dupe_of=${existing.id}` : ""),
+    );
     scheduleBillReminders(bill);
     await notifyNewBill(api, bill);
+    if (existing) await sendDuplicateAlert(api, bill, existing);
     tracked += 1;
   }
 
@@ -318,17 +427,30 @@ export async function runBillScan(api: Api): Promise<void> {
       const biller = item.biller.trim();
       const currency =
         (typeof item.currency === "string" && item.currency.trim()) || "INR";
+      const existing = detectDuplicateBill({
+        biller,
+        amount: item.amount,
+        currency,
+        dueDate: item.due_date,
+        snippet: candidate.snippet,
+      });
       const bill = createBill(
         biller,
         item.amount,
         currency,
         item.due_date,
         candidate.threadId,
+        candidate.snippet,
+        existing?.id ?? null,
       );
       if (!bill) continue;
-      console.log(`Bill ${bill.id}: status -> upcoming (llm)`);
+      console.log(
+        `Bill ${bill.id}: status -> upcoming (llm)` +
+          (existing ? ` dupe_of=${existing.id}` : ""),
+      );
       scheduleBillReminders(bill);
       await notifyNewBill(api, bill);
+      if (existing) await sendDuplicateAlert(api, bill, existing);
       tracked += 1;
     }
   }

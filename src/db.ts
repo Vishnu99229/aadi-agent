@@ -35,6 +35,7 @@ export interface PendingAction {
   event_attendees: string | null;
   event_description: string | null;
   created_at: string;
+  auto_send_at: string | null;
 }
 
 export type ItemTag = "work" | "personal";
@@ -53,6 +54,7 @@ export interface TaskRecord {
   promise_context: string | null;
   deadline: string | null;
   recipient: string | null;
+  suspected_duplicate_of: number | null;
 }
 
 export type ReminderRecurrence = "none" | "daily" | "weekly" | "weekdays";
@@ -601,6 +603,27 @@ if (!tableHasColumn("reminders", "related_bill_id")) {
   db.exec(`ALTER TABLE reminders ADD COLUMN related_bill_id INTEGER`);
 }
 
+// Autonomy / rules engine: when a draft passes auto_send_approved, the
+// pending action's auto_send_at carries the scheduled send instant.
+// The scheduler fires sends whose row has auto_send_at <= now.
+if (!tableHasColumn("pending_actions", "auto_send_at")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN auto_send_at TEXT`);
+}
+
+// Dedupe metadata: when MinHash flags a near-duplicate we store the
+// MATCHED record's id here instead of silently dropping the new row.
+if (!tableHasColumn("tasks", "suspected_duplicate_of")) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN suspected_duplicate_of INTEGER`);
+}
+if (!tableHasColumn("bills", "suspected_duplicate_of")) {
+  db.exec(`ALTER TABLE bills ADD COLUMN suspected_duplicate_of INTEGER`);
+}
+// Bills need the raw snippet to dedupe against; previous rows won't have
+// it, which is fine - dedupe only runs on the trailing 7 days.
+if (!tableHasColumn("bills", "source_text")) {
+  db.exec(`ALTER TABLE bills ADD COLUMN source_text TEXT`);
+}
+
 if (!tableHasColumn("accounts", "relationship")) {
   db.exec(
     `ALTER TABLE accounts ADD COLUMN relationship TEXT NOT NULL DEFAULT 'partner'`,
@@ -865,7 +888,7 @@ export function clearMessages(): void {
 
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
               telegram_message_id, event_title, event_start, event_end,
-              event_attendees, event_description, created_at`;
+              event_attendees, event_description, created_at, auto_send_at`;
 
 export function createPendingAction(
   draftId: string,
@@ -949,6 +972,29 @@ export function getLatestPendingSendAction(): PendingAction | undefined {
     .get() as PendingAction | undefined;
 }
 
+export function setPendingActionAutoSendAt(
+  id: number,
+  autoSendAtIso: string | null,
+): void {
+  db.prepare(
+    `UPDATE pending_actions SET auto_send_at = ? WHERE id = ?`,
+  ).run(autoSendAtIso, id);
+}
+
+export function getDueAutoSendActions(nowIso: string): PendingAction[] {
+  return db
+    .prepare(
+      `SELECT ${PENDING_ACTION_COLUMNS}
+       FROM pending_actions
+       WHERE status = 'pending'
+         AND type = 'send_draft'
+         AND auto_send_at IS NOT NULL
+         AND auto_send_at <= ?
+       ORDER BY auto_send_at ASC, id ASC`,
+    )
+    .all(nowIso) as PendingAction[];
+}
+
 export function setPendingActionTelegramMessage(
   id: number,
   telegramMessageId: number,
@@ -988,7 +1034,8 @@ export function getExpiredPendingActions(): PendingAction[] {
 }
 
 const TASK_COLUMNS = `id, text, tag, due_at, status, created_at, kind,
-  source_thread_id, source_message_id, promise_context, deadline, recipient`;
+  source_thread_id, source_message_id, promise_context, deadline, recipient,
+  suspected_duplicate_of`;
 
 export function createTask(
   text: string,
@@ -1669,6 +1716,8 @@ export interface BillRecord {
   thread_id: string;
   status: BillStatus;
   created_at: string;
+  suspected_duplicate_of: number | null;
+  source_text: string | null;
 }
 
 export type ImportantDateType = "birthday" | "anniversary" | "other";
@@ -1684,20 +1733,35 @@ export interface ImportantDateRecord {
   created_at: string;
 }
 
+const BILL_COLUMNS = `id, biller, amount, currency, due_date, thread_id,
+  status, created_at, suspected_duplicate_of, source_text`;
+
 export function createBill(
   biller: string,
   amount: number | null,
   currency: string,
   dueDate: string,
   threadId: string,
+  sourceText: string | null = null,
+  suspectedDuplicateOf: number | null = null,
 ): BillRecord | undefined {
   try {
     const result = db
       .prepare(
-        `INSERT INTO bills (biller, amount, currency, due_date, thread_id)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO bills (
+           biller, amount, currency, due_date, thread_id,
+           source_text, suspected_duplicate_of
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(biller, amount, currency, dueDate, threadId);
+      .run(
+        biller,
+        amount,
+        currency,
+        dueDate,
+        threadId,
+        sourceText,
+        suspectedDuplicateOf,
+      );
     return getBill(Number(result.lastInsertRowid))!;
   } catch {
     return undefined;
@@ -1706,20 +1770,57 @@ export function createBill(
 
 export function getBill(id: number): BillRecord | undefined {
   return db
-    .prepare(
-      `SELECT id, biller, amount, currency, due_date, thread_id, status, created_at
-       FROM bills WHERE id = ?`,
-    )
+    .prepare(`SELECT ${BILL_COLUMNS} FROM bills WHERE id = ?`)
     .get(id) as BillRecord | undefined;
 }
 
 export function getBills(): BillRecord[] {
   return db
     .prepare(
-      `SELECT id, biller, amount, currency, due_date, thread_id, status, created_at
+      `SELECT ${BILL_COLUMNS}
        FROM bills ORDER BY due_date ASC, id ASC`,
     )
     .all() as BillRecord[];
+}
+
+export function getRecentBills(sinceIso: string): BillRecord[] {
+  return db
+    .prepare(
+      `SELECT ${BILL_COLUMNS}
+       FROM bills
+       WHERE created_at >= ?
+       ORDER BY created_at DESC`,
+    )
+    .all(sinceIso) as BillRecord[];
+}
+
+export function markBillSuspectedDuplicate(
+  id: number,
+  of: number | null,
+): void {
+  db.prepare(
+    `UPDATE bills SET suspected_duplicate_of = ? WHERE id = ?`,
+  ).run(of, id);
+}
+
+export function getRecentPromiseTasks(sinceIso: string): TaskRecord[] {
+  return db
+    .prepare(
+      `SELECT ${TASK_COLUMNS}
+       FROM tasks
+       WHERE kind = 'promise' AND created_at >= ?
+       ORDER BY created_at DESC`,
+    )
+    .all(sinceIso) as TaskRecord[];
+}
+
+export function markTaskSuspectedDuplicate(
+  id: number,
+  of: number | null,
+): void {
+  db.prepare(
+    `UPDATE tasks SET suspected_duplicate_of = ? WHERE id = ?`,
+  ).run(of, id);
 }
 
 export function transitionBillStatus(

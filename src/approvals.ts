@@ -4,9 +4,11 @@ import { config } from "./config.js";
 import {
   createPendingAction,
   createPendingEventAction,
+  getDueAutoSendActions,
   getExpiredPendingActions,
   getPendingAction,
   getPendingActionForDraft,
+  setPendingActionAutoSendAt,
   setPendingActionTelegramMessage,
   transitionPendingAction,
   type PendingAction,
@@ -18,6 +20,7 @@ import {
   allowSendDraft,
 } from "./security/send_approval.js";
 import { parseAddressList } from "./followup_logic.js";
+import { evaluateDraft, type AutonomyOutcome } from "./rules_engine.js";
 
 const PREVIEW_LIMIT = 3800;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
@@ -45,6 +48,13 @@ export interface DraftApprovalPreview {
   body: string;
   googleAccount: "personal" | "work";
   extraLines?: string[];
+  /** Autonomy facts for the rule engine. When omitted the draft always
+   *  gets a manual approval card (safe default). */
+  autonomyFacts?: {
+    is_known_client: boolean;
+    has_attachment: boolean;
+    domain_seen_count: number;
+  };
 }
 
 export interface DraftEditContext {
@@ -64,6 +74,15 @@ function keyboard(actionId: number, sendOnly = false): InlineKeyboard {
     .text("Send", `approval:send:${actionId}`)
     .text("Edit", `approval:edit:${actionId}`)
     .text("Discard", `approval:discard:${actionId}`);
+}
+
+function autoSendKeyboard(actionId: number): InlineKeyboard {
+  // Autonomy-approved drafts fire automatically after the cancel window;
+  // the only user action during the window is to intercept.
+  return new InlineKeyboard().text(
+    "Cancel",
+    `approval:discard:${actionId}`,
+  );
 }
 
 function truncate(text: string, limit: number): string {
@@ -247,13 +266,51 @@ export async function queueDraftApproval(
     );
   }
 
-  const text = previewText(preview);
-  if (options.sendOnly) {
-    sendOnlyActions.add(action.id);
-  } else {
-    sendOnlyActions.delete(action.id);
+  // Autonomy rule engine runs BEFORE the Telegram card goes out. Only
+  // runs when the caller provided facts; absent facts == safe default
+  // (manual approval). require_manual_approval ALWAYS wins over auto.
+  let outcome: AutonomyOutcome | null = null;
+  if (preview.autonomyFacts) {
+    try {
+      outcome = await evaluateDraft(preview.autonomyFacts);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(
+        `Autonomy rules failed (${errorType}); falling back to manual approval.`,
+      );
+      outcome = null;
+    }
   }
-  const markup = keyboard(action.id, sendOnlyActions.has(action.id));
+
+  const sendOnly = options.sendOnly ?? false;
+  const isAutoSend =
+    !sendOnly && outcome?.kind === "auto_send_approved";
+
+  const bodyText = previewText(preview);
+  const text = isAutoSend
+    ? `${bodyText}\n\nAuto-sending in ${
+        (outcome as { kind: "auto_send_approved"; cancelWindowMinutes: number })
+          .cancelWindowMinutes
+      } mins. Tap Cancel to intercept.\nRule: ${outcome!.rule}`
+    : bodyText;
+
+  if (isAutoSend) {
+    const minutes =
+      (outcome as { kind: "auto_send_approved"; cancelWindowMinutes: number })
+        .cancelWindowMinutes;
+    const sendAt = new Date(Date.now() + minutes * 60_000).toISOString();
+    setPendingActionAutoSendAt(action.id, sendAt);
+    sendOnlyActions.delete(action.id);
+  } else {
+    setPendingActionAutoSendAt(action.id, null);
+    if (sendOnly) sendOnlyActions.add(action.id);
+    else sendOnlyActions.delete(action.id);
+  }
+
+  const markup = isAutoSend
+    ? autoSendKeyboard(action.id)
+    : keyboard(action.id, sendOnlyActions.has(action.id));
+
   if (action.telegram_message_id) {
     try {
       await telegram.editMessageText(
@@ -262,7 +319,9 @@ export async function queueDraftApproval(
         text,
         { reply_markup: markup },
       );
-      console.log(`Approval action ${action.id}: preview updated`);
+      console.log(
+        `Approval action ${action.id}: preview updated (auto_send=${isAutoSend})`,
+      );
       return action.id;
     } catch {
       console.log(`Approval action ${action.id}: preview replacement failed`);
@@ -273,7 +332,11 @@ export async function queueDraftApproval(
     reply_markup: markup,
   });
   setPendingActionTelegramMessage(action.id, message.message_id);
-  console.log(`Approval action ${action.id}: preview sent`);
+  console.log(
+    `Approval action ${action.id}: preview sent (auto_send=${isAutoSend}` +
+      (outcome ? `, rule=${outcome.rule}` : "") +
+      `)`,
+  );
   return action.id;
 }
 
@@ -738,6 +801,64 @@ export function startApprovalExpirySweep(): NodeJS.Timeout {
   const interval = setInterval(() => {
     void expirePendingApprovals();
   }, EXPIRY_SWEEP_MS);
+  interval.unref();
+  return interval;
+}
+
+/** Fire every autonomy-approved draft whose cancel window has elapsed.
+ *  Re-reads the row before sending so a mid-window Cancel is honoured
+ *  (the row would be `discarded` and the send is skipped). */
+export async function executeDueAutoSends(): Promise<number> {
+  const due = getDueAutoSendActions(new Date().toISOString());
+  let sent = 0;
+  for (const stale of due) {
+    const action = getPendingAction(stale.id);
+    if (!action || action.status !== "pending") continue;
+    if (activeActions.has(action.id)) continue;
+    activeActions.add(action.id);
+    try {
+      const outcome = await performDraftSend(action);
+      if (outcome.ok) {
+        sent += 1;
+        if (action.telegram_message_id) {
+          try {
+            await telegram.editMessageText(
+              config.ownerTelegramId,
+              action.telegram_message_id,
+              "Draft approval\n\nStatus: Sent (auto)",
+              { reply_markup: new InlineKeyboard() },
+            );
+          } catch {
+            console.log(
+              `Approval action ${action.id}: auto-send preview update failed`,
+            );
+          }
+        }
+        console.log(`Approval action ${action.id}: auto-sent`);
+      } else {
+        console.error(
+          `Approval action ${action.id}: auto-send failed (${outcome.reason}); row stays pending`,
+        );
+      }
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(
+        `Approval action ${action.id}: auto-send threw (${errorType}); row stays pending`,
+      );
+    } finally {
+      activeActions.delete(action.id);
+    }
+  }
+  return sent;
+}
+
+const AUTO_SEND_POLL_MS = 60_000;
+
+export function startAutoSendDispatcher(): NodeJS.Timeout {
+  void executeDueAutoSends();
+  const interval = setInterval(() => {
+    void executeDueAutoSends();
+  }, AUTO_SEND_POLL_MS);
   interval.unref();
   return interval;
 }

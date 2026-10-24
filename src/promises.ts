@@ -1,9 +1,20 @@
 import type { gmail_v1 } from "googleapis";
-import { everyClock, type IntervalJob } from "./scheduler.js";
 import {
+  InlineKeyboard,
+  type Api,
+  type Context,
+} from "grammy";
+import { everyClock, type IntervalJob } from "./scheduler.js";
+import { config } from "./config.js";
+import {
+  cancelPendingRemindersForTask,
   createPromiseTask,
   createReminder,
   getPromiseByMessageId,
+  getRecentPromiseTasks,
+  getTask,
+  markTaskDone,
+  markTaskSuspectedDuplicate,
   type TaskRecord,
 } from "./db.js";
 import {
@@ -11,6 +22,7 @@ import {
   recipientDomain,
 } from "./followups.js";
 import { extractDeadline } from "./promise_dates.js";
+import { findNearDuplicate } from "./dedupe.js";
 import {
   getGoogleAccount,
   type LoadedGoogleAccount,
@@ -312,9 +324,93 @@ function recipientLabel(recipient: string): string {
   return first.replace(/[<>]/g, "").trim() || recipient;
 }
 
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const DUPLICATE_THRESHOLD = 0.95;
+
+function promiseDupeFingerprint(input: {
+  promise: string;
+  recipient: string;
+}): string {
+  // Dedupe on recipient + promise phrasing. Different recipients with
+  // the same promise are NOT duplicates (two deliverables, two owners).
+  return `${input.recipient.toLowerCase()} | ${input.promise.toLowerCase()}`;
+}
+
+export function detectDuplicatePromise(input: {
+  promise: string;
+  recipient: string;
+}): TaskRecord | null {
+  const since = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
+  const recent = getRecentPromiseTasks(since).filter(
+    (row) => row.status === "open",
+  );
+  const newText = promiseDupeFingerprint(input);
+  const match = findNearDuplicate(
+    newText,
+    recent.map((row) => ({
+      text: promiseDupeFingerprint({
+        promise: row.promise_context ?? row.text,
+        recipient: row.recipient ?? "",
+      }),
+      record: row,
+    })),
+    DUPLICATE_THRESHOLD,
+  );
+  return match?.record ?? null;
+}
+
+function promiseDupeKeyboard(taskId: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Keep Both", `promisedup:keep:${taskId}`)
+    .text("Mark as Duplicate", `promisedup:remove:${taskId}`);
+}
+
+async function sendPromiseDuplicateAlert(
+  api: Api,
+  newTask: TaskRecord,
+  existing: TaskRecord,
+): Promise<void> {
+  const line = (task: TaskRecord) =>
+    `${task.text} (to ${task.recipient ?? "unknown"}, deadline ${task.deadline ?? "none"})`;
+  const text =
+    `I found a promise that looks ${Math.round(DUPLICATE_THRESHOLD * 100)}%+ similar to one from the last 7 days. Is it a duplicate?\n\n` +
+    `New (#${newTask.id}): ${line(newTask)}\n` +
+    `Existing (#${existing.id}): ${line(existing)}`;
+  await api.sendMessage(config.ownerTelegramId, text, {
+    reply_markup: promiseDupeKeyboard(newTask.id),
+  });
+}
+
+export async function handlePromiseDuplicateCallback(
+  ctx: Context,
+  operation: "keep" | "remove",
+  taskId: number,
+): Promise<void> {
+  await ctx.answerCallbackQuery();
+  const task = getTask(taskId);
+  if (!task) {
+    await ctx.reply("That promise is no longer available.");
+    return;
+  }
+  if (operation === "keep") {
+    markTaskSuspectedDuplicate(task.id, null);
+    console.log(`Promise ${task.id}: duplicate flag cleared (keep both)`);
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
+    return;
+  }
+  if (markTaskDone(task.id)) {
+    const cancelled = cancelPendingRemindersForTask(task.id);
+    console.log(
+      `Promise ${task.id}: marked duplicate (done); cancelled ${cancelled} reminder(s)`,
+    );
+  }
+  await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
+}
+
 async function processCandidate(
   candidate: SentCandidate,
   account: LoadedGoogleAccount,
+  api?: Api,
 ): Promise<"skipped" | "no_promise" | "tracked"> {
   if (getPromiseByMessageId(candidate.messageId)) {
     return "skipped";
@@ -343,6 +439,10 @@ async function processCandidate(
   // Deadline parsing is TS, not LLM. chrono-node + our explicit anchors
   // resolve "Friday" / "by EOW" / "tomorrow" / "25 Nov" against sentAt.
   const deadline = extractDeadline(candidate.body, candidate.sentAt);
+  const existing = detectDuplicatePromise({
+    promise: extraction.promise,
+    recipient: candidate.recipient,
+  });
   const task = createPromiseTask({
     promise: extraction.promise,
     recipient: candidate.recipient,
@@ -355,6 +455,11 @@ async function processCandidate(
     // Lost a dedup race; nothing to do.
     return "skipped";
   }
+  if (existing) {
+    markTaskSuspectedDuplicate(task.id, existing.id);
+    if (api) await sendPromiseDuplicateAlert(api, task, existing);
+    console.log(`Promise ${task.id}: suspected duplicate of ${existing.id}`);
+  }
   const reminders = scheduleRemindersForPromise(
     task,
     recipientLabel(candidate.recipient),
@@ -366,8 +471,11 @@ async function processCandidate(
   return "tracked";
 }
 
-/** Scan the work Sent folder for Vishnu's commitments and track them. */
-export async function runPromiseScan(): Promise<void> {
+/** Scan the work Sent folder for Vishnu's commitments and track them.
+ *  `api` is optional only so unit tests can call without a bot. In
+ *  production the registered scheduler passes bot.api so the dedupe
+ *  review card can be delivered. */
+export async function runPromiseScan(api?: Api): Promise<void> {
   const account = await getGoogleAccount("work");
   const gmail = gmailClient(account);
   const profile = await gmail.users.getProfile({ userId: "me" });
@@ -400,7 +508,7 @@ export async function runPromiseScan(): Promise<void> {
       const domain = recipientDomain(candidate.recipient);
       if (domain === undefined) continue;
       considered += 1;
-      const result = await processCandidate(candidate, account);
+      const result = await processCandidate(candidate, account, api);
       if (result === "tracked") tracked += 1;
       else if (result === "no_promise") dropped += 1;
     } catch (error) {
@@ -416,12 +524,12 @@ export async function runPromiseScan(): Promise<void> {
   );
 }
 
-export function registerPromiseScan(): IntervalJob {
+export function registerPromiseScan(api?: Api): IntervalJob {
   const task = everyClock(
     "promise-scan",
     SCAN_HOUR,
     SCAN_MINUTE,
-    runPromiseScan,
+    () => runPromiseScan(api),
     { weekdays: [1, 2, 3, 4, 5], kind: "daily", preferDeepSeekOffPeak: true },
   );
   console.log(

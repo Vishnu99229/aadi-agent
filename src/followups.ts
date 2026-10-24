@@ -41,6 +41,8 @@ import {
 } from "./google/auth.js";
 import { createThreadReplyDraft, gmailClient } from "./google/mail.js";
 import { complete, completeBackground } from "./llm.js";
+import { buildAutonomyFacts } from "./autonomy_facts.js";
+import { rootAndLatest } from "./email_threading.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const SENT_LOOKBACK_QUERY = "in:sent newer_than:14d";
@@ -161,9 +163,22 @@ function messageTime(message: gmail_v1.Schema$Message): number {
 function latestNonDraftMessage(
   thread: gmail_v1.Schema$Thread,
 ): gmail_v1.Schema$Message | undefined {
-  return [...(thread.messages ?? [])]
-    .filter((message) => !message.labelIds?.includes("DRAFT"))
-    .sort((left, right) => messageTime(right) - messageTime(left))[0];
+  const materials = (thread.messages ?? []).filter(
+    (message) => !message.labelIds?.includes("DRAFT"),
+  );
+  if (materials.length === 0) return undefined;
+  // JWZ reconstruction over the References / In-Reply-To chain tells us
+  // the TRUE latest message even when a client strips those headers in
+  // part of the thread. Fallback: date-sort when JWZ can't resolve.
+  const { latest } = rootAndLatest(materials);
+  if (latest) {
+    const byGmailId = new Map(materials.map((m) => [m.id ?? "", m]));
+    const match = byGmailId.get(latest.id);
+    if (match) return match;
+  }
+  return [...materials].sort(
+    (left, right) => messageTime(right) - messageTime(left),
+  )[0];
 }
 
 function isSent(message: gmail_v1.Schema$Message): boolean {
@@ -977,6 +992,10 @@ export async function createFollowupDraftForApproval(
       body: plan.body,
       googleAccount: account.id,
       extraLines: cc ? [`Cc: ${cc}`] : undefined,
+      autonomyFacts: buildAutonomyFacts({
+        toHeader: to,
+        hasAttachment: false,
+      }),
     },
     { sendOnly },
   );
