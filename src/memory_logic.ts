@@ -77,6 +77,12 @@ const FORGET_ALL_RE =
   /^forget (everything|all( memories)?|all of (them|it|that))\s*[.!]?\s*$/i;
 const FORGET_NOISE_RE = /^forget (it|about it|that|this)\s*[.!]?\s*$/i;
 const FORGET_RE = /^forget\s+(.+)$/i;
+/** Imperative reminder/scheduling commands. The agent's set_reminder tool
+ *  handles these; the memory system must never swallow them. */
+const REMINDER_COMMAND_RE =
+  /^\s*(?:please\s+)?(?:can\s+you\s+)?(?:remind|ping|nudge|alert|wake|buzz)\s+(?:me|us)\b/i;
+const FOLLOWUP_COMMAND_RE =
+  /^\s*(?:please\s+)?(?:can\s+you\s+)?(?:let\s+me\s+know|follow\s+up(?:\s+with\s+me)?)\b/i;
 
 export interface ExtractedFact {
   content: string;
@@ -118,6 +124,13 @@ export function parseForgetQuery(text: string): string | null {
   return match?.[1]?.trim() || null;
 }
 
+export function isReminderCommand(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    REMINDER_COMMAND_RE.test(trimmed) || FOLLOWUP_COMMAND_RE.test(trimmed)
+  );
+}
+
 export function shouldSkipAutoCapture(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed.length < 12) {
@@ -130,6 +143,10 @@ export function shouldSkipAutoCapture(text: string): boolean {
     return true;
   }
   if (isForgetEverything(trimmed) || parseForgetQuery(trimmed) !== null) {
+    return true;
+  }
+  // Imperative reminder commands are handled by set_reminder, not memory.
+  if (isReminderCommand(trimmed)) {
     return true;
   }
   return false;

@@ -67,6 +67,7 @@ export interface ReminderRecord {
   status: ReminderStatus;
   created_at: string;
   related_task_id: number | null;
+  related_bill_id: number | null;
 }
 
 export type FollowupStatus =
@@ -594,6 +595,11 @@ db.exec(
 if (!tableHasColumn("reminders", "related_task_id")) {
   db.exec(`ALTER TABLE reminders ADD COLUMN related_task_id INTEGER`);
 }
+// Same pattern for bills: a bill reminder's "Done" button marks the
+// bill paid and cancels its sibling reminders.
+if (!tableHasColumn("reminders", "related_bill_id")) {
+  db.exec(`ALTER TABLE reminders ADD COLUMN related_bill_id INTEGER`);
+}
 
 if (!tableHasColumn("accounts", "relationship")) {
   db.exec(
@@ -1083,21 +1089,36 @@ export function markTaskDone(id: number): boolean {
 }
 
 const REMINDER_COLUMNS = `id, text, tag, remind_at, recurrence, status,
-  created_at, related_task_id`;
+  created_at, related_task_id, related_bill_id`;
+
+export interface ReminderLinks {
+  relatedTaskId?: number | null;
+  relatedBillId?: number | null;
+}
 
 export function createReminder(
   text: string,
   tag: ItemTag,
   remindAt: string,
   recurrence: ReminderRecurrence,
-  relatedTaskId: number | null = null,
+  links: number | null | ReminderLinks = null,
 ): ReminderRecord {
+  // Back-compat: callers that passed a number used to mean task id.
+  const taskId =
+    typeof links === "number"
+      ? links
+      : links && typeof links === "object"
+        ? (links.relatedTaskId ?? null)
+        : null;
+  const billId =
+    links && typeof links === "object" ? (links.relatedBillId ?? null) : null;
   const result = db
     .prepare(
-      `INSERT INTO reminders (text, tag, remind_at, recurrence, related_task_id)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO reminders (
+         text, tag, remind_at, recurrence, related_task_id, related_bill_id
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
     )
-    .run(text, tag, remindAt, recurrence, relatedTaskId);
+    .run(text, tag, remindAt, recurrence, taskId, billId);
 
   return getReminder(Number(result.lastInsertRowid))!;
 }
@@ -1143,6 +1164,19 @@ export function cancelPendingRemindersForTask(taskId: number): number {
        WHERE related_task_id = ? AND status = 'pending'`,
     )
     .run(taskId);
+  return result.changes;
+}
+
+/** Mirror helper for bills: cancels every pending reminder linked to the
+ *  bill, used when the bill is marked paid or ignored. */
+export function cancelPendingRemindersForBill(billId: number): number {
+  const result = db
+    .prepare(
+      `UPDATE reminders
+       SET status = 'cancelled'
+       WHERE related_bill_id = ? AND status = 'pending'`,
+    )
+    .run(billId);
   return result.changes;
 }
 

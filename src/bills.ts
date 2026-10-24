@@ -4,6 +4,7 @@ import { InlineKeyboard, type Api, type Context } from "grammy";
 import { everyClock, SoftJobError, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import {
+  cancelPendingRemindersForBill,
   createBill,
   createReminder,
   getBill,
@@ -100,9 +101,10 @@ async function withGmailRetry<T>(label: string, call: () => Promise<T>): Promise
 }
 
 function billKeyboard(id: number): InlineKeyboard {
+  // Reminders are scheduled automatically on bill detection (T-3d, T-1d,
+  // on the due day). No "Remind me" button — it would duplicate them.
   return new InlineKeyboard()
     .text("Paid", `bill:paid:${id}`)
-    .text("Remind me", `bill:remind:${id}`)
     .text("Ignore", `bill:ignore:${id}`);
 }
 
@@ -296,6 +298,7 @@ export async function runBillScan(api: Api): Promise<void> {
     );
     if (!bill) continue;
     console.log(`Bill ${bill.id}: status -> upcoming (deterministic)`);
+    scheduleBillReminders(bill);
     await notifyNewBill(api, bill);
     tracked += 1;
   }
@@ -324,6 +327,7 @@ export async function runBillScan(api: Api): Promise<void> {
       );
       if (!bill) continue;
       console.log(`Bill ${bill.id}: status -> upcoming (llm)`);
+      scheduleBillReminders(bill);
       await notifyNewBill(api, bill);
       tracked += 1;
     }
@@ -334,23 +338,36 @@ export async function runBillScan(api: Api): Promise<void> {
   );
 }
 
-function scheduleBillReminders(bill: BillRecord): void {
+function formatAmountForReminder(bill: BillRecord): string {
+  return bill.amount === null
+    ? "amount unknown"
+    : `${bill.currency} ${bill.amount}`;
+}
+
+/** On bill detection, schedule the three fixed-cadence pings at 09:00 IST:
+ *  3 days before the due date, 1 day before, and on the due date itself.
+ *  Any slot in the past is skipped. Each reminder is linked to the bill so
+ *  "Done" marks the bill paid and cancels its siblings. */
+function scheduleBillReminders(bill: BillRecord): number {
   const now = Date.now();
-  const threeDaysBefore = addDaysYmd(bill.due_date, -3);
-  const remindTimes = [threeDaysBefore, bill.due_date];
-  for (const day of remindTimes) {
+  const text =
+    `Bill due: ${bill.biller} for ${formatAmountForReminder(bill)}. ` +
+    `Due on ${bill.due_date}. Tap Done when paid.`;
+  const offsets = [-3, -1, 0];
+  let created = 0;
+  for (const offset of offsets) {
+    const day = addDaysYmd(bill.due_date, offset);
     const remindAt = nineAmKolkataIso(day);
-    if (new Date(remindAt).getTime() <= now) {
-      continue;
-    }
-    const reminder = createReminder(
-      `Pay ${bill.biller}`,
-      "personal",
-      remindAt,
-      "none",
+    if (new Date(remindAt).getTime() <= now) continue;
+    const reminder = createReminder(text, "personal", remindAt, "none", {
+      relatedBillId: bill.id,
+    });
+    console.log(
+      `Reminder ${reminder.id}: status -> pending (bill ${bill.id}, offset=${offset})`,
     );
-    console.log(`Reminder ${reminder.id}: status -> pending`);
+    created += 1;
   }
+  return created;
 }
 
 export async function handleBillCallback(
@@ -369,6 +386,12 @@ export async function handleBillCallback(
     if (transitionBillStatus(billId, "upcoming", "paid")) {
       console.log(`Bill ${billId}: status -> paid`);
     }
+    const cancelled = cancelPendingRemindersForBill(billId);
+    if (cancelled > 0) {
+      console.log(
+        `Bill ${billId}: cancelled ${cancelled} pending reminder(s)`,
+      );
+    }
     await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
     return;
   }
@@ -377,13 +400,20 @@ export async function handleBillCallback(
     if (transitionBillStatus(billId, "upcoming", "ignored")) {
       console.log(`Bill ${billId}: status -> ignored`);
     }
+    const cancelled = cancelPendingRemindersForBill(billId);
+    if (cancelled > 0) {
+      console.log(
+        `Bill ${billId}: cancelled ${cancelled} pending reminder(s)`,
+      );
+    }
     await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
     return;
   }
 
-  scheduleBillReminders(bill);
+  // The "Remind me" button has been removed from the keyboard; reminders
+  // are scheduled on detection. This branch is now a no-op kept only to
+  // satisfy the exhaustive-operation type.
   await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
-  await ctx.reply("Reminders set for 3 days before and on the due date (personal).");
 }
 
 export function registerBillScan(api: Api): IntervalJob {

@@ -262,6 +262,7 @@ Return JSON only: {"facts":[{"content":"one clear fact","category":"deal|plan|ev
 Important: deals and status, plans, upcoming demos/meetings, deadlines, decisions, commitments, key people and roles. Save those.
 Unsure: might matter but could be casual. Ask.
 Trivial: small talk, questions with no new fact, thanks, scheduling a one-off lookup. Ignore. Return [].
+Do NOT extract facts from purely imperative scheduling or reminder commands ("Remind me to call Priya at 5pm", "Ping me tomorrow", "Let me know next week"). Those are handled by the reminder tool, not the memory system. Return [].
 Never invent. Never include passwords, OTPs, card/account numbers, or health details (omit those).
 event_date only for a specific calendar day, Asia/Kolkata, YYYY-MM-DD.
 If the message updates a candidate memory, set update_of_id to that id.

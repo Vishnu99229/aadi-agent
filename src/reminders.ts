@@ -1,11 +1,13 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import { config } from "./config.js";
 import {
+  cancelPendingRemindersForBill,
   cancelPendingRemindersForTask,
   createReminder,
   getDueReminders,
   getReminder,
   markTaskDone,
+  transitionBillStatus,
   transitionReminderStatus,
   type ReminderRecord,
 } from "./db.js";
@@ -211,6 +213,22 @@ export async function handleReminderCallback(
         console.log(
           `Reminder ${reminderId}: linked task ${reminder.related_task_id} ` +
             `closed=${taskClosed} siblings_cancelled=${siblings}`,
+        );
+      }
+      // Same for bills: mark the linked bill paid and cancel the T-3d /
+      // T-1d / due-day sibling reminders.
+      if (reminder.related_bill_id !== null) {
+        const billPaid = transitionBillStatus(
+          reminder.related_bill_id,
+          "upcoming",
+          "paid",
+        );
+        const siblings = cancelPendingRemindersForBill(
+          reminder.related_bill_id,
+        );
+        console.log(
+          `Reminder ${reminderId}: linked bill ${reminder.related_bill_id} ` +
+            `paid=${billPaid} siblings_cancelled=${siblings}`,
         );
       }
       await editHandledMessage(ctx, "Done");
