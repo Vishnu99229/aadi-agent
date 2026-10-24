@@ -641,7 +641,7 @@ function toOpenAiUserContent(
   });
 }
 
-function toOpenRouterMessages(
+export function toOpenRouterMessages(
   system: LlmSystemPrompt,
   messages: LlmMessage[],
 ): ChatCompletionMessageParam[] {
@@ -665,19 +665,22 @@ function toOpenRouterMessages(
         };
       }
 
-      return {
+      const assistant: ChatCompletionMessageParam = {
         role: "assistant",
         content:
           message.textParts.length > 0 ? message.textParts.join("\n") : null,
-        tool_calls: message.toolCalls.map((toolCall) => ({
+      };
+      if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) {
+        assistant.tool_calls = message.toolCalls.map((toolCall) => ({
           type: "function",
           id: toolCall.id,
           function: {
             name: toolCall.name,
             arguments: JSON.stringify(toolCall.input),
           },
-        })),
-      };
+        }));
+      }
+      return assistant;
     }),
   ];
 }
