@@ -59,9 +59,9 @@ const modules = {
   delete_task: deleteTask,
   draft_mom: draftMom,
   forget_memory: forgetMemory,
-  ignore_bill: ignoreBill,
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
+  ignore_bill: ignoreBill,
   learn_qa_bank: learnQa,
   list_accounts: listAccounts,
   list_attachments: listAttachments,
@@ -108,6 +108,7 @@ export const TOOL_ORDER = [
   "forget_memory",
   "draft_reply",
   "get_current_time",
+  "ignore_bill",
   "learn_qa_bank",
   "list_accounts",
   "list_attachments",
@@ -141,7 +142,6 @@ export const TOOL_ORDER = [
   "update_memory",
   "update_draft",
   "delete_task",
-  "ignore_bill",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(

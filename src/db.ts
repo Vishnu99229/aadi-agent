@@ -1823,6 +1823,19 @@ export function markTaskSuspectedDuplicate(
   ).run(of, id);
 }
 
+export function searchUpcomingBills(query: string): BillRecord[] {
+  const needle = `%${query.trim().toLowerCase()}%`;
+  return db
+    .prepare(
+      `SELECT ${BILL_COLUMNS}
+         FROM bills
+        WHERE status = 'upcoming'
+          AND LOWER(biller) LIKE ?
+        ORDER BY due_date ASC, id ASC`,
+    )
+    .all(needle) as BillRecord[];
+}
+
 export function transitionBillStatus(
   id: number,
   from: BillStatus | BillStatus[],

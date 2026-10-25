@@ -1,93 +1,53 @@
 import type { LlmTool } from "../llm.js";
-import { getBill, getBills, transitionBillStatus } from "../db.js";
+import {
+  searchUpcomingBills,
+  transitionBillStatus,
+  type BillRecord,
+} from "../db.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "ignore_bill",
   description:
-    "Dismiss a tracked bill so it stops appearing in upcoming/overdue lists. Pass either its numeric id from list_bills, or a biller name/fragment (case-insensitive). Use this when Vishnu says to ignore, drop or remove a bill.",
+    "Ignore, dismiss, delete, drop, or clear a bill. Use this whenever the user expresses intent to stop tracking or remove a bill from the upcoming list (e.g., 'ignore the X bill', 'drop Y', 'clear Z'). Do not ask for permission, just execute.",
   inputSchema: {
     type: "object",
     properties: {
-      id: { type: "number", description: "Bill id from list_bills." },
-      biller: {
+      query: {
         type: "string",
         description:
-          "Biller name or fragment, matched case-insensitively against open bills. Use when the id isn't known.",
+          "A biller name or fragment to match case-insensitively against upcoming bills (e.g., 'youtube premium', 'jio', 'netflix').",
       },
     },
-    required: [],
+    required: ["query"],
   },
 };
 
-function findByBiller(query: string) {
-  const needle = query.trim().toLowerCase();
-  if (!needle) return [];
-  return getBills().filter(
-    (bill) =>
-      bill.status !== "ignored" &&
-      bill.biller.toLowerCase().includes(needle),
-  );
-}
-
 export function handler(input: unknown): string {
-  const values = input as { id?: unknown; biller?: unknown };
-  const hasId =
-    typeof values.id === "number" &&
-    Number.isSafeInteger(values.id) &&
-    values.id > 0;
-  const hasBiller = typeof values.biller === "string" && values.biller.trim();
-
-  if (!hasId && !hasBiller) {
-    throw new Error("Provide either id (bill id) or biller (name fragment).");
+  const values = input as { query?: unknown };
+  if (typeof values.query !== "string" || !values.query.trim()) {
+    throw new Error("query must be a non-empty string.");
   }
 
-  let bill = hasId ? getBill(values.id as number) : undefined;
+  const matches = searchUpcomingBills(values.query);
+  if (matches.length === 0) {
+    return "No active bills found matching that description.";
+  }
 
-  if (!bill && hasBiller) {
-    const matches = findByBiller(values.biller as string);
-    if (matches.length === 0) {
-      throw new Error(
-        `No open bill found matching "${values.biller}". Use list_bills to see what's there.`,
-      );
+  const ignored: BillRecord[] = [];
+  for (const bill of matches) {
+    if (transitionBillStatus(bill.id, "upcoming", "ignored")) {
+      console.log(`Bill ${bill.id}: status -> ignored`);
+      ignored.push(bill);
     }
-    if (matches.length > 1) {
-      return JSON.stringify({
-        ambiguous: true,
-        matches: matches.map((b) => ({
-          id: b.id,
-          biller: b.biller,
-          amount: b.amount,
-          currency: b.currency,
-          due_date: b.due_date,
-          status: b.status,
-        })),
-      });
-    }
-    bill = matches[0];
   }
 
-  if (!bill) {
-    throw new Error(`Bill ${values.id} was not found.`);
+  if (ignored.length === 0) {
+    return "No active bills found matching that description.";
   }
-
-  if (bill.status === "ignored") {
-    return JSON.stringify({
-      id: bill.id,
-      biller: bill.biller,
-      status: "ignored",
-      already_ignored: true,
-    });
+  if (ignored.length === 1) {
+    return `Ignored bill: ${ignored[0]!.biller}`;
   }
-
-  if (!transitionBillStatus(bill.id, ["upcoming", "paid"], "ignored")) {
-    throw new Error(`Bill ${bill.id} could not be ignored.`);
-  }
-
-  console.log(`Bill ${bill.id}: status -> ignored`);
-  return JSON.stringify({
-    id: bill.id,
-    biller: bill.biller,
-    status: "ignored",
-  });
+  const list = ignored.map((b) => `- ${b.biller} (id ${b.id})`).join("\n");
+  return `Ignored ${ignored.length} bills:\n${list}`;
 }
