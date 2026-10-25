@@ -131,6 +131,33 @@ export function isReminderCommand(text: string): boolean {
   );
 }
 
+const IMPERATIVE_VERBS = [
+  "ignore",
+  "delete",
+  "remove",
+  "drop",
+  "dismiss",
+  "mark",
+  "change",
+  "update",
+  "clear",
+  "cancel",
+  "stop",
+  "unignore",
+  "undo",
+  "complete",
+  "finish",
+] as const;
+
+const IMPERATIVE_START_RE = new RegExp(
+  `^(?:please\\s+|pls\\s+|hey\\s+aadi[,\\s]+|aadi[,\\s]+|just\\s+|can\\s+you\\s+|could\\s+you\\s+)*(?:${IMPERATIVE_VERBS.join("|")})\\b`,
+  "i",
+);
+
+export function isImperativeMutationCommand(text: string): boolean {
+  return IMPERATIVE_START_RE.test(text.trim());
+}
+
 export function shouldSkipAutoCapture(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed.length < 12) {
@@ -147,6 +174,11 @@ export function shouldSkipAutoCapture(text: string): boolean {
   }
   // Imperative reminder commands are handled by set_reminder, not memory.
   if (isReminderCommand(trimmed)) {
+    return true;
+  }
+  // Action commands ("ignore that bill", "delete the task", "mark it paid")
+  // are routed to tools, not stored as long-term facts.
+  if (isImperativeMutationCommand(trimmed)) {
     return true;
   }
   return false;

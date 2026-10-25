@@ -263,6 +263,7 @@ Important: deals and status, plans, upcoming demos/meetings, deadlines, decision
 Unsure: might matter but could be casual. Ask.
 Trivial: small talk, questions with no new fact, thanks, scheduling a one-off lookup. Ignore. Return [].
 Do NOT extract facts from purely imperative scheduling or reminder commands ("Remind me to call Priya at 5pm", "Ping me tomorrow", "Let me know next week"). Those are handled by the reminder tool, not the memory system. Return [].
+Do NOT extract facts from commands that modify Aadi's database — "ignore that bill", "delete the task", "remove the Jio reminder", "mark it paid", "change the stage to closed", "clear my follow-ups", etc. Those are tool calls, not long-term facts. Return []. Only extract durable facts and preferences (deals, people, plans, decisions).
 Never invent. Never include passwords, OTPs, card/account numbers, or health details (omit those).
 event_date only for a specific calendar day, Asia/Kolkata, YYYY-MM-DD.
 If the message updates a candidate memory, set update_of_id to that id.

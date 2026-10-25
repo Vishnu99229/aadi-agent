@@ -6,7 +6,9 @@ import * as markBillPaid from "./mark_bill_paid.js";
 import * as removeDate from "./remove_date.js";
 import * as cancelReminder from "./cancel_reminder.js";
 import * as completeTask from "./complete_task.js";
+import * as deleteTask from "./delete_task.js";
 import * as forgetMemory from "./forget_memory.js";
+import * as ignoreBill from "./ignore_bill.js";
 import * as draftMom from "./draft_mom.js";
 import * as draftReply from "./draft_reply.js";
 import * as listAttachments from "./list_attachments.js";
@@ -54,8 +56,10 @@ const modules = {
   add_task: addTask,
   cancel_reminder: cancelReminder,
   complete_task: completeTask,
+  delete_task: deleteTask,
   draft_mom: draftMom,
   forget_memory: forgetMemory,
+  ignore_bill: ignoreBill,
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
   learn_qa_bank: learnQa,
@@ -136,6 +140,8 @@ export const TOOL_ORDER = [
   "update_account",
   "update_memory",
   "update_draft",
+  "delete_task",
+  "ignore_bill",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(
