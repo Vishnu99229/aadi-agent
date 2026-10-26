@@ -10,6 +10,7 @@ import * as deleteTask from "./delete_task.js";
 import * as forgetMemory from "./forget_memory.js";
 import * as ignoreBill from "./ignore_bill.js";
 import * as draftMom from "./draft_mom.js";
+import * as draftNewEmail from "./draft_new_email.js";
 import * as draftReply from "./draft_reply.js";
 import * as listAttachments from "./list_attachments.js";
 import * as readAttachment from "./read_attachment.js";
@@ -59,6 +60,7 @@ const modules = {
   complete_task: completeTask,
   delete_task: deleteTask,
   draft_mom: draftMom,
+  draft_new_email: draftNewEmail,
   forget_memory: forgetMemory,
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
@@ -145,6 +147,7 @@ export const TOOL_ORDER = [
   "update_draft",
   "delete_task",
   "read_draft",
+  "draft_new_email",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(

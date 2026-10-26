@@ -21,11 +21,13 @@ import {
 } from "./security/send_approval.js";
 import { parseAddressList } from "./followup_logic.js";
 import { evaluateDraft, type AutonomyOutcome } from "./rules_engine.js";
+import { installNetworkRetry } from "./telegram_io.js";
 
 const PREVIEW_LIMIT = 3800;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
 
 const telegram = new Api(config.telegramBotToken);
+installNetworkRetry(telegram);
 const activeActions = new Set<number>();
 const editingActionByUser = new Map<number, number>();
 const sendOnlyActions = new Set<number>();
@@ -42,7 +44,8 @@ export function setAfterDraftSend(handler: AfterDraftSend): void {
 
 export interface DraftApprovalPreview {
   draftId: string;
-  threadId: string;
+  /** Null for a standalone (non-reply) email. */
+  threadId: string | null;
   to: string;
   subject: string;
   body: string;
@@ -113,8 +116,12 @@ function createdAtMs(action: PendingAction): number {
   return new Date(`${action.created_at.replace(" ", "T")}Z`).getTime();
 }
 
+export function pendingActionAgeMs(action: PendingAction): number {
+  return Date.now() - createdAtMs(action);
+}
+
 function isExpired(action: PendingAction): boolean {
-  return Date.now() - createdAtMs(action) >= 24 * 60 * 60 * 1000;
+  return pendingActionAgeMs(action) >= 24 * 60 * 60 * 1000;
 }
 
 function callbackMessageText(ctx: Context): string {

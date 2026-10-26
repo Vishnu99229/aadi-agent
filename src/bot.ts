@@ -12,6 +12,7 @@ import {
 import {
   consumeDraftEdit,
   handleApprovalCallback,
+  pendingActionAgeMs,
   sendPendingDraftByText,
 } from "./approvals.js";
 import { sendMorningBrief } from "./brief.js";
@@ -110,12 +111,19 @@ import {
   parseForgetQuery,
 } from "./memory_logic.js";
 import { quotedMessageText, withQuotedContext } from "./reply_context.js";
-import { isSendDraftCommand } from "./send_triggers.js";
+import { isAmbiguousSendCommand, isSendDraftCommand } from "./send_triggers.js";
+import {
+  installNetworkRetry,
+  redactBotToken,
+  safeErrorText,
+  splitForTelegram,
+} from "./telegram_io.js";
 
-const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
+const AMBIGUOUS_SEND_WINDOW_MS = 10 * 60 * 1000;
 
 export const bot = new Bot(config.telegramBotToken);
+installNetworkRetry(bot.api);
 
 bot.use(ownerOnly(config.ownerTelegramId));
 
@@ -152,16 +160,8 @@ bot.use(async (ctx, next) => {
 });
 
 async function sendPlainText(ctx: Context, text: string): Promise<void> {
-  const characters = Array.from(text);
-
-  for (
-    let offset = 0;
-    offset < characters.length;
-    offset += TELEGRAM_MESSAGE_LIMIT
-  ) {
-    await ctx.reply(
-      characters.slice(offset, offset + TELEGRAM_MESSAGE_LIMIT).join(""),
-    );
+  for (const chunk of splitForTelegram(text)) {
+    await ctx.reply(chunk);
   }
 }
 
@@ -177,7 +177,7 @@ async function whileTyping<T>(
     await ctx.api.sendChatAction(ctx.chat!.id, "typing");
   };
 
-  await sendTyping();
+  await sendTyping().catch(() => undefined);
   const interval = setInterval(() => {
     void sendTyping().catch(() => undefined);
   }, TYPING_REFRESH_MS);
@@ -191,7 +191,10 @@ async function whileTyping<T>(
 
 function shortError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/\s+/g, " ").trim().slice(0, 180) || "Unknown error";
+  return (
+    redactBotToken(message).replace(/\s+/g, " ").trim().slice(0, 180) ||
+    "Unknown error"
+  );
 }
 
 const KEYBOARD_SETTING = "reply_keyboard";
@@ -710,19 +713,26 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   if (await tryHandleMeetingChat(ctx, userText)) {
     return;
   }
-  // Short-circuit "send it" / "yes, send it" / "go ahead and send" so Vishnu
-  // can dispatch the most recent pending draft without tapping the inline
-  // Send button. Runs before the LLM so no agent path can forge it;
-  // ownerOnly middleware above already fenced the chat.
-  if (isSendDraftCommand(userText)) {
+  // Short-circuit "send it" / "yes, send it" / "ok send" so Vishnu can
+  // dispatch the most recent pending draft without tapping the inline Send
+  // button. Runs before the LLM so no agent path can forge it; ownerOnly
+  // middleware above already fenced the chat. A bare "done" only counts as
+  // approval right after a draft card went out; otherwise it is ordinary chat.
+  const explicitSend = isSendDraftCommand(userText);
+  if (explicitSend || isAmbiguousSendCommand(userText)) {
     const latest = getLatestPendingSendAction();
-    if (!latest) {
+    if (explicitSend && !latest) {
       await ctx.reply("You don't have any pending drafts waiting for approval.");
       return;
     }
-    const result = await sendPendingDraftByText(latest);
-    await ctx.reply(result.message);
-    return;
+    if (
+      latest &&
+      (explicitSend || pendingActionAgeMs(latest) <= AMBIGUOUS_SEND_WINDOW_MS)
+    ) {
+      const result = await sendPendingDraftByText(latest);
+      await ctx.reply(result.message);
+      return;
+    }
   }
   // If the last thing Aadi showed was a forget-memory list and Vishnu
   // replied with an unambiguous batch answer like "both" or "1 and 2",
@@ -940,11 +950,11 @@ bot.on("message:text", async (ctx) => {
     }
     await handleUserText(ctx, ctx.from.id, text);
   } catch (error) {
-    console.error("Agent error:", error);
+    console.error(`Agent error: ${safeErrorText(error)}`);
     await ctx.reply(`Something broke: ${shortError(error)}`);
   }
 });
 
 bot.catch((error) => {
-  console.error("Telegram bot error:", error.error);
+  console.error(`Telegram bot error: ${safeErrorText(error.error)}`);
 });

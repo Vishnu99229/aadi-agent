@@ -1,5 +1,21 @@
+import { Api, HttpError } from "grammy";
+import {
+  createPendingAction,
+  createPendingEventAction,
+  getLatestPendingSendAction,
+  setPendingActionTelegramMessage,
+} from "../src/db.ts";
 import { plainTextBody } from "../src/google/mail.ts";
-import { isSendDraftCommand } from "../src/send_triggers.ts";
+import {
+  isAmbiguousSendCommand,
+  isSendDraftCommand,
+} from "../src/send_triggers.ts";
+import {
+  installNetworkRetry,
+  redactBotToken,
+  safeErrorText,
+  splitForTelegram,
+} from "../src/telegram_io.ts";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -12,11 +28,23 @@ function b64(text: string): string {
 }
 
 function testSendCommands(): void {
-  const positives = [
+  const explicit = [
     "send",
     "send it",
     "Send it.",
     "send this",
+    "send email",
+    "send mail",
+    "send the email",
+    "send the mail",
+    "send the draft",
+    "SEND THE MAIL",
+    "done send",
+    "ok send",
+    "OK, send it",
+    "okay send",
+    "looks good send",
+    "Looks good, send it!",
     "yes send it",
     "Yes, send it!",
     "yes please send it",
@@ -24,14 +52,18 @@ function testSendCommands(): void {
     "please send it",
     "go ahead and send",
     "Go ahead and send it.",
-    "send the email",
-    "send the draft",
     "  send it  ",
   ];
-  for (const text of positives) {
+  for (const text of explicit) {
     assert(isSendDraftCommand(text), `should match: ${JSON.stringify(text)}`);
+    assert(!isAmbiguousSendCommand(text), `not ambiguous: ${JSON.stringify(text)}`);
   }
-  const negatives = [
+  for (const text of ["done", "Done.", "DONE!"]) {
+    assert(isAmbiguousSendCommand(text), `ambiguous: ${JSON.stringify(text)}`);
+    assert(!isSendDraftCommand(text), `not explicit: ${JSON.stringify(text)}`);
+  }
+  const neither = [
+    "sent",
     "don't send it",
     "do not send",
     "send me the report",
@@ -40,11 +72,14 @@ function testSendCommands(): void {
     "resend it",
     "sending",
     "send it tomorrow",
+    "done with the call",
+    "ok",
     "yes",
     "",
   ];
-  for (const text of negatives) {
+  for (const text of neither) {
     assert(!isSendDraftCommand(text), `should not match: ${JSON.stringify(text)}`);
+    assert(!isAmbiguousSendCommand(text), `not ambiguous: ${JSON.stringify(text)}`);
   }
 }
 
@@ -82,6 +117,93 @@ function testPlainTextBody(): void {
   );
 }
 
+function testSplitForTelegram(): void {
+  assert(splitForTelegram("").length === 0, "empty text sends nothing");
+  assert(splitForTelegram("short").join("|") === "short", "short text is one chunk");
+
+  const emoji = "😀".repeat(3000);
+  const emojiChunks = splitForTelegram(emoji, 4000);
+  assert(
+    emojiChunks.every((chunk) => chunk.length <= 4000),
+    "chunks stay within the UTF-16 limit",
+  );
+  assert(
+    emojiChunks.every((chunk) => !/^[\udc00-\udfff]|[\ud800-\udbff]$/.test(chunk)),
+    "no chunk starts or ends mid surrogate pair",
+  );
+  assert(emojiChunks.join("") === emoji, "emoji chunks rejoin losslessly");
+
+  const lines = Array.from({ length: 300 }, (_, i) => `line ${i} ${"x".repeat(20)}`);
+  const lineChunks = splitForTelegram(lines.join("\n"), 1000);
+  assert(
+    lineChunks.every((chunk) => chunk.length <= 1000),
+    "line chunks stay within limit",
+  );
+  assert(
+    lineChunks.every((chunk) => chunk.split("\n").every((line) => lines.includes(line))),
+    "splits fall on line breaks when available",
+  );
+}
+
+function testRedaction(): void {
+  const leaked =
+    "request to https://api.telegram.org/bot123456789:AAH-fake_Token-xyz/sendMessage failed";
+  const redacted = redactBotToken(leaked);
+  assert(!redacted.includes("AAH-fake_Token-xyz"), "token removed");
+  assert(redacted.includes("bot<redacted>/sendMessage"), "url shape kept");
+  const wrapped = new HttpError("Network request for 'sendMessage' failed!", new Error(leaked));
+  assert(!safeErrorText(wrapped).includes("AAH-fake"), "safeErrorText never prints the inner URL");
+}
+
+async function testNetworkRetry(): Promise<void> {
+  const api = new Api("123:test");
+  let calls = 0;
+  api.config.use(async (_prev, method) => {
+    calls += 1;
+    if (method === "sendMessage" && calls < 3) {
+      throw new HttpError("Network request for 'sendMessage' failed!", new Error("ECONNABORTED"));
+    }
+    if (method === "getMe") {
+      throw new HttpError("Network request for 'getMe' failed!", new Error("ECONNABORTED"));
+    }
+    return { ok: true, result: { message_id: 7 } } as never;
+  });
+  installNetworkRetry(api, [0, 0]);
+
+  const sent = await api.sendMessage(1, "hi");
+  assert(sent.message_id === 7 && calls === 3, "sendMessage retried twice then succeeded");
+
+  calls = 0;
+  let threw = false;
+  try {
+    await api.getMe();
+  } catch {
+    threw = true;
+  }
+  assert(threw && calls === 1, "methods outside the retry list are not retried");
+}
+
+function testLatestPendingIsDraftOnly(): void {
+  const draft = createPendingAction("draft-standalone", null, "work");
+  setPendingActionTelegramMessage(draft.id, 101);
+  assert(draft.thread_id === null, "standalone draft stores a null thread_id");
+  const event = createPendingEventAction({
+    title: "Sync",
+    startIso: "2026-10-28T10:00:00+05:30",
+    endIso: "2026-10-28T10:30:00+05:30",
+    attendees: [],
+  });
+  setPendingActionTelegramMessage(event.id, 102);
+  assert(
+    getLatestPendingSendAction()?.id === draft.id,
+    "a newer calendar card does not shadow the pending email draft",
+  );
+}
+
 testSendCommands();
 testPlainTextBody();
+testSplitForTelegram();
+testRedaction();
+await testNetworkRetry();
+testLatestPendingIsDraftOnly();
 console.log("Chat UX checks passed.");

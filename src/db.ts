@@ -902,7 +902,7 @@ const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, s
 
 export function createPendingAction(
   draftId: string,
-  threadId: string,
+  threadId: string | null,
   googleAccount: GoogleAccountId = "personal",
 ): PendingAction {
   const result = db
@@ -975,6 +975,7 @@ export function getLatestPendingSendAction(): PendingAction | undefined {
       `SELECT ${PENDING_ACTION_COLUMNS}
        FROM pending_actions
        WHERE status = 'pending'
+         AND type = 'send_draft'
          AND telegram_message_id IS NOT NULL
        ORDER BY id DESC
        LIMIT 1`,
