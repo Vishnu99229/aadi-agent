@@ -561,6 +561,16 @@ db.exec(`
     message_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS processed_messages (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_processed_messages_at
+    ON processed_messages (processed_at);
 `);
 
 // Promises tracker (Part 1): extend tasks with promise-specific columns.
@@ -3348,4 +3358,43 @@ export function listMeetingAutoSendIds(threadId: string): string[] {
       .prepare(`SELECT message_id FROM meeting_auto_sends WHERE thread_id = ?`)
       .all(threadId) as Array<{ message_id: string }>
   ).map((row) => row.message_id);
+}
+
+const claimTelegramMessageTxn = db.transaction(
+  (chatId: number, messageId: number): boolean => {
+    const existing = db
+      .prepare(
+        `SELECT 1 FROM processed_messages
+         WHERE chat_id = ? AND message_id = ?
+           AND processed_at > datetime('now', '-5 minutes')`,
+      )
+      .get(chatId, messageId);
+    if (existing) return false;
+    db.prepare(
+      `INSERT OR REPLACE INTO processed_messages (chat_id, message_id)
+       VALUES (?, ?)`,
+    ).run(chatId, messageId);
+    return true;
+  },
+);
+
+/** Atomically claims a Telegram message for processing. Returns true if this
+ *  is the first time we've seen (chat_id, message_id) in the last 5 minutes,
+ *  false if the message was already handled (e.g. re-delivered after a
+ *  restart). */
+export function claimTelegramMessage(
+  chatId: number,
+  messageId: number,
+): boolean {
+  return claimTelegramMessageTxn(chatId, messageId);
+}
+
+/** Delete processed-message rows older than one hour so the table does not
+ *  grow unbounded. */
+export function pruneProcessedMessages(): number {
+  return db
+    .prepare(
+      `DELETE FROM processed_messages WHERE processed_at < datetime('now', '-1 hour')`,
+    )
+    .run().changes;
 }

@@ -18,11 +18,13 @@ import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
 import { ownerOnly } from "./security/owner_lock.js";
 import {
+  claimTelegramMessage,
   clearMessages,
   deleteMemory,
   getLatestPendingSendAction,
   getMeetingBrief,
   getSetting,
+  pruneProcessedMessages,
   setSetting,
 } from "./db.js";
 import { formatCostReport } from "./usage.js";
@@ -115,6 +117,38 @@ const TYPING_REFRESH_MS = 4_000;
 export const bot = new Bot(config.telegramBotToken);
 
 bot.use(ownerOnly(config.ownerTelegramId));
+
+// Telegram re-delivers the last un-acknowledged update after a crash or
+// deploy. Without this guard Aadi would process the same message twice and
+// send a second reply (sometimes the "still here, what's up?" nudge). Claim
+// (chat_id, message_id) atomically before letting any message handler run;
+// if the claim fails the duplicate is dropped silently. Callback queries do
+// not populate ctx.message, so button taps are not affected.
+let lastProcessedPruneAt = 0;
+bot.use(async (ctx, next) => {
+  const msg = ctx.message;
+  if (!msg || !ctx.chat) {
+    await next();
+    return;
+  }
+  if (!claimTelegramMessage(ctx.chat.id, msg.message_id)) {
+    console.log(
+      `Dropping duplicate Telegram message ${ctx.chat.id}/${msg.message_id}.`,
+    );
+    return;
+  }
+  const now = Date.now();
+  if (now - lastProcessedPruneAt > 10 * 60 * 1000) {
+    lastProcessedPruneAt = now;
+    try {
+      pruneProcessedMessages();
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Processed-message prune failed (${errorType}).`);
+    }
+  }
+  await next();
+});
 
 async function sendPlainText(ctx: Context, text: string): Promise<void> {
   const characters = Array.from(text);
