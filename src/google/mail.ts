@@ -79,6 +79,31 @@ export async function resolveGmailDraft(
   throw new Error("No Gmail draft with that ID was found in the connected accounts.");
 }
 
+export function messageHeader(
+  headers: gmail_v1.Schema$MessagePartHeader[] | undefined,
+  name: string,
+): string {
+  return (
+    headers?.find((item) => item.name?.toLowerCase() === name.toLowerCase())
+      ?.value ?? ""
+  );
+}
+
+/** Every inline text/plain part of a message, decoded and joined. Skips
+ *  text/plain attachments. */
+export function plainTextBody(part: gmail_v1.Schema$MessagePart): string {
+  const own =
+    part.mimeType?.toLowerCase() === "text/plain" &&
+    !part.filename &&
+    part.body?.data
+      ? [Buffer.from(part.body.data, "base64url").toString("utf8")]
+      : [];
+  return [...own, ...(part.parts ?? []).map(plainTextBody)]
+    .filter(Boolean)
+    .join("\n")
+    .replace(/\r\n?/g, "\n");
+}
+
 function safeHeader(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }

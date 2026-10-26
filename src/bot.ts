@@ -110,6 +110,7 @@ import {
   parseForgetQuery,
 } from "./memory_logic.js";
 import { quotedMessageText, withQuotedContext } from "./reply_context.js";
+import { isSendDraftCommand } from "./send_triggers.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const TYPING_REFRESH_MS = 4_000;
@@ -709,11 +710,11 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   if (await tryHandleMeetingChat(ctx, userText)) {
     return;
   }
-  // Short-circuit "send it" / "send the email" / "send" so Vishnu can
-  // dispatch the most recent pending draft without tapping the inline
+  // Short-circuit "send it" / "yes, send it" / "go ahead and send" so Vishnu
+  // can dispatch the most recent pending draft without tapping the inline
   // Send button. Runs before the LLM so no agent path can forge it;
   // ownerOnly middleware above already fenced the chat.
-  if (/^(send it|send the email|send this|send)[.!?]*\s*$/i.test(userText.trim())) {
+  if (isSendDraftCommand(userText)) {
     const latest = getLatestPendingSendAction();
     if (!latest) {
       await ctx.reply("You don't have any pending drafts waiting for approval.");

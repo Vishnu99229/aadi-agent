@@ -157,12 +157,14 @@ export async function handler(input: unknown): Promise<string> {
       : htmlToText(htmlParts.join("\n"));
   const body = truncate(removeQuotedReplies(rawBody));
   const headers = payload.headers;
+  const cc = header(headers, "Cc");
 
   return [
     `Account: ${account.label}`,
     `Tag: ${account.tag}`,
     `From: ${header(headers, "From")}`,
     `To: ${header(headers, "To")}`,
+    ...(cc ? [`Cc: ${cc}`] : []),
     `Subject: ${header(headers, "Subject")}`,
     `Date: ${header(headers, "Date")}`,
     "",

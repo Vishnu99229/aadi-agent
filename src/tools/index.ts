@@ -31,6 +31,7 @@ import * as searchMemories from "./search_memories.js";
 import * as searchQa from "./search_qa.js";
 import * as updateMemory from "./update_memory.js";
 import * as readDocument from "./read_document.js";
+import * as readDraft from "./read_draft.js";
 import * as readDriveFile from "./read_drive_file.js";
 import * as removeAccount from "./remove_account.js";
 import * as readEmail from "./read_email.js";
@@ -77,6 +78,7 @@ const modules = {
   propose_calendar_event: proposeCalendarEvent,
   read_attachment: readAttachment,
   read_document: readDocument,
+  read_draft: readDraft,
   read_drive_file: readDriveFile,
   remove_account: removeAccount,
   remove_date: removeDate,
@@ -142,6 +144,7 @@ export const TOOL_ORDER = [
   "update_memory",
   "update_draft",
   "delete_task",
+  "read_draft",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(

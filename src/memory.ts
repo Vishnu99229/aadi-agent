@@ -2,7 +2,6 @@ import { InlineKeyboard, type Context } from "grammy";
 import {
   createMemory,
   createPendingAccountUpdate,
-  createPendingMemoryConfirm,
   createReminder,
   deleteAllMemories,
   deleteMemory,
@@ -242,10 +241,12 @@ export async function handleExplicitRemember(
   return true;
 }
 
-function rememberKeyboard(pendingId: number): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("Yes", `mem:yes:${pendingId}`)
-    .text("No", `mem:no:${pendingId}`);
+function autoCaptureKeyboard(memory: MemoryRecord): InlineKeyboard {
+  const keyboard = offerKeyboard(memory);
+  if (!keyboard) {
+    return new InlineKeyboard().text("Forget", `mem:forget:${memory.id}`);
+  }
+  return keyboard.row().text("Forget", `mem:forget:${memory.id}`);
 }
 
 async function extractFactsFromMessage(userText: string): Promise<ExtractedFact[]> {
@@ -260,7 +261,7 @@ async function extractFactsFromMessage(userText: string): Promise<ExtractedFact[
       cacheable: `You extract long-term facts from Vishnu's Telegram message for Aadi.
 Return JSON only: {"facts":[{"content":"one clear fact","category":"deal|plan|event|person|preference|other","tag":"work|personal","event_date":"YYYY-MM-DD or null","weight":"important|unsure|trivial","update_of_id":null or id}]}
 Important: deals and status, plans, upcoming demos/meetings, deadlines, decisions, commitments, key people and roles. Save those.
-Unsure: might matter but could be casual. Ask.
+Unsure: might matter but could be casual.
 Trivial: small talk, questions with no new fact, thanks, scheduling a one-off lookup. Ignore. Return [].
 Do NOT extract facts from purely imperative scheduling or reminder commands ("Remind me to call Priya at 5pm", "Ping me tomorrow", "Let me know next week"). Those are handled by the reminder tool, not the memory system. Return [].
 Do NOT extract facts from commands that modify Aadi's database — "ignore that bill", "delete the task", "remove the Jio reminder", "mark it paid", "change the stage to closed", "clear my follow-ups", etc. Those are tool calls, not long-term facts. Return []. Only extract durable facts and preferences (deals, people, plans, decisions).
@@ -305,46 +306,19 @@ export async function captureFromUserMessage(
     return;
   }
   const existing = searchMemories(userText, 15);
-  const important = facts.filter((item) => item.weight === "important");
-  const unsure = facts.find((item) => item.weight === "unsure");
-  const saved: Array<{ memory: MemoryRecord; updated: boolean }> = [];
-  for (const fact of important.slice(0, 2)) {
-    if (isSensitiveMemoryText(fact.content)) {
-      continue;
-    }
-    saved.push(persistFact(fact, "auto", existing));
-  }
-  if (saved.length === 1) {
-    const item = saved[0]!;
-    await sendConfirmation(
-      ctx,
-      confirmationLine(
-        item.updated ? "Updated" : "Noted",
-        item.memory.content,
-        item.memory.tag,
-      ),
-      item.memory,
+  const toSave = [
+    ...facts.filter((item) => item.weight === "important"),
+    ...facts.filter((item) => item.weight === "unsure"),
+  ]
+    .filter((item) => !isSensitiveMemoryText(item.content))
+    .slice(0, 2);
+  for (const fact of toSave) {
+    const { memory, updated } = persistFact(fact, "auto", existing);
+    console.log(`Memory ${memory.id}: auto-saved (${fact.weight})`);
+    await ctx.reply(
+      confirmationLine(updated ? "Updated" : "Noted", memory.content, memory.tag),
+      { reply_markup: autoCaptureKeyboard(memory), disable_notification: true },
     );
-  } else if (saved.length > 1) {
-    const first = saved[0]!;
-    await sendConfirmation(
-      ctx,
-      `${confirmationLine(first.updated ? "Updated" : "Noted", first.memory.content, first.memory.tag)} (+${saved.length - 1} more)`,
-      first.memory,
-    );
-  }
-  if (unsure && saved.length === 0 && !isSensitiveMemoryText(unsure.content)) {
-    const pending = createPendingMemoryConfirm({
-      content: unsure.content,
-      category: unsure.category,
-      tag: unsure.tag,
-      eventDate: unsure.event_date,
-      updateOfId: findMemoryToUpdate(existing, unsure)?.id ?? unsure.update_of_id,
-    });
-    console.log(`Memory confirm ${pending.id}: asked`);
-    await ctx.reply("Should I remember this?", {
-      reply_markup: rememberKeyboard(pending.id),
-    });
   }
 }
 

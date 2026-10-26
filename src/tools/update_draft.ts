@@ -2,13 +2,19 @@ import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { queueDraftApproval } from "../approvals.js";
 import { getPendingActionForDraft } from "../db.js";
-import { gmailClient, resolveGmailDraft } from "../google/mail.js";
+import {
+  gmailClient,
+  messageHeader as header,
+  plainTextBody,
+  resolveGmailDraft,
+} from "../google/mail.js";
+import { dropSelf, toAddressList } from "./draft_reply.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "update_draft",
   description:
-    "Replace the plain-text body of an existing Gmail draft without sending it. Preserve the draft's recipients, subject, and thread. Returns the draft ID. Sending requires separate Telegram approval and is not available to this tool.",
+    "Update an existing Gmail draft without sending it: replace its plain-text body, its Cc list, or both. Preserves To, subject and thread. Returns the draft ID. Sending requires separate Telegram approval and is not available to this tool.",
   inputSchema: {
     type: "object",
     properties: {
@@ -19,22 +25,20 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
       body: {
         type: "string",
         description:
-          'The complete replacement plain-text body, written as Vishnu and ending with "Vishnu".',
+          'The complete replacement plain-text body, written as Vishnu and ending with "Vishnu". Omit to keep the current body unchanged (for example when only changing Cc).',
+      },
+      cc: {
+        description:
+          "Replacement Cc list: one or more email addresses or RFC headers. Replaces the whole Cc line, so include any current Cc addresses (from read_draft) you want to keep. Pass an empty list to remove all Cc. Omit to keep the current Cc.",
+        oneOf: [
+          { type: "string" },
+          { type: "array", items: { type: "string" } },
+        ],
       },
     },
-    required: ["draft_id", "body"],
+    required: ["draft_id"],
   },
 };
-
-function header(
-  headers: gmail_v1.Schema$MessagePartHeader[] | undefined,
-  name: string,
-): string {
-  return (
-    headers?.find((item) => item.name?.toLowerCase() === name.toLowerCase())
-      ?.value ?? ""
-  );
-}
 
 function safeHeader(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
@@ -50,10 +54,11 @@ function encodeBody(body: string): string {
 function buildDraftMessage(
   headers: gmail_v1.Schema$MessagePartHeader[] | undefined,
   body: string,
+  cc: string,
 ): string {
   const outputHeaders = [
     ["To", header(headers, "To")],
-    ["Cc", header(headers, "Cc")],
+    ["Cc", cc],
     ["Bcc", header(headers, "Bcc")],
     ["Subject", header(headers, "Subject")],
     ["In-Reply-To", header(headers, "In-Reply-To")],
@@ -73,12 +78,18 @@ function buildDraftMessage(
 }
 
 export async function handler(input: unknown): Promise<string> {
-  const values = input as { draft_id?: unknown; body?: unknown };
+  const values = input as { draft_id?: unknown; body?: unknown; cc?: unknown };
   if (typeof values.draft_id !== "string" || !values.draft_id.trim()) {
     throw new Error("draft_id must be a non-empty Gmail draft ID.");
   }
-  if (typeof values.body !== "string" || !values.body.trim()) {
-    throw new Error("body must be a non-empty plain-text reply.");
+  if (
+    values.body !== undefined &&
+    (typeof values.body !== "string" || !values.body.trim())
+  ) {
+    throw new Error("body must be a non-empty plain-text reply when given.");
+  }
+  if (values.body === undefined && values.cc === undefined) {
+    throw new Error("Pass body, cc, or both.");
   }
 
   const pending = getPendingActionForDraft(values.draft_id.trim());
@@ -97,7 +108,19 @@ export async function handler(input: unknown): Promise<string> {
     throw new Error("The Gmail draft is missing its recipient metadata.");
   }
 
-  const raw = buildDraftMessage(headers, values.body);
+  const body =
+    typeof values.body === "string"
+      ? values.body
+      : plainTextBody(message.payload ?? {}).trim();
+  if (!body) {
+    throw new Error("The draft has no plain-text body to keep; pass body.");
+  }
+  const cc =
+    values.cc === undefined
+      ? header(headers, "Cc")
+      : dropSelf(toAddressList(values.cc).join(", "));
+
+  const raw = buildDraftMessage(headers, body, cc);
   const result = await gmail.users.drafts.update({
     userId: "me",
     id: values.draft_id,
@@ -116,13 +139,15 @@ export async function handler(input: unknown): Promise<string> {
     threadId,
     to: safeHeader(to),
     subject: safeHeader(subject),
-    body: values.body,
+    body,
     googleAccount: account.id,
+    extraLines: cc ? [`Cc: ${safeHeader(cc)}`] : undefined,
   });
 
   return JSON.stringify({
     draft_id: draftId,
     account: account.id,
     tag: account.tag,
+    cc: cc ? safeHeader(cc) : null,
   });
 }

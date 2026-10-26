@@ -72,7 +72,7 @@ function replySubject(subject: string): string {
   return /^re\s*:/i.test(normalized) ? normalized : `Re: ${normalized}`;
 }
 
-function toAddressList(value: unknown): string[] {
+export function toAddressList(value: unknown): string[] {
   if (value === undefined || value === null) return [];
   if (typeof value === "string") return value.trim() ? [value.trim()] : [];
   if (Array.isArray(value)) {
@@ -84,7 +84,7 @@ function toAddressList(value: unknown): string[] {
   return [];
 }
 
-function dropSelf(header: string): string {
+export function dropSelf(header: string): string {
   const kept = parseAddressList(header).filter(
     (item) => !isSelfEmail(item.email),
   );
