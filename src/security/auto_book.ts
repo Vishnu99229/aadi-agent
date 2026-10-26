@@ -1,5 +1,6 @@
 import { google } from "googleapis";
 import type { LoadedGoogleAccount } from "../google/auth.js";
+import { encodeMimeHeader } from "../google/mime.js";
 import { SELF_EMAILS } from "../mom_logic.js";
 
 export class AutoBookRefusedError extends Error {
@@ -306,7 +307,7 @@ function buildMultipartRaw(params: {
   const boundary = `aadi_${Date.now().toString(16)}`;
   return [
     `To: ${safeHeader(params.to)}`,
-    `Subject: ${safeHeader(subject)}`,
+    `Subject: ${encodeMimeHeader(subject)}`,
     `In-Reply-To: ${safeHeader(params.inReplyTo)}`,
     `References: ${references}`,
     "MIME-Version: 1.0",

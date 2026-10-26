@@ -241,14 +241,6 @@ export async function handleExplicitRemember(
   return true;
 }
 
-function autoCaptureKeyboard(memory: MemoryRecord): InlineKeyboard {
-  const keyboard = offerKeyboard(memory);
-  if (!keyboard) {
-    return new InlineKeyboard().text("Forget", `mem:forget:${memory.id}`);
-  }
-  return keyboard.row().text("Forget", `mem:forget:${memory.id}`);
-}
-
 async function extractFactsFromMessage(userText: string): Promise<ExtractedFact[]> {
   const candidates = searchMemories(userText, 10).map((item) => ({
     id: item.id,
@@ -264,6 +256,7 @@ Important: deals and status, plans, upcoming demos/meetings, deadlines, decision
 Unsure: might matter but could be casual.
 Trivial: small talk, questions with no new fact, thanks, scheduling a one-off lookup. Ignore. Return [].
 Do NOT extract facts from purely imperative scheduling or reminder commands ("Remind me to call Priya at 5pm", "Ping me tomorrow", "Let me know next week"). Those are handled by the reminder tool, not the memory system. Return [].
+Do NOT extract facts from requests for Aadi to do something now: draft, write, send or reply to an email, look something up, summarise a document. "Aadi plans to email X" is never a fact. Return [].
 Do NOT extract facts from commands that modify Aadi's database — "ignore that bill", "delete the task", "remove the Jio reminder", "mark it paid", "change the stage to closed", "clear my follow-ups", etc. Those are tool calls, not long-term facts. Return []. Only extract durable facts and preferences (deals, people, plans, decisions).
 Never invent. Never include passwords, OTPs, card/account numbers, or health details (omit those).
 event_date only for a specific calendar day, Asia/Kolkata, YYYY-MM-DD.
@@ -290,10 +283,9 @@ At most 2 facts. Prefer one. Content under 140 characters.`,
   return parseExtractedFacts(response.textParts.join("\n"));
 }
 
-export async function captureFromUserMessage(
-  ctx: Context,
-  userText: string,
-): Promise<void> {
+/** Background capture after a chat turn. Silent: it saves, it never messages
+ *  Vishnu. Wrong memories are undone from /memory or "forget X". */
+export async function captureFromUserMessage(userText: string): Promise<void> {
   if (shouldSkipAutoCapture(userText)) {
     return;
   }
@@ -314,10 +306,8 @@ export async function captureFromUserMessage(
     .slice(0, 2);
   for (const fact of toSave) {
     const { memory, updated } = persistFact(fact, "auto", existing);
-    console.log(`Memory ${memory.id}: auto-saved (${fact.weight})`);
-    await ctx.reply(
-      confirmationLine(updated ? "Updated" : "Noted", memory.content, memory.tag),
-      { reply_markup: autoCaptureKeyboard(memory), disable_notification: true },
+    console.log(
+      `Memory ${memory.id}: auto-${updated ? "updated" : "saved"} (${fact.weight})`,
     );
   }
 }

@@ -55,6 +55,7 @@ const MENU_COMMANDS = [
   { command: "build", description: "Ask a Cursor agent to change Aadi's code" },
   { command: "builds", description: "List recent code builds" },
   { command: "health", description: "Show scheduled job last-run times" },
+  { command: "memory", description: "List saved memories and forget any" },
   { command: "meetings", description: "List auto-handled meeting threads" },
   { command: "reset", description: "Clear conversation history" },
 ] as const;

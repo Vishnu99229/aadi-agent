@@ -8,9 +8,12 @@ import {
   getExpiredPendingActions,
   getPendingAction,
   getPendingActionForDraft,
+  listDraftsShownBefore,
+  ownerMessageIdsBefore,
   setPendingActionAutoSendAt,
   setPendingActionTelegramMessage,
   transitionPendingAction,
+  type GoogleAccountId,
   type PendingAction,
   type PendingEventInput,
 } from "./db.js";
@@ -22,12 +25,32 @@ import {
 import { parseAddressList } from "./followup_logic.js";
 import { evaluateDraft, type AutonomyOutcome } from "./rules_engine.js";
 import { installNetworkRetry } from "./telegram_io.js";
+import { plainTextBody, stripSignature } from "./google/mail.js";
+import { assertTestSeam } from "./test_seam.js";
 
 const PREVIEW_LIMIT = 3800;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
 
-const telegram = new Api(config.telegramBotToken);
-installNetworkRetry(telegram);
+const realTelegram = new Api(config.telegramBotToken);
+installNetworkRetry(realTelegram);
+let telegram: Api = realTelegram;
+let fakeGmailFor: ((account: GoogleAccountId) => gmail_v1.Gmail) | undefined;
+
+export function setApprovalsTestHooks(hooks: {
+  telegram?: Api;
+  gmailFor?: (account: GoogleAccountId) => gmail_v1.Gmail;
+}): void {
+  assertTestSeam("setApprovalsTestHooks");
+  telegram = hooks.telegram ?? realTelegram;
+  fakeGmailFor = hooks.gmailFor;
+}
+
+async function gmailFor(account: GoogleAccountId): Promise<gmail_v1.Gmail> {
+  if (fakeGmailFor) {
+    return fakeGmailFor(account);
+  }
+  return google.gmail({ version: "v1", auth: await getGoogleClientFor(account) });
+}
 const activeActions = new Set<number>();
 const editingActionByUser = new Map<number, number>();
 const sendOnlyActions = new Set<number>();
@@ -116,12 +139,8 @@ function createdAtMs(action: PendingAction): number {
   return new Date(`${action.created_at.replace(" ", "T")}Z`).getTime();
 }
 
-export function pendingActionAgeMs(action: PendingAction): number {
-  return Date.now() - createdAtMs(action);
-}
-
 function isExpired(action: PendingAction): boolean {
-  return pendingActionAgeMs(action) >= 24 * 60 * 60 * 1000;
+  return Date.now() - createdAtMs(action) >= 24 * 60 * 60 * 1000;
 }
 
 function callbackMessageText(ctx: Context): string {
@@ -396,8 +415,7 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
   }
   let sentMessageId: string | undefined;
   try {
-    const auth = await getGoogleClientFor(action.google_account);
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmail = await gmailFor(action.google_account);
     const sent = await gmail.users.drafts.send({
       userId: "me",
       requestBody: { id: draftId },
@@ -538,8 +556,7 @@ async function fetchDraftRecipientLabel(
     return "the recipient";
   }
   try {
-    const auth = await getGoogleClientFor(action.google_account);
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmail = await gmailFor(action.google_account);
     const draft = await gmail.users.drafts.get({
       userId: "me",
       id: action.draft_id,
@@ -566,26 +583,83 @@ export interface TextSendDraftResult {
   message: string;
 }
 
-// Owner-authorized send via typed command. Runs before the LLM so no
-// agent path can trigger it; owner-lock already fenced the chat.
+export interface SendConfirmation {
+  chatId: number;
+  /** Telegram id of Vishnu's confirming message, typed or voice. */
+  messageId: number;
+}
+
+export function countConfirmableDrafts(confirmation: SendConfirmation): number {
+  return listDraftsShownBefore(confirmation.messageId).filter(
+    (action) => !isExpired(action),
+  ).length;
+}
+
+/** Which shown draft a chat confirmation means. One draft: that one. Several:
+ *  the only one whose card arrived during Vishnu's last two turns, if exactly
+ *  one did; otherwise undefined so the caller asks which. Both lists are
+ *  newest first. */
+export function pickConfirmedDraft(
+  shown: readonly PendingAction[],
+  priorOwnerMessageIds: readonly number[],
+): PendingAction | undefined {
+  if (shown.length <= 1) {
+    return shown[0];
+  }
+  const windowStart = priorOwnerMessageIds[1] ?? priorOwnerMessageIds[0] ?? 0;
+  const recent = shown.filter(
+    (action) => (action.telegram_message_id ?? 0) > windowStart,
+  );
+  return recent.length === 1 ? recent[0] : undefined;
+}
+
+// Owner-confirmed send from a chat message (typed or voice): the exact "send"
+// fast path or the model's confirm_send_pending_draft intent. Only a draft
+// whose card was posted before that message can be sent, and it goes through
+// the same gate and dispatch as the card's Send button.
 export async function sendPendingDraftByText(
-  action: PendingAction,
+  confirmation: SendConfirmation,
 ): Promise<TextSendDraftResult> {
-  if (action.status === "pending" && isExpired(action)) {
-    await expireAction(action);
+  const shown: PendingAction[] = [];
+  for (const action of listDraftsShownBefore(confirmation.messageId)) {
+    if (isExpired(action)) {
+      await expireAction(action);
+    } else {
+      shown.push(action);
+    }
+  }
+  if (shown.length === 0) {
     return {
       ok: false,
-      message: "That draft expired. Draft it again if you still want to send.",
+      message: "No draft is waiting for your approval, so nothing was sent.",
     };
   }
-  if (action.status !== "pending") {
-    return { ok: false, message: `That draft is already ${action.status}.` };
+  const action = pickConfirmedDraft(
+    shown,
+    ownerMessageIdsBefore(confirmation.chatId, confirmation.messageId, 2),
+  );
+  if (!action) {
+    const recipients = await Promise.all(shown.map(fetchDraftRecipientLabel));
+    console.log(`Send confirmation: ${shown.length} drafts pending; asked which`);
+    return {
+      ok: false,
+      message: `${shown.length} drafts are waiting: ${recipients
+        .map((recipient) => `to ${recipient}`)
+        .join(", ")}. Which one should I send? You can also tap Send on its card.`,
+    };
   }
   if (activeActions.has(action.id)) {
     return { ok: false, message: "That draft is already being sent." };
   }
   activeActions.add(action.id);
   try {
+    // The same token the card's Send button carries, minted only for a draft
+    // whose card was posted before Vishnu's confirming message.
+    allowSendDraft({
+      callbackData: `approval:send:${action.id}`,
+      actionId: action.id,
+      actionStatus: action.status,
+    });
     const recipient = await fetchDraftRecipientLabel(action);
     const outcome = await performDraftSend(action);
     if (!outcome.ok) {
@@ -611,7 +685,8 @@ export async function sendPendingDraftByText(
         );
       }
     }
-    return { ok: true, message: `Sending the draft to ${recipient}...` };
+    console.log(`Approval action ${action.id}: sent on chat confirmation`);
+    return { ok: true, message: `Sent the draft to ${recipient}.` };
   } finally {
     activeActions.delete(action.id);
   }
@@ -630,8 +705,7 @@ async function discardDraft(
     return;
   }
   try {
-    const auth = await getGoogleClientFor(action.google_account);
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmail = await gmailFor(action.google_account);
     await gmail.users.drafts.delete({
       userId: "me",
       id: draftId,
@@ -740,24 +814,6 @@ export async function handleApprovalCallback(
   }
 }
 
-function decodeBody(data: string | null | undefined): string {
-  return data ? Buffer.from(data, "base64url").toString("utf8") : "";
-}
-
-function plainTextBody(part: gmail_v1.Schema$MessagePart | undefined): string {
-  if (!part) {
-    return "";
-  }
-  if (part.mimeType?.toLowerCase() === "text/plain" && part.body?.data) {
-    return decodeBody(part.body.data);
-  }
-
-  return (part.parts ?? [])
-    .map((child) => plainTextBody(child))
-    .filter(Boolean)
-    .join("\n");
-}
-
 export async function consumeDraftEdit(
   userId: number,
 ): Promise<DraftEditContext | undefined> {
@@ -782,18 +838,18 @@ export async function consumeDraftEdit(
   }
   const draftId = action.draft_id;
 
-  const auth = await getGoogleClientFor(action.google_account);
-  const gmail = google.gmail({ version: "v1", auth });
+  const gmail = await gmailFor(action.google_account);
   const draft = await gmail.users.drafts.get({
     userId: "me",
     id: draftId,
     format: "full",
   });
+  const payload = draft.data.message?.payload;
 
   return {
     actionId: action.id,
     draftId,
-    body: plainTextBody(draft.data.message?.payload),
+    body: payload ? stripSignature(plainTextBody(payload).trim()).body : "",
   };
 }
 

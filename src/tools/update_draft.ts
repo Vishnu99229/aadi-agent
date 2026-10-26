@@ -1,12 +1,14 @@
-import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { queueDraftApproval } from "../approvals.js";
 import { getPendingActionForDraft } from "../db.js";
 import {
+  buildMimeMessage,
   gmailClient,
   messageHeader as header,
   plainTextBody,
   resolveGmailDraft,
+  signatureHtmlFor,
+  stripSignature,
 } from "../google/mail.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 
@@ -44,39 +46,6 @@ function safeHeader(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }
 
-function encodeBody(body: string): string {
-  return Buffer.from(body, "utf8")
-    .toString("base64")
-    .match(/.{1,76}/g)!
-    .join("\r\n");
-}
-
-function buildDraftMessage(
-  headers: gmail_v1.Schema$MessagePartHeader[] | undefined,
-  body: string,
-  cc: string,
-): string {
-  const outputHeaders = [
-    ["To", header(headers, "To")],
-    ["Cc", cc],
-    ["Bcc", header(headers, "Bcc")],
-    ["Subject", header(headers, "Subject")],
-    ["In-Reply-To", header(headers, "In-Reply-To")],
-    ["References", header(headers, "References")],
-  ]
-    .filter(([, value]) => Boolean(value))
-    .map(([name, value]) => `${name}: ${safeHeader(value)}`);
-
-  return [
-    ...outputHeaders,
-    "MIME-Version: 1.0",
-    'Content-Type: text/plain; charset="UTF-8"',
-    "Content-Transfer-Encoding: base64",
-    "",
-    encodeBody(body),
-  ].join("\r\n");
-}
-
 export async function handler(input: unknown): Promise<string> {
   const values = input as { draft_id?: unknown; body?: unknown; cc?: unknown };
   if (typeof values.draft_id !== "string" || !values.draft_id.trim()) {
@@ -108,11 +77,12 @@ export async function handler(input: unknown): Promise<string> {
     throw new Error("The Gmail draft is missing its recipient metadata.");
   }
 
+  const current = stripSignature(plainTextBody(message.payload ?? {}).trim());
   const body =
     typeof values.body === "string"
-      ? values.body
-      : plainTextBody(message.payload ?? {}).trim();
-  if (!body) {
+      ? stripSignature(values.body).body
+      : current.body;
+  if (!body.trim()) {
     throw new Error("The draft has no plain-text body to keep; pass body.");
   }
   const cc =
@@ -120,7 +90,20 @@ export async function handler(input: unknown): Promise<string> {
       ? header(headers, "Cc")
       : dropSelf(toAddressList(values.cc).join(", "));
 
-  const raw = buildDraftMessage(headers, body, cc);
+  // Keep the signature only on drafts Aadi signed; scheduling drafts stay
+  // plain text.
+  const raw = buildMimeMessage(
+    [
+      ["To", to],
+      ["Cc", cc],
+      ["Bcc", header(headers, "Bcc")],
+      ["Subject", subject],
+      ["In-Reply-To", header(headers, "In-Reply-To")],
+      ["References", header(headers, "References")],
+    ],
+    body,
+    current.signed ? await signatureHtmlFor(account) : "",
+  );
   const result = await gmail.users.drafts.update({
     userId: "me",
     id: values.draft_id,

@@ -969,6 +969,43 @@ export function getPendingActionForDraft(
     .get(draftId) as PendingAction | undefined;
 }
 
+/** Pending email drafts whose approval card was posted before `messageId`.
+ *  Telegram message ids in a chat only grow, so a lower card id means Vishnu
+ *  saw the card before he sent that message. Newest card first. */
+export function listDraftsShownBefore(messageId: number): PendingAction[] {
+  return db
+    .prepare(
+      `SELECT ${PENDING_ACTION_COLUMNS}
+       FROM pending_actions
+       WHERE status = 'pending'
+         AND type = 'send_draft'
+         AND draft_id IS NOT NULL
+         AND telegram_message_id IS NOT NULL
+         AND telegram_message_id < ?
+       ORDER BY telegram_message_id DESC`,
+    )
+    .all(messageId) as PendingAction[];
+}
+
+/** Vishnu's own message ids in `chatId` that came before `messageId`, newest
+ *  first (from the dedupe log, kept for 24 hours). */
+export function ownerMessageIdsBefore(
+  chatId: number,
+  messageId: number,
+  limit: number,
+): number[] {
+  return (
+    db
+      .prepare(
+        `SELECT message_id FROM processed_messages
+         WHERE chat_id = ? AND message_id < ?
+         ORDER BY message_id DESC
+         LIMIT ?`,
+      )
+      .all(chatId, messageId, limit) as Array<{ message_id: number }>
+  ).map((row) => row.message_id);
+}
+
 export function getLatestPendingSendAction(): PendingAction | undefined {
   return db
     .prepare(
@@ -3390,12 +3427,12 @@ export function claimTelegramMessage(
   return claimTelegramMessageTxn(chatId, messageId);
 }
 
-/** Delete processed-message rows older than one hour so the table does not
- *  grow unbounded. */
+/** Keep 24 hours of ids (the draft-approval lifetime): send confirmation uses
+ *  them to tell which drafts came from Vishnu's last couple of turns. */
 export function pruneProcessedMessages(): number {
   return db
     .prepare(
-      `DELETE FROM processed_messages WHERE processed_at < datetime('now', '-1 hour')`,
+      `DELETE FROM processed_messages WHERE processed_at < datetime('now', '-24 hours')`,
     )
     .run().changes;
 }

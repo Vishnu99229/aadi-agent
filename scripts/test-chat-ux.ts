@@ -6,10 +6,7 @@ import {
   setPendingActionTelegramMessage,
 } from "../src/db.ts";
 import { plainTextBody } from "../src/google/mail.ts";
-import {
-  isAmbiguousSendCommand,
-  isSendDraftCommand,
-} from "../src/send_triggers.ts";
+import { isSendDraftCommand } from "../src/send_triggers.ts";
 import {
   installNetworkRetry,
   redactBotToken,
@@ -28,58 +25,27 @@ function b64(text: string): string {
 }
 
 function testSendCommands(): void {
-  const explicit = [
-    "send",
-    "send it",
-    "Send it.",
-    "send this",
-    "send email",
-    "send mail",
-    "send the email",
-    "send the mail",
-    "send the draft",
-    "SEND THE MAIL",
-    "done send",
-    "ok send",
-    "OK, send it",
-    "okay send",
-    "looks good send",
-    "Looks good, send it!",
+  for (const text of ["send", "send it", "Send it.", "SEND IT!", "  send it  "]) {
+    assert(isSendDraftCommand(text), `fast path: ${JSON.stringify(text)}`);
+  }
+  // Everything else, including real send intents, is left to the model.
+  const notFastPath = [
+    "send that",
     "yes send it",
-    "Yes, send it!",
-    "yes please send it",
-    "please send",
-    "please send it",
+    "ok send",
     "go ahead and send",
-    "Go ahead and send it.",
-    "  send it  ",
-  ];
-  for (const text of explicit) {
-    assert(isSendDraftCommand(text), `should match: ${JSON.stringify(text)}`);
-    assert(!isAmbiguousSendCommand(text), `not ambiguous: ${JSON.stringify(text)}`);
-  }
-  for (const text of ["done", "Done.", "DONE!"]) {
-    assert(isAmbiguousSendCommand(text), `ambiguous: ${JSON.stringify(text)}`);
-    assert(!isSendDraftCommand(text), `not explicit: ${JSON.stringify(text)}`);
-  }
-  const neither = [
+    "haan bhej do",
+    "done",
     "sent",
     "don't send it",
-    "do not send",
     "send me the report",
     "send it to Priya",
-    "can you send the deck?",
-    "resend it",
-    "sending",
     "send it tomorrow",
-    "done with the call",
     "ok",
-    "yes",
     "",
   ];
-  for (const text of neither) {
-    assert(!isSendDraftCommand(text), `should not match: ${JSON.stringify(text)}`);
-    assert(!isAmbiguousSendCommand(text), `not ambiguous: ${JSON.stringify(text)}`);
+  for (const text of notFastPath) {
+    assert(!isSendDraftCommand(text), `not fast path: ${JSON.stringify(text)}`);
   }
 }
 

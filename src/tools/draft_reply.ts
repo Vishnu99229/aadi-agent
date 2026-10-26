@@ -6,8 +6,9 @@ import { parseGoogleAccountFilter } from "../google/auth.js";
 import {
   buildThreadReplyMime,
   gmailClient,
-  mimeHeaderBlock,
+  mimeHeaderNames,
   resolveGmailMessage,
+  signatureHtmlFor,
 } from "../google/mail.js";
 import { parseAddressList } from "../followup_logic.js";
 import { isSelfEmail } from "../mom_logic.js";
@@ -161,10 +162,9 @@ export async function handler(input: unknown): Promise<string> {
     inReplyTo: messageId,
     references: header(headers, "References"),
     body: values.body,
+    signatureHtml: await signatureHtmlFor(account),
   });
-  console.log(
-    `Draft MIME headers (body redacted):\n${mimeHeaderBlock(raw)}`,
-  );
+  console.log(`Draft MIME headers: ${mimeHeaderNames(raw)}`);
   const result = await gmail.users.drafts.create({
     userId: "me",
     requestBody: {

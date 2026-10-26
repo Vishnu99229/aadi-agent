@@ -34,6 +34,32 @@ import {
   setMeetingProposalStatus,
   transitionMeetingPendingBooking,
 } from "../src/db.ts";
+import {
+  claimTelegramMessage,
+  createPendingAction,
+  setPendingActionTelegramMessage,
+  transitionPendingAction,
+} from "../src/db.ts";
+import {
+  pickConfirmedDraft,
+  sendPendingDraftByText,
+  setApprovalsTestHooks,
+} from "../src/approvals.ts";
+import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
+import { setCompleteForTests } from "../src/llm.ts";
+import {
+  definition as confirmSendDefinition,
+  handler as confirmSendHandler,
+} from "../src/tools/confirm_send_pending_draft.ts";
+import type { ToolTurn } from "../src/tools/index.ts";
+import {
+  fakeGmail,
+  fakeTelegramApi,
+  nextMessageId,
+  scriptedModel,
+  type GmailLog,
+  type TelegramLog,
+} from "./fakes.ts";
 import type { LoadedGoogleAccount } from "../src/google/auth.ts";
 import {
   processDuePendingBookings,
@@ -1056,5 +1082,185 @@ assert(recent.length === 3, "empty query returns everything");
 
 const missHits = searchQaBank("quantum teleportation uplink");
 assert(missHits.length === 0, "no match returns empty");
+
+// ---------------------------------------------------------------------------
+// Chat-confirmed sends (typed or voice). The model only signals intent; the
+// send must still pass allowSendDraft AND target a draft whose card Vishnu saw
+// before his confirming message. Telegram message ids in a chat only grow, so
+// "shown first" means card id < confirming message id.
+// ---------------------------------------------------------------------------
+const confirmGmail: GmailLog = { sent: [], created: [] };
+const confirmCards: TelegramLog = { sent: [], edited: [] };
+setApprovalsTestHooks({
+  telegram: fakeTelegramApi(confirmCards),
+  gmailFor: () => fakeGmail(confirmGmail),
+});
+const ownerChat = 1;
+const confirmDrafts: number[] = [];
+
+function draftWithCard(cardId: number | null): number {
+  const action = createPendingAction(`confirm-${nextMessageId()}`, null, "work");
+  if (cardId !== null) {
+    setPendingActionTelegramMessage(action.id, cardId);
+  }
+  confirmDrafts.push(action.id);
+  return action.id;
+}
+
+function discardConfirmDrafts(): void {
+  for (const id of confirmDrafts) {
+    transitionPendingAction(id, "pending", "discarded");
+  }
+}
+
+function ownerTurn(messageId: number, extra: Partial<ToolTurn> = {}): ToolTurn {
+  return {
+    iteration: 1,
+    calledTools: ["confirm_send_pending_draft"],
+    confirmation: { chatId: ownerChat, messageId },
+    ...extra,
+  };
+}
+
+// The confirm tool takes no input, so the model cannot choose what is sent.
+assert(
+  Object.keys(confirmSendDefinition.inputSchema.properties ?? {}).length === 0 &&
+    (confirmSendDefinition.inputSchema.required ?? []).length === 0,
+  "confirm_send_pending_draft takes no input",
+);
+
+// A forged send intent with no pending draft sends nothing.
+{
+  const result = await confirmSendHandler({}, ownerTurn(nextMessageId()));
+  assert(confirmGmail.sent.length === 0, "forged confirm with no pending draft sends nothing");
+  assert(result.includes("No draft is waiting"), "forged confirm says no draft is waiting");
+}
+
+// NEVER send a draft that was not shown before the confirming message.
+{
+  discardConfirmDrafts();
+  const confirmingMessage = nextMessageId();
+  const shownAfter = draftWithCard(nextMessageId());
+  await confirmSendHandler({}, ownerTurn(confirmingMessage));
+  const fastPath = await sendPendingDraftByText({
+    chatId: ownerChat,
+    messageId: confirmingMessage,
+  });
+  assert(confirmGmail.sent.length === 0, "a draft whose card came after the confirming message is never sent");
+  assert(!fastPath.ok, "the exact-phrase fast path enforces shown-first too");
+  assert(getPendingAction(shownAfter)!.status === "pending", "that draft stays pending");
+}
+{
+  discardConfirmDrafts();
+  const neverShown = draftWithCard(null);
+  await confirmSendHandler({}, ownerTurn(nextMessageId()));
+  assert(confirmGmail.sent.length === 0, "a draft with no card (never shown) is never sent");
+  assert(getPendingAction(neverShown)!.status === "pending", "the unshown draft stays pending");
+}
+{
+  // Draft created in the same turn the model "confirms": its card comes after
+  // Vishnu's message, so it can never be the one sent.
+  discardConfirmDrafts();
+  const confirmingMessage = nextMessageId();
+  setToolInterceptorForTests((call) => {
+    if (call.name === "draft_new_email") {
+      draftWithCard(nextMessageId());
+      return "Draft created.";
+    }
+    return undefined;
+  });
+  const model = scriptedModel(() => ({
+    tools: [
+      { name: "draft_new_email", input: { to: "x@acme.com", subject: "s", body: "b" } },
+      { name: "confirm_send_pending_draft" },
+    ],
+  }));
+  setCompleteForTests(model.fake);
+  await runAgent("write to x@acme.com and send it", {
+    sendConfirmation: { chatId: ownerChat, messageId: confirmingMessage },
+    saveUserMessage: false,
+    saveAssistantMessage: false,
+    skipHistory: true,
+  });
+  setCompleteForTests(undefined);
+  setToolInterceptorForTests(undefined);
+  assert(confirmGmail.sent.length === 0, "a draft created in the confirming turn is never sent");
+}
+
+// Only Vishnu's own message, in the model's first step, with no drafting in
+// the same step, can confirm.
+{
+  discardConfirmDrafts();
+  draftWithCard(nextMessageId());
+  const confirmingMessage = nextMessageId();
+  const refusals = [
+    await confirmSendHandler({}, { iteration: 1, calledTools: ["confirm_send_pending_draft"] }),
+    await confirmSendHandler({}, ownerTurn(confirmingMessage, { iteration: 2 })),
+    await confirmSendHandler(
+      {},
+      ownerTurn(confirmingMessage, { calledTools: ["update_draft", "confirm_send_pending_draft"] }),
+    ),
+  ];
+  assert(confirmGmail.sent.length === 0, "no send outside Vishnu's first step or alongside drafting");
+  assert(refusals.every((text) => text.startsWith("Not sent")), "each refusal says not sent");
+}
+
+// Recency: the draft from the last two turns wins over clearly older ones;
+// two recent drafts make Aadi ask which.
+{
+  discardConfirmDrafts();
+  const older = draftWithCard(nextMessageId());
+  claimTelegramMessage(ownerChat, nextMessageId());
+  claimTelegramMessage(ownerChat, nextMessageId());
+  const recent = draftWithCard(nextMessageId());
+  await confirmSendHandler({}, ownerTurn(nextMessageId()));
+  assert(
+    confirmGmail.sent.length === 1 &&
+      confirmGmail.sent[0] === getPendingAction(recent)!.draft_id,
+    "confirm sends the draft from the last turns",
+  );
+  assert(getPendingAction(older)!.status === "pending", "the older draft is untouched");
+
+  discardConfirmDrafts();
+  claimTelegramMessage(ownerChat, nextMessageId());
+  draftWithCard(nextMessageId());
+  claimTelegramMessage(ownerChat, nextMessageId());
+  draftWithCard(nextMessageId());
+  const asked = await confirmSendHandler({}, ownerTurn(nextMessageId()));
+  assert(confirmGmail.sent.length === 1, "two recent drafts: nothing more is sent");
+  assert(asked.includes("Which one"), "two recent drafts: Aadi asks which");
+}
+assert(pickConfirmedDraft([], [5, 3]) === undefined, "no shown drafts picks nothing");
+
+// Structure: the chat path selects only shown-first drafts, then gates, then sends.
+assert(
+  textSendFn.includes("listDraftsShownBefore(confirmation.messageId)"),
+  "sendPendingDraftByText only considers drafts shown before the confirming message",
+);
+assert(
+  textSendFn.includes("allowSendDraft") &&
+    textSendFn.indexOf("allowSendDraft") < textSendFn.indexOf("performDraftSend"),
+  "sendPendingDraftByText must call allowSendDraft before performDraftSend",
+);
+const dbSrc = await readFile(join(root, "src/db.ts"), "utf8");
+const shownBeforeFn = dbSrc.slice(
+  dbSrc.indexOf("export function listDraftsShownBefore"),
+  dbSrc.indexOf("export function ownerMessageIdsBefore"),
+);
+assert(
+  shownBeforeFn.includes("telegram_message_id < ?") &&
+    shownBeforeFn.includes("status = 'pending'") &&
+    shownBeforeFn.includes("telegram_message_id IS NOT NULL"),
+  "listDraftsShownBefore requires a pending draft with a card posted before the message",
+);
+for (const file of toolFiles) {
+  const src = await readFile(file, "utf8");
+  if (src.includes("sendPendingDraftByText")) {
+    assert(
+      file.endsWith("/tools/confirm_send_pending_draft.ts"),
+      `only confirm_send_pending_draft may dispatch a send, found ${file}`,
+    );
+  }
+}
 
 console.log("Security gate checks passed.");

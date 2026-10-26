@@ -2,7 +2,7 @@ import type { LlmTool } from "../llm.js";
 import { queueDraftApproval } from "../approvals.js";
 import { parseAddressList } from "../followup_logic.js";
 import { getGoogleAccount } from "../google/auth.js";
-import { createNewEmailDraft } from "../google/mail.js";
+import { createNewEmailDraft, signatureHtmlFor } from "../google/mail.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -69,6 +69,7 @@ export async function handler(input: unknown): Promise<string> {
     to: [to],
     subject,
     body: values.body,
+    signatureHtml: await signatureHtmlFor(account),
   });
 
   await queueDraftApproval({

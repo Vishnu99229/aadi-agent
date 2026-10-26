@@ -39,7 +39,11 @@ import {
   loadGoogleAccounts,
   type LoadedGoogleAccount,
 } from "./google/auth.js";
-import { createThreadReplyDraft, gmailClient } from "./google/mail.js";
+import {
+  createThreadReplyDraft,
+  gmailClient,
+  signatureHtmlFor,
+} from "./google/mail.js";
 import { complete, completeBackground } from "./llm.js";
 import { buildAutonomyFacts } from "./autonomy_facts.js";
 import { rootAndLatest } from "./email_threading.js";
@@ -982,6 +986,7 @@ export async function createFollowupDraftForApproval(
     inReplyTo: messageId,
     references: header(latestHeaders, "References"),
     body: plan.body,
+    signatureHtml: await signatureHtmlFor(account),
   });
   await queueDraftApproval(
     {

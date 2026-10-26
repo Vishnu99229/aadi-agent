@@ -11,7 +11,7 @@ import {
   type NoteRecord,
 } from "./db.js";
 import { getGoogleAccount } from "./google/auth.js";
-import { createNewEmailDraft } from "./google/mail.js";
+import { createNewEmailDraft, signatureHtmlFor } from "./google/mail.js";
 import {
   buildMomDraft,
   hasMomRecipients,
@@ -151,6 +151,7 @@ export async function draftMomForNote(
     to: draft.to,
     subject: draft.subject,
     body: draft.body,
+    signatureHtml: await signatureHtmlFor(account),
   });
   console.log(
     `MoM draft created: draft_id=${created.draftId} recipients=${draft.to.length} note_id=${noteId}`,

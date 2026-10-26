@@ -7,6 +7,7 @@ import {
   messageHeader,
   plainTextBody,
   resolveGmailDraft,
+  stripSignature,
 } from "../google/mail.js";
 
 const BODY_LIMIT = 8000;
@@ -48,7 +49,10 @@ export async function handler(input: unknown): Promise<string> {
   );
   const payload = draft.message?.payload;
   const headers = payload?.headers;
-  const characters = Array.from(payload ? plainTextBody(payload).trim() : "");
+  const { body: text, signed } = stripSignature(
+    payload ? plainTextBody(payload).trim() : "",
+  );
+  const characters = Array.from(text);
   const body =
     characters.length > BODY_LIMIT
       ? `${characters.slice(0, BODY_LIMIT).join("")}\n[truncated]`
@@ -60,6 +64,7 @@ export async function handler(input: unknown): Promise<string> {
     `To: ${messageHeader(headers, "To")}`,
     `Cc: ${messageHeader(headers, "Cc") || "(none)"}`,
     `Subject: ${messageHeader(headers, "Subject")}`,
+    `Signature: ${signed ? "included" : "none"}`,
     "",
     body || "(No plain-text body found.)",
   ].join("\n");

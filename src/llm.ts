@@ -16,6 +16,7 @@ import type {
 import { getTaskBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import { assertLocalModelAllowed } from "./local_llm_guard.js";
+import { assertTestSeam } from "./test_seam.js";
 import {
   estimateLlmCostUsd,
   isHaiku55Model,
@@ -879,9 +880,23 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+let fakeComplete:
+  | ((params: CompleteParams) => Promise<CompleteResult>)
+  | undefined;
+
+export function setCompleteForTests(
+  fake: ((params: CompleteParams) => Promise<CompleteResult>) | undefined,
+): void {
+  assertTestSeam("setCompleteForTests");
+  fakeComplete = fake;
+}
+
 export async function complete(
   params: CompleteParams,
 ): Promise<CompleteResult> {
+  if (fakeComplete) {
+    return fakeComplete(params);
+  }
   const backend = params.backend ?? getTaskBackend("chat");
   try {
     return await completeWithNamedBackend(backend, params);

@@ -12,8 +12,8 @@ import {
 import {
   consumeDraftEdit,
   handleApprovalCallback,
-  pendingActionAgeMs,
   sendPendingDraftByText,
+  type SendConfirmation,
 } from "./approvals.js";
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
@@ -22,7 +22,6 @@ import {
   claimTelegramMessage,
   clearMessages,
   deleteMemory,
-  getLatestPendingSendAction,
   getMeetingBrief,
   getSetting,
   pruneProcessedMessages,
@@ -111,7 +110,7 @@ import {
   parseForgetQuery,
 } from "./memory_logic.js";
 import { quotedMessageText, withQuotedContext } from "./reply_context.js";
-import { isAmbiguousSendCommand, isSendDraftCommand } from "./send_triggers.js";
+import { isSendDraftCommand } from "./send_triggers.js";
 import {
   installNetworkRetry,
   redactBotToken,
@@ -120,7 +119,6 @@ import {
 } from "./telegram_io.js";
 
 const TYPING_REFRESH_MS = 4_000;
-const AMBIGUOUS_SEND_WINDOW_MS = 10 * 60 * 1000;
 
 export const bot = new Bot(config.telegramBotToken);
 installNetworkRetry(bot.api);
@@ -713,26 +711,17 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   if (await tryHandleMeetingChat(ctx, userText)) {
     return;
   }
-  // Short-circuit "send it" / "yes, send it" / "ok send" so Vishnu can
-  // dispatch the most recent pending draft without tapping the inline Send
-  // button. Runs before the LLM so no agent path can forge it; ownerOnly
-  // middleware above already fenced the chat. A bare "done" only counts as
-  // approval right after a draft card went out; otherwise it is ordinary chat.
-  const explicitSend = isSendDraftCommand(userText);
-  if (explicitSend || isAmbiguousSendCommand(userText)) {
-    const latest = getLatestPendingSendAction();
-    if (explicitSend && !latest) {
-      await ctx.reply("You don't have any pending drafts waiting for approval.");
-      return;
-    }
-    if (
-      latest &&
-      (explicitSend || pendingActionAgeMs(latest) <= AMBIGUOUS_SEND_WINDOW_MS)
-    ) {
-      const result = await sendPendingDraftByText(latest);
-      await ctx.reply(result.message);
-      return;
-    }
+  // Vishnu's own message (typed, or a voice transcript routed here). Any
+  // other way of saying "send it" is read by the model, which can only signal
+  // intent through confirm_send_pending_draft.
+  const confirmation: SendConfirmation | undefined =
+    ctx.chat && ctx.message
+      ? { chatId: ctx.chat.id, messageId: ctx.message.message_id }
+      : undefined;
+  if (confirmation && isSendDraftCommand(userText)) {
+    const result = await sendPendingDraftByText(confirmation);
+    await ctx.reply(result.message);
+    return;
   }
   // If the last thing Aadi showed was a forget-memory list and Vishnu
   // replied with an unambiguous batch answer like "both" or "1 and 2",
@@ -788,10 +777,11 @@ Call update_draft exactly once with the draft ID above and the complete revised 
         : accountQuestion
           ? "account_status"
           : undefined,
+      sendConfirmation: confirmation,
     }),
   );
   await sendPlainText(ctx, reply);
-  void captureFromUserMessage(ctx, userText).catch((error: unknown) => {
+  void captureFromUserMessage(userText).catch((error: unknown) => {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Memory capture failed (${errorType}).`);
   });

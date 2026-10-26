@@ -1,5 +1,7 @@
 import type { LlmTool } from "../llm.js";
+import type { SendConfirmation } from "../approvals.js";
 import * as accountStatus from "./account_status.js";
+import * as confirmSendPendingDraft from "./confirm_send_pending_draft.js";
 import * as addAccount from "./add_account.js";
 import * as addTask from "./add_task.js";
 import * as markBillPaid from "./mark_bill_paid.js";
@@ -46,9 +48,18 @@ import * as trackThread from "./track_thread.js";
 import * as updateAccount from "./update_account.js";
 import * as updateDraft from "./update_draft.js";
 
+export interface ToolTurn {
+  /** 1 = the model's first step, decided from Vishnu's message alone. */
+  iteration: number;
+  /** Every tool the model called in this same step. */
+  calledTools: readonly string[];
+  /** Present only when the turn is Vishnu's own chat message (typed or voice). */
+  confirmation?: SendConfirmation;
+}
+
 export interface RegisteredTool {
   definition: Extract<LlmTool, { type: "function" }>;
-  handler: (input: unknown) => string | Promise<string>;
+  handler: (input: unknown, turn: ToolTurn) => string | Promise<string>;
 }
 
 const modules = {
@@ -58,6 +69,7 @@ const modules = {
   add_task: addTask,
   cancel_reminder: cancelReminder,
   complete_task: completeTask,
+  confirm_send_pending_draft: confirmSendPendingDraft,
   delete_task: deleteTask,
   draft_mom: draftMom,
   draft_new_email: draftNewEmail,
@@ -148,6 +160,7 @@ export const TOOL_ORDER = [
   "delete_task",
   "read_draft",
   "draft_new_email",
+  "confirm_send_pending_draft",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(
