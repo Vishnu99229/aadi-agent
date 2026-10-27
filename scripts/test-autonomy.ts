@@ -12,10 +12,6 @@ import {
   similarity,
 } from "../src/dedupe.ts";
 import {
-  evaluateDraft,
-  resetEngineForTests,
-} from "../src/rules_engine.ts";
-import {
   findOptimalSlot,
   SchedulingTimeoutError,
   solveSync,
@@ -110,47 +106,6 @@ const match = findNearDuplicate(
 );
 assert.ok(match && match.record.id === 7, "near-dup should match the twin");
 
-// ---- Rules engine ----
-resetEngineForTests();
-// Facts for a brand-new domain: must require manual approval.
-const newDomainOutcome = await evaluateDraft({
-  is_known_client: false,
-  has_attachment: false,
-  domain_seen_count: 0,
-});
-assert.equal(newDomainOutcome?.kind, "require_manual_approval");
-assert.equal(newDomainOutcome?.rule, "block-auto-send-to-new-domains");
-
-// Known client, no attachment, seen >= 2 -> auto send approved.
-const autoOutcome = await evaluateDraft({
-  is_known_client: true,
-  has_attachment: false,
-  domain_seen_count: 10,
-});
-assert.equal(autoOutcome?.kind, "auto_send_approved");
-assert.equal(autoOutcome?.rule, "auto-approve-known-client-text-replies");
-assert.equal((autoOutcome as { cancelWindowMinutes: number }).cancelWindowMinutes, 5);
-
-// Known client WITH attachment: no rule fires -> null (safe default = manual).
-const withAttachment = await evaluateDraft({
-  is_known_client: true,
-  has_attachment: true,
-  domain_seen_count: 10,
-});
-assert.equal(withAttachment, null, "attachment must disqualify auto-send");
-
-// Known client but domain only seen once -> block-rule wins over auto.
-const borderline = await evaluateDraft({
-  is_known_client: true,
-  has_attachment: false,
-  domain_seen_count: 1,
-});
-assert.equal(
-  borderline?.kind,
-  "require_manual_approval",
-  "manual approval ALWAYS beats auto when both fire",
-);
-
 // ---- Scheduling CSP ----
 // Monday 2026-10-26 window 09:00-18:00 IST (03:30-12:30 UTC).
 const rangeStart = "2026-10-26T03:30:00Z";
@@ -235,4 +190,4 @@ const err = new SchedulingTimeoutError();
 assert.equal(err.name, "SchedulingTimeoutError");
 assert.match(err.message, /optimal slot|manual time/i);
 
-console.log("Autonomy stack checks passed.");
+console.log("Threading, dedupe and scheduling checks passed.");

@@ -45,7 +45,6 @@ import {
   signatureHtmlFor,
 } from "./google/mail.js";
 import { complete, completeBackground } from "./llm.js";
-import { buildAutonomyFacts } from "./autonomy_facts.js";
 import { rootAndLatest } from "./email_threading.js";
 
 const TIME_ZONE = "Asia/Kolkata";
@@ -997,10 +996,6 @@ export async function createFollowupDraftForApproval(
       body: plan.body,
       googleAccount: account.id,
       extraLines: cc ? [`Cc: ${cc}`] : undefined,
-      autonomyFacts: buildAutonomyFacts({
-        toHeader: to,
-        hasAttachment: false,
-      }),
     },
     { sendOnly },
   );

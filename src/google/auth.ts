@@ -1,6 +1,7 @@
 import { access, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { google, type Auth } from "googleapis";
+import { assertTestSeam } from "../test_seam.js";
 
 export const GOOGLE_API_TIMEOUT_MS = 30_000;
 google.options({ timeout: GOOGLE_API_TIMEOUT_MS });
@@ -250,9 +251,24 @@ export async function getGoogleClientFor(
   );
 }
 
+let testAccountHook:
+  | ((accountId: GoogleAccountId) => LoadedGoogleAccount | undefined)
+  | undefined;
+
+export function setGoogleAccountForTests(
+  hook: ((accountId: GoogleAccountId) => LoadedGoogleAccount | undefined) | undefined,
+): void {
+  assertTestSeam("setGoogleAccountForTests");
+  testAccountHook = hook;
+}
+
 export async function getGoogleAccount(
   accountId: GoogleAccountId,
 ): Promise<LoadedGoogleAccount> {
+  const override = testAccountHook?.(accountId);
+  if (override) {
+    return override;
+  }
   const account = (await loadGoogleAccounts()).find(
     (item) => item.id === accountId,
   );

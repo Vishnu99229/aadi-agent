@@ -1,8 +1,11 @@
 import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
-import { queueDraftApproval } from "../approvals.js";
-import { buildAutonomyFacts } from "../autonomy_facts.js";
+import {
+  queueDraftApproval,
+  sendCreatedDraftNow,
+} from "../approvals.js";
 import { parseGoogleAccountFilter } from "../google/auth.js";
+import type { ToolTurn } from "./index.js";
 import {
   buildThreadReplyMime,
   gmailClient,
@@ -17,7 +20,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "draft_reply",
   description:
-    "Create a Gmail reply draft in the same thread and mailbox. Never sends. Sending needs Telegram approval.",
+    "Create a Gmail reply draft in the same thread and mailbox. Set send_immediately true only when Vishnu explicitly asked to send in this chat turn; that sends now with no approval card. If he asked to draft, omit send_immediately so sending needs Telegram approval.",
   inputSchema: {
     type: "object",
     properties: {
@@ -52,6 +55,11 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
           { type: "string" },
           { type: "array", items: { type: "string" } },
         ],
+      },
+      send_immediately: {
+        type: "boolean",
+        description:
+          "True only when Vishnu explicitly asked to send this reply in this chat turn. Omit or false when he asked to draft it first.",
       },
     },
     required: ["email_id", "body"],
@@ -98,13 +106,14 @@ export function dropSelf(header: string): string {
     .join(", ");
 }
 
-export async function handler(input: unknown): Promise<string> {
+export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   const values = input as {
     email_id?: unknown;
     body?: unknown;
     account?: unknown;
     to?: unknown;
     cc?: unknown;
+    send_immediately?: unknown;
   };
   if (typeof values.email_id !== "string" || !values.email_id.trim()) {
     throw new Error("email_id must be a non-empty Gmail message ID.");
@@ -179,6 +188,18 @@ export async function handler(input: unknown): Promise<string> {
     throw new Error("Gmail created the draft without returning a draft ID.");
   }
 
+  const sendImmediately = values.send_immediately === true;
+  if (sendImmediately) {
+    const sent = await sendCreatedDraftNow({
+      draftId: result.data.id,
+      googleAccount: account.id,
+      confirmation: turn.confirmation,
+    });
+    if (sent.ok) {
+      return `Sent to ${to}.`;
+    }
+  }
+
   await queueDraftApproval({
     draftId: result.data.id,
     threadId,
@@ -187,13 +208,6 @@ export async function handler(input: unknown): Promise<string> {
     body: values.body,
     googleAccount: account.id,
     extraLines: cc ? [`Cc: ${cc}`] : undefined,
-    // draft_reply is always text-only (createThreadReplyDraft never
-    // attaches files), so has_attachment is a hard false here. If that
-    // ever changes, flip this to a real check against the Gmail draft.
-    autonomyFacts: buildAutonomyFacts({
-      toHeader: to,
-      hasAttachment: false,
-    }),
   });
 
   return JSON.stringify({

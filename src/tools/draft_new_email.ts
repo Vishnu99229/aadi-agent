@@ -1,5 +1,8 @@
 import type { LlmTool } from "../llm.js";
-import { queueDraftApproval } from "../approvals.js";
+import {
+  queueDraftApproval,
+  sendCreatedDraftNow,
+} from "../approvals.js";
 import { decodedAccounts } from "../accounts.js";
 import {
   formatMailboxList,
@@ -9,12 +12,13 @@ import { parseAddressList } from "../followup_logic.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor } from "../google/mail.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
+import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "draft_new_email",
   description:
-    "Create a new standalone Gmail draft (not a reply to any thread). Never sends. Sending needs Vishnu's Telegram Send tap. Default recipients: external (non-epicode.in) in To, epicode.in colleagues in Cc. If more than one external company is present, put the prospect (matched account or the person Vishnu named) in To and other externals in Cc. Pass cc yourself when you already split them; otherwise the tool splits a mixed To list using the subject as the hint.",
+    "Create a new standalone Gmail draft (not a reply to any thread). Set send_immediately true only when Vishnu explicitly asked to send in this chat turn; that sends now with no approval card. If he asked to draft, omit send_immediately so he gets Send / Edit / Discard. Default recipients: external (non-epicode.in) in To, epicode.in colleagues in Cc. If more than one external company is present, put the prospect (matched account or the person Vishnu named) in To and other externals in Cc. Pass cc yourself when you already split them; otherwise the tool splits a mixed To list using the subject as the hint.",
   inputSchema: {
     type: "object",
     properties: {
@@ -46,18 +50,24 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         description:
           "Mailbox to send from. Defaults to work (Epicode); use personal for a personal email.",
       },
+      send_immediately: {
+        type: "boolean",
+        description:
+          "True only when Vishnu explicitly asked to send this email in this chat turn (for example 'send an email to X' or 'email X saying Y'). Omit or false when he asked to draft it first.",
+      },
     },
     required: ["to", "subject", "body"],
   },
 };
 
-export async function handler(input: unknown): Promise<string> {
+export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   const values = input as {
     to?: unknown;
     cc?: unknown;
     subject?: unknown;
     body?: unknown;
     account?: unknown;
+    send_immediately?: unknown;
   };
   if (typeof values.to !== "string" || !values.to.trim()) {
     throw new Error("to must be a non-empty email address.");
@@ -103,6 +113,18 @@ export async function handler(input: unknown): Promise<string> {
     body: values.body,
     signatureHtml: await signatureHtmlFor(account),
   });
+
+  const sendImmediately = values.send_immediately === true;
+  if (sendImmediately) {
+    const sent = await sendCreatedDraftNow({
+      draftId,
+      googleAccount: account.id,
+      confirmation: turn.confirmation,
+    });
+    if (sent.ok) {
+      return `Sent to ${toHeader}.`;
+    }
+  }
 
   await queueDraftApproval({
     draftId,
