@@ -60,6 +60,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.132.1",
     "@google-cloud/local-auth": "^3.0.1",
+    "@google-cloud/vision": "^6.2.0",
     "better-sqlite3": "^12.11.1",
     "chrono-node": "^2.7.7",
     "dotenv": "^18.0.6",

@@ -416,6 +416,7 @@ export const config = {
   deepseekCostRates: readCostRates("DEEPSEEK", DEEPSEEK_FLASH_OFFPEAK_DEFAULTS),
   localCostRates: ZERO_COST_RATES,
   backupPassword: process.env.BACKUP_PASSWORD?.trim() ?? "",
+  googleVisionApiKey: process.env.GOOGLE_VISION_API_KEY?.trim() ?? "",
   cursorApiKey: process.env.CURSOR_API_KEY?.trim() ?? "",
   githubToken: process.env.GITHUB_TOKEN?.trim() ?? "",
   githubOwner: "Vishnu99229",

@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InlineKeyboard, type Context } from "grammy";
+import { getTaskBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import {
   createDocument,
@@ -28,8 +29,13 @@ import {
   detectDocumentKind,
   isSupportedAttachment,
 } from "./document_types.js";
+import { complete } from "./llm.js";
 import { composedSummaryText, extractPdfText } from "./pdf_text.js";
 import { recordRecentUpload } from "./recent_upload.js";
+import {
+  extractTextFromImage,
+  OCR_MIN_CHARS,
+} from "./vision_ocr.js";
 import { extractSpreadsheetText } from "./xlsx_text.js";
 
 export const DOCUMENT_READ_ERROR =
@@ -190,10 +196,11 @@ export async function ingestDocumentBytes(params: {
     } else if (kind === "xlsx") {
       storedText = extractSpreadsheetText(params.bytes);
     } else {
-      analysis = await analyzeImage(
+      const photo = await analyzePhotoBytes(
         params.bytes,
         imageMediaType(params.fileName, params.mimeType),
       );
+      analysis = photo.analysis;
       storedText = analysis.extracted_text || extractedFallback(analysis);
       pagesProcessed = 1;
     }
@@ -414,6 +421,79 @@ function extractedFallback(analysis: {
   ].join("\n");
 }
 
+function ocrPrompt(extractedText: string): string {
+  return `I have extracted the following text from an image via Google Cloud Vision OCR:
+
+<extracted_text>
+${extractedText}
+</extracted_text>
+
+Based on this text, please analyze the user's intent and respond accordingly.`;
+}
+
+async function analyzeExtractedImageText(
+  extractedText: string,
+): Promise<{ analysis: DocumentAnalysis; reply: string }> {
+  const result = await complete({
+    backend: getTaskBackend("chat"),
+    tools: [],
+    task: "document",
+    system: {
+      cacheable:
+        "You read OCR text from a photo Vishnu sent on Telegram. Plain text only. Be concise.",
+    },
+    messages: [{ role: "user", content: ocrPrompt(extractedText) }],
+  });
+  const reply = result.textParts.join("\n").trim();
+  const bullets = (reply || extractedText)
+    .split("\n")
+    .map((line) => line.replace(/^[-•\s]+/, "").trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  return {
+    reply: reply || extractedText.slice(0, 500),
+    analysis: {
+      tag: "personal",
+      document_type: "image",
+      summary_bullets: bullets,
+      dates: [],
+      money: [],
+      risks: [],
+      action_items: [],
+      extracted_text: extractedText,
+      pages_processed: 1,
+      truncated: false,
+      fallback_summary: true,
+      usage: {
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        estimatedCostUsd: result.usage.estimatedCostUsd,
+      },
+    },
+  };
+}
+
+export async function analyzePhotoBytes(
+  imageBytes: Uint8Array,
+  mediaType: "image/jpeg" | "image/png" | "image/webp",
+): Promise<{
+  analysis: DocumentAnalysis;
+  reply: string;
+  source: "ocr" | "vision-llm";
+}> {
+  const extractedText = await extractTextFromImage(Buffer.from(imageBytes));
+  if (extractedText.trim().length > OCR_MIN_CHARS) {
+    console.log(
+      `Vision OCR: using extracted text chars=${extractedText.trim().length}`,
+    );
+    const reasoned = await analyzeExtractedImageText(extractedText);
+    return { ...reasoned, source: "ocr" };
+  }
+  console.log("Vision OCR: empty, falling back to vision LLM");
+  const analysis = await analyzeImage(imageBytes, mediaType);
+  return { analysis, reply: "", source: "vision-llm" };
+}
+
 export async function processIncomingPhoto(ctx: Context): Promise<number | null> {
   const photos = ctx.message?.photo;
   if (!photos?.length) {
@@ -428,16 +508,21 @@ export async function processIncomingPhoto(ctx: Context): Promise<number | null>
   try {
     const largest = photos[photos.length - 1]!;
     const bytes = await downloadTelegramFile(ctx, largest.file_id);
-    const analysis = await analyzeImage(bytes, "image/jpeg");
+    const photo = await analyzePhotoBytes(bytes, "image/jpeg");
     persistAnalysis(
       record.id,
-      analysis,
-      analysis.extracted_text || extractedFallback(analysis),
+      photo.analysis,
+      photo.analysis.extracted_text || extractedFallback(photo.analysis),
     );
 
     const pending =
-      analysis.action_items.length > 0 ? analysis.action_items : null;
-    const reply = formatDocumentReply(record.id, analysis);
+      photo.analysis.action_items.length > 0
+        ? photo.analysis.action_items
+        : null;
+    const reply =
+      photo.source === "ocr"
+        ? `${photo.reply}\n\nDocument id: ${record.id} (use read_document for follow-ups)`
+        : formatDocumentReply(record.id, photo.analysis);
     const keyboard = pending ? documentKeyboard(record.id) : undefined;
     await ctx.reply(reply, keyboard ? { reply_markup: keyboard } : undefined);
     return record.id;
