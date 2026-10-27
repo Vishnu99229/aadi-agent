@@ -6,7 +6,10 @@ import {
   setPendingActionTelegramMessage,
 } from "../src/db.ts";
 import { plainTextBody } from "../src/google/mail.ts";
-import { isSendDraftCommand } from "../src/send_triggers.ts";
+import {
+  isAmbiguousSendAck,
+  isSendDraftCommand,
+} from "../src/send_triggers.ts";
 import {
   installNetworkRetry,
   redactBotToken,
@@ -46,6 +49,12 @@ function testSendCommands(): void {
   ];
   for (const text of notFastPath) {
     assert(!isSendDraftCommand(text), `not fast path: ${JSON.stringify(text)}`);
+  }
+  for (const text of ["ok", "Okay.", "k", "KK"]) {
+    assert(isAmbiguousSendAck(text), `ambiguous ack: ${JSON.stringify(text)}`);
+  }
+  for (const text of ["send it", "haan bhej do", "ok send", "yes"]) {
+    assert(!isAmbiguousSendAck(text), `not ambiguous ack: ${JSON.stringify(text)}`);
   }
 }
 

@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { assertTestSeam } from "./test_seam.js";
 
 export type MessageRole = "user" | "assistant";
 
@@ -36,6 +37,10 @@ export interface PendingAction {
   event_description: string | null;
   created_at: string;
   auto_send_at: string | null;
+  updated_at: string | null;
+  to_header: string | null;
+  cc_header: string | null;
+  subject: string | null;
 }
 
 export type ItemTag = "work" | "personal";
@@ -620,6 +625,22 @@ if (!tableHasColumn("pending_actions", "auto_send_at")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN auto_send_at TEXT`);
 }
 
+if (!tableHasColumn("pending_actions", "updated_at")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN updated_at TEXT`);
+  db.exec(
+    `UPDATE pending_actions SET updated_at = created_at WHERE updated_at IS NULL`,
+  );
+}
+if (!tableHasColumn("pending_actions", "to_header")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN to_header TEXT`);
+}
+if (!tableHasColumn("pending_actions", "cc_header")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN cc_header TEXT`);
+}
+if (!tableHasColumn("pending_actions", "subject")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN subject TEXT`);
+}
+
 // Dedupe metadata: when MinHash flags a near-duplicate we store the
 // MATCHED record's id here instead of silently dropping the new row.
 if (!tableHasColumn("tasks", "suspected_duplicate_of")) {
@@ -898,7 +919,8 @@ export function clearMessages(): void {
 
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
               telegram_message_id, event_title, event_start, event_end,
-              event_attendees, event_description, created_at, auto_send_at`;
+              event_attendees, event_description, created_at, auto_send_at,
+              updated_at, to_header, cc_header, subject`;
 
 export function createPendingAction(
   draftId: string,
@@ -1070,13 +1092,50 @@ export function transitionPendingAction(
   return result.changes === 1;
 }
 
+export function setPendingActionDraftMeta(
+  id: number,
+  meta: { toHeader: string; ccHeader: string; subject: string },
+): void {
+  db.prepare(
+    `UPDATE pending_actions
+     SET to_header = ?, cc_header = ?, subject = ?, updated_at = datetime('now')
+     WHERE id = ?`,
+  ).run(meta.toHeader, meta.ccHeader, meta.subject, id);
+}
+
+/** Tests only: pin created/updated so recency and 3-hour expiry are deterministic. */
+export function setPendingActionTimestampsForTests(
+  id: number,
+  timestamps: { createdAt?: string; updatedAt?: string },
+): void {
+  assertTestSeam("setPendingActionTimestampsForTests");
+  if (timestamps.createdAt) {
+    db.prepare(`UPDATE pending_actions SET created_at = ? WHERE id = ?`).run(
+      timestamps.createdAt,
+      id,
+    );
+  }
+  if (timestamps.updatedAt) {
+    db.prepare(`UPDATE pending_actions SET updated_at = ? WHERE id = ?`).run(
+      timestamps.updatedAt,
+      id,
+    );
+  }
+}
+
 export function getExpiredPendingActions(): PendingAction[] {
   return db
     .prepare(
       `SELECT ${PENDING_ACTION_COLUMNS}
        FROM pending_actions
        WHERE status = 'pending'
-         AND created_at <= datetime('now', '-24 hours')`,
+         AND (
+           (type = 'send_draft'
+            AND datetime(COALESCE(updated_at, created_at)) <= datetime('now', '-3 hours'))
+           OR
+           (type = 'create_event'
+            AND created_at <= datetime('now', '-24 hours'))
+         )`,
     )
     .all() as PendingAction[];
 }

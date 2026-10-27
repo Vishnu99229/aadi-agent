@@ -681,6 +681,14 @@ function testHistoryQuoteAndCalendar(): void {
     !shouldForceCalendarTool("remember to buy milk", []),
     "unrelated chat does not force the calendar",
   );
+  assert(
+    !shouldForceCalendarTool("create a meeting with Nitish tomorrow at 4pm", []),
+    "create-meeting requests do not force list_events",
+  );
+  assert(
+    !shouldForceCalendarTool("share the meeting link here", ["create_meeting"]),
+    "create_meeting satisfies the calendar guard",
+  );
 }
 
 testSkipRules();

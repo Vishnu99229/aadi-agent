@@ -123,7 +123,14 @@ export async function handler(input: unknown): Promise<string> {
       });
       for (const event of response.data.items ?? []) {
         const attendees = (event.attendees ?? [])
-          .map((attendee) => attendee.displayName ?? attendee.email)
+          .map((attendee) => {
+            const email = attendee.email?.trim() ?? "";
+            const name = attendee.displayName?.trim() ?? "";
+            if (email && name) {
+              return `${name} <${email}>`;
+            }
+            return email || name;
+          })
           .filter((name): name is string => Boolean(name));
         const startValue = event.start?.dateTime ?? event.start?.date ?? "";
         events.push({

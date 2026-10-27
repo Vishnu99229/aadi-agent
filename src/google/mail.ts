@@ -272,6 +272,7 @@ function encodeBody(body: string): string {
 export async function createNewEmailDraft(params: {
   account: LoadedGoogleAccount;
   to: string[];
+  cc?: string[];
   subject: string;
   body: string;
   /** HTML send-as signature; omitted means a plain-text-only draft. */
@@ -282,9 +283,11 @@ export async function createNewEmailDraft(params: {
   if (!toHeader) {
     throw new Error("Missing To header for draft");
   }
+  const ccHeader = (params.cc ?? []).map(safeHeader).filter(Boolean).join(", ");
   const raw = buildMimeMessage(
     [
       ["To", toHeader],
+      ["Cc", ccHeader],
       ["Subject", params.subject],
     ],
     params.body,

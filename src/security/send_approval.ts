@@ -66,3 +66,35 @@ export function allowCreateEvent(params: {
     throw new EventNotApprovedError();
   }
 }
+
+function requireOwnerChatConfirmation(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  if (
+    !confirmation ||
+    !Number.isSafeInteger(confirmation.chatId) ||
+    !Number.isSafeInteger(confirmation.messageId) ||
+    confirmation.messageId <= 0
+  ) {
+    throw new EventNotApprovedError();
+  }
+}
+
+/** Vishnu's own chat/voice turn is the approval for create_meeting.
+ *  Never call this from inbound email handling. */
+export function allowOwnerChatCreateEvent(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
+/** Vishnu's own chat/voice turn is the approval for delete_calendar_event.
+ *  Never call this from inbound email handling. */
+export function allowOwnerChatDeleteEvent(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}

@@ -38,10 +38,11 @@ import {
   claimTelegramMessage,
   createPendingAction,
   setPendingActionTelegramMessage,
+  setPendingActionTimestampsForTests,
   transitionPendingAction,
 } from "../src/db.ts";
 import {
-  pickConfirmedDraft,
+  pickLatestDraft,
   sendPendingDraftByText,
   setApprovalsTestHooks,
 } from "../src/approvals.ts";
@@ -78,6 +79,7 @@ import {
   EventNotApprovedError,
   SendNotApprovedError,
   allowCreateEvent,
+  allowOwnerChatCreateEvent,
   allowSendDraft,
   parseCreateEventApprovalCallback,
   parseSendApprovalCallback,
@@ -576,6 +578,7 @@ for (const file of toolFiles) {
 const messageSendFiles: string[] = [];
 const draftSendFiles: string[] = [];
 const eventInsertFiles: string[] = [];
+const eventDeleteFiles: string[] = [];
 for (const file of srcFiles) {
   if (file.endsWith("/google/test.ts")) {
     continue;
@@ -590,6 +593,9 @@ for (const file of srcFiles) {
   if (src.includes("events.insert")) {
     eventInsertFiles.push(file);
   }
+  if (src.includes("events.delete")) {
+    eventDeleteFiles.push(file);
+  }
 }
 assert(
   messageSendFiles.length === 1 && messageSendFiles[0]!.endsWith("/security/auto_book.ts"),
@@ -600,11 +606,30 @@ assert(
   `drafts.send only allowed in approvals.ts, found ${draftSendFiles.join(", ") || "none"}`,
 );
 const eventInsertAllowed = eventInsertFiles.every(
-  (file) => file.endsWith("/meeting_book.ts") || file.endsWith("/approvals.ts"),
+  (file) =>
+    file.endsWith("/meeting_book.ts") ||
+    file.endsWith("/approvals.ts") ||
+    file.endsWith("/owner_meeting.ts"),
 );
 assert(
-  eventInsertAllowed && eventInsertFiles.length <= 2,
-  `events.insert only allowed in meeting_book.ts (auto-book) and approvals.ts (approved create_event), found ${eventInsertFiles.join(", ") || "none"}`,
+  eventInsertAllowed && eventInsertFiles.length <= 3,
+  `events.insert only allowed in meeting_book.ts (auto-book), approvals.ts (approved create_event), and owner_meeting.ts (owner-chat create_meeting), found ${eventInsertFiles.join(", ") || "none"}`,
+);
+assert(
+  eventInsertFiles.some((file) => file.endsWith("/owner_meeting.ts")),
+  "owner_meeting.ts must be the create_meeting insert path",
+);
+const eventDeleteAllowed = eventDeleteFiles.every(
+  (file) =>
+    file.endsWith("/meeting_book.ts") || file.endsWith("/owner_calendar.ts"),
+);
+assert(
+  eventDeleteAllowed && eventDeleteFiles.length <= 2,
+  `events.delete only allowed in meeting_book.ts and owner_calendar.ts (owner-chat delete_calendar_event), found ${eventDeleteFiles.join(", ") || "none"}`,
+);
+assert(
+  eventDeleteFiles.some((file) => file.endsWith("/owner_calendar.ts")),
+  "owner_calendar.ts must be the delete_calendar_event path",
 );
 
 const meetingBookSrc = await readFile(join(root, "src/meeting_book.ts"), "utf8");
@@ -630,6 +655,29 @@ const toolsIndex = await readFile(join(root, "src/tools/index.ts"), "utf8");
 assert(!/book_meeting|send_email|create_event/.test(toolsIndex), "no model send/book tools");
 assert(!/sendSchedulingEmail|messages.send/.test(toolsIndex), "model tools have no send");
 assert(!/calendar\.events/.test(toolsIndex), "model tools have no calendar write");
+assert(
+  toolsIndex.includes("create_meeting"),
+  "create_meeting is registered for owner-chat booking",
+);
+const ownerMeetingSrc = await readFile(join(root, "src/owner_meeting.ts"), "utf8");
+assert(
+  ownerMeetingSrc.includes('sendUpdates: event.sendUpdates') ||
+    ownerMeetingSrc.includes('sendUpdates: "all"'),
+  "owner-chat meetings email the invite",
+);
+assert(
+  ownerMeetingSrc.includes("guestsCanSeeOtherGuests: true"),
+  "attendees can see each other",
+);
+const systemMd = await readFile(join(root, "prompts/system.md"), "utf8");
+assert(
+  systemMd.includes("Never claim you did something a tool did not confirm"),
+  "system prompt forbids claiming undone work",
+);
+assert(
+  systemMd.includes("Never offer or promise a capability that has no tool"),
+  "system prompt forbids offering missing tools",
+);
 
 function fakeWorkAccount(): LoadedGoogleAccount {
   return {
@@ -1122,18 +1170,22 @@ function ownerTurn(messageId: number, extra: Partial<ToolTurn> = {}): ToolTurn {
   };
 }
 
-// The confirm tool takes no input, so the model cannot choose what is sent.
 assert(
-  Object.keys(confirmSendDefinition.inputSchema.properties ?? {}).length === 0 &&
-    (confirmSendDefinition.inputSchema.required ?? []).length === 0,
-  "confirm_send_pending_draft takes no input",
+  (confirmSendDefinition.inputSchema.required ?? []).includes("draft_id"),
+  "confirm_send_pending_draft requires draft_id",
 );
 
 // A forged send intent with no pending draft sends nothing.
 {
-  const result = await confirmSendHandler({}, ownerTurn(nextMessageId()));
+  const result = await confirmSendHandler(
+    { draft_id: "forged-id" },
+    ownerTurn(nextMessageId()),
+  );
   assert(confirmGmail.sent.length === 0, "forged confirm with no pending draft sends nothing");
-  assert(result.includes("No draft is waiting"), "forged confirm says no draft is waiting");
+  assert(
+    /no draft is waiting|not in the pending set/i.test(result),
+    "forged confirm refuses",
+  );
 }
 
 // NEVER send a draft that was not shown before the confirming message.
@@ -1141,7 +1193,11 @@ assert(
   discardConfirmDrafts();
   const confirmingMessage = nextMessageId();
   const shownAfter = draftWithCard(nextMessageId());
-  await confirmSendHandler({}, ownerTurn(confirmingMessage));
+  const afterId = getPendingAction(shownAfter)!.draft_id!;
+  await confirmSendHandler(
+    { draft_id: afterId },
+    ownerTurn(confirmingMessage),
+  );
   const fastPath = await sendPendingDraftByText({
     chatId: ownerChat,
     messageId: confirmingMessage,
@@ -1153,7 +1209,10 @@ assert(
 {
   discardConfirmDrafts();
   const neverShown = draftWithCard(null);
-  await confirmSendHandler({}, ownerTurn(nextMessageId()));
+  await confirmSendHandler(
+    { draft_id: getPendingAction(neverShown)!.draft_id! },
+    ownerTurn(nextMessageId()),
+  );
   assert(confirmGmail.sent.length === 0, "a draft with no card (never shown) is never sent");
   assert(getPendingAction(neverShown)!.status === "pending", "the unshown draft stays pending");
 }
@@ -1172,7 +1231,7 @@ assert(
   const model = scriptedModel(() => ({
     tools: [
       { name: "draft_new_email", input: { to: "x@acme.com", subject: "s", body: "b" } },
-      { name: "confirm_send_pending_draft" },
+      { name: "confirm_send_pending_draft", input: { draft_id: "same-turn" } },
     ],
   }));
   setCompleteForTests(model.fake);
@@ -1191,50 +1250,96 @@ assert(
 // the same step, can confirm.
 {
   discardConfirmDrafts();
-  draftWithCard(nextMessageId());
+  const shown = draftWithCard(nextMessageId());
+  const draftId = getPendingAction(shown)!.draft_id!;
   const confirmingMessage = nextMessageId();
   const refusals = [
-    await confirmSendHandler({}, { iteration: 1, calledTools: ["confirm_send_pending_draft"] }),
-    await confirmSendHandler({}, ownerTurn(confirmingMessage, { iteration: 2 })),
     await confirmSendHandler(
-      {},
-      ownerTurn(confirmingMessage, { calledTools: ["update_draft", "confirm_send_pending_draft"] }),
+      { draft_id: draftId },
+      { iteration: 1, calledTools: ["confirm_send_pending_draft"] },
     ),
+    await confirmSendHandler(
+      { draft_id: draftId },
+      ownerTurn(confirmingMessage, { iteration: 2 }),
+    ),
+    await confirmSendHandler(
+      { draft_id: draftId },
+      ownerTurn(confirmingMessage, {
+        calledTools: ["update_draft", "confirm_send_pending_draft"],
+      }),
+    ),
+    await confirmSendHandler({}, ownerTurn(confirmingMessage)),
   ];
   assert(confirmGmail.sent.length === 0, "no send outside Vishnu's first step or alongside drafting");
   assert(refusals.every((text) => text.startsWith("Not sent")), "each refusal says not sent");
 }
 
-// Recency: the draft from the last two turns wins over clearly older ones;
-// two recent drafts make Aadi ask which.
+function hoursAgo(hours: number): string {
+  return new Date(Date.now() - hours * 3600_000)
+    .toISOString()
+    .slice(0, 19)
+    .replace("T", " ");
+}
+
+// Recency: most recently created or edited wins; two equal timestamps ask.
 {
   discardConfirmDrafts();
   const older = draftWithCard(nextMessageId());
-  claimTelegramMessage(ownerChat, nextMessageId());
-  claimTelegramMessage(ownerChat, nextMessageId());
   const recent = draftWithCard(nextMessageId());
-  await confirmSendHandler({}, ownerTurn(nextMessageId()));
+  setPendingActionTimestampsForTests(older, {
+    createdAt: hoursAgo(2),
+    updatedAt: hoursAgo(2),
+  });
+  setPendingActionTimestampsForTests(recent, {
+    createdAt: hoursAgo(1.5),
+    updatedAt: hoursAgo(0.2),
+  });
+  const sent = await sendPendingDraftByText({
+    chatId: ownerChat,
+    messageId: nextMessageId(),
+  });
+  assert(sent.ok, "fast path sends the most recently edited draft");
   assert(
-    confirmGmail.sent.length === 1 &&
-      confirmGmail.sent[0] === getPendingAction(recent)!.draft_id,
-    "confirm sends the draft from the last turns",
+    confirmGmail.sent.at(-1) === getPendingAction(recent)!.draft_id,
+    "latest edited draft is the one sent",
   );
   assert(getPendingAction(older)!.status === "pending", "the older draft is untouched");
 
   discardConfirmDrafts();
-  claimTelegramMessage(ownerChat, nextMessageId());
-  draftWithCard(nextMessageId());
-  claimTelegramMessage(ownerChat, nextMessageId());
-  draftWithCard(nextMessageId());
-  const asked = await confirmSendHandler({}, ownerTurn(nextMessageId()));
-  assert(confirmGmail.sent.length === 1, "two recent drafts: nothing more is sent");
-  assert(asked.includes("Which one"), "two recent drafts: Aadi asks which");
+  const left = draftWithCard(nextMessageId());
+  const right = draftWithCard(nextMessageId());
+  const tied = hoursAgo(0.3);
+  setPendingActionTimestampsForTests(left, {
+    createdAt: tied,
+    updatedAt: tied,
+  });
+  setPendingActionTimestampsForTests(right, {
+    createdAt: tied,
+    updatedAt: tied,
+  });
+  const asked = await sendPendingDraftByText({
+    chatId: ownerChat,
+    messageId: nextMessageId(),
+  });
+  assert(!asked.ok, "two equally recent drafts: nothing is sent");
+  assert(asked.message.includes("Which one"), "two equally recent drafts: Aadi asks which");
 }
-assert(pickConfirmedDraft([], [5, 3]) === undefined, "no shown drafts picks nothing");
+assert(pickLatestDraft([]) === undefined, "no shown drafts picks nothing");
+
+{
+  try {
+    allowOwnerChatCreateEvent(undefined);
+    throw new Error("owner-chat create must refuse without confirmation");
+  } catch (error) {
+    assert(error instanceof EventNotApprovedError, "owner-chat create is gated");
+  }
+  allowOwnerChatCreateEvent({ chatId: 1, messageId: 2 });
+}
 
 // Structure: the chat path selects only shown-first drafts, then gates, then sends.
 assert(
-  textSendFn.includes("listDraftsShownBefore(confirmation.messageId)"),
+  approvalsSrc.includes("listDraftsShownBefore(confirmation.messageId)") &&
+    textSendFn.includes("shownPendingDrafts(confirmation)"),
   "sendPendingDraftByText only considers drafts shown before the confirming message",
 );
 assert(

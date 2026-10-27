@@ -29,7 +29,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
       body: {
         type: "string",
         description:
-          'The complete plain-text reply body, written as Vishnu and ending with "Vishnu".',
+          "The complete plain-text reply body, written as Vishnu. Do not add a sign-off or name; Gmail appends the signature.",
       },
       account: {
         type: "string",

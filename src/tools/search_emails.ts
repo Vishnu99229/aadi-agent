@@ -64,7 +64,7 @@ async function searchAccount(
         userId: "me",
         id: message.id!,
         format: "metadata",
-        metadataHeaders: ["From", "Subject", "Date"],
+        metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
       });
       const headers = response.data.payload?.headers;
 
@@ -73,6 +73,8 @@ async function searchAccount(
         tag: account.tag,
         id: response.data.id ?? message.id,
         from: header(headers, "From"),
+        to: header(headers, "To"),
+        cc: header(headers, "Cc"),
         subject: header(headers, "Subject"),
         date: header(headers, "Date"),
         snippet: response.data.snippet ?? "",

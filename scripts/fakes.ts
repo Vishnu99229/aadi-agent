@@ -38,12 +38,23 @@ export function fakeTelegramApi(log: TelegramLog): Api {
 export interface GmailLog {
   sent: string[];
   created: string[];
+  deleted?: string[];
+}
+
+export interface FakeDraftMeta {
+  to?: string;
+  cc?: string;
+  subject?: string;
+  body?: string;
 }
 
 export const TEST_SIGNATURE_HTML =
   '<div dir="ltr">Vishnu Rajan<br>GTM, Epicode &amp; Partners</div>';
 
-export function fakeGmail(log: GmailLog): gmail_v1.Gmail {
+export function fakeGmail(
+  log: GmailLog,
+  drafts: Record<string, FakeDraftMeta> = {},
+): gmail_v1.Gmail {
   return {
     users: {
       drafts: {
@@ -51,15 +62,34 @@ export function fakeGmail(log: GmailLog): gmail_v1.Gmail {
           log.sent.push(requestBody.id);
           return { data: { id: `sent-${requestBody.id}` } };
         },
-        get: async ({ id }: { id: string }) => ({
-          data: {
-            id,
-            message: {
-              payload: { headers: [{ name: "To", value: "Priya <priya@acme.com>" }] },
+        get: async ({ id }: { id: string }) => {
+          const meta = drafts[id] ?? {};
+          const headers = [
+            { name: "To", value: meta.to ?? "Priya <priya@acme.com>" },
+            { name: "Cc", value: meta.cc ?? "" },
+            { name: "Subject", value: meta.subject ?? "Demo" },
+          ];
+          const body = meta.body ?? "Hello";
+          return {
+            data: {
+              id,
+              message: {
+                threadId: `thread-${id}`,
+                payload: {
+                  headers,
+                  mimeType: "text/plain",
+                  body: {
+                    data: Buffer.from(body, "utf8").toString("base64url"),
+                  },
+                },
+              },
             },
-          },
-        }),
-        delete: async () => ({ data: {} }),
+          };
+        },
+        delete: async ({ id }: { id: string }) => {
+          log.deleted?.push(id);
+          return { data: {} };
+        },
         create: async ({
           requestBody,
         }: {

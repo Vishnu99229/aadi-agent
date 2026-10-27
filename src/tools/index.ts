@@ -2,12 +2,16 @@ import type { LlmTool } from "../llm.js";
 import type { SendConfirmation } from "../approvals.js";
 import * as accountStatus from "./account_status.js";
 import * as confirmSendPendingDraft from "./confirm_send_pending_draft.js";
+import * as createMeeting from "./create_meeting.js";
+import * as discardPendingDraft from "./discard_pending_draft.js";
+import * as resendDraftCard from "./resend_draft_card.js";
 import * as addAccount from "./add_account.js";
 import * as addTask from "./add_task.js";
 import * as markBillPaid from "./mark_bill_paid.js";
 import * as removeDate from "./remove_date.js";
 import * as cancelReminder from "./cancel_reminder.js";
 import * as completeTask from "./complete_task.js";
+import * as deleteCalendarEvent from "./delete_calendar_event.js";
 import * as deleteTask from "./delete_task.js";
 import * as forgetMemory from "./forget_memory.js";
 import * as ignoreBill from "./ignore_bill.js";
@@ -55,6 +59,8 @@ export interface ToolTurn {
   calledTools: readonly string[];
   /** Present only when the turn is Vishnu's own chat message (typed or voice). */
   confirmation?: SendConfirmation;
+  /** Vishnu's own words for this turn (no quoted-message wrapper). */
+  userText?: string;
 }
 
 export interface RegisteredTool {
@@ -70,6 +76,9 @@ const modules = {
   cancel_reminder: cancelReminder,
   complete_task: completeTask,
   confirm_send_pending_draft: confirmSendPendingDraft,
+  create_meeting: createMeeting,
+  delete_calendar_event: deleteCalendarEvent,
+  discard_pending_draft: discardPendingDraft,
   delete_task: deleteTask,
   draft_mom: draftMom,
   draft_new_email: draftNewEmail,
@@ -90,6 +99,7 @@ const modules = {
   list_waiting: listWaiting,
   mark_bill_paid: markBillPaid,
   propose_calendar_event: proposeCalendarEvent,
+  resend_draft_card: resendDraftCard,
   read_attachment: readAttachment,
   read_document: readDocument,
   read_draft: readDraft,
@@ -138,6 +148,8 @@ export const TOOL_ORDER = [
   "list_waiting",
   "mark_bill_paid",
   "propose_calendar_event",
+  "create_meeting",
+  "delete_calendar_event",
   "read_attachment",
   "read_document",
   "read_drive_file",
@@ -161,6 +173,8 @@ export const TOOL_ORDER = [
   "read_draft",
   "draft_new_email",
   "confirm_send_pending_draft",
+  "discard_pending_draft",
+  "resend_draft_card",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(

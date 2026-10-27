@@ -7,6 +7,7 @@ import type {
 import { getTaskBackend, getTaskEffort } from "./chat_backend.js";
 import { config } from "./config.js";
 import type { DocumentActionItem, ItemTag } from "./db.js";
+import { complete, type LlmBackend, type LlmContentPart } from "./llm.js";
 import { estimateLlmCostUsd, isHaiku55Model, logAnthropicUsage } from "./usage.js";
 
 const MAX_PDF_PAGES = 50;
@@ -507,26 +508,94 @@ export async function analyzePdf(
   return withPages(merged, pagesProcessed, truncated, parts.some((part) => part.fallback_summary));
 }
 
+/** Image OCR never follows the Chat /model picker. DeepSeek has no vision. */
+export const IMAGE_VISION_BACKENDS: readonly LlmBackend[] = ["haiku", "gemini"];
+
+function parseJsonObject(text: string): unknown {
+  const trimmed = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  return JSON.parse(trimmed);
+}
+
 export async function analyzeImage(
   imageBytes: Uint8Array,
   mediaType: "image/jpeg" | "image/png" | "image/webp",
 ): Promise<DocumentAnalysis> {
-  return analyzeContent(
-    [
-      {
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: mediaType,
-          data: Buffer.from(imageBytes).toString("base64"),
+  const data = Buffer.from(imageBytes).toString("base64");
+  const userContent: LlmContentPart[] = [
+    { type: "image", mediaType, data },
+    {
+      type: "text",
+      text: `${analysisPrompt}\nThis is a photo of a document.`,
+    },
+  ];
+  let lastError: unknown;
+  for (const backend of IMAGE_VISION_BACKENDS) {
+    try {
+      const result = await complete({
+        backend,
+        tools: [],
+        task: "document",
+        system: {
+          cacheable:
+            "Extract facts from this image for Vishnu. Reply with JSON only.",
         },
-      },
-    ],
-    "This is a photo of a document.",
-    1,
-    false,
-    "photo",
-  );
+        messages: [{ role: "user", content: userContent }],
+        jsonSchema: backend === "gemini" ? undefined : analysisSchema,
+      });
+      const text = result.textParts.join("\n").trim();
+      if (!text) {
+        throw new Error("Vision model returned empty text.");
+      }
+      const usage = {
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        estimatedCostUsd: result.usage.estimatedCostUsd,
+      };
+      try {
+        return withPages(
+          { analysis: normalizeAnalysis(parseJsonObject(text)), usage },
+          1,
+          false,
+          false,
+        );
+      } catch {
+        const bullets = text
+          .split("\n")
+          .map((line) => line.replace(/^[-•\s]+/, "").trim())
+          .filter(Boolean)
+          .slice(0, 5);
+        return withPages(
+          {
+            analysis: {
+              tag: "personal",
+              document_type: "document",
+              summary_bullets: bullets,
+              dates: [],
+              money: [],
+              risks: [],
+              action_items: [],
+              extracted_text: text,
+            },
+            usage,
+          },
+          1,
+          false,
+          true,
+        );
+      }
+    } catch (error) {
+      lastError = error;
+      console.error(
+        `Image vision (${backend}) failed (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Image vision failed on every vision backend.");
 }
 
 export async function analyzeText(

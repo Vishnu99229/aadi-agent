@@ -35,6 +35,9 @@ import { extractSpreadsheetText } from "./xlsx_text.js";
 export const DOCUMENT_READ_ERROR =
   "I couldn't read that file properly, try sending it again.";
 
+export const IMAGE_READ_ERROR =
+  "I couldn't read the text in this image. Please type it out.";
+
 const TELEGRAM_MAX_BYTES = 20 * 1024 * 1024;
 
 function telegramFileUrl(filePath: string): string {
@@ -442,7 +445,7 @@ export async function processIncomingPhoto(ctx: Context): Promise<number | null>
     console.error(
       `Document ${record.id} analysis failed (${error instanceof Error ? error.message : String(error)}).`,
     );
-    await ctx.reply(DOCUMENT_READ_ERROR);
+    await ctx.reply(IMAGE_READ_ERROR);
     return record.id;
   }
 }

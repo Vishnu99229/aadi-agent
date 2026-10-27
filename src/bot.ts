@@ -57,6 +57,7 @@ import { sendWeeklyReview } from "./weekly.js";
 import { handleReminderCallback } from "./reminders.js";
 import {
   DOCUMENT_READ_ERROR,
+  IMAGE_READ_ERROR,
   handleDocumentCallback,
   ingestDocumentBytes,
   ingestDocumentText,
@@ -898,7 +899,7 @@ bot.on("message:photo", async (ctx) => {
     } catch (error) {
       const errorType = error instanceof Error ? error.name : "UnknownError";
       console.error(`Document photo failed (${errorType}).`);
-      await ctx.reply(DOCUMENT_READ_ERROR);
+      await ctx.reply(IMAGE_READ_ERROR);
     }
     return;
   }
@@ -907,7 +908,7 @@ bot.on("message:photo", async (ctx) => {
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Document photo failed (${errorType}).`);
-    await ctx.reply(DOCUMENT_READ_ERROR);
+    await ctx.reply(IMAGE_READ_ERROR);
   }
 });
 

@@ -7,6 +7,7 @@ import { bot } from "../src/bot.ts";
 import {
   claimTelegramMessage,
   createPendingAction,
+  getLatestPendingSendAction,
   getPendingAction,
   listMemories,
   setPendingActionTelegramMessage,
@@ -72,7 +73,15 @@ await bot.init();
 let background = '{"facts":[]}';
 const model = scriptedModel((text): ScriptedStep => {
   if (SEND_PHRASES.includes(text)) {
-    return { tools: [{ name: "confirm_send_pending_draft" }] };
+    const latest = getLatestPendingSendAction();
+    return {
+      tools: [
+        {
+          name: "confirm_send_pending_draft",
+          input: { draft_id: latest?.draft_id ?? "" },
+        },
+      ],
+    };
   }
   if (text === "change the time to 3pm") {
     return { tools: [{ name: "update_draft", input: { draft_id: "x", body: "3pm" } }] };

@@ -16,18 +16,26 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "update_draft",
   description:
-    "Update an existing Gmail draft without sending it: replace its plain-text body, its Cc list, or both. Preserves To, subject and thread. Returns the draft ID. Sending requires separate Telegram approval and is not available to this tool.",
+    "Update an existing Gmail draft in place without sending it: replace its To list, Cc list, plain-text body, or any combination. Preserves subject and thread. Refreshes the existing approval card; do not create a new draft to change recipients. Sending requires separate Telegram approval and is not available to this tool.",
   inputSchema: {
     type: "object",
     properties: {
       draft_id: {
         type: "string",
-        description: "The Gmail draft ID returned by draft_reply.",
+        description: "The Gmail draft ID returned by draft_reply or draft_new_email.",
+      },
+      to: {
+        description:
+          "Replacement To list: one or more email addresses or RFC headers. Replaces the whole To line. Omit to keep the current To.",
+        oneOf: [
+          { type: "string" },
+          { type: "array", items: { type: "string" } },
+        ],
       },
       body: {
         type: "string",
         description:
-          'The complete replacement plain-text body, written as Vishnu and ending with "Vishnu". Omit to keep the current body unchanged (for example when only changing Cc).',
+          "The complete replacement plain-text body, written as Vishnu. Do not add a sign-off or name; Gmail appends the signature. Omit to keep the current body unchanged (for example when only changing recipients).",
       },
       cc: {
         description:
@@ -47,7 +55,12 @@ function safeHeader(value: string): string {
 }
 
 export async function handler(input: unknown): Promise<string> {
-  const values = input as { draft_id?: unknown; body?: unknown; cc?: unknown };
+  const values = input as {
+    draft_id?: unknown;
+    body?: unknown;
+    cc?: unknown;
+    to?: unknown;
+  };
   if (typeof values.draft_id !== "string" || !values.draft_id.trim()) {
     throw new Error("draft_id must be a non-empty Gmail draft ID.");
   }
@@ -57,8 +70,12 @@ export async function handler(input: unknown): Promise<string> {
   ) {
     throw new Error("body must be a non-empty plain-text reply when given.");
   }
-  if (values.body === undefined && values.cc === undefined) {
-    throw new Error("Pass body, cc, or both.");
+  if (
+    values.body === undefined &&
+    values.cc === undefined &&
+    values.to === undefined
+  ) {
+    throw new Error("Pass body, to, cc, or a combination.");
   }
 
   const pending = getPendingActionForDraft(values.draft_id.trim());
@@ -71,7 +88,10 @@ export async function handler(input: unknown): Promise<string> {
   const headers = message?.payload?.headers;
   const threadId = message?.threadId;
 
-  const to = header(headers, "To");
+  const to =
+    values.to === undefined
+      ? header(headers, "To")
+      : dropSelf(toAddressList(values.to).join(", "));
   const subject = header(headers, "Subject");
   if (!message || !threadId || !to) {
     throw new Error("The Gmail draft is missing its recipient metadata.");
@@ -121,6 +141,7 @@ export async function handler(input: unknown): Promise<string> {
     draftId,
     threadId,
     to: safeHeader(to),
+    cc: cc ? safeHeader(cc) : undefined,
     subject: safeHeader(subject),
     body,
     googleAccount: account.id,
@@ -131,6 +152,7 @@ export async function handler(input: unknown): Promise<string> {
     draft_id: draftId,
     account: account.id,
     tag: account.tag,
+    to: safeHeader(to),
     cc: cc ? safeHeader(cc) : null,
   });
 }
