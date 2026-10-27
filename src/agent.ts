@@ -235,6 +235,7 @@ export async function runAgent(
       `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
       sendIntentContext(options.sendConfirmation),
       recentUpload,
+      "If Vishnu asked a specific question about a document or photo, answer only that question. Do not dump a full summary unless he asked for a summary.",
       memories,
       history.summary
         ? `Earlier conversation summary:\n${history.summary}`

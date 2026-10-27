@@ -141,10 +141,12 @@ export async function ingestDocumentBytes(params: {
   bytes: Uint8Array;
   tag: ItemTag;
   hint?: string;
+  userPrompt?: string;
 }): Promise<{
   documentId: number;
   reply: string;
   pendingActionItems: DocumentActionItem[] | null;
+  answeredPrompt?: boolean;
 }> {
   if (!isSupportedAttachment(params.fileName, params.mimeType)) {
     throw new Error(
@@ -199,10 +201,25 @@ export async function ingestDocumentBytes(params: {
       const photo = await analyzePhotoBytes(
         params.bytes,
         imageMediaType(params.fileName, params.mimeType),
+        params.userPrompt,
       );
       analysis = photo.analysis;
       storedText = analysis.extracted_text || extractedFallback(analysis);
       pagesProcessed = 1;
+      if (
+        params.userPrompt?.trim() &&
+        photo.source === "ocr" &&
+        photo.reply.trim()
+      ) {
+        persistAnalysis(record.id, analysis, storedText);
+        return {
+          documentId: record.id,
+          reply: photo.reply,
+          pendingActionItems:
+            analysis.action_items.length > 0 ? analysis.action_items : null,
+          answeredPrompt: true,
+        };
+      }
     }
 
     if (storedText) {
@@ -374,7 +391,7 @@ export async function processIncomingDocument(
   fileName: string,
   fileId: string,
   mimeType?: string,
-): Promise<number | null> {
+): Promise<{ documentId: number; answeredPrompt: boolean } | null> {
   if (!isSupportedAttachment(fileName, mimeType)) {
     await ctx.reply(
       "Send a PDF, DOCX, XLSX/XLS, or a photo of a document. Other formats are not supported yet.",
@@ -383,12 +400,14 @@ export async function processIncomingDocument(
   }
 
   try {
+    const userPrompt = ctx.message?.caption?.trim() ?? "";
     const bytes = await downloadTelegramFile(ctx, fileId);
     const result = await ingestDocumentBytes({
       fileName,
       mimeType,
       bytes,
       tag: "personal",
+      userPrompt: userPrompt || undefined,
     });
     const keyboard = result.pendingActionItems
       ? documentKeyboard(result.documentId)
@@ -397,7 +416,10 @@ export async function processIncomingDocument(
       result.reply,
       keyboard ? { reply_markup: keyboard } : undefined,
     );
-    return result.documentId;
+    return {
+      documentId: result.documentId,
+      answeredPrompt: result.answeredPrompt === true,
+    };
   } catch (error) {
     console.error(
       `Document analysis failed (${error instanceof Error ? error.message : String(error)}).`,
@@ -421,28 +443,39 @@ function extractedFallback(analysis: {
   ].join("\n");
 }
 
-function ocrPrompt(extractedText: string): string {
-  return `I have extracted the following text from an image via Google Cloud Vision OCR:
+function ocrPrompt(extractedText: string, userPrompt?: string): string {
+  const extracted = `I have extracted the following text from an image via Google Cloud Vision OCR:
 
 <extracted_text>
 ${extractedText}
-</extracted_text>
+</extracted_text>`;
+  const question = userPrompt?.trim();
+  if (question) {
+    return `The user asked: "${question}"
+
+${extracted}
+
+Answer ONLY the user's question based on this text. Do not summarize the entire document unless they asked for a summary. If the text does not contain the answer, say so briefly.`;
+  }
+  return `${extracted}
 
 Based on this text, please analyze the user's intent and respond accordingly.`;
 }
 
 async function analyzeExtractedImageText(
   extractedText: string,
+  userPrompt?: string,
 ): Promise<{ analysis: DocumentAnalysis; reply: string }> {
   const result = await complete({
     backend: getTaskBackend("chat"),
     tools: [],
     task: "document",
     system: {
-      cacheable:
-        "You read OCR text from a photo Vishnu sent on Telegram. Plain text only. Be concise.",
+      cacheable: userPrompt?.trim()
+        ? "You read OCR text from a photo Vishnu sent on Telegram. Answer only his question. Plain text only. Be concise."
+        : "You read OCR text from a photo Vishnu sent on Telegram. Plain text only. Be concise.",
     },
-    messages: [{ role: "user", content: ocrPrompt(extractedText) }],
+    messages: [{ role: "user", content: ocrPrompt(extractedText, userPrompt) }],
   });
   const reply = result.textParts.join("\n").trim();
   const bullets = (reply || extractedText)
@@ -476,6 +509,7 @@ async function analyzeExtractedImageText(
 export async function analyzePhotoBytes(
   imageBytes: Uint8Array,
   mediaType: "image/jpeg" | "image/png" | "image/webp",
+  userPrompt?: string,
 ): Promise<{
   analysis: DocumentAnalysis;
   reply: string;
@@ -484,9 +518,9 @@ export async function analyzePhotoBytes(
   const extractedText = await extractTextFromImage(Buffer.from(imageBytes));
   if (extractedText.trim().length > OCR_MIN_CHARS) {
     console.log(
-      `Vision OCR: using extracted text chars=${extractedText.trim().length}`,
+      `Vision OCR: using extracted text chars=${extractedText.trim().length} has_prompt=${Boolean(userPrompt?.trim())}`,
     );
-    const reasoned = await analyzeExtractedImageText(extractedText);
+    const reasoned = await analyzeExtractedImageText(extractedText, userPrompt);
     return { ...reasoned, source: "ocr" };
   }
   console.log("Vision OCR: empty, falling back to vision LLM");
@@ -494,11 +528,15 @@ export async function analyzePhotoBytes(
   return { analysis, reply: "", source: "vision-llm" };
 }
 
-export async function processIncomingPhoto(ctx: Context): Promise<number | null> {
+export async function processIncomingPhoto(
+  ctx: Context,
+): Promise<{ documentId: number; answeredPrompt: boolean } | null> {
   const photos = ctx.message?.photo;
   if (!photos?.length) {
     return null;
   }
+
+  const userPrompt = ctx.message?.caption?.trim() ?? "";
 
   // Store first so follow-up questions work even if analysis fails.
   const record = createDocument("photo-document.jpg", "personal", "", null);
@@ -508,7 +546,11 @@ export async function processIncomingPhoto(ctx: Context): Promise<number | null>
   try {
     const largest = photos[photos.length - 1]!;
     const bytes = await downloadTelegramFile(ctx, largest.file_id);
-    const photo = await analyzePhotoBytes(bytes, "image/jpeg");
+    const photo = await analyzePhotoBytes(
+      bytes,
+      "image/jpeg",
+      userPrompt || undefined,
+    );
     persistAnalysis(
       record.id,
       photo.analysis,
@@ -519,19 +561,29 @@ export async function processIncomingPhoto(ctx: Context): Promise<number | null>
       photo.analysis.action_items.length > 0
         ? photo.analysis.action_items
         : null;
+    const answeredPrompt = Boolean(userPrompt) && photo.source === "ocr";
+    if (answeredPrompt) {
+      const keyboard = pending ? documentKeyboard(record.id) : undefined;
+      await ctx.reply(photo.reply, keyboard ? { reply_markup: keyboard } : undefined);
+      return { documentId: record.id, answeredPrompt: true };
+    }
+    if (userPrompt) {
+      // Caption still needs an answer; vision-LLM stored text for the agent.
+      return { documentId: record.id, answeredPrompt: false };
+    }
     const reply =
       photo.source === "ocr"
         ? `${photo.reply}\n\nDocument id: ${record.id} (use read_document for follow-ups)`
         : formatDocumentReply(record.id, photo.analysis);
     const keyboard = pending ? documentKeyboard(record.id) : undefined;
     await ctx.reply(reply, keyboard ? { reply_markup: keyboard } : undefined);
-    return record.id;
+    return { documentId: record.id, answeredPrompt: false };
   } catch (error) {
     console.error(
       `Document ${record.id} analysis failed (${error instanceof Error ? error.message : String(error)}).`,
     );
     await ctx.reply(IMAGE_READ_ERROR);
-    return record.id;
+    return { documentId: record.id, answeredPrompt: false };
   }
 }
 

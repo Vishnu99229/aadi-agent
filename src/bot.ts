@@ -841,7 +841,7 @@ async function answerDocumentCaption(
 ): Promise<void> {
   const reply = await whileTyping(ctx, () =>
     runAgent(
-      `Vishnu's question about the document just uploaded (id ${documentId}, file "${fileName}"): ${caption}\nUse read_document with id ${documentId} to answer from its saved text.`,
+      `Vishnu's question about the document just uploaded (id ${documentId}, file "${fileName}"): ${caption}\nUse read_document with id ${documentId} to answer from its saved text. Answer ONLY this question. Do not summarize the entire document unless he asked for a summary.`,
       { task: "documents" },
     ),
   );
@@ -856,11 +856,21 @@ bot.on("message:document", async (ctx) => {
   const fileName = doc.file_name ?? "document.bin";
   const caption = ctx.message.caption?.trim() ?? "";
   try {
-    const documentId = await whileTyping(ctx, () =>
+    const ingested = await whileTyping(ctx, () =>
       processIncomingDocument(ctx, fileName, doc.file_id, doc.mime_type),
     );
-    if (documentId && caption && !isWrapUpText(caption)) {
-      await answerDocumentCaption(ctx, caption, documentId, fileName);
+    if (
+      ingested &&
+      caption &&
+      !isWrapUpText(caption) &&
+      !ingested.answeredPrompt
+    ) {
+      await answerDocumentCaption(
+        ctx,
+        caption,
+        ingested.documentId,
+        fileName,
+      );
     }
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -885,14 +895,14 @@ bot.on("message:photo", async (ctx) => {
       return;
     }
     try {
-      const documentId = await whileTyping(ctx, () =>
+      const ingested = await whileTyping(ctx, () =>
         processIncomingPhoto(ctx),
       );
-      if (documentId) {
+      if (ingested && !ingested.answeredPrompt) {
         await answerDocumentCaption(
           ctx,
           caption,
-          documentId,
+          ingested.documentId,
           "photo-document.jpg",
         );
       }
