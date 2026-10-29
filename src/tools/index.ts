@@ -6,6 +6,7 @@ import * as createMeeting from "./create_meeting.js";
 import * as discardPendingDraft from "./discard_pending_draft.js";
 import * as resendDraftCard from "./resend_draft_card.js";
 import * as addAccount from "./add_account.js";
+import * as addCalendarAttendee from "./add_calendar_attendee.js";
 import * as addTask from "./add_task.js";
 import * as markBillPaid from "./mark_bill_paid.js";
 import * as removeDate from "./remove_date.js";
@@ -71,6 +72,7 @@ export interface RegisteredTool {
 const modules = {
   account_status: accountStatus,
   add_account: addAccount,
+  add_calendar_attendee: addCalendarAttendee,
   add_date: addDate,
   add_task: addTask,
   cancel_reminder: cancelReminder,
@@ -126,6 +128,7 @@ const modules = {
 export const TOOL_ORDER = [
   "account_status",
   "add_account",
+  "add_calendar_attendee",
   "add_date",
   "add_task",
   "cancel_reminder",

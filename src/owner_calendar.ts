@@ -1,7 +1,10 @@
 import { google, type calendar_v3 } from "googleapis";
-import { loadGoogleAccounts, type GoogleAccountId } from "./google/auth.js";
+import { getGoogleAccount, loadGoogleAccounts, type GoogleAccountId } from "./google/auth.js";
 import { istInclusiveRange } from "./tools/list_events.js";
-import { allowOwnerChatDeleteEvent } from "./security/send_approval.js";
+import {
+  allowOwnerChatAddAttendee,
+  allowOwnerChatDeleteEvent,
+} from "./security/send_approval.js";
 import { assertTestSeam } from "./test_seam.js";
 
 const TIME_ZONE = "Asia/Kolkata";
@@ -18,8 +21,17 @@ interface OwnerCalendarHooks {
   list?: (query: {
     title: string;
     date?: string;
+    accountId?: GoogleAccountId;
   }) => Promise<OwnerCalendarEvent[]>;
   delete?: (event: OwnerCalendarEvent) => Promise<void>;
+  getAttendees?: (
+    event: OwnerCalendarEvent,
+  ) => Promise<Array<{ email?: string | null }>>;
+  patch?: (query: {
+    event: OwnerCalendarEvent;
+    attendees: Array<{ email?: string | null }>;
+    sendUpdates: string;
+  }) => Promise<void>;
 }
 
 let testHooks: OwnerCalendarHooks = {};
@@ -91,13 +103,18 @@ function startOfEvent(event: calendar_v3.Schema$Event): string {
 async function listMatchingEvents(
   title: string,
   date: string | undefined,
+  accountId?: GoogleAccountId,
 ): Promise<OwnerCalendarEvent[]> {
   if (testHooks.list) {
-    return testHooks.list({ title, date });
+    return testHooks.list({ title, date, accountId });
   }
   const range = searchRange(date);
   const found: OwnerCalendarEvent[] = [];
-  for (const account of await loadGoogleAccounts()) {
+  const loaded = await loadGoogleAccounts();
+  const accounts = accountId
+    ? loaded.filter((item) => item.id === accountId)
+    : loaded;
+  for (const account of accounts) {
     const calendar = google.calendar({ version: "v3", auth: account.client });
     const listed = await calendar.events.list({
       calendarId: "primary",
@@ -200,4 +217,111 @@ export async function deleteOwnerCalendarEvent(input: {
     return "Not deleted: Google Calendar refused the delete. Nothing was changed.";
   }
   return `Deleted event: ${event.title} on ${formatEventDate(event.start)}.`;
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+async function workCalendar() {
+  const account = await getGoogleAccount("work");
+  return google.calendar({ version: "v3", auth: account.client });
+}
+
+async function currentAttendees(
+  event: OwnerCalendarEvent,
+): Promise<Array<{ email?: string | null }>> {
+  if (testHooks.getAttendees) {
+    return testHooks.getAttendees(event);
+  }
+  const calendar = await workCalendar();
+  const got = await calendar.events.get({
+    calendarId: "primary",
+    eventId: event.eventId,
+  });
+  return got.data.attendees ?? [];
+}
+
+async function patchAttendees(
+  event: OwnerCalendarEvent,
+  attendees: Array<{ email?: string | null }>,
+): Promise<void> {
+  if (testHooks.patch) {
+    await testHooks.patch({ event, attendees, sendUpdates: "all" });
+    return;
+  }
+  const calendar = await workCalendar();
+  await calendar.events.patch({
+    calendarId: "primary",
+    eventId: event.eventId,
+    sendUpdates: "all",
+    requestBody: { attendees },
+  });
+}
+
+export async function addOwnerCalendarAttendee(input: {
+  eventTitle: string;
+  date?: string;
+  attendeeEmail: string;
+  confirmation: { chatId: number; messageId: number } | undefined;
+}): Promise<string> {
+  try {
+    allowOwnerChatAddAttendee(input.confirmation);
+  } catch {
+    return "Not added: only Vishnu's own chat message can add a calendar attendee.";
+  }
+
+  const title = input.eventTitle.trim();
+  const email = input.attendeeEmail.trim();
+  if (!title) {
+    return "Not added: I need the event title.";
+  }
+  if (!EMAIL_RE.test(email)) {
+    return "Not added: attendee_email must be an email address.";
+  }
+  if (input.date && !/^\d{4}-\d{2}-\d{2}$/.test(input.date)) {
+    return "Not added: date must be YYYY-MM-DD.";
+  }
+
+  let matches: OwnerCalendarEvent[];
+  try {
+    matches = await listMatchingEvents(title, input.date, "work");
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`add_calendar_attendee: list failed (${errorType})`);
+    return "Not added: I could not search the work calendar. Try again.";
+  }
+
+  if (matches.length === 0) {
+    return `Not added: no matching work event named "${title}".`;
+  }
+  if (matches.length > 1) {
+    const lines = matches.map((event, index) => formatMatch(event, index));
+    return `Not added: several matches — which one?\n${lines.join("\n")}`;
+  }
+
+  const event = matches[0]!;
+  let attendees: Array<{ email?: string | null }>;
+  try {
+    attendees = await currentAttendees(event);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`add_calendar_attendee: get failed (${errorType})`);
+    return "Not added: I could not read that event. Try again.";
+  }
+
+  const already = attendees.some(
+    (person) => (person.email ?? "").toLowerCase() === email.toLowerCase(),
+  );
+  if (already) {
+    return `Not added: ${email} is already on ${event.title}.`;
+  }
+
+  try {
+    await patchAttendees(event, [...attendees, { email }]);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`add_calendar_attendee: patch failed (${errorType})`);
+    return "Not added: Google Calendar refused the update. Nothing was changed.";
+  }
+  console.log(`add_calendar_attendee: patched eventId=${event.eventId}`);
+  return `Added ${email} to ${event.title}.`;
 }

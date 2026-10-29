@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import "dotenv/config";
 
 function ensureTestEnv(): void {
@@ -37,6 +38,11 @@ const {
   toMeetingAttendees,
 } = await import("../src/meeting_logic.ts");
 const { shouldForceCalendarTool } = await import("../src/calendar_guard.ts");
+const {
+  addOwnerCalendarAttendee,
+  resetOwnerCalendarTestHooks,
+  setOwnerCalendarTestHooks,
+} = await import("../src/owner_calendar.ts");
 const { calendarAccountIds, istInclusiveRange } = await import(
   "../src/tools/list_events.ts"
 );
@@ -689,6 +695,124 @@ function testHistoryQuoteAndCalendar(): void {
     !shouldForceCalendarTool("share the meeting link here", ["create_meeting"]),
     "create_meeting satisfies the calendar guard",
   );
+  assert(
+    shouldForceCalendarTool("what's on my calendar", []),
+    "explicit calendar questions still force list_events",
+  );
+  assert(
+    shouldForceCalendarTool("when is my next meeting", []),
+    "next-meeting questions still force list_events",
+  );
+  assert(
+    !shouldForceCalendarTool(
+      "Call notes: the meeting with Sujal went well, we stretched the 3pm Catch up",
+      [],
+    ),
+    "wrap-up notes do not force list_events",
+  );
+  assert(
+    !shouldForceCalendarTool("wrap up the Aspirare call, they want a follow-up meeting", []),
+    "wrap up prefix does not force list_events",
+  );
+  assert(
+    !shouldForceCalendarTool("The meeting with Sujal went well", []),
+    "mentioning a meeting in recap does not force list_events",
+  );
+  assert(
+    !shouldForceCalendarTool("add ashwini@epicode.in to the Catch up meeting", []),
+    "add-attendee requests do not force list_events",
+  );
+}
+
+async function testAddCalendarAttendee(): Promise<void> {
+  resetOwnerCalendarTestHooks();
+  const confirmation = { chatId: 1, messageId: 10 };
+  const catchup = {
+    accountId: "work" as const,
+    eventId: "evt-1",
+    title: "Catch up",
+    start: "2026-10-27T15:00:00+05:30",
+    attendeeCount: 1,
+  };
+
+  {
+    const reply = await addOwnerCalendarAttendee({
+      eventTitle: "Catch up",
+      attendeeEmail: "ashwini@epicode.in",
+      confirmation: undefined,
+    });
+    assert(
+      reply.startsWith("Not added: only Vishnu's own chat"),
+      "refused without confirmation",
+    );
+  }
+
+  {
+    const patches: Array<{
+      attendees: Array<{ email?: string | null }>;
+      sendUpdates: string;
+    }> = [];
+    setOwnerCalendarTestHooks({
+      list: async () => [catchup],
+      getAttendees: async () => [{ email: "vishnu@epicode.in" }],
+      patch: async (query) => {
+        patches.push({
+          attendees: query.attendees,
+          sendUpdates: query.sendUpdates,
+        });
+      },
+    });
+    const reply = await addOwnerCalendarAttendee({
+      eventTitle: "Catch up",
+      date: "2026-10-27",
+      attendeeEmail: "ashwini@epicode.in",
+      confirmation,
+    });
+    assert(patches.length === 1, "one match patches the event");
+    assert(patches[0]!.sendUpdates === "all", "patch sends updates to all attendees");
+    assert(
+      patches[0]!.attendees.some((person) => person.email === "ashwini@epicode.in"),
+      "patch includes the new attendee",
+    );
+    assert(
+      patches[0]!.attendees.some((person) => person.email === "vishnu@epicode.in"),
+      "patch keeps existing attendees",
+    );
+    assert(
+      reply === "Added ashwini@epicode.in to Catch up.",
+      `got ${reply}`,
+    );
+  }
+
+  {
+    const patches: unknown[] = [];
+    setOwnerCalendarTestHooks({
+      list: async () => [
+        catchup,
+        { ...catchup, eventId: "evt-2", start: "2026-10-28T10:00:00+05:30" },
+      ],
+      patch: async () => {
+        patches.push("patched");
+      },
+    });
+    const reply = await addOwnerCalendarAttendee({
+      eventTitle: "Catch up",
+      attendeeEmail: "ashwini@epicode.in",
+      confirmation,
+    });
+    assert(reply.startsWith("Not added: several matches"), "several matches ask");
+    assert(patches.length === 0, "several matches patches nothing");
+  }
+
+  const ownerSrc = await readFile(
+    new URL("../src/owner_calendar.ts", import.meta.url),
+    "utf8",
+  );
+  assert(
+    ownerSrc.includes('sendUpdates: "all"') && ownerSrc.includes("events.patch"),
+    "add_calendar_attendee patches with sendUpdates=all",
+  );
+  resetOwnerCalendarTestHooks();
 }
 
 testSkipRules();
@@ -702,4 +826,5 @@ testBriefRetimed();
 testMultiThresholdReminders();
 testBriefFiltering();
 testHistoryQuoteAndCalendar();
+await testAddCalendarAttendee();
 console.log("Stage 7 checks passed.");

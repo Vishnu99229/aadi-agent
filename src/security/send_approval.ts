@@ -101,6 +101,15 @@ export function allowOwnerChatDeleteEvent(confirmation: {
   requireOwnerChatConfirmation(confirmation);
 }
 
+/** Vishnu's own chat/voice turn is the approval for add_calendar_attendee.
+ *  Never call this from inbound email handling. */
+export function allowOwnerChatAddAttendee(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
 /** Vishnu's own chat/voice turn is the approval for send_immediately on
  *  draft_reply / draft_new_email. Never call this from inbound email. */
 export function allowOwnerChatSendDraft(confirmation: {
