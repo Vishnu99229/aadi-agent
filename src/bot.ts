@@ -129,6 +129,7 @@ import {
   beginTurn,
   closeTurn,
   formatTurnFailure,
+  retryKeyboard,
   retryTextFor,
   settleChatWork,
   turnTimeoutMs,
@@ -202,10 +203,6 @@ async function whileTyping<T>(
   } finally {
     stop();
   }
-}
-
-function retryKeyboard(turnId: number): InlineKeyboard {
-  return new InlineKeyboard().text("Retry", `retry:${turnId}`);
 }
 
 async function sendTurnFailure(

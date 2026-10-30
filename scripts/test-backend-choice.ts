@@ -274,7 +274,7 @@ assert(
 );
 
 clearMessages();
-for (let index = 0; index < 9; index += 1) {
+for (let index = 0; index < 31; index += 1) {
   saveMessage(index % 2 === 0 ? "user" : "assistant", `turn ${index}`);
 }
 setTaskBackend("chat", "gemini");

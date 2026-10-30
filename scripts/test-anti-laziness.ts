@@ -12,6 +12,7 @@ import {
   closeTurn,
   formatTurnFailure,
   formatTurnsHealthLine,
+  retryKeyboard,
   settleChatWork,
 } from "../src/turns.ts";
 import { modelReply } from "./fakes.ts";
@@ -78,6 +79,41 @@ async function testFakeModelSentClaimBlocked(): Promise<void> {
   setToolInterceptorForTests(undefined);
 }
 
+async function testRealToolSuccessAllowed(): Promise<void> {
+  setCompleteForTests(async (params) => {
+    if (params.tools.length === 0) {
+      return modelReply({ text: '{"facts":[]}' });
+    }
+    const last = params.messages.at(-1);
+    if (last?.role === "tool") {
+      return modelReply({ text: "I sent the email to Priya." });
+    }
+    return modelReply({
+      text: "",
+      tools: [{ name: "draft_reply", input: { send_immediately: true } }],
+    });
+  });
+  setToolInterceptorForTests(() => "Sent to priya@acme.com.");
+  const reply = await runAgent("send the Eternal email", {
+    saveUserMessage: false,
+    saveAssistantMessage: false,
+    skipHistory: true,
+  });
+  assert(
+    reply === "I sent the email to Priya.",
+    `successful send tool allows the claim, got: ${reply}`,
+  );
+  setCompleteForTests(undefined);
+  setToolInterceptorForTests(undefined);
+}
+
+function testRetryButton(): void {
+  const keyboard = retryKeyboard(42);
+  const row = keyboard.inline_keyboard[0]?.[0];
+  assert(row?.text === "Retry", "failure keyboard is labelled Retry");
+  assert(row?.callback_data === "retry:42", "Retry callback includes the turn id");
+}
+
 async function testThrownEmptyTimeout(): Promise<void> {
   const thrown = await settleChatWork(async () => {
     throw new Error("boom from model");
@@ -127,6 +163,8 @@ function testHealthCounts(): void {
 async function main(): Promise<void> {
   testReceiptDetection();
   await testFakeModelSentClaimBlocked();
+  await testRealToolSuccessAllowed();
+  testRetryButton();
   await testThrownEmptyTimeout();
   testHealthCounts();
   console.log("test-anti-laziness: ok");

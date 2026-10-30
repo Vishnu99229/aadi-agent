@@ -39,11 +39,16 @@ import {
   unreceiptedClaims,
   type ToolReceipt,
 } from "./receipt.js";
+import {
+  SUMMARISE_SYSTEM,
+  historyLimits,
+  planHistoryWindow,
+  redactSecrets,
+  stubLongToolOutputs,
+} from "./chat_history.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ITERATIONS = 8;
-const HISTORY_KEEP = 8;
-const HISTORY_LOOKBACK = 40;
 
 const webSearchTool: LlmTool = {
   type: "web_search",
@@ -119,15 +124,7 @@ async function runTool(
   }
 }
 
-function saveConversation(
-  userText: string,
-  reply: string,
-  saveUserMessage: boolean,
-  saveAssistantMessage: boolean,
-): string {
-  if (saveUserMessage) {
-    saveMessage("user", userText);
-  }
+function saveAssistantReply(reply: string, saveAssistantMessage: boolean): string {
   if (saveAssistantMessage) {
     saveMessage("assistant", reply);
   }
@@ -159,28 +156,51 @@ async function summariseOlderMessages(
   older: StoredMessage[],
   previous: string,
 ): Promise<string> {
-  const lines = older.map(
-    (message) => `${message.role}: ${message.content.slice(0, 400)}`,
-  );
+  const lines = older.map((message) => {
+    const body = redactSecrets(message.content).slice(0, 400);
+    return `${message.role}: ${body}`;
+  });
   const result = await complete({
     backend: getTaskBackend("chat"),
     effort: "low",
     cacheTtl: "5m",
     task: "other",
-    maxTokens: 400,
+    maxTokens: 500,
     tools: [],
     system: {
-      cacheable:
-        "Summarise this Telegram chat for Aadi. Keep names, dates, decisions, and open tasks. Plain text, under 120 words. No secrets.",
+      cacheable: SUMMARISE_SYSTEM,
     },
     messages: [
       {
         role: "user",
-        content: `${previous ? `Previous summary:\n${previous}\n\n` : ""}New turns:\n${lines.join("\n")}`,
+        content: redactSecrets(
+          `${previous ? `Previous summary:\n${previous}\n\n` : ""}New turns:\n${lines.join("\n")}`,
+        ),
       },
     ],
   });
-  return result.textParts.join("\n").trim() || previous;
+  return redactSecrets(result.textParts.join("\n").trim() || previous);
+}
+
+function storedToLlmMessages(stored: StoredMessage[]): LlmMessage[] {
+  const out: LlmMessage[] = [];
+  for (const message of stored) {
+    if (message.role === "user") {
+      out.push({ role: "user", content: message.content });
+      continue;
+    }
+    const last = out.at(-1);
+    if (last && last.role === "assistant") {
+      last.textParts.push(message.content);
+    } else {
+      out.push({
+        role: "assistant",
+        textParts: [message.content],
+        toolCalls: [],
+      });
+    }
+  }
+  return out;
 }
 
 async function historyForAgent(skipHistory: boolean): Promise<{
@@ -190,29 +210,38 @@ async function historyForAgent(skipHistory: boolean): Promise<{
   if (skipHistory) {
     return { summary: "", messages: [] };
   }
-  const all = getRecentMessages(HISTORY_LOOKBACK);
-  if (all.length <= HISTORY_KEEP) {
-    return {
-      summary: getSetting(CONVERSATION_SUMMARY_KEY) ?? "",
-      messages: all,
-    };
-  }
-  const older = all.slice(0, -HISTORY_KEEP);
-  const recent = all.slice(-HISTORY_KEEP);
-  const untilId = older.at(-1)!.id;
+  const lookback = historyLimits().keepMax + historyLimits().fold * 5;
+  const all = getRecentMessages(lookback);
   const storedUntil = Number(getSetting(CONVERSATION_SUMMARY_UNTIL_KEY) ?? 0);
   let summary = getSetting(CONVERSATION_SUMMARY_KEY) ?? "";
-  if (storedUntil !== untilId) {
+  const plan = planHistoryWindow(all, storedUntil);
+  let foldedBlocks = 0;
+  for (const block of plan.folds) {
+    const last = block.at(-1);
+    if (!last) {
+      continue;
+    }
     try {
-      summary = await summariseOlderMessages(older, summary);
+      summary = await summariseOlderMessages(block, summary);
+      foldedBlocks += 1;
       setSetting(CONVERSATION_SUMMARY_KEY, summary);
-      setSetting(CONVERSATION_SUMMARY_UNTIL_KEY, String(untilId));
+      setSetting(CONVERSATION_SUMMARY_UNTIL_KEY, String(last.id));
+      console.log(
+        `history fold: count=${block.length} until_id=${last.id}`,
+      );
     } catch (error) {
       const errorType = error instanceof Error ? error.name : "UnknownError";
       console.error(`Conversation summary failed (${errorType}).`);
+      break;
     }
   }
-  return { summary, messages: recent };
+  const dropped = plan.folds
+    .slice(0, foldedBlocks)
+    .reduce((count, block) => count + block.length, 0);
+  const remaining = stubLongToolOutputs(
+    all.filter((message) => message.id > storedUntil),
+  );
+  return { summary, messages: remaining.slice(dropped) };
 }
 
 function usageTaskForAgent(task: ModelTask | undefined): UsageTask {
@@ -241,6 +270,9 @@ export async function runAgent(
   const recentUpload = recentUploadLine();
   const memories = memoryContextLine(userText);
   const history = await historyForAgent(options.skipHistory === true);
+  if (saveUserMessage) {
+    saveMessage("user", userText);
+  }
   const system = {
     cacheable: basePrompt.trim(),
     dynamic: [
@@ -257,15 +289,7 @@ export async function runAgent(
       .join("\n"),
   };
 
-  const messages: LlmMessage[] = history.messages.map((message) =>
-    message.role === "user"
-      ? { role: "user", content: message.content }
-      : {
-          role: "assistant",
-          textParts: [message.content],
-          toolCalls: [],
-        },
-  );
+  const messages: LlmMessage[] = storedToLlmMessages(history.messages);
   messages.push({ role: "user", content: userText });
 
   const collectedText: string[] = [];
@@ -348,6 +372,9 @@ export async function runAgent(
           name: call.name,
           success: isSuccessfulToolResult(result.content, result.isError),
         });
+        if (saveAssistantMessage) {
+          saveMessage("tool", result.content, call.name);
+        }
       }
       messages.push({
         role: "assistant",
@@ -401,10 +428,8 @@ export async function runAgent(
     if (response.stopReason === "pause_turn") {
       const partialReply =
         collectedText.join("\n\n") || "I couldn't finish the request.";
-      return saveConversation(
-        userText,
+      return saveAssistantReply(
         `${partialReply}\n\nNote: the server-side tool continuation limit was reached.`,
-        saveUserMessage,
         saveAssistantMessage,
       );
     }
@@ -415,9 +440,6 @@ export async function runAgent(
       collectedText.at(-1) ||
       (reacted ? "" : "I couldn't produce a text response.");
     if (!finalReply) {
-      if (saveUserMessage) {
-        saveMessage("user", userText);
-      }
       succeeded = !toolFailed;
       return "";
     }
@@ -439,28 +461,19 @@ export async function runAgent(
       }
       console.log(`receipt check: blocked actions=${missing.join(",")}`);
       succeeded = !toolFailed;
-      return saveConversation(
-        userText,
+      return saveAssistantReply(
         receiptFailureMessage(missing),
-        saveUserMessage,
         saveAssistantMessage,
       );
     }
     succeeded = !toolFailed;
-    return saveConversation(
-      userText,
-      finalReply,
-      saveUserMessage,
-      saveAssistantMessage,
-    );
+    return saveAssistantReply(finalReply, saveAssistantMessage);
   }
 
   const partialReply =
     collectedText.join("\n\n") || "I couldn't finish the request.";
-  return saveConversation(
-    userText,
+  return saveAssistantReply(
     `${partialReply}\n\nNote: I hit the 8-iteration safety limit.`,
-    saveUserMessage,
     saveAssistantMessage,
   );
   } finally {

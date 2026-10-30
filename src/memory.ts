@@ -259,6 +259,7 @@ Do NOT extract facts from purely imperative scheduling or reminder commands ("Re
 Do NOT extract facts from requests for Aadi to do something now: draft, write, send or reply to an email, look something up, summarise a document. "Aadi plans to email X" is never a fact. Return [].
 Do NOT extract facts from commands that modify Aadi's database — "ignore that bill", "delete the task", "remove the Jio reminder", "mark it paid", "change the stage to closed", "clear my follow-ups", etc. Those are tool calls, not long-term facts. Return []. Only extract durable facts and preferences (deals, people, plans, decisions).
 Never invent. Never include passwords, OTPs, card/account numbers, or health details (omit those).
+Never store mood, tone, or how Vishnu sounded. Those belong only in the rolling conversation summary.
 event_date only for a specific calendar day, Asia/Kolkata, YYYY-MM-DD.
 If the message updates a candidate memory, set update_of_id to that id.
 At most 2 facts. Prefer one. Content under 140 characters.`,

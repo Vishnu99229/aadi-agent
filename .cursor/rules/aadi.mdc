@@ -55,7 +55,7 @@ Aadi is Vishnu's personal AI agent. Vishnu talks to it on Telegram. It answers q
 - Builds from Telegram auto-merge to main when checks pass; always git pull on the Mac before working there.
 
 ## Definition of done
-- Never say "tests pass" or "shipped" without pasting the actual command output.
-- Anything that touches Telegram, Gmail, Calendar, or a model needs a LIVE check with real output. Mocks are not proof.
-- Never claim it works on the phone until confirmed in the phone logs.
-- State explicitly if a step was skipped.
+- Never say "tests pass" or "shipped" without pasting the actual command output (tsc, test:security, npm test).
+- Anything that touches Telegram, Gmail, Calendar, or a model needs a LIVE check with real output shown. Mocks are not proof.
+- Never claim a feature works on the phone until confirmed in the phone logs after deploy.
+- If a step was skipped, say so explicitly.

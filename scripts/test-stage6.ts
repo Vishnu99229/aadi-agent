@@ -84,8 +84,9 @@ async function testSoftJobFailure(): Promise<void> {
 
 function testBillDedupeAndTools(): void {
   const uniqueDay = `2099-01-${String(Date.now() % 28 + 1).padStart(2, "0")}`;
-  const first = createBill("Test ISP", 999, "INR", uniqueDay, "thread-a");
-  const dup = createBill("Test ISP", 999, "INR", uniqueDay, "thread-b");
+  const vendor = `Test ISP ${Date.now()}`;
+  const first = createBill(vendor, 999, "INR", uniqueDay, "thread-a");
+  const dup = createBill(vendor, 999, "INR", uniqueDay, "thread-b");
   assert(first !== undefined, "bill created");
   assert(dup === undefined, "duplicate bill rejected");
   const listed = JSON.parse(listBills({ filter: "upcoming" })) as {

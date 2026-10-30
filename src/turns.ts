@@ -1,3 +1,4 @@
+import { InlineKeyboard } from "grammy";
 import { assertTestSeam } from "./test_seam.js";
 import {
   beginChatTurn as insertChatTurn,
@@ -29,6 +30,10 @@ export interface TurnGate {
 export function formatTurnFailure(reason: string): string {
   const clean = reason.replace(/\s+/g, " ").trim().slice(0, 180) || "unknown error";
   return `I couldn't finish that: ${clean}.`;
+}
+
+export function retryKeyboard(turnId: number): InlineKeyboard {
+  return new InlineKeyboard().text("Retry", `retry:${turnId}`);
 }
 
 export function beginTurn(): TurnGate {

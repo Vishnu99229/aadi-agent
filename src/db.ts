@@ -1,13 +1,14 @@
 import Database from "better-sqlite3";
 import { assertTestSeam } from "./test_seam.js";
 
-export type MessageRole = "user" | "assistant";
+export type MessageRole = "user" | "assistant" | "tool";
 
 export interface StoredMessage {
   id: number;
   role: MessageRole;
   content: string;
   created_at: string;
+  tool_name: string | null;
 }
 
 export type PendingActionStatus =
@@ -132,9 +133,10 @@ function tableHasColumn(table: string, column: string): boolean {
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tool_name TEXT
   );
 
   CREATE TABLE IF NOT EXISTS pending_actions (
@@ -592,6 +594,35 @@ db.exec(`
     ON chat_turns (started_at, outcome);
 `);
 
+{
+  const schema = db
+    .prepare(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+    )
+    .get() as { sql: string } | undefined;
+  const allowsTool = schema?.sql?.includes("'tool'") === true;
+  if (!allowsTool) {
+    const toolNameSelect = tableHasColumn("messages", "tool_name")
+      ? "tool_name"
+      : "NULL";
+    db.exec(`
+      CREATE TABLE messages_role_migrate (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        tool_name TEXT
+      );
+      INSERT INTO messages_role_migrate (id, role, content, created_at, tool_name)
+        SELECT id, role, content, created_at, ${toolNameSelect} FROM messages;
+      DROP TABLE messages;
+      ALTER TABLE messages_role_migrate RENAME TO messages;
+    `);
+  } else if (!tableHasColumn("messages", "tool_name")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN tool_name TEXT`);
+  }
+}
+
 // Promises tracker (Part 1): extend tasks with promise-specific columns.
 // All additive and nullable so existing rows stay valid.
 if (!tableHasColumn("tasks", "kind")) {
@@ -899,18 +930,22 @@ if (followupsSchema.includes("thread_id TEXT NOT NULL UNIQUE")) {
 }
 
 const insertMessage = db.prepare(
-  "INSERT INTO messages (role, content) VALUES (?, ?)",
+  "INSERT INTO messages (role, content, tool_name) VALUES (?, ?, ?)",
 );
 
-export function saveMessage(role: MessageRole, content: string): void {
-  insertMessage.run(role, content);
+export function saveMessage(
+  role: MessageRole,
+  content: string,
+  toolName?: string | null,
+): void {
+  insertMessage.run(role, content, role === "tool" ? toolName ?? "tool" : null);
 }
 
 export function getRecentMessages(limit = 10): StoredMessage[] {
   const safeLimit = Math.max(0, Math.floor(limit));
   const rows = db
     .prepare(
-      `SELECT id, role, content, created_at
+      `SELECT id, role, content, created_at, tool_name
        FROM messages
        ORDER BY id DESC
        LIMIT ?`,
