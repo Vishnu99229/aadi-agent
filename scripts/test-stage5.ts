@@ -9,6 +9,7 @@ import {
 } from "../src/db.ts";
 import { isWrapUpText, stripWrapUpPrefix } from "../src/wrapup_triggers.ts";
 import { handler as reactToMessage } from "../src/tools/react_to_message.ts";
+import { reactToSimpleGratitude } from "../src/gratitude.ts";
 import { PDFDocument } from "pdf-lib";
 
 function assert(condition: boolean, message: string): void {
@@ -128,6 +129,28 @@ async function testReactToMessage(): Promise<void> {
   assert(missing.startsWith("Not reacted:"), "no ctx does not claim a reaction");
 }
 
+async function testGratitudeIntercept(): Promise<void> {
+  const reacts: string[] = [];
+  const replies: string[] = [];
+  const ctx = {
+    react: async (emoji: string) => {
+      reacts.push(emoji);
+    },
+    reply: async (text: string) => {
+      replies.push(text);
+    },
+  };
+  const handled = await reactToSimpleGratitude("thanks aadi", ctx);
+  assert(handled, "thanks aadi is simple gratitude");
+  assert(reacts.join(",") === "❤️", 'ctx.react("❤️") is called');
+  assert(replies.length === 0, "no text reply is sent");
+
+  reacts.length = 0;
+  const skipped = await reactToSimpleGratitude("thanks, can you check my calendar", ctx);
+  assert(!skipped, "gratitude plus a question is not intercepted");
+  assert(reacts.length === 0, "non-simple thanks does not react in the interceptor");
+}
+
 async function main(): Promise<void> {
   testWrapUpTriggers();
   await testPdfTrim();
@@ -135,6 +158,7 @@ async function main(): Promise<void> {
   testNotesSearch();
   testDocumentExpiry();
   await testReactToMessage();
+  await testGratitudeIntercept();
   console.log("Stage 5 automated checks passed.");
 }
 

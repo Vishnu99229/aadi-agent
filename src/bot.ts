@@ -1,5 +1,6 @@
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { runAgent } from "./agent.js";
+import { reactToSimpleGratitude } from "./gratitude.js";
 import { findAccountByName } from "./account_logic.js";
 import { decodedAccounts } from "./accounts.js";
 import {
@@ -760,6 +761,14 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   const forgetQuery = parseForgetQuery(userText);
   if (forgetQuery) {
     await handleForgetQuery(ctx, forgetQuery);
+    return;
+  }
+
+  if (
+    await reactToSimpleGratitude(userText, {
+      react: (emoji) => ctx.react(emoji as never),
+    })
+  ) {
     return;
   }
 
