@@ -26,6 +26,7 @@ import {
   onMeetingDraftSent,
   registerMeetingBookingJobs,
 } from "./meeting_book.js";
+import { registerJobWorker } from "./job_worker.js";
 
 installOutboundHistory(bot.api);
 const morningBriefTask = registerMorningBrief(bot.api);
@@ -46,6 +47,7 @@ const attachmentAlertTask = registerAttachmentAlertScan(bot.api);
 const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
 setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
+const jobQueueTask = registerJobWorker(bot.api);
 await applyPendingDeployResult();
 const MENU_COMMANDS = [
   { command: "followups", description: "Scan and list emails waiting on a reply" },
@@ -56,6 +58,7 @@ const MENU_COMMANDS = [
   { command: "memory", description: "List saved memories and forget any" },
   { command: "meetings", description: "List auto-handled meeting threads" },
   { command: "reset", description: "Clear conversation history" },
+  { command: "jobs", description: "List running and recent big jobs" },
 ] as const;
 
 const COMMAND_SCOPES = [
@@ -98,6 +101,7 @@ process.once("SIGINT", () => {
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
   buildPollTask.stop();
+  jobQueueTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
@@ -117,6 +121,7 @@ process.once("SIGTERM", () => {
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
   buildPollTask.stop();
+  jobQueueTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);

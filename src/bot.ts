@@ -77,6 +77,12 @@ import {
 } from "./google/drive.js";
 import { deliverWrapUp, handleNoteCallback } from "./notes.js";
 import { START_GREETING } from "./start_greeting.js";
+import {
+  handleJobChatCommand,
+  jobsListText,
+  processNextJobStep,
+  tryStartBigJob,
+} from "./job_worker.js";
 import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
 import { transcribeTelegramVoice } from "./voice.js";
 import {
@@ -436,6 +442,10 @@ bot.command("followups", async (ctx) => {
   });
 });
 
+bot.command("jobs", async (ctx) => {
+  await ctx.reply(jobsListText());
+});
+
 bot.command("health", async (ctx) => {
   await sendPlainText(ctx, formatHealthReport());
 });
@@ -771,6 +781,15 @@ async function handleUserText(
     return;
   }
 
+  const jobCommand = handleJobChatCommand(userText);
+  if (jobCommand) {
+    await ctx.reply(jobCommand);
+    if (/^Continuing /i.test(jobCommand)) {
+      void processNextJobStep();
+    }
+    return;
+  }
+
   const session = reactionSessionFor(ctx);
   startContextualReaction(userText, session);
 
@@ -865,6 +884,24 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   if (forgetQuery) {
     await handleForgetQuery(ctx, forgetQuery);
     return;
+  }
+
+  if (ctx.chat) {
+    try {
+      const started = await whileTyping(ctx, () =>
+        tryStartBigJob({
+          ownerText: userText,
+          chatId: ctx.chat!.id,
+          api: ctx.api,
+        }),
+      );
+      if (started) {
+        return;
+      }
+    } catch (error) {
+      await ctx.reply(`I couldn't start that job: ${shortError(error)}`);
+      return;
+    }
   }
 
   const drafting =

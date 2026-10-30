@@ -46,6 +46,7 @@ export const HEALTH_JOBS = [
   "important-dates",
   "weekly-review",
   "weekly-backup",
+  "job-queue",
 ] as const;
 
 /**

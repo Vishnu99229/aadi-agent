@@ -227,6 +227,45 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_documents_created
     ON documents (created_at);
 
+  CREATE TABLE IF NOT EXISTS jobs (
+    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running'
+      CHECK (status IN ('running', 'done', 'failed', 'cancelled', 'paused')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    budget_usd REAL NOT NULL DEFAULT 0.5,
+    owner_text TEXT NOT NULL,
+    telegram_chat_id INTEGER,
+    telegram_message_id INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_jobs_status_updated
+    ON jobs (status, updated_at);
+
+  CREATE TABLE IF NOT EXISTS job_steps (
+    job_id INTEGER NOT NULL,
+    step_id TEXT NOT NULL,
+    step_order INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'running', 'done', 'failed', 'skipped')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    input_ref TEXT NOT NULL DEFAULT '{}',
+    done_condition TEXT NOT NULL,
+    result_ref TEXT,
+    done_check_passed INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    started_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (job_id, step_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_job_steps_job_order
+    ON job_steps (job_id, step_order);
+
   CREATE TABLE IF NOT EXISTS qa_bank (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     question TEXT NOT NULL,
@@ -3623,4 +3662,259 @@ export function countChatTurnsToday(now = new Date()): {
     }
   }
   return { failed, timeout };
+}
+
+export type JobStatus =
+  | "running"
+  | "done"
+  | "failed"
+  | "cancelled"
+  | "paused";
+
+export type JobStepStatus =
+  | "pending"
+  | "running"
+  | "done"
+  | "failed"
+  | "skipped";
+
+export interface JobRecord {
+  job_id: number;
+  title: string;
+  status: JobStatus;
+  created_at: string;
+  updated_at: string;
+  cost_usd: number;
+  budget_usd: number;
+  owner_text: string;
+  telegram_chat_id: number | null;
+  telegram_message_id: number | null;
+}
+
+export interface JobStepRecord {
+  job_id: number;
+  step_id: string;
+  step_order: number;
+  type: string;
+  status: JobStepStatus;
+  attempts: number;
+  depends_on: string;
+  input_ref: string;
+  done_condition: string;
+  result_ref: string | null;
+  done_check_passed: number;
+  error: string | null;
+  started_at: string | null;
+  updated_at: string;
+}
+
+const JOB_COLUMNS = `job_id, title, status, created_at, updated_at, cost_usd,
+  budget_usd, owner_text, telegram_chat_id, telegram_message_id`;
+
+const JOB_STEP_COLUMNS = `job_id, step_id, step_order, type, status, attempts,
+  depends_on, input_ref, done_condition, result_ref, done_check_passed, error,
+  started_at, updated_at`;
+
+export function createJob(input: {
+  title: string;
+  ownerText: string;
+  budgetUsd?: number;
+  telegramChatId?: number | null;
+  telegramMessageId?: number | null;
+}): JobRecord {
+  const result = db
+    .prepare(
+      `INSERT INTO jobs (title, owner_text, budget_usd, telegram_chat_id, telegram_message_id)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.title,
+      input.ownerText,
+      input.budgetUsd ?? 0.5,
+      input.telegramChatId ?? null,
+      input.telegramMessageId ?? null,
+    );
+  return getJob(Number(result.lastInsertRowid))!;
+}
+
+export function getJob(jobId: number): JobRecord | undefined {
+  return db
+    .prepare(`SELECT ${JOB_COLUMNS} FROM jobs WHERE job_id = ?`)
+    .get(jobId) as JobRecord | undefined;
+}
+
+export function listJobs(limit = 20): JobRecord[] {
+  const safe = Math.max(1, Math.min(50, Math.floor(limit)));
+  return db
+    .prepare(
+      `SELECT ${JOB_COLUMNS} FROM jobs
+       ORDER BY CASE status
+         WHEN 'running' THEN 0
+         WHEN 'paused' THEN 1
+         ELSE 2
+       END, updated_at DESC
+       LIMIT ?`,
+    )
+    .all(safe) as JobRecord[];
+}
+
+export function listActiveJobs(): JobRecord[] {
+  return db
+    .prepare(
+      `SELECT ${JOB_COLUMNS} FROM jobs
+       WHERE status IN ('running', 'paused')
+       ORDER BY created_at ASC`,
+    )
+    .all() as JobRecord[];
+}
+
+export function updateJob(
+  jobId: number,
+  update: {
+    status?: JobStatus;
+    telegramMessageId?: number | null;
+    telegramChatId?: number | null;
+    budgetUsd?: number;
+  },
+): void {
+  const current = getJob(jobId);
+  if (!current) {
+    return;
+  }
+  db.prepare(
+    `UPDATE jobs
+     SET status = ?,
+         telegram_message_id = ?,
+         telegram_chat_id = ?,
+         budget_usd = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE job_id = ?`,
+  ).run(
+    update.status ?? current.status,
+    update.telegramMessageId === undefined
+      ? current.telegram_message_id
+      : update.telegramMessageId,
+    update.telegramChatId === undefined
+      ? current.telegram_chat_id
+      : update.telegramChatId,
+    update.budgetUsd ?? current.budget_usd,
+    jobId,
+  );
+}
+
+export function addJobCost(jobId: number, usd: number): number {
+  const add = Number.isFinite(usd) ? Math.max(0, usd) : 0;
+  db.prepare(
+    `UPDATE jobs
+     SET cost_usd = cost_usd + ?, updated_at = CURRENT_TIMESTAMP
+     WHERE job_id = ?`,
+  ).run(add, jobId);
+  return getJob(jobId)?.cost_usd ?? 0;
+}
+
+export function insertJobStep(input: {
+  jobId: number;
+  stepId: string;
+  order: number;
+  type: string;
+  dependsOn: string[];
+  inputRef: unknown;
+  doneCondition: unknown;
+}): JobStepRecord {
+  db.prepare(
+    `INSERT INTO job_steps (
+       job_id, step_id, step_order, type, depends_on, input_ref, done_condition
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.jobId,
+    input.stepId,
+    input.order,
+    input.type,
+    JSON.stringify(input.dependsOn),
+    JSON.stringify(input.inputRef ?? {}),
+    JSON.stringify(input.doneCondition),
+  );
+  return getJobStep(input.jobId, input.stepId)!;
+}
+
+export function getJobStep(
+  jobId: number,
+  stepId: string,
+): JobStepRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${JOB_STEP_COLUMNS} FROM job_steps
+       WHERE job_id = ? AND step_id = ?`,
+    )
+    .get(jobId, stepId) as JobStepRecord | undefined;
+}
+
+export function listJobSteps(jobId: number): JobStepRecord[] {
+  return db
+    .prepare(
+      `SELECT ${JOB_STEP_COLUMNS} FROM job_steps
+       WHERE job_id = ?
+       ORDER BY step_order ASC`,
+    )
+    .all(jobId) as JobStepRecord[];
+}
+
+export function updateJobStep(
+  jobId: number,
+  stepId: string,
+  update: {
+    status?: JobStepStatus;
+    attempts?: number;
+    resultRef?: unknown;
+    doneCheckPassed?: boolean;
+    error?: string | null;
+    startedAt?: string | null;
+  },
+): void {
+  const current = getJobStep(jobId, stepId);
+  if (!current) {
+    return;
+  }
+  db.prepare(
+    `UPDATE job_steps
+     SET status = ?,
+         attempts = ?,
+         result_ref = ?,
+         done_check_passed = ?,
+         error = ?,
+         started_at = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE job_id = ? AND step_id = ?`,
+  ).run(
+    update.status ?? current.status,
+    update.attempts ?? current.attempts,
+    update.resultRef === undefined
+      ? current.result_ref
+      : JSON.stringify(update.resultRef),
+    update.doneCheckPassed === undefined
+      ? current.done_check_passed
+      : update.doneCheckPassed
+        ? 1
+        : 0,
+    update.error === undefined ? current.error : update.error,
+    update.startedAt === undefined ? current.started_at : update.startedAt,
+    jobId,
+    stepId,
+  );
+}
+
+export function recoverStuckJobSteps(olderThanMs: number, now = Date.now()): number {
+  const cutoff = new Date(now - olderThanMs).toISOString();
+  const result = db
+    .prepare(
+      `UPDATE job_steps
+       SET status = 'pending',
+           error = 'resumed after stuck running',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE status = 'running'
+         AND started_at IS NOT NULL
+         AND started_at <= ?`,
+    )
+    .run(cutoff);
+  return result.changes;
 }

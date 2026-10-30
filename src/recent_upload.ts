@@ -2,7 +2,7 @@
 
 const RECENT_WINDOW_MS = 30 * 60 * 1_000;
 
-interface RecentUpload {
+export interface RecentUpload {
   documentId: number;
   fileName: string;
   kind: string;
@@ -17,6 +17,13 @@ export function recordRecentUpload(
   kind: string,
 ): void {
   latest = { documentId, fileName, kind, uploadedAt: Date.now() };
+}
+
+export function getRecentUpload(now = Date.now()): RecentUpload | null {
+  if (!latest || now - latest.uploadedAt > RECENT_WINDOW_MS) {
+    return null;
+  }
+  return latest;
 }
 
 export function recentUploadLine(now = Date.now()): string | null {
