@@ -32,6 +32,13 @@ import {
 } from "./approvals.js";
 import { assertTestSeam } from "./test_seam.js";
 import type { ReactionSession } from "./contextual_react.js";
+import {
+  isSuccessfulToolResult,
+  receiptFailureMessage,
+  receiptRetryPrompt,
+  unreceiptedClaims,
+  type ToolReceipt,
+} from "./receipt.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ITERATIONS = 8;
@@ -274,6 +281,8 @@ export async function runAgent(
   const guardText = options.guardText ?? userText;
   let succeeded = false;
   let toolFailed = false;
+  let receiptRetryUsed = false;
+  const receipts: ToolReceipt[] = [];
 
   try {
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
@@ -331,6 +340,14 @@ export async function runAgent(
       );
       if (toolResults.some((result) => result.isError)) {
         toolFailed = true;
+      }
+      for (let i = 0; i < clientToolCalls.length; i += 1) {
+        const call = clientToolCalls[i]!;
+        const result = toolResults[i]!;
+        receipts.push({
+          name: call.name,
+          success: isSuccessfulToolResult(result.content, result.isError),
+        });
       }
       messages.push({
         role: "assistant",
@@ -403,6 +420,31 @@ export async function runAgent(
       }
       succeeded = !toolFailed;
       return "";
+    }
+    const missing = unreceiptedClaims(finalReply, receipts);
+    if (missing.length > 0) {
+      if (!receiptRetryUsed) {
+        receiptRetryUsed = true;
+        console.log(`receipt check: retry actions=${missing.join(",")}`);
+        messages.push({
+          role: "assistant",
+          textParts: response.textParts,
+          toolCalls: [],
+        });
+        messages.push({
+          role: "user",
+          content: receiptRetryPrompt(missing),
+        });
+        continue;
+      }
+      console.log(`receipt check: blocked actions=${missing.join(",")}`);
+      succeeded = !toolFailed;
+      return saveConversation(
+        userText,
+        receiptFailureMessage(missing),
+        saveUserMessage,
+        saveAssistantMessage,
+      );
     }
     succeeded = !toolFailed;
     return saveConversation(

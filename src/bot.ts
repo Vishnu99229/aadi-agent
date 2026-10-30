@@ -124,6 +124,16 @@ import {
   safeErrorText,
   splitForTelegram,
 } from "./telegram_io.js";
+import {
+  attachRetryText,
+  beginTurn,
+  closeTurn,
+  formatTurnFailure,
+  retryTextFor,
+  settleChatWork,
+  turnTimeoutMs,
+  type TurnGate,
+} from "./turns.js";
 
 const TYPING_REFRESH_MS = 4_000;
 
@@ -170,27 +180,82 @@ async function sendPlainText(ctx: Context, text: string): Promise<void> {
   }
 }
 
+function startTyping(ctx: Context): () => void {
+  if (!ctx.chat) {
+    return () => undefined;
+  }
+  const sendTyping = () => {
+    void ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => undefined);
+  };
+  sendTyping();
+  const interval = setInterval(sendTyping, TYPING_REFRESH_MS);
+  return () => clearInterval(interval);
+}
+
 async function whileTyping<T>(
   ctx: Context,
   operation: () => Promise<T>,
 ): Promise<T> {
-  if (!ctx.chat) {
-    return operation();
-  }
-
-  const sendTyping = async () => {
-    await ctx.api.sendChatAction(ctx.chat!.id, "typing");
-  };
-
-  await sendTyping().catch(() => undefined);
-  const interval = setInterval(() => {
-    void sendTyping().catch(() => undefined);
-  }, TYPING_REFRESH_MS);
-
+  const stop = startTyping(ctx);
   try {
     return await operation();
   } finally {
-    clearInterval(interval);
+    stop();
+  }
+}
+
+function retryKeyboard(turnId: number): InlineKeyboard {
+  return new InlineKeyboard().text("Retry", `retry:${turnId}`);
+}
+
+async function sendTurnFailure(
+  ctx: Context,
+  gate: TurnGate,
+  reason: string,
+): Promise<void> {
+  const text = formatTurnFailure(reason);
+  try {
+    await ctx.reply(text, { reply_markup: retryKeyboard(gate.id) });
+  } catch (error) {
+    console.error(`Turn failure reply failed: ${safeErrorText(error)}`);
+  }
+}
+
+async function completeChatReply(
+  ctx: Context,
+  userText: string,
+  work: () => Promise<string>,
+): Promise<void> {
+  const gate = beginTurn();
+  attachRetryText(gate, userText);
+  const startedAt = Date.now();
+  const stopTyping = startTyping(ctx);
+  try {
+    const settled = await settleChatWork(work, turnTimeoutMs());
+    if (settled.status === "timeout") {
+      gate.open = false;
+      closeTurn(gate, "timeout", startedAt);
+      await sendTurnFailure(ctx, gate, "timed out after 60s");
+      return;
+    }
+    if (settled.status === "empty") {
+      closeTurn(gate, "empty", startedAt);
+      await sendTurnFailure(ctx, gate, "empty reply");
+      return;
+    }
+    if (settled.status === "failed") {
+      closeTurn(gate, "failed", startedAt, settled.reason);
+      await sendTurnFailure(ctx, gate, settled.reason);
+      return;
+    }
+    if (!gate.open) {
+      closeTurn(gate, "timeout", startedAt);
+      return;
+    }
+    closeTurn(gate, "ok", startedAt);
+    await sendPlainText(ctx, settled.reply);
+  } finally {
+    stopTyping();
   }
 }
 
@@ -433,6 +498,18 @@ bot.command("wrapup", async (ctx) => {
     console.error(`Wrap-up failed (${errorType}).`);
     await ctx.reply(`Something broke: ${shortError(error)}`);
   }
+});
+
+bot.callbackQuery(/^retry:(\d+)$/, async (ctx) => {
+  const turnId = Number(ctx.match[1]);
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  const retryText = retryTextFor(turnId);
+  if (!retryText) {
+    await ctx.reply("Nothing to retry.");
+    return;
+  }
+  console.log(`turn id=${turnId} outcome=retry`);
+  await handleUserText(ctx, ctx.from.id, retryText);
 });
 
 bot.callbackQuery(/^meet:/, async (ctx) => {
@@ -725,14 +802,13 @@ ${userText}
 </edit_instructions>
 
 Call update_draft exactly once with the draft ID above and the complete revised body. Do not create a new draft and do not send anything. If the requested change requires missing information, ask Vishnu instead of updating the draft.`;
-    const reply = await whileTyping(ctx, () =>
+    await completeChatReply(ctx, userText, () =>
       runAgent(editInstruction, {
         saveUserMessage: false,
         task: "drafting",
         reactions: session,
       }),
     );
-    await sendPlainText(ctx, reply);
     return;
   }
 
@@ -806,7 +882,7 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       : "chat";
   const quoted = quotedMessageText(ctx.message?.reply_to_message);
   const modelText = withQuotedContext(userText, quoted);
-  const reply = await whileTyping(ctx, () =>
+  await completeChatReply(ctx, userText, () =>
     runAgent(modelText, {
       guardText: userText,
       task,
@@ -820,7 +896,6 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       reactions: session,
     }),
   );
-  await sendPlainText(ctx, reply);
   void captureFromUserMessage(userText).catch((error: unknown) => {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Memory capture failed (${errorType}).`);
@@ -878,13 +953,12 @@ async function answerDocumentCaption(
   documentId: number,
   fileName: string,
 ): Promise<void> {
-  const reply = await whileTyping(ctx, () =>
+  await completeChatReply(ctx, caption, () =>
     runAgent(
       `Vishnu's question about the document just uploaded (id ${documentId}, file "${fileName}"): ${caption}\nUse read_document with id ${documentId} to answer from its saved text. Answer ONLY this question. Do not summarize the entire document unless he asked for a summary.`,
       { task: "documents" },
     ),
   );
-  await sendPlainText(ctx, reply);
 }
 
 bot.on("message:document", async (ctx) => {
@@ -994,7 +1068,10 @@ bot.on("message:text", async (ctx) => {
     await handleUserText(ctx, ctx.from.id, text);
   } catch (error) {
     console.error(`Agent error: ${safeErrorText(error)}`);
-    await ctx.reply(`Something broke: ${shortError(error)}`);
+    const gate = beginTurn();
+    attachRetryText(gate, ctx.message.text);
+    closeTurn(gate, "failed", Date.now(), shortError(error));
+    await sendTurnFailure(ctx, gate, shortError(error));
   }
 });
 

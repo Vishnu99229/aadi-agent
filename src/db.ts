@@ -576,6 +576,20 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_processed_messages_at
     ON processed_messages (processed_at);
+
+  CREATE TABLE IF NOT EXISTS chat_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at TEXT,
+    duration_ms INTEGER,
+    outcome TEXT NOT NULL DEFAULT 'running'
+      CHECK (outcome IN ('running', 'ok', 'failed', 'timeout', 'empty')),
+    error TEXT,
+    retry_text TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_chat_turns_started
+    ON chat_turns (started_at, outcome);
 `);
 
 // Promises tracker (Part 1): extend tasks with promise-specific columns.
@@ -3494,4 +3508,84 @@ export function pruneProcessedMessages(): number {
       `DELETE FROM processed_messages WHERE processed_at < datetime('now', '-24 hours')`,
     )
     .run().changes;
+}
+
+export type ChatTurnOutcome = "running" | "ok" | "failed" | "timeout" | "empty";
+
+export function beginChatTurn(): number {
+  const info = db
+    .prepare(
+      `INSERT INTO chat_turns (started_at, outcome) VALUES (?, 'running')`,
+    )
+    .run(new Date().toISOString());
+  return Number(info.lastInsertRowid);
+}
+
+export function setChatTurnRetryText(id: number, text: string): void {
+  db.prepare(`UPDATE chat_turns SET retry_text = ? WHERE id = ?`).run(text, id);
+}
+
+export function getChatTurnRetryText(id: number): string | undefined {
+  const row = db
+    .prepare(`SELECT retry_text FROM chat_turns WHERE id = ?`)
+    .get(id) as { retry_text: string | null } | undefined;
+  return row?.retry_text ?? undefined;
+}
+
+export function finishChatTurn(
+  id: number,
+  input: { outcome: ChatTurnOutcome; durationMs: number; error?: string },
+): void {
+  db.prepare(
+    `UPDATE chat_turns
+     SET ended_at = ?, duration_ms = ?, outcome = ?, error = ?
+     WHERE id = ?`,
+  ).run(
+    new Date().toISOString(),
+    input.durationMs,
+    input.outcome,
+    input.error ?? null,
+    id,
+  );
+}
+
+function istDayBounds(now: Date): { startIso: string; endIso: string } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  const start = new Date(`${year}-${month}-${day}T00:00:00+05:30`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+export function countChatTurnsToday(now = new Date()): {
+  failed: number;
+  timeout: number;
+} {
+  const { startIso, endIso } = istDayBounds(now);
+  const rows = db
+    .prepare(
+      `SELECT outcome, COUNT(*) AS n
+       FROM chat_turns
+       WHERE started_at >= ? AND started_at < ?
+         AND outcome IN ('failed', 'empty', 'timeout')
+       GROUP BY outcome`,
+    )
+    .all(startIso, endIso) as Array<{ outcome: string; n: number }>;
+  let failed = 0;
+  let timeout = 0;
+  for (const row of rows) {
+    if (row.outcome === "timeout") {
+      timeout += row.n;
+    } else {
+      failed += row.n;
+    }
+  }
+  return { failed, timeout };
 }

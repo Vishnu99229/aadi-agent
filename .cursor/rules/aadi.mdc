@@ -53,3 +53,9 @@ Aadi is Vishnu's personal AI agent. Vishnu talks to it on Telegram. It answers q
 - Never run a local LLM (Ollama/Gemma) on the phone while Aadi is running — they exceed the phone's RAM together and crash it. Local models are Mac-only, or require pausing Aadi first. Ollama is never in the boot script.
 - Run git pull before starting work on the Mac; Aadi can deploy changes from Telegram via /build.
 - Builds from Telegram auto-merge to main when checks pass; always git pull on the Mac before working there.
+
+## Definition of done
+- Never say "tests pass" or "shipped" without pasting the actual command output.
+- Anything that touches Telegram, Gmail, Calendar, or a model needs a LIVE check with real output. Mocks are not proof.
+- Never claim it works on the phone until confirmed in the phone logs.
+- State explicitly if a step was skipped.

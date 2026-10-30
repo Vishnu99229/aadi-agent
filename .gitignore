@@ -15,3 +15,4 @@ VERSION
 .aadi-merge.json
 .aadi-pr.json
 .aider*
+.claude/worktrees/
