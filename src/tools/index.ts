@@ -38,6 +38,7 @@ import * as remember from "./remember.js";
 import * as searchMemories from "./search_memories.js";
 import * as searchQa from "./search_qa.js";
 import * as updateMemory from "./update_memory.js";
+import * as reactToMessage from "./react_to_message.js";
 import * as readDocument from "./read_document.js";
 import * as readDraft from "./read_draft.js";
 import * as readDriveFile from "./read_drive_file.js";
@@ -62,6 +63,8 @@ export interface ToolTurn {
   confirmation?: SendConfirmation;
   /** Vishnu's own words for this turn (no quoted-message wrapper). */
   userText?: string;
+  /** Telegram context for the current user message (react only). */
+  ctx?: { react: (emoji: string) => Promise<unknown> };
 }
 
 export interface RegisteredTool {
@@ -101,6 +104,7 @@ const modules = {
   list_waiting: listWaiting,
   mark_bill_paid: markBillPaid,
   propose_calendar_event: proposeCalendarEvent,
+  react_to_message: reactToMessage,
   resend_draft_card: resendDraftCard,
   read_attachment: readAttachment,
   read_document: readDocument,
@@ -153,6 +157,7 @@ export const TOOL_ORDER = [
   "propose_calendar_event",
   "create_meeting",
   "delete_calendar_event",
+  "react_to_message",
   "read_attachment",
   "read_document",
   "read_drive_file",

@@ -719,6 +719,12 @@ Call update_draft exactly once with the draft ID above and the complete revised 
     ctx.chat && ctx.message
       ? { chatId: ctx.chat.id, messageId: ctx.message.message_id }
       : undefined;
+  const reactionCtx =
+    ctx.message !== undefined
+      ? {
+          react: (emoji: string) => ctx.react(emoji as never),
+        }
+      : undefined;
   if (confirmation && isSendDraftCommand(userText)) {
     const result = await sendPendingDraftByText(confirmation);
     await ctx.reply(result.message);
@@ -779,6 +785,7 @@ Call update_draft exactly once with the draft ID above and the complete revised 
           ? "account_status"
           : undefined,
       sendConfirmation: confirmation,
+      ctx: reactionCtx,
     }),
   );
   await sendPlainText(ctx, reply);

@@ -141,6 +141,8 @@ export interface RunAgentOptions {
   /** Set only for Vishnu's own chat message (typed or voice). Enables
    *  confirm_send_pending_draft for drafts shown before that message. */
   sendConfirmation?: SendConfirmation;
+  /** Telegram context so react_to_message can call ctx.react. */
+  ctx?: { react: (emoji: string) => Promise<unknown> };
 }
 
 async function summariseOlderMessages(
@@ -311,6 +313,7 @@ export async function runAgent(
         calledTools: clientToolCalls.map((call) => call.name),
         confirmation: options.sendConfirmation,
         userText: options.guardText ?? userText,
+        ctx: options.ctx,
       };
       const toolResults = await Promise.all(
         clientToolCalls.map((call) => runTool(call, turn)),
@@ -375,10 +378,17 @@ export async function runAgent(
       );
     }
 
+    const reacted = toolsUsed.has("react_to_message");
     const finalReply =
       responseText ||
       collectedText.at(-1) ||
-      "I couldn't produce a text response.";
+      (reacted ? "" : "I couldn't produce a text response.");
+    if (!finalReply) {
+      if (saveUserMessage) {
+        saveMessage("user", userText);
+      }
+      return "";
+    }
     return saveConversation(
       userText,
       finalReply,

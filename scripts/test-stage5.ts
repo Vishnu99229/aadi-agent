@@ -8,6 +8,7 @@ import {
   deleteExpiredDocuments,
 } from "../src/db.ts";
 import { isWrapUpText, stripWrapUpPrefix } from "../src/wrapup_triggers.ts";
+import { handler as reactToMessage } from "../src/tools/react_to_message.ts";
 import { PDFDocument } from "pdf-lib";
 
 function assert(condition: boolean, message: string): void {
@@ -83,12 +84,57 @@ function testDocumentExpiry(): void {
   assert(removed >= 1, "expired documents removed");
 }
 
+async function testReactToMessage(): Promise<void> {
+  const seen: string[] = [];
+  const turn = {
+    iteration: 1,
+    calledTools: ["react_to_message"],
+    ctx: {
+      react: async (emoji: string) => {
+        seen.push(emoji);
+      },
+    },
+  };
+  const applied = await reactToMessage({ emoji: "🔥" }, turn);
+  assert(seen.join(",") === "🔥", "react_to_message calls ctx.react");
+  assert(applied === "Reacted with 🔥.", `got ${applied}`);
+
+  seen.length = 0;
+  const heart = await reactToMessage({ emoji: "❤️" }, turn);
+  assert(seen.join(",") === "❤", "heart reaction is sent as Telegram ❤");
+  assert(heart === "Reacted with ❤.", `got ${heart}`);
+
+  seen.length = 0;
+  const fallbackTurn = {
+    iteration: 1,
+    calledTools: ["react_to_message"],
+    ctx: {
+      react: async (emoji: string) => {
+        seen.push(emoji);
+        if (emoji !== "👍") {
+          throw new Error("REACTION_INVALID");
+        }
+      },
+    },
+  };
+  const fallback = await reactToMessage({ emoji: "🤔" }, fallbackTurn);
+  assert(seen.join(",") === "🤔,👍", "invalid emoji falls back to thumbs up");
+  assert(fallback === "Reacted with 👍.", `got ${fallback}`);
+
+  const missing = await reactToMessage(
+    { emoji: "👍" },
+    { iteration: 1, calledTools: ["react_to_message"] },
+  );
+  assert(missing.startsWith("Not reacted:"), "no ctx does not claim a reaction");
+}
+
 async function main(): Promise<void> {
   testWrapUpTriggers();
   await testPdfTrim();
   testDocumentPersistence();
   testNotesSearch();
   testDocumentExpiry();
+  await testReactToMessage();
   console.log("Stage 5 automated checks passed.");
 }
 
