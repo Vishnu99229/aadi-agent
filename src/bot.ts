@@ -666,11 +666,24 @@ async function ingestDriveLinks(ctx: Context, text: string): Promise<void> {
   }
 }
 
+async function tryGratitudeReaction(
+  ctx: Context,
+  userText: string,
+): Promise<boolean> {
+  return reactToSimpleGratitude(userText, {
+    react: (emoji) => ctx.react(emoji as never),
+  });
+}
+
 async function handleUserText(
   ctx: Context,
   userId: number,
   userText: string,
 ): Promise<void> {
+  if (await tryGratitudeReaction(ctx, userText)) {
+    return;
+  }
+
   const buildFollowupId = consumeBuildFollowup(userId);
   if (buildFollowupId !== undefined) {
     await submitBuildFollowup(ctx, buildFollowupId, userText);
@@ -761,14 +774,6 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   const forgetQuery = parseForgetQuery(userText);
   if (forgetQuery) {
     await handleForgetQuery(ctx, forgetQuery);
-    return;
-  }
-
-  if (
-    await reactToSimpleGratitude(userText, {
-      react: (emoji) => ctx.react(emoji as never),
-    })
-  ) {
     return;
   }
 
@@ -941,6 +946,9 @@ bot.on("message:photo", async (ctx) => {
 bot.on("message:text", async (ctx) => {
   try {
     const text = ctx.message.text;
+    if (await tryGratitudeReaction(ctx, text)) {
+      return;
+    }
     if ((QUICK_ACTIONS as readonly string[]).includes(text)) {
       if (text === "Menu") {
         await sendMenu(ctx);

@@ -1,16 +1,6 @@
 import type { LlmTool } from "../llm.js";
+import { applyTelegramReaction } from "../telegram_react.js";
 import type { ToolTurn } from "./index.js";
-
-const FALLBACK_EMOJI = "👍";
-
-/** Telegram's reaction list uses ❤ without a variation selector. */
-function normalizeEmoji(emoji: string): string {
-  const trimmed = emoji.trim();
-  if (trimmed === "❤️" || trimmed === "❤︎") {
-    return "❤";
-  }
-  return trimmed;
-}
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -32,34 +22,16 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   const values = (input ?? {}) as { emoji?: unknown };
   const raw = typeof values.emoji === "string" ? values.emoji : "";
-  const emoji = normalizeEmoji(raw);
-  if (!emoji) {
+  if (!raw.trim()) {
     return "Not reacted: I need an emoji.";
   }
   const ctx = turn.ctx;
   if (!ctx?.react) {
     return "Not reacted: no Telegram message to react to.";
   }
-
-  try {
-    await ctx.react(emoji);
-    console.log("react_to_message: applied");
-    return `Reacted with ${emoji}.`;
-  } catch (error) {
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.log(`react_to_message: rejected (${errorType})`);
-    if (emoji === FALLBACK_EMOJI) {
-      return "Not reacted: Telegram rejected the reaction.";
-    }
-    try {
-      await ctx.react(FALLBACK_EMOJI);
-      console.log("react_to_message: fallback applied");
-      return `Reacted with ${FALLBACK_EMOJI}.`;
-    } catch (fallbackError) {
-      const fallbackType =
-        fallbackError instanceof Error ? fallbackError.name : "UnknownError";
-      console.log(`react_to_message: fallback rejected (${fallbackType})`);
-      return "Not reacted: Telegram rejected the reaction.";
-    }
+  const applied = await applyTelegramReaction(ctx.react, raw);
+  if (!applied) {
+    return "Not reacted: Telegram rejected the reaction.";
   }
+  return `Reacted with ${applied}.`;
 }

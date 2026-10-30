@@ -9,7 +9,11 @@ import {
 } from "../src/db.ts";
 import { isWrapUpText, stripWrapUpPrefix } from "../src/wrapup_triggers.ts";
 import { handler as reactToMessage } from "../src/tools/react_to_message.ts";
-import { reactToSimpleGratitude } from "../src/gratitude.ts";
+import {
+  isSimpleGratitude,
+  reactToSimpleGratitude,
+} from "../src/gratitude.ts";
+import { normalizeReactionEmoji } from "../src/telegram_react.ts";
 import { PDFDocument } from "pdf-lib";
 
 function assert(condition: boolean, message: string): void {
@@ -142,13 +146,33 @@ async function testGratitudeIntercept(): Promise<void> {
   };
   const handled = await reactToSimpleGratitude("thanks aadi", ctx);
   assert(handled, "thanks aadi is simple gratitude");
-  assert(reacts.join(",") === "❤️", 'ctx.react("❤️") is called');
+  assert(reacts.join(",") === "❤", "gratitude interceptor reacts with ❤");
   assert(replies.length === 0, "no text reply is sent");
 
   reacts.length = 0;
-  const skipped = await reactToSimpleGratitude("thanks, can you check my calendar", ctx);
-  assert(!skipped, "gratitude plus a question is not intercepted");
-  assert(reacts.length === 0, "non-simple thanks does not react in the interceptor");
+  assert(
+    await reactToSimpleGratitude("thanks a lot", ctx),
+    "thanks a lot is simple gratitude",
+  );
+  assert(
+    await reactToSimpleGratitude("good work, thanks aadi", ctx),
+    "good work, thanks aadi is simple gratitude",
+  );
+  assert(
+    await reactToSimpleGratitude("Good work aadi, thanks", ctx),
+    "Good work aadi, thanks is simple gratitude",
+  );
+  assert(isSimpleGratitude("Thanks"), "Thanks matches");
+  assert(isSimpleGratitude("good work"), "good work matches");
+  assert(
+    !isSimpleGratitude("thanks, can you check my calendar"),
+    "thanks plus a request is not intercepted",
+  );
+  assert(
+    !isSimpleGratitude("Thanks aadi for sending the details of RFP"),
+    "thanks plus a real sentence is not intercepted",
+  );
+  assert(normalizeReactionEmoji("❤️") === "❤", "❤️ normalises to ❤");
 }
 
 async function main(): Promise<void> {
