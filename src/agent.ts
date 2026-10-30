@@ -31,6 +31,7 @@ import {
   type SendConfirmation,
 } from "./approvals.js";
 import { assertTestSeam } from "./test_seam.js";
+import type { ReactionSession } from "./contextual_react.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ITERATIONS = 8;
@@ -143,6 +144,8 @@ export interface RunAgentOptions {
   sendConfirmation?: SendConfirmation;
   /** Telegram context so react_to_message can call ctx.react. */
   ctx?: { react: (emoji: string) => Promise<unknown> };
+  /** Parallel 👀 / 👍 on Vishnu's message when this turn uses tools. */
+  reactions?: ReactionSession;
 }
 
 async function summariseOlderMessages(
@@ -269,7 +272,10 @@ export async function runAgent(
   let calendarRetryUsed = false;
   const toolsUsed = new Set<string>();
   const guardText = options.guardText ?? userText;
+  let succeeded = false;
+  let toolFailed = false;
 
+  try {
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     const response = await complete({
       system,
@@ -304,6 +310,11 @@ export async function runAgent(
         throw new Error("LLM requested tool use without a client tool call.");
       }
 
+      const taskTools = calledTools.filter((name) => name !== "react_to_message");
+      if (taskTools.length > 0) {
+        options.reactions?.noteWorking();
+      }
+
       // Independent calls can arrive together and are all executed. Consecutive
       // tool messages are serialized by the Claude adapter as one user message
       // containing every matching tool_result block. Calls that depend on an
@@ -318,6 +329,9 @@ export async function runAgent(
       const toolResults = await Promise.all(
         clientToolCalls.map((call) => runTool(call, turn)),
       );
+      if (toolResults.some((result) => result.isError)) {
+        toolFailed = true;
+      }
       messages.push({
         role: "assistant",
         textParts: response.textParts,
@@ -387,8 +401,10 @@ export async function runAgent(
       if (saveUserMessage) {
         saveMessage("user", userText);
       }
+      succeeded = !toolFailed;
       return "";
     }
+    succeeded = !toolFailed;
     return saveConversation(
       userText,
       finalReply,
@@ -405,4 +421,9 @@ export async function runAgent(
     saveUserMessage,
     saveAssistantMessage,
   );
+  } finally {
+    void Promise.resolve(options.reactions?.finish(succeeded)).catch(
+      () => undefined,
+    );
+  }
 }

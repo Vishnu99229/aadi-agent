@@ -77,10 +77,16 @@ const ALLOWED_REACTIONS = new Set([
   "😡",
 ]);
 
+export function stripVariationSelectors(emoji: string): string {
+  return [...emoji.trim()].filter((ch) => ch !== "\uFE0F").join("");
+}
+
+export function isAllowedTelegramReaction(emoji: string): boolean {
+  return ALLOWED_REACTIONS.has(stripVariationSelectors(emoji));
+}
+
 export function normalizeReactionEmoji(emoji: string): string {
-  const stripped = [...emoji.trim()]
-    .filter((ch) => ch !== "\uFE0F")
-    .join("");
+  const stripped = stripVariationSelectors(emoji);
   if (ALLOWED_REACTIONS.has(stripped)) {
     return stripped;
   }

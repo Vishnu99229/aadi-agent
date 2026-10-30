@@ -1,6 +1,11 @@
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { runAgent } from "./agent.js";
 import { reactToSimpleGratitude } from "./gratitude.js";
+import {
+  createReactionSession,
+  startContextualReaction,
+  type ReactionSession,
+} from "./contextual_react.js";
 import { findAccountByName } from "./account_logic.js";
 import { decodedAccounts } from "./accounts.js";
 import {
@@ -675,6 +680,14 @@ async function tryGratitudeReaction(
   });
 }
 
+function reactionSessionFor(ctx: Context): ReactionSession {
+  return createReactionSession({
+    react: (emoji) => ctx.react(emoji as never),
+    messageId: ctx.message?.message_id,
+    fromIsBot: ctx.from?.is_bot === true,
+  });
+}
+
 async function handleUserText(
   ctx: Context,
   userId: number,
@@ -683,6 +696,9 @@ async function handleUserText(
   if (await tryGratitudeReaction(ctx, userText)) {
     return;
   }
+
+  const session = reactionSessionFor(ctx);
+  startContextualReaction(userText, session);
 
   const buildFollowupId = consumeBuildFollowup(userId);
   if (buildFollowupId !== undefined) {
@@ -713,6 +729,7 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       runAgent(editInstruction, {
         saveUserMessage: false,
         task: "drafting",
+        reactions: session,
       }),
     );
     await sendPlainText(ctx, reply);
@@ -800,6 +817,7 @@ Call update_draft exactly once with the draft ID above and the complete revised 
           : undefined,
       sendConfirmation: confirmation,
       ctx: reactionCtx,
+      reactions: session,
     }),
   );
   await sendPlainText(ctx, reply);
