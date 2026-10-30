@@ -760,6 +760,7 @@ async function testAddCalendarAttendee(): Promise<void> {
           attendees: query.attendees,
           sendUpdates: query.sendUpdates,
         });
+        return { attendees: query.attendees };
       },
     });
     const reply = await addOwnerCalendarAttendee({
@@ -802,6 +803,56 @@ async function testAddCalendarAttendee(): Promise<void> {
     });
     assert(reply.startsWith("Not added: several matches"), "several matches ask");
     assert(patches.length === 0, "several matches patches nothing");
+  }
+
+  {
+    const patches: Array<Array<{ email?: string | null }>> = [];
+    setOwnerCalendarTestHooks({
+      list: async () => [{ ...catchup, attendeeCount: 0 }],
+      getAttendees: async () => undefined,
+      patch: async (query) => {
+        patches.push(query.attendees);
+        return { attendees: query.attendees };
+      },
+    });
+    const reply = await addOwnerCalendarAttendee({
+      eventTitle: "Catch up",
+      attendeeEmail: "sendhil@epicode.in",
+      confirmation,
+    });
+    assert(patches.length === 1, "empty attendees still patches");
+    assert(
+      JSON.stringify(patches[0]) === JSON.stringify([{ email: "sendhil@epicode.in" }]),
+      "creates an attendees array with the new email",
+    );
+    assert(
+      reply === "Added sendhil@epicode.in to Catch up.",
+      `empty attendees got ${reply}`,
+    );
+  }
+
+  {
+    const patches: number[] = [];
+    setOwnerCalendarTestHooks({
+      list: async () => [catchup],
+      getAttendees: async () => [],
+      patch: async () => {
+        patches.push(1);
+        return { attendees: [] };
+      },
+    });
+    const reply = await addOwnerCalendarAttendee({
+      eventTitle: "Catch up",
+      attendeeEmail: "sendhil@epicode.in",
+      confirmation,
+    });
+    assert(patches.length === 1, "failed patch is attempted once when the event is not recent");
+    assert(
+      reply ===
+        "Failed to add sendhil@epicode.in to Catch up. Error: Google Calendar failed to apply the attendee update.",
+      `failed patch got ${reply}`,
+    );
+    assert(!reply.startsWith("Added "), "failed patch is not reported as success");
   }
 
   const ownerSrc = await readFile(

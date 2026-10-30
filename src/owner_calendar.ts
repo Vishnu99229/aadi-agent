@@ -26,12 +26,14 @@ interface OwnerCalendarHooks {
   delete?: (event: OwnerCalendarEvent) => Promise<void>;
   getAttendees?: (
     event: OwnerCalendarEvent,
-  ) => Promise<Array<{ email?: string | null }>>;
+  ) => Promise<Array<{ email?: string | null }> | null | undefined>;
+  eventCreated?: string | null;
+  sleep?: (ms: number) => Promise<void>;
   patch?: (query: {
     event: OwnerCalendarEvent;
     attendees: Array<{ email?: string | null }>;
     sendUpdates: string;
-  }) => Promise<void>;
+  }) => Promise<{ attendees?: Array<{ email?: string | null }> | null } | void>;
 }
 
 let testHooks: OwnerCalendarHooks = {};
@@ -220,41 +222,119 @@ export async function deleteOwnerCalendarEvent(input: {
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const RECENT_EVENT_MS = 2 * 60 * 1000;
+const INDEX_RETRY_DELAY_MS = 1000;
+const PATCH_APPLY_ERROR = "Google Calendar failed to apply the attendee update.";
+
+type CalendarAttendee = { email?: string | null };
+
+function hasAttendeeEmail(
+  attendees: CalendarAttendee[] | null | undefined,
+  email: string,
+): boolean {
+  const needle = email.toLowerCase();
+  return (attendees || []).some(
+    (person) => (person.email ?? "").toLowerCase() === needle,
+  );
+}
+
+function createdWithin(created: string | null | undefined, windowMs: number): boolean {
+  if (!created) {
+    return false;
+  }
+  const at = Date.parse(created);
+  return Number.isFinite(at) && Date.now() - at <= windowMs;
+}
+
+async function wait(ms: number): Promise<void> {
+  if (testHooks.sleep) {
+    await testHooks.sleep(ms);
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function failedAdd(email: string, title: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `Failed to add ${email} to ${title}. Error: ${message}`;
+}
 
 async function workCalendar() {
   const account = await getGoogleAccount("work");
   return google.calendar({ version: "v3", auth: account.client });
 }
 
-async function currentAttendees(
-  event: OwnerCalendarEvent,
-): Promise<Array<{ email?: string | null }>> {
+async function loadWorkEvent(event: OwnerCalendarEvent): Promise<{
+  attendees: CalendarAttendee[];
+  created?: string | null;
+}> {
   if (testHooks.getAttendees) {
-    return testHooks.getAttendees(event);
+    const listed = await testHooks.getAttendees(event);
+    return {
+      attendees: listed || [],
+      created: testHooks.eventCreated,
+    };
   }
   const calendar = await workCalendar();
   const got = await calendar.events.get({
     calendarId: "primary",
     eventId: event.eventId,
   });
-  return got.data.attendees ?? [];
+  const currentAttendees = got.data.attendees || [];
+  return {
+    attendees: currentAttendees,
+    created: got.data.created,
+  };
 }
 
-async function patchAttendees(
+async function applyAttendeePatch(
   event: OwnerCalendarEvent,
-  attendees: Array<{ email?: string | null }>,
+  attendees: CalendarAttendee[],
+  email: string,
 ): Promise<void> {
   if (testHooks.patch) {
-    await testHooks.patch({ event, attendees, sendUpdates: "all" });
+    const patched = await testHooks.patch({
+      event,
+      attendees,
+      sendUpdates: "all",
+    });
+    if (!hasAttendeeEmail(patched?.attendees, email)) {
+      throw new Error(PATCH_APPLY_ERROR);
+    }
     return;
   }
   const calendar = await workCalendar();
-  await calendar.events.patch({
+  const patched = await calendar.events.patch({
     calendarId: "primary",
     eventId: event.eventId,
     sendUpdates: "all",
     requestBody: { attendees },
   });
+  const currentAttendees = patched.data.attendees || [];
+  if (!hasAttendeeEmail(currentAttendees, email)) {
+    throw new Error(PATCH_APPLY_ERROR);
+  }
+}
+
+async function patchAttendeesWithRetry(
+  event: OwnerCalendarEvent,
+  attendees: CalendarAttendee[],
+  email: string,
+  recentlyCreated: boolean,
+): Promise<void> {
+  if (recentlyCreated) {
+    await wait(INDEX_RETRY_DELAY_MS);
+  }
+  try {
+    await applyAttendeePatch(event, attendees, email);
+  } catch (error) {
+    if (!recentlyCreated) {
+      throw error;
+    }
+    console.log(`add_calendar_attendee: retrying patch eventId=${event.eventId}`);
+    await wait(INDEX_RETRY_DELAY_MS);
+    await applyAttendeePatch(event, attendees, email);
+  }
 }
 
 export async function addOwnerCalendarAttendee(input: {
@@ -287,7 +367,7 @@ export async function addOwnerCalendarAttendee(input: {
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.log(`add_calendar_attendee: list failed (${errorType})`);
-    return "Not added: I could not search the work calendar. Try again.";
+    return failedAdd(email, title, "I could not search the work calendar.");
   }
 
   if (matches.length === 0) {
@@ -299,28 +379,32 @@ export async function addOwnerCalendarAttendee(input: {
   }
 
   const event = matches[0]!;
-  let attendees: Array<{ email?: string | null }>;
+  let loaded: { attendees: CalendarAttendee[]; created?: string | null };
   try {
-    attendees = await currentAttendees(event);
+    loaded = await loadWorkEvent(event);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.log(`add_calendar_attendee: get failed (${errorType})`);
-    return "Not added: I could not read that event. Try again.";
+    return failedAdd(email, event.title, error);
   }
 
-  const already = attendees.some(
-    (person) => (person.email ?? "").toLowerCase() === email.toLowerCase(),
-  );
-  if (already) {
+  const currentAttendees = loaded.attendees || [];
+  if (hasAttendeeEmail(currentAttendees, email)) {
     return `Not added: ${email} is already on ${event.title}.`;
   }
 
+  const nextAttendees = [...currentAttendees, { email }];
   try {
-    await patchAttendees(event, [...attendees, { email }]);
+    await patchAttendeesWithRetry(
+      event,
+      nextAttendees,
+      email,
+      createdWithin(loaded.created, RECENT_EVENT_MS),
+    );
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.log(`add_calendar_attendee: patch failed (${errorType})`);
-    return "Not added: Google Calendar refused the update. Nothing was changed.";
+    return failedAdd(email, event.title, error);
   }
   console.log(`add_calendar_attendee: patched eventId=${event.eventId}`);
   return `Added ${email} to ${event.title}.`;
