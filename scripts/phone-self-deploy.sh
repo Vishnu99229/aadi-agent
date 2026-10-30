@@ -32,6 +32,7 @@ BACKUP_DIR="$LIVE/backups"
 EXCLUDE_FILE="$HOME/aadi-rsync-excludes"
 MERGED=0
 REVERT_JSON=""
+MERGE_SHA=""
 
 send_tg() {
   if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
@@ -152,6 +153,7 @@ backups
 node_modules
 dist
 .git
+VERSION
 .aadi-heartbeat
 .aadi-deploy-result.json
 .aadi-merge.json
@@ -183,6 +185,18 @@ if [ "$PR_NUMBER" != "0" ]; then
     fi
   fi
   MERGED=1
+  MERGE_SHA="$(node -e '
+    const fs = require("fs");
+    function sha(p) {
+      try {
+        const j = JSON.parse(fs.readFileSync(p, "utf8"));
+        if (typeof j.sha === "string" && j.sha) return j.sha;
+        if (typeof j.merge_commit_sha === "string" && j.merge_commit_sha) return j.merge_commit_sha;
+      } catch {}
+      return "";
+    }
+    process.stdout.write(sha(process.argv[1]) || sha(process.argv[2]));
+  ' "$MERGE_JSON" "$PR_JSON")"
   rm -f "$MERGE_JSON" "$PR_JSON"
 fi
 
@@ -216,6 +230,8 @@ INNER="$(find "$UNPACK" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 if [ -z "$INNER" ]; then
   fail "The main archive was empty."
 fi
+INNER_SHA="$(basename "$INNER" | awk -F- '{print $NF}')"
+COMMIT="${INNER_SHA:-$MERGE_SHA}"
 rsync -a "$INNER/" "$STAGING/"
 rm -rf "$UNPACK" "$ZIP"
 
@@ -227,6 +243,8 @@ node scripts/ensure-allow-scripts.cjs
 if ! npm install --no-audit --no-fund; then
   rollback_and_exit "npm install failed."
 fi
+
+sh scripts/write-version.sh "$LIVE" "$COMMIT" || true
 
 rm -f "$HEARTBEAT"
 pkill -f "[t]sx src/index.ts" || true

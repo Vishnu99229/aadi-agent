@@ -1082,6 +1082,7 @@ assert(
 assert(healthNow.includes("meeting-pending: last ran"), "health lists meeting-pending");
 assert(healthNow.includes("meeting-poll: last ran"), "health lists meeting-poll");
 assert(healthNow.startsWith("Aadi health"), "health report title");
+assert(healthNow.includes("version:"), "health report includes version line");
 
 let catchUpCalls = 0;
 const catchUpJob = everyClock(

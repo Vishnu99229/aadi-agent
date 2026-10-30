@@ -7,6 +7,7 @@ import {
   heartbeatPath,
   writeHeartbeat,
 } from "./heartbeat.js";
+import { formatVersionLine, readDeployVersion } from "./version.js";
 
 export const GOOGLE_API_TIMEOUT_MS = 30_000;
 const JOB_TIMEOUT_MS = 5 * 60 * 1000;
@@ -548,10 +549,10 @@ export function lastRanLabel(iso: string | null, now: Date): string {
   return `last ran ${hhmm} ${pad2(ranParts.day)}/${pad2(ranParts.month)}`;
 }
 
-export function formatHealthReport(now = new Date()): string {
+export function formatHealthReport(now = new Date(), cwd = process.cwd()): string {
   const runs = new Map(listJobRuns().map((row) => [row.name, row]));
-  const lines = ["Aadi health"];
-  const beatPath = heartbeatPath();
+  const lines = ["Aadi health", formatVersionLine(readDeployVersion(cwd))];
+  const beatPath = heartbeatPath(cwd);
   if (existsSync(beatPath)) {
     let iso = "";
     try {
