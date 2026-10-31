@@ -62,7 +62,7 @@ import { handleDateWishCallback } from "./important_dates.js";
 import { sendWeeklyReview } from "./weekly.js";
 import { handleReminderCallback } from "./reminders.js";
 import {
-  DOCUMENT_READ_ERROR,
+  documentFailureReply,
   IMAGE_READ_ERROR,
   handleDocumentCallback,
   ingestDocumentBytes,
@@ -1022,7 +1022,7 @@ bot.on("message:document", async (ctx) => {
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Document processing failed (${errorType}).`);
-    await ctx.reply(DOCUMENT_READ_ERROR);
+    await ctx.reply(documentFailureReply(error));
   }
 });
 

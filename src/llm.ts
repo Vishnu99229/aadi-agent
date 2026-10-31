@@ -880,6 +880,10 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+export function isAnthropicCreditError(error: unknown): boolean {
+  return /credit balance is too low/i.test(errorText(error));
+}
+
 let fakeComplete:
   | ((params: CompleteParams) => Promise<CompleteResult>)
   | undefined;
@@ -889,6 +893,15 @@ export function setCompleteForTests(
 ): void {
   assertTestSeam("setCompleteForTests");
   fakeComplete = fake;
+}
+
+function messagesHavePdf(params: CompleteParams): boolean {
+  return params.messages.some(
+    (message) =>
+      message.role === "user" &&
+      Array.isArray(message.content) &&
+      message.content.some((part) => part.type === "document"),
+  );
 }
 
 export async function complete(
@@ -901,7 +914,7 @@ export async function complete(
   try {
     return await completeWithNamedBackend(backend, params);
   } catch (error) {
-    if (backend === "claude") {
+    if (backend === "claude" || isAnthropicCreditError(error)) {
       throw error;
     }
     const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -920,6 +933,33 @@ export async function complete(
         `Primary (${backendFailureName(backend)}) failed: ${errorText(error)}. Fallback (Claude) failed: ${errorText(fallbackError)}.`,
       );
     }
+  }
+}
+
+/** Haiku/Claude first; if Anthropic credit is empty, DeepSeek for text-only calls. */
+export async function completeWithCreditFallback(
+  params: CompleteParams,
+): Promise<CompleteResult> {
+  const backend = params.backend ?? getTaskBackend("chat");
+  try {
+    return await complete(params);
+  } catch (error) {
+    if (
+      config.deepseekApiKey &&
+      backend !== "deepseek" &&
+      backend !== "deepseek-reasoner" &&
+      isAnthropicCreditError(error) &&
+      !messagesHavePdf(params)
+    ) {
+      console.error("Anthropic credit too low; using deepseek.");
+      return await complete({
+        ...params,
+        backend: "deepseek",
+        model: undefined,
+        jsonSchema: undefined,
+      });
+    }
+    throw error;
   }
 }
 

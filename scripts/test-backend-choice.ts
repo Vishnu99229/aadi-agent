@@ -14,7 +14,7 @@ process.env.GEMINI_API_KEY = "";
 const CREDIT = "Your credit balance is too low to access the Anthropic API.";
 const HAIKU_REJECT = "Haiku rate limited";
 
-type Mode = "ok" | "fail";
+type Mode = "ok" | "fail" | "credit";
 
 const state: {
   mode: Mode;
@@ -117,6 +117,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     model = "";
   }
   state.calls.push({ url, model, body });
+  if (state.mode === "credit") {
+    return errorMessage(CREDIT);
+  }
   if (state.mode === "fail") {
     const message = model.includes("haiku") ? HAIKU_REJECT : CREDIT;
     return errorMessage(message);
@@ -134,6 +137,7 @@ const { CONVERSATION_SUMMARY_KEY, clearMessages, deleteSetting, getSetting, save
   await import("../src/db.ts");
 const { getTaskBackend, setTaskBackend } = await import("../src/chat_backend.ts");
 const { complete, completeBackground } = await import("../src/llm.ts");
+const { completeForJob } = await import("../src/job_llm.ts");
 const { runAgent } = await import("../src/agent.ts");
 
 function resetModelSettings(): void {
@@ -200,6 +204,51 @@ assert(
   haikuAndClaude,
 );
 assert(state.calls.length === 2, "haiku failure retries once on claude");
+
+state.mode = "credit";
+resetCalls();
+const creditLogs: string[] = [];
+const originalCreditError = console.error;
+console.error = (...args: unknown[]) => {
+  creditLogs.push(args.map((part) => String(part)).join(" "));
+};
+let haikuCredit = "";
+try {
+  await complete({ ...minimal, backend: "haiku" });
+  throw new Error("expected haiku credit error to throw");
+} catch (error) {
+  haikuCredit = error instanceof Error ? error.message : String(error);
+} finally {
+  console.error = originalCreditError;
+}
+assert(haikuCredit.includes(CREDIT), haikuCredit);
+assert(
+  !haikuCredit.includes("Fallback (Claude)"),
+  `credit error retried Claude: ${haikuCredit}`,
+);
+assert(state.calls.length === 1, `credit error made ${state.calls.length} calls`);
+assert(
+  !creditLogs.some((line) => line.includes("retrying on Claude")),
+  `credit error logged Claude retry: ${creditLogs.join(" | ")}`,
+);
+
+resetCalls();
+let jobCredit = "";
+try {
+  await completeForJob({ ...minimal, backend: "haiku" });
+  throw new Error("expected job credit error to throw");
+} catch (error) {
+  jobCredit = error instanceof Error ? error.message : String(error);
+}
+assert(jobCredit.includes(CREDIT), jobCredit);
+assert(
+  !jobCredit.includes("Fallback (Claude)"),
+  `job credit error retried Claude: ${jobCredit}`,
+);
+assert(
+  state.calls.length === 1,
+  `job credit error made ${state.calls.length} calls`,
+);
 
 resetCalls();
 let deepseekAndClaude = "";

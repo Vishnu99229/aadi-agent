@@ -29,7 +29,7 @@ import {
   detectDocumentKind,
   isSupportedAttachment,
 } from "./document_types.js";
-import { complete } from "./llm.js";
+import { complete, isAnthropicCreditError } from "./llm.js";
 import { composedSummaryText, extractPdfText } from "./pdf_text.js";
 import { recordRecentUpload } from "./recent_upload.js";
 import {
@@ -40,6 +40,30 @@ import { extractSpreadsheetText } from "./xlsx_text.js";
 
 export const DOCUMENT_READ_ERROR =
   "I couldn't read that file properly, try sending it again.";
+
+export function documentFailureReply(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  if (isAnthropicCreditError(error)) {
+    return "I extracted the file but couldn't analyse it: Anthropic credit is too low.";
+  }
+  if (
+    /did not provide a file path|download failed|empty file|20 MB bot download/i.test(
+      text,
+    )
+  ) {
+    return "I couldn't download that file. Try sending it again.";
+  }
+  if (/no text found|scanned PDF/i.test(text)) {
+    return "No text found — is it a scanned PDF?";
+  }
+  if (/timed out|timeout|aborted/i.test(text)) {
+    return "Reading that file timed out. Try sending it again.";
+  }
+  if (/pdfjs|getDocument|InvalidPDF|PasswordException/i.test(text)) {
+    return "I couldn't extract text from that PDF. Try sending it again.";
+  }
+  return DOCUMENT_READ_ERROR;
+}
 
 export const IMAGE_READ_ERROR =
   "I couldn't read the text in this image. Please type it out.";
@@ -190,7 +214,7 @@ export async function ingestDocumentBytes(params: {
         if (transcript.text.replace(/\s+/g, "").length >= 80) {
           storedText = transcript.text;
         } else {
-          limitedFollowup = true;
+          throw new Error("No text found — is it a scanned PDF?");
         }
       }
     } else if (kind === "docx") {
@@ -424,7 +448,7 @@ export async function processIncomingDocument(
     console.error(
       `Document analysis failed (${error instanceof Error ? error.message : String(error)}).`,
     );
-    await ctx.reply(DOCUMENT_READ_ERROR);
+    await ctx.reply(documentFailureReply(error));
     return null;
   }
 }

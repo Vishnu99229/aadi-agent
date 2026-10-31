@@ -1,14 +1,14 @@
-import Anthropic from "@anthropic-ai/sdk";
-import type {
-  DocumentBlockParam,
-  ImageBlockParam,
-  TextBlockParam,
-} from "@anthropic-ai/sdk/resources/messages/messages";
 import { getTaskBackend, getTaskEffort } from "./chat_backend.js";
 import { config } from "./config.js";
 import type { DocumentActionItem, ItemTag } from "./db.js";
-import { complete, type LlmBackend, type LlmContentPart } from "./llm.js";
-import { estimateLlmCostUsd, isHaiku55Model, logAnthropicUsage } from "./usage.js";
+import {
+  complete,
+  completeWithCreditFallback,
+  type CompleteResult,
+  type LlmBackend,
+  type LlmContentPart,
+} from "./llm.js";
+import { isHaiku55Model } from "./usage.js";
 
 const MAX_PDF_PAGES = 50;
 const HAIKU_PDF_PAGES_PER_CALL = 15;
@@ -35,8 +35,6 @@ export interface DocumentAnalysis {
   fallback_summary: boolean;
   usage: DocumentAnalysisUsage;
 }
-
-const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
 // Structured output schema (Anthropic output_config.format, json_schema).
 // Constrained decoding guarantees valid JSON matching this shape, so no
@@ -87,28 +85,6 @@ function documentsModel(): string {
   return getTaskBackend("documents") === "claude"
     ? config.claudeModel
     : config.backgroundModel;
-}
-
-function documentsEffortFields(model: string): {
-  thinking?: { type: "disabled" } | { type: "adaptive" };
-  effort: "low" | "medium" | "high";
-} {
-  const effort = getTaskEffort("documents");
-  if (!isHaiku55Model(model)) {
-    return { effort };
-  }
-  if (effort === "low") {
-    return { thinking: { type: "disabled" }, effort };
-  }
-  return { thinking: { type: "adaptive" }, effort };
-}
-
-function estimateCostUsd(
-  inputTokens: number,
-  outputTokens: number,
-  model = documentsModel(),
-): number {
-  return estimateLlmCostUsd({ inputTokens, outputTokens }, model);
 }
 
 function uniqueStrings(items: string[]): string[] {
@@ -174,104 +150,83 @@ function normalizeAnalysis(parsed: unknown): Omit<DocumentAnalysis, "pages_proce
   };
 }
 
-type DocumentContent = DocumentBlockParam | ImageBlockParam | TextBlockParam;
+function documentComplete(params: {
+  content: LlmContentPart[];
+  jsonSchema?: Record<string, unknown>;
+}): Promise<CompleteResult> {
+  return completeWithCreditFallback({
+    backend: getTaskBackend("documents"),
+    task: "document",
+    effort: getTaskEffort("documents"),
+    cacheTtl: "5m",
+    maxTokens: SUMMARY_MAX_TOKENS,
+    tools: [],
+    jsonSchema: params.jsonSchema,
+    system: {
+      cacheable:
+        "Extract facts from this document for Vishnu. Reply with JSON only when a schema is given.",
+    },
+    messages: [{ role: "user", content: params.content }],
+  });
+}
+
+function usageFromComplete(result: {
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+  };
+}): DocumentAnalysisUsage {
+  return {
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    estimatedCostUsd: result.usage.estimatedCostUsd,
+  };
+}
 
 async function requestStructuredAnalysis(
-  content: DocumentContent[],
+  content: LlmContentPart[],
   promptExtra: string,
 ): Promise<{ analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">; usage: DocumentAnalysisUsage }> {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let lastError: unknown = null;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const model = documentsModel();
-      const effortFields = documentsEffortFields(model);
-      const response = await anthropic.messages.create({
-        model,
-        max_tokens: SUMMARY_MAX_TOKENS,
-        ...(effortFields.thinking ? { thinking: effortFields.thinking } : {}),
-        output_config: {
-          format: { type: "json_schema", schema: analysisSchema },
-          effort: effortFields.effort,
-        },
-        messages: [
-          {
-            role: "user",
-            content: [
-              ...content,
-              { type: "text", text: `${analysisPrompt}\n${promptExtra}` },
-            ],
-          },
-        ],
-      });
-      inputTokens += response.usage.input_tokens;
-      outputTokens += response.usage.output_tokens;
-      logAnthropicUsage("document", model, response.usage);
-      if (response.stop_reason === "refusal") {
-        throw new Error("Document analysis was refused by the model.");
-      }
-      if (response.stop_reason === "max_tokens") {
-        throw new Error("Document analysis hit max_tokens before finishing.");
-      }
-      const text = response.content
-        .filter((block) => block.type === "text")
-        .map((block) => block.text)
-        .join("\n");
-      return {
-        analysis: normalizeAnalysis(JSON.parse(text)),
-        usage: {
-          inputTokens,
-          outputTokens,
-          estimatedCostUsd: estimateCostUsd(inputTokens, outputTokens),
-        },
-      };
-    } catch (error) {
-      lastError = error;
-      console.error(
-        `Document structured analysis attempt ${attempt} failed (${error instanceof Error ? error.message : String(error)}).`,
-      );
-    }
+  const result = await documentComplete({
+    content: [
+      ...content,
+      { type: "text", text: `${analysisPrompt}\n${promptExtra}` },
+    ],
+    jsonSchema: analysisSchema,
+  });
+  if (result.stopReason === "refusal") {
+    throw new Error("Document analysis was refused by the model.");
   }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Document structured analysis failed twice.");
+  if (result.stopReason === "max_tokens") {
+    throw new Error("Document analysis hit max_tokens before finishing.");
+  }
+  const text = result.textParts.join("\n").trim();
+  if (!text) {
+    throw new Error("Document analysis returned empty text.");
+  }
+  return {
+    analysis: normalizeAnalysis(parseJsonObject(text)),
+    usage: usageFromComplete(result),
+  };
 }
 
 async function requestFallbackSummary(
-  content: DocumentContent[],
+  content: LlmContentPart[],
   promptExtra: string,
   usage: DocumentAnalysisUsage,
 ): Promise<{ analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">; usage: DocumentAnalysisUsage }> {
-  const model = documentsModel();
-  const effortFields = documentsEffortFields(model);
-  const response = await anthropic.messages.create({
-    model,
-    max_tokens: SUMMARY_MAX_TOKENS,
-    ...(effortFields.thinking ? { thinking: effortFields.thinking } : {}),
-    output_config: { effort: effortFields.effort },
-    messages: [
-      {
-        role: "user",
-        content: [
-          ...content,
-          { type: "text", text: `${fallbackPrompt}\n${promptExtra}` },
-        ],
-      },
+  const result = await documentComplete({
+    content: [
+      ...content,
+      { type: "text", text: `${fallbackPrompt}\n${promptExtra}` },
     ],
   });
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
-  logAnthropicUsage("document", model, response.usage);
+  const text = result.textParts.join("\n").trim();
   const lines = text
     .split("\n")
     .map((line) => line.replace(/^[-•\s]+/, "").trim())
     .filter(Boolean);
-  const inputTokens = usage.inputTokens + response.usage.input_tokens;
-  const outputTokens = usage.outputTokens + response.usage.output_tokens;
   return {
     analysis: {
       tag: "personal",
@@ -284,9 +239,9 @@ async function requestFallbackSummary(
       extracted_text: text,
     },
     usage: {
-      inputTokens,
-      outputTokens,
-      estimatedCostUsd: estimateCostUsd(inputTokens, outputTokens),
+      inputTokens: usage.inputTokens + result.usage.inputTokens,
+      outputTokens: usage.outputTokens + result.usage.outputTokens,
+      estimatedCostUsd: usage.estimatedCostUsd + result.usage.estimatedCostUsd,
     },
   };
 }
@@ -307,7 +262,7 @@ function withPages(
 }
 
 async function analyzeContent(
-  content: DocumentContent[],
+  content: LlmContentPart[],
   promptExtra: string,
   pagesProcessed: number,
   truncated: boolean,
@@ -339,25 +294,25 @@ async function analyzeContent(
 async function transcribePdfChunk(
   pdfBytes: Uint8Array,
   pagesProcessed: number,
-  model: string,
 ): Promise<{ text: string; usage: DocumentAnalysisUsage }> {
-  const effortFields = documentsEffortFields(model);
-  const response = await anthropic.messages.create({
-    model,
-    max_tokens: SUMMARY_MAX_TOKENS,
-    ...(effortFields.thinking ? { thinking: effortFields.thinking } : {}),
-    output_config: { effort: effortFields.effort },
+  const result = await completeWithCreditFallback({
+    backend: getTaskBackend("documents"),
+    task: "document",
+    effort: getTaskEffort("documents"),
+    cacheTtl: "5m",
+    maxTokens: SUMMARY_MAX_TOKENS,
+    tools: [],
+    system: {
+      cacheable: "Transcribe PDF text for Vishnu. Plain text only. No JSON.",
+    },
     messages: [
       {
         role: "user",
         content: [
           {
             type: "document",
-            source: {
-              type: "base64",
-              media_type: "application/pdf",
-              data: Buffer.from(pdfBytes).toString("base64"),
-            },
+            mediaType: "application/pdf",
+            data: Buffer.from(pdfBytes).toString("base64"),
           },
           {
             type: "text",
@@ -369,21 +324,8 @@ Plain text only. Do not summarize and do not use JSON.`,
       },
     ],
   });
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
-  logAnthropicUsage("document", model, response.usage);
-  const usage = {
-    inputTokens: response.usage.input_tokens,
-    outputTokens: response.usage.output_tokens,
-    estimatedCostUsd: estimateCostUsd(
-      response.usage.input_tokens,
-      response.usage.output_tokens,
-      model,
-    ),
-  };
+  const text = result.textParts.join("\n").trim();
+  const usage = usageFromComplete(result);
   console.log(
     `Document transcription: pages=${pagesProcessed}, input_tokens=${usage.inputTokens}, output_tokens=${usage.outputTokens}, estimated_cost_usd=${usage.estimatedCostUsd.toFixed(6)}`,
   );
@@ -400,7 +342,7 @@ export async function transcribePdfVisibleText(
     ? HAIKU_PDF_PAGES_PER_CALL
     : MAX_PDF_PAGES;
   if (pagesProcessed <= batchSize) {
-    return transcribePdfChunk(pdfBytes, pagesProcessed, model);
+    return transcribePdfChunk(pdfBytes, pagesProcessed);
   }
   const texts: string[] = [];
   const usage: DocumentAnalysisUsage = {
@@ -411,7 +353,7 @@ export async function transcribePdfVisibleText(
   for (let start = 0; start < pagesProcessed; start += batchSize) {
     const count = Math.min(batchSize, pagesProcessed - start);
     const slice = await slicePdfPages(pdfBytes, start, count);
-    const part = await transcribePdfChunk(slice, count, model);
+    const part = await transcribePdfChunk(slice, count);
     texts.push(part.text);
     usage.inputTokens += part.usage.inputTokens;
     usage.outputTokens += part.usage.outputTokens;
@@ -469,11 +411,8 @@ export async function analyzePdf(
       [
         {
           type: "document",
-          source: {
-            type: "base64",
-            media_type: "application/pdf",
-            data: Buffer.from(pdfBytes).toString("base64"),
-          },
+          mediaType: "application/pdf",
+          data: Buffer.from(pdfBytes).toString("base64"),
         },
       ],
       `Pages sent: ${pagesProcessed}. truncated: ${truncated}.`,
@@ -490,11 +429,8 @@ export async function analyzePdf(
       [
         {
           type: "document",
-          source: {
-            type: "base64",
-            media_type: "application/pdf",
-            data: Buffer.from(slice).toString("base64"),
-          },
+          mediaType: "application/pdf",
+          data: Buffer.from(slice).toString("base64"),
         },
       ],
       `Pages ${start + 1}-${start + count} of ${pagesProcessed}. truncated: ${truncated}.`,
