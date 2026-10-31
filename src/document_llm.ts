@@ -79,6 +79,7 @@ const analysisSchema = {
 
 const analysisPrompt = `Analyze this document for Vishnu. Tag it work or personal.
 Give exactly up to 5 short summary bullets, every key date or deadline (include the event date if this is a brochure or invitation), amounts mentioned, and risks or obligations.
+If the source contains a date or an amount, dates and money must not be empty arrays — copy them as written.
 List concrete action items with work/personal tags and ISO8601 due_at with offset, or null due_at when unclear.
 If there are no action items, return []. Never punctuation, placeholders, or filler (for example ";;;;").
 Do not dump the full document. Keep each string short. Never invent figures or dates not present.`;
@@ -125,6 +126,42 @@ function isJunkActionText(text: string): boolean {
     return true;
   }
   return /^[^A-Za-z0-9]+$/.test(trimmed);
+}
+
+const DATE_IN_SOURCE_RE =
+  /\b(?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b/i;
+const MONEY_IN_SOURCE_RE =
+  /₹\s*[\d,]+|\bINR\s*[\d,]+|\bRs\.?\s*[\d,]+|\$\s*[\d,]+|\bUSD\s*[\d,]+/i;
+
+export type ExtractionGap = "dates" | "money";
+
+export function sourceHasDates(text: string): boolean {
+  return DATE_IN_SOURCE_RE.test(text);
+}
+
+export function sourceHasMoney(text: string): boolean {
+  return MONEY_IN_SOURCE_RE.test(text);
+}
+
+export function documentExtractionGaps(
+  analysis: { dates: string[]; money: string[] },
+  sourceText: string,
+): ExtractionGap[] {
+  const gaps: ExtractionGap[] = [];
+  if (analysis.dates.length === 0 && sourceHasDates(sourceText)) {
+    gaps.push("dates");
+  }
+  if (analysis.money.length === 0 && sourceHasMoney(sourceText)) {
+    gaps.push("money");
+  }
+  return gaps;
+}
+
+function sourceTextFromContent(content: LlmContentPart[]): string {
+  return content
+    .filter((part): part is Extract<LlmContentPart, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
 }
 
 function uniqueStrings(items: string[]): string[] {
@@ -215,17 +252,10 @@ function usageFromComplete(result: {
   };
 }
 
-async function requestStructuredAnalysis(
-  content: LlmContentPart[],
-  promptExtra: string,
-): Promise<{ analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">; usage: DocumentAnalysisUsage }> {
-  const result = await documentComplete({
-    content: [
-      ...content,
-      { type: "text", text: `${analysisPrompt}\n${promptExtra}` },
-    ],
-    jsonSchema: analysisSchema,
-  });
+function analysisFromComplete(result: CompleteResult): {
+  analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">;
+  usage: DocumentAnalysisUsage;
+} {
   if (result.stopReason === "refusal") {
     throw new Error("Document analysis was refused by the model.");
   }
@@ -240,6 +270,71 @@ async function requestStructuredAnalysis(
     analysis: normalizeAnalysis(parseJsonObject(text)),
     usage: usageFromComplete(result),
   };
+}
+
+function addUsage(
+  a: DocumentAnalysisUsage,
+  b: DocumentAnalysisUsage,
+): DocumentAnalysisUsage {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    estimatedCostUsd: a.estimatedCostUsd + b.estimatedCostUsd,
+  };
+}
+
+async function requestStructuredAnalysis(
+  content: LlmContentPart[],
+  promptExtra: string,
+): Promise<{ analysis: Omit<DocumentAnalysis, "pages_processed" | "truncated" | "fallback_summary" | "usage">; usage: DocumentAnalysisUsage }> {
+  const result = await documentComplete({
+    content: [
+      ...content,
+      { type: "text", text: `${analysisPrompt}\n${promptExtra}` },
+    ],
+    jsonSchema: analysisSchema,
+  });
+  const first = analysisFromComplete(result);
+  const gaps = documentExtractionGaps(
+    first.analysis,
+    sourceTextFromContent(content),
+  );
+  if (gaps.length === 0) {
+    return first;
+  }
+  console.log(`Document analysis: retry missing=${gaps.join(",")}`);
+  try {
+    const retry = await documentComplete({
+      content: [
+        ...content,
+        {
+          type: "text",
+          text: `${analysisPrompt}\n${promptExtra}\nThe previous json left ${gaps.join(" and ")} empty. Those values are in the source text. Return the same JSON object with ${gaps.join(" and ")} filled from the source only. Never invent. json only.`,
+        },
+      ],
+      jsonSchema: analysisSchema,
+    });
+    const second = analysisFromComplete(retry);
+    return {
+      analysis: {
+        ...first.analysis,
+        dates:
+          gaps.includes("dates") && second.analysis.dates.length > 0
+            ? second.analysis.dates
+            : first.analysis.dates,
+        money:
+          gaps.includes("money") && second.analysis.money.length > 0
+            ? second.analysis.money
+            : first.analysis.money,
+      },
+      usage: addUsage(first.usage, second.usage),
+    };
+  } catch (error) {
+    console.error(
+      `Document analysis: retry failed (${error instanceof Error ? error.message : String(error)}).`,
+    );
+    return first;
+  }
 }
 
 async function requestFallbackSummary(

@@ -130,7 +130,11 @@ export interface CompleteParams {
   /** Prompt-cache TTL. Omitted: 1h for chat-like tasks, 5m for one-burst jobs. */
   cacheTtl?: "5m" | "1h";
   skipUsageLog?: boolean;
-  /** Anthropic output_config.format json_schema for structured background calls. */
+  /**
+   * Structured output. Anthropic uses output_config.format json_schema.
+   * DeepSeek only supports response_format json_object (not json_schema);
+   * the schema is then placed in the prompt. See api-docs.deepseek.com/guides/json_mode.
+   */
   jsonSchema?: Record<string, unknown>;
 }
 
@@ -688,6 +692,28 @@ export function toOpenRouterMessages(
   ];
 }
 
+function isDeepSeekLabel(label: string): boolean {
+  return label === "deepseek" || label === "deepseek-reasoner";
+}
+
+/** DeepSeek JSON Output: json_object only; prompt must contain "json" and an example.
+ *  Official docs: api-docs.deepseek.com/guides/json_mode — json_schema is rejected. */
+export function deepSeekJsonMode(schema: Record<string, unknown> | undefined): {
+  responseFormat?: { type: "json_object" };
+  systemExtra?: string;
+} {
+  if (!schema) {
+    return {};
+  }
+  return {
+    responseFormat: { type: "json_object" },
+    systemExtra: `Reply with a single json object only. The entire assistant message must be valid json, no markdown fences.
+EXAMPLE JSON OUTPUT: fill every required key in this JSON schema from the source; use [] when a list has no items; never omit required keys.
+JSON schema:
+${JSON.stringify(schema)}`,
+  };
+}
+
 function toOpenRouterTools(tools: LlmTool[]): ChatCompletionTool[] {
   return tools
     .filter(
@@ -747,24 +773,36 @@ async function completeWithOpenAiCompatible(
   }
 
   const tools = toOpenRouterTools(params.tools);
-  const system = webSearchRequested
+  let system = webSearchRequested
     ? {
         ...params.system,
         dynamic: `${params.system.dynamic ?? ""}\nWeb search is unavailable for this provider. Be explicit about that limitation and do not present unverified current information as fresh.`,
       }
     : params.system;
+  const jsonMode = isDeepSeekLabel(label)
+    ? deepSeekJsonMode(params.jsonSchema)
+    : {};
+  if (jsonMode.systemExtra) {
+    system = {
+      cacheable: system.cacheable,
+      dynamic: [system.dynamic, jsonMode.systemExtra].filter(Boolean).join("\n"),
+    };
+  }
   const response = await client.chat.completions.create(
     {
       model,
       messages: toOpenRouterMessages(system, params.messages),
       ...(tools.length > 0 ? { tools } : {}),
       max_tokens: params.maxTokens ?? MAX_TOKENS,
+      ...(jsonMode.responseFormat
+        ? { response_format: jsonMode.responseFormat }
+        : {}),
       ...(options.thinking
         ? {
             reasoning_effort: "high" as const,
             thinking: { type: "enabled" },
           }
-        : label.startsWith("deepseek")
+        : isDeepSeekLabel(label)
           ? { thinking: { type: "disabled" } }
           : {}),
     } as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
@@ -940,10 +978,7 @@ export async function complete(
         ...params,
         backend,
         model: backend === primary ? params.model : undefined,
-        jsonSchema:
-          backend === "deepseek" || backend === "deepseek-reasoner"
-            ? undefined
-            : params.jsonSchema,
+        jsonSchema: params.jsonSchema,
         effort:
           backend === "claude" || backend === "haiku"
             ? params.effort
