@@ -171,7 +171,6 @@ const localLlm = new OpenAI({
   timeout: 15 * 60 * 1000,
 });
 
-let loggedOpenAiWebSearchDisabled = false;
 
 function withEstimatedCost(
   usage: Omit<LlmUsage, "estimatedCostUsd">,
@@ -453,13 +452,13 @@ function withLatestMessageCacheBreakpoint(
 function toAnthropicTools(tools: LlmTool[]): AnthropicTool[] {
   return tools.map((tool): AnthropicTool => {
     if (tool.type === "web_search") {
-      // web_search_20260318 defaults to code_execution-based programmatic
-      // calling. Anthropic does not allow forced tool_choice settings or
-      // disable_parallel_tool_use=true while programmatic calling is enabled.
+      // Direct calling: 20260318 defaults allowed_callers to code_execution,
+      // which 400s on models without programmatic tool calling.
       return {
-        type: "web_search_20260318",
+        type: "web_search_20250305",
         name: "web_search",
         max_uses: tool.maxUses,
+        allowed_callers: ["direct"],
       };
     }
 
@@ -763,23 +762,8 @@ async function completeWithOpenAiCompatible(
   label: string,
   options: { thinking?: boolean } = {},
 ): Promise<CompleteResult> {
-  const webSearchRequested = params.tools.some(
-    (tool) => tool.type === "web_search",
-  );
-  if (webSearchRequested && !loggedOpenAiWebSearchDisabled) {
-    console.log(
-      `Web search disabled for ${label}: Anthropic server-side web search is unavailable and no paid search API is configured.`,
-    );
-    loggedOpenAiWebSearchDisabled = true;
-  }
-
   const tools = toOpenRouterTools(params.tools);
-  let system = webSearchRequested
-    ? {
-        ...params.system,
-        dynamic: `${params.system.dynamic ?? ""}\nWeb search is unavailable for this provider. Be explicit about that limitation and do not present unverified current information as fresh.`,
-      }
-    : params.system;
+  let system = params.system;
   const jsonMode = isDeepSeekLabel(label)
     ? deepSeekJsonMode(params.jsonSchema)
     : {};

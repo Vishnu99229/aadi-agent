@@ -278,6 +278,67 @@ const meetingTestSenders = (process.env.MEETING_TEST_SENDERS ?? "")
   .map((item) => item.trim().toLowerCase())
   .filter(Boolean);
 
+export const WEB_SEARCH_PROVIDERS = ["deepseek", "gemini", "claude"] as const;
+export type WebSearchProvider = (typeof WEB_SEARCH_PROVIDERS)[number];
+const DEFAULT_WEB_SEARCH_ORDER: WebSearchProvider[] = [
+  "deepseek",
+  "gemini",
+  "claude",
+];
+
+function isWebSearchProvider(value: string): value is WebSearchProvider {
+  return (WEB_SEARCH_PROVIDERS as readonly string[]).includes(value);
+}
+
+function parseWebSearchOrder(
+  raw: string | undefined,
+  fallback: WebSearchProvider[],
+): WebSearchProvider[] {
+  if (!raw?.trim()) {
+    return [...fallback];
+  }
+  const parsed = raw
+    .split(/[\s,]+/)
+    .map((part) => part.trim().toLowerCase())
+    .filter(isWebSearchProvider);
+  if (parsed.length === 0) {
+    console.error(
+      'WEB_SEARCH_ORDER must be a comma-separated list of deepseek, gemini, claude.',
+    );
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function parseWebSearchProvider(
+  raw: string | undefined,
+): WebSearchProvider | undefined {
+  const value = raw?.trim().toLowerCase() ?? "";
+  if (!value) {
+    return undefined;
+  }
+  if (!isWebSearchProvider(value)) {
+    console.error(
+      'WEB_SEARCH_PROVIDER must be deepseek, gemini, or claude when set.',
+    );
+    process.exit(1);
+  }
+  return value;
+}
+
+const webSearchOrder = parseWebSearchOrder(
+  process.env.WEB_SEARCH_ORDER,
+  DEFAULT_WEB_SEARCH_ORDER,
+);
+const webSearchProvider = parseWebSearchProvider(
+  process.env.WEB_SEARCH_PROVIDER,
+);
+const webSearchDailyCap = parsePositiveNumber(
+  process.env.WEB_SEARCH_DAILY_CAP,
+  100,
+  "WEB_SEARCH_DAILY_CAP",
+);
+
 export interface ModelCostRates {
   inputCostPerMillion: number;
   outputCostPerMillion: number;
@@ -444,4 +505,7 @@ export const config = {
   autoSendDailyCap,
   autoBookMinConfidence,
   meetingTestSenders,
+  webSearchOrder,
+  webSearchProvider,
+  webSearchDailyCap,
 } as const;

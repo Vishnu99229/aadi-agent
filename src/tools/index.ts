@@ -37,6 +37,7 @@ import * as proposeCalendarEvent from "./propose_calendar_event.js";
 import * as remember from "./remember.js";
 import * as searchMemories from "./search_memories.js";
 import * as searchQa from "./search_qa.js";
+import * as webSearch from "./web_search.js";
 import * as updateMemory from "./update_memory.js";
 import * as reactToMessage from "./react_to_message.js";
 import * as readDocument from "./read_document.js";
@@ -120,6 +121,7 @@ const modules = {
   search_memories: searchMemories,
   search_notes: searchNotes,
   search_qa_bank: searchQa,
+  web_search: webSearch,
   set_reminder: setReminder,
   stop_tracking: stopTracking,
   track_thread: trackThread,
@@ -171,6 +173,7 @@ export const TOOL_ORDER = [
   "search_memories",
   "search_notes",
   "search_qa_bank",
+  "web_search",
   "set_reminder",
   "stop_tracking",
   "track_thread",

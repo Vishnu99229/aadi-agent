@@ -1,9 +1,4 @@
-import type {
-  LlmBackend,
-  LlmMessage,
-  LlmTool,
-  ToolCall,
-} from "./llm.js";
+import type { LlmBackend, LlmMessage, LlmTool, ToolCall } from "./llm.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
 import { shouldForceCalendarTool } from "./calendar_guard.js";
@@ -40,6 +35,11 @@ import {
   type ToolReceipt,
 } from "./receipt.js";
 import {
+  parseSearchSources,
+  withSearchCitations,
+  type SearchHit,
+} from "./web_search.js";
+import {
   SUMMARISE_SYSTEM,
   historyLimits,
   planHistoryWindow,
@@ -50,15 +50,9 @@ import {
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ITERATIONS = 8;
 
-const webSearchTool: LlmTool = {
-  type: "web_search",
-  maxUses: 5,
-};
-
-const toolDefinitions: LlmTool[] = [
-  ...TOOL_ORDER.map((name) => customTools[name]!.definition),
-  webSearchTool,
-];
+const toolDefinitions: LlmTool[] = TOOL_ORDER.map(
+  (name) => customTools[name]!.definition,
+);
 
 function formatCurrentTime(): string {
   return new Intl.DateTimeFormat("en-IN", {
@@ -307,6 +301,7 @@ export async function runAgent(
   let toolFailed = false;
   let receiptRetryUsed = false;
   const receipts: ToolReceipt[] = [];
+  let searchSources: SearchHit[] = [];
 
   try {
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
@@ -368,10 +363,17 @@ export async function runAgent(
       for (let i = 0; i < clientToolCalls.length; i += 1) {
         const call = clientToolCalls[i]!;
         const result = toolResults[i]!;
+        const success = isSuccessfulToolResult(result.content, result.isError);
         receipts.push({
           name: call.name,
-          success: isSuccessfulToolResult(result.content, result.isError),
+          success,
         });
+        if (call.name === "web_search" && success) {
+          const hits = parseSearchSources(result.content);
+          if (hits.length > 0) {
+            searchSources = hits;
+          }
+        }
         if (saveAssistantMessage) {
           saveMessage("tool", result.content, call.name);
         }
@@ -467,7 +469,10 @@ export async function runAgent(
       );
     }
     succeeded = !toolFailed;
-    return saveAssistantReply(finalReply, saveAssistantMessage);
+    return saveAssistantReply(
+      withSearchCitations(finalReply, searchSources),
+      saveAssistantMessage,
+    );
   }
 
   const partialReply =

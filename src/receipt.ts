@@ -11,6 +11,7 @@ export const CLAIM_ACTIONS = [
   "updated",
   "answered",
   "completed",
+  "searched",
 ] as const;
 
 export type ClaimAction = (typeof CLAIM_ACTIONS)[number];
@@ -63,6 +64,7 @@ const TOOLS_FOR: Record<ClaimAction, ReadonlySet<string>> = {
   updated: new Set(["update_draft", "update_memory", "update_account"]),
   answered: new Set(["search_qa_bank", "learn_qa_bank"]),
   completed: new Set(["complete_task"]),
+  searched: new Set(["web_search"]),
 };
 
 const CLAIM_RE: Record<ClaimAction, RegExp> = {
@@ -78,6 +80,8 @@ const CLAIM_RE: Record<ClaimAction, RegExp> = {
   updated: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?updated\b|\b(?:draft|event|it)\s+(?:is\s+|was\s+)?updated\b|^updated\b/i,
   answered: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?answered\b|\banswered (?:all|every|the) questions?\b/i,
   completed: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?completed\b|\b(?:task|it)\s+(?:is\s+|was\s+)?(?:completed|done)\b|^completed\b/i,
+  searched:
+    /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?(?:searched|looked (?:it|that|this) up)\b|\b(?:from|via) (?:the )?(?:web|internet|search results?)\b|\bas of (?:today|now|this (?:morning|afternoon|evening))\b|\b(?:latest|breaking) (?:news|headlines?)\b|\bcurrent (?:price|rate|score|standings?|headline)\b|\blive (?:score|price|rate|updates?)\b|\baccording to (?:search|the web|sources?|reports?)\b|\b(?:search )?results? (?:show|say|from)\b/i,
 };
 
 const NEGATION =
@@ -148,9 +152,15 @@ export function unreceiptedClaims(
 }
 
 export function receiptRetryPrompt(actions: readonly ClaimAction[]): string {
+  if (actions.includes("searched")) {
+    return "You stated a current fact as if you searched, but no search provider returned results this turn. Call web_search now, or say plainly you could not search. Do not invent news, prices or sources.";
+  }
   return `You claimed ${actions.join(", ")} but no tool did it. Do it now, or say plainly it didn't happen.`;
 }
 
 export function receiptFailureMessage(actions: readonly ClaimAction[]): string {
+  if (actions.includes("searched") && actions.length === 1) {
+    return "I couldn't search: no provider returned results, so I won't present that as a live lookup.";
+  }
   return `I couldn't do that: no tool confirmed ${actions.join(", ")}.`;
 }
