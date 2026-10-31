@@ -710,8 +710,8 @@ function replySubject(subject: string): string {
   return /^re\s*:/i.test(normalized) ? normalized : `Re: ${normalized}`;
 }
 
-/** Thrown when both DeepSeek and the Claude fallback inside `complete()` fail
- *  (or return empty). Carries a Telegram-ready message so the caller can
+/** Thrown when every backend in complete()'s fallback chain fails
+ *  (or returns empty). Carries a Telegram-ready message so the caller can
  *  alert Vishnu by name; the follow-up row stays in `waiting` for a retry. */
 export class FollowupDraftLlmError extends Error {
   constructor(

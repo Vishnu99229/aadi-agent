@@ -4,8 +4,10 @@ process.env.AADI_DB_PATH ??= ":memory:";
 
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { getDocument } from "../src/db.ts";
+import { sanitizeActionItems } from "../src/document_llm.ts";
 import {
   documentFailureReply,
+  documentKeyboard,
   ingestDocumentBytes,
 } from "../src/documents.ts";
 import {
@@ -190,6 +192,96 @@ assert(
 assert(
   calls.some((call) => /Transcribe all readable text/i.test(userText(call))),
   "scanned PDF ran the transcription prompt",
+);
+
+assert(
+  sanitizeActionItems([
+    { text: ";;;;", tag: "personal", due_at: null },
+    { text: "   ", tag: "work", due_at: null },
+    { text: "", tag: "personal", due_at: null },
+    { text: "...", tag: "personal", due_at: null },
+    "!!!",
+    {
+      text: "File the GST return",
+      tag: "work",
+      due_at: "2026-11-01T10:00:00+05:30",
+    },
+  ]).map((item) => item.text).join("|") === "File the GST return",
+  "sanitize drops empty, whitespace, and punctuation-only action items",
+);
+assert(sanitizeActionItems([]).length === 0, "empty action_items stays []");
+
+function keyboardLabels(addTasks: boolean): string[] {
+  return documentKeyboard(99, addTasks)
+    .inline_keyboard.flat()
+    .map((button) => ("text" in button ? String(button.text) : ""));
+}
+assert(
+  keyboardLabels(false).join("|") === "Skip",
+  "no valid action items → Skip only",
+);
+assert(
+  keyboardLabels(true).join("|") === "Add as tasks|Skip",
+  "valid action items → Add as tasks and Skip",
+);
+
+setCompleteForTests(async () =>
+  fakeResult(
+    JSON.stringify({
+      tag: "personal",
+      document_type: "note",
+      summary_bullets: ["Junk actions"],
+      dates: [],
+      money: [],
+      risks: [],
+      action_items: [
+        { text: ";;;;", tag: "personal", due_at: null },
+        { text: "  ", tag: "work", due_at: null },
+      ],
+    }),
+  ),
+);
+const junkIngest = await ingestDocumentBytes({
+  fileName: "junk.pdf",
+  mimeType: "application/pdf",
+  bytes: textBytes,
+  tag: "personal",
+});
+assert(
+  junkIngest.pendingActionItems === null,
+  "junk-only action_items do not queue Add as tasks",
+);
+
+setCompleteForTests(async () =>
+  fakeResult(
+    JSON.stringify({
+      tag: "work",
+      document_type: "note",
+      summary_bullets: ["Has a real task"],
+      dates: [],
+      money: [],
+      risks: [],
+      action_items: [
+        { text: ";;;;", tag: "personal", due_at: null },
+        {
+          text: "Send the signed NDA",
+          tag: "work",
+          due_at: "2026-11-02T09:00:00+05:30",
+        },
+      ],
+    }),
+  ),
+);
+const mixedIngest = await ingestDocumentBytes({
+  fileName: "mixed.pdf",
+  mimeType: "application/pdf",
+  bytes: textBytes,
+  tag: "personal",
+});
+assert(
+  mixedIngest.pendingActionItems?.length === 1 &&
+    mixedIngest.pendingActionItems[0]?.text === "Send the signed NDA",
+  "valid action item is kept after sanitising junk",
 );
 
 setCompleteForTests(undefined);

@@ -138,6 +138,7 @@ const { CONVERSATION_SUMMARY_KEY, clearMessages, deleteSetting, getSetting, save
 const { getTaskBackend, setTaskBackend } = await import("../src/chat_backend.ts");
 const { complete, completeBackground } = await import("../src/llm.ts");
 const { completeForJob } = await import("../src/job_llm.ts");
+const { clearLlmBackendFlagsForTests } = await import("../src/llm_fallback.ts");
 const { runAgent } = await import("../src/agent.ts");
 
 function resetModelSettings(): void {
@@ -159,6 +160,7 @@ const minimal = {
 };
 
 resetModelSettings();
+clearLlmBackendFlagsForTests();
 setTaskBackend("chat", "haiku");
 state.mode = "ok";
 resetCalls();
@@ -183,28 +185,30 @@ assert(
 
 state.mode = "fail";
 resetCalls();
+clearLlmBackendFlagsForTests();
 let haikuAndClaude = "";
 try {
   await complete({ ...minimal, backend: "haiku" });
-  throw new Error("expected haiku and claude to both fail");
+  throw new Error("expected haiku then claude to both fail");
 } catch (error) {
   haikuAndClaude = error instanceof Error ? error.message : String(error);
 }
 assert(
-  haikuAndClaude.startsWith(`Primary (Haiku) failed: 400 ${HAIKU_REJECT}.`),
+  haikuAndClaude.startsWith("All LLM backends failed:"),
   haikuAndClaude,
 );
+assert(haikuAndClaude.includes("haiku:"), haikuAndClaude);
 assert(
-  haikuAndClaude.includes(`Fallback (Claude) failed: 400 ${CREDIT}.`),
-  haikuAndClaude,
+  haikuAndClaude.indexOf("haiku:") < haikuAndClaude.indexOf("claude:"),
+  `claude must be last: ${haikuAndClaude}`,
 );
+assert(state.calls.length === 2, "haiku then claude, no jump");
 assert(
-  haikuAndClaude.indexOf("Primary (Haiku)") <
-    haikuAndClaude.indexOf("Fallback (Claude)"),
+  !haikuAndClaude.includes("Fallback (Claude)"),
   haikuAndClaude,
 );
-assert(state.calls.length === 2, "haiku failure retries once on claude");
 
+clearLlmBackendFlagsForTests();
 state.mode = "credit";
 resetCalls();
 const creditLogs: string[] = [];
@@ -221,7 +225,7 @@ try {
 } finally {
   console.error = originalCreditError;
 }
-assert(haikuCredit.includes(CREDIT), haikuCredit);
+assert(/credit too low/i.test(haikuCredit), haikuCredit);
 assert(
   !haikuCredit.includes("Fallback (Claude)"),
   `credit error retried Claude: ${haikuCredit}`,
@@ -231,8 +235,10 @@ assert(
   !creditLogs.some((line) => line.includes("retrying on Claude")),
   `credit error logged Claude retry: ${creditLogs.join(" | ")}`,
 );
+clearLlmBackendFlagsForTests();
 
 resetCalls();
+clearLlmBackendFlagsForTests();
 let jobCredit = "";
 try {
   await completeForJob({ ...minimal, backend: "haiku" });
@@ -240,7 +246,7 @@ try {
 } catch (error) {
   jobCredit = error instanceof Error ? error.message : String(error);
 }
-assert(jobCredit.includes(CREDIT), jobCredit);
+assert(/credit too low|credit balance is too low/i.test(jobCredit), jobCredit);
 assert(
   !jobCredit.includes("Fallback (Claude)"),
   `job credit error retried Claude: ${jobCredit}`,
@@ -249,28 +255,24 @@ assert(
   state.calls.length === 1,
   `job credit error made ${state.calls.length} calls`,
 );
+clearLlmBackendFlagsForTests();
 
 resetCalls();
-let deepseekAndClaude = "";
+let deepseekSkipped = "";
 try {
   await complete({ ...minimal, backend: "deepseek" });
-  throw new Error("expected deepseek and claude to both fail");
+  throw new Error("expected usable anthropic backends to fail");
 } catch (error) {
-  deepseekAndClaude = error instanceof Error ? error.message : String(error);
+  deepseekSkipped = error instanceof Error ? error.message : String(error);
 }
 assert(
-  deepseekAndClaude.startsWith("Primary (DeepSeek) failed:"),
-  deepseekAndClaude,
+  !state.calls.some((call) => call.url.includes("deepseek")),
+  "deepseek with no key is never attempted",
 );
-assert(
-  deepseekAndClaude.includes("DEEPSEEK_API_KEY"),
-  deepseekAndClaude,
-);
-assert(
-  deepseekAndClaude.includes(`Fallback (Claude) failed: 400 ${CREDIT}.`),
-  deepseekAndClaude,
-);
+assert(deepseekSkipped.startsWith("All LLM backends failed:"), deepseekSkipped);
+assert(!deepseekSkipped.includes("DEEPSEEK_API_KEY"), deepseekSkipped);
 
+clearLlmBackendFlagsForTests();
 resetCalls();
 let claudeOnly = "";
 try {
@@ -279,10 +281,11 @@ try {
 } catch (error) {
   claudeOnly = error instanceof Error ? error.message : String(error);
 }
-assert(claudeOnly.includes(CREDIT), claudeOnly);
+assert(/credit too low|credit balance is too low/i.test(claudeOnly), claudeOnly);
 assert(!claudeOnly.includes("Primary ("), claudeOnly);
 assert(!claudeOnly.includes("Fallback ("), claudeOnly);
 
+clearLlmBackendFlagsForTests();
 state.mode = "ok";
 resetCalls();
 setTaskBackend("brief", "gemini");
@@ -310,16 +313,16 @@ assert(
   `background made ${state.calls.length} calls`,
 );
 assert(
-  state.calls[0]?.model === "claude-sonnet-test",
-  `background fell back to ${state.calls[0]?.model}`,
+  state.calls[0]?.model === "claude-haiku-test",
+  `background used ${state.calls[0]?.model}, not Claude jump`,
 );
 assert(
   state.calls[0]?.body.includes("Classify this background fixture") === true,
   "background prompt was sent",
 );
 assert(
-  logged.some((line) => line.includes("Backend gemini failed")),
-  `expected gemini failure log, got ${logged.join(" | ")}`,
+  !logged.some((line) => line.includes("retrying on Claude")),
+  `jumped to Claude: ${logged.join(" | ")}`,
 );
 
 clearMessages();
@@ -348,16 +351,16 @@ const summaryCall = state.calls.find((call) =>
 );
 assert(summaryCall !== undefined, "conversation summary called the model");
 assert(
-  summaryCall?.model === "claude-sonnet-test",
-  `summary used ${summaryCall?.model}, expected the chat-model fallback`,
+  summaryCall?.model === "claude-haiku-test",
+  `summary used ${summaryCall?.model}, expected haiku before claude`,
 );
 assert(
   getSetting(CONVERSATION_SUMMARY_KEY) === "Summary of older chat.",
   "summary was stored",
 );
 assert(
-  logged.some((line) => line.includes("Backend gemini failed")),
-  "summary attempted the chosen chat backend before Claude",
+  !logged.some((line) => line.includes("retrying on Claude")),
+  "summary must not jump to Claude",
 );
 
 console.log("backend choice tests passed");

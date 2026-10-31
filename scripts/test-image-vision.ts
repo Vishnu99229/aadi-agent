@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { getTaskBackend } from "../src/chat_backend.ts";
-import { IMAGE_VISION_BACKENDS } from "../src/document_llm.ts";
+import { imageVisionBackends } from "../src/document_llm.ts";
 import { analyzePhotoBytes, IMAGE_READ_ERROR } from "../src/documents.ts";
 import { setCompleteForTests, type CompleteParams } from "../src/llm.ts";
 import {
@@ -21,9 +21,15 @@ const samplePng = Buffer.from(SAMPLE_PNG_BASE64, "base64");
 const jpegBytes = new Uint8Array([1, 2, 3, 4]);
 
 assert(
-  IMAGE_VISION_BACKENDS[0] === "haiku" && IMAGE_VISION_BACKENDS[1] === "gemini",
-  "vision-LLM fallback still uses haiku then gemini",
+  imageVisionBackends()[0] === "gemini" || imageVisionBackends()[0] === "haiku",
+  "vision chain starts with gemini when keyed, else usable Anthropic",
 );
+if (process.env.GEMINI_API_KEY) {
+  assert(
+    imageVisionBackends()[0] === "gemini",
+    "gemini is first vision backend when the key is present",
+  );
+}
 assert(
   IMAGE_READ_ERROR === "I couldn't read the text in this image. Please type it out.",
   "photo fallback copy",

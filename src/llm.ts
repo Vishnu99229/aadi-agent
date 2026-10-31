@@ -16,6 +16,14 @@ import type {
 import { getTaskBackend } from "./chat_backend.js";
 import { config } from "./config.js";
 import { assertLocalModelAllowed } from "./local_llm_guard.js";
+import {
+  flagLlmBackend,
+  getFallbackChain,
+  isBackendUsable,
+  isCreditOrAuthError,
+  shortBackendReason,
+  type LlmBackend,
+} from "./llm_fallback.js";
 import { assertTestSeam } from "./test_seam.js";
 import {
   estimateLlmCostUsd,
@@ -101,13 +109,7 @@ export type LlmStopReason =
   | "refusal"
   | "other";
 
-export type LlmBackend =
-  | "claude"
-  | "haiku"
-  | "gemini"
-  | "local-gemma"
-  | "deepseek"
-  | "deepseek-reasoner";
+export type { LlmBackend } from "./llm_fallback.js";
 
 export interface CompleteParams {
   system: LlmSystemPrompt;
@@ -809,10 +811,20 @@ async function completeWithOpenAiCompatible(
   };
 }
 
+let fakeComplete:
+  | ((params: CompleteParams) => Promise<CompleteResult>)
+  | undefined;
+let namedBackendOverride:
+  | ((backend: LlmBackend, params: CompleteParams) => Promise<CompleteResult>)
+  | undefined;
+
 async function completeWithNamedBackend(
   backend: LlmBackend,
   params: CompleteParams,
 ): Promise<CompleteResult> {
+  if (namedBackendOverride) {
+    return namedBackendOverride(backend, params);
+  }
   if (backend === "claude" || backend === "haiku") {
     const model =
       params.model ??
@@ -860,22 +872,6 @@ async function completeWithNamedBackend(
   );
 }
 
-function backendFailureName(backend: LlmBackend): string {
-  switch (backend) {
-    case "claude":
-      return "Claude";
-    case "haiku":
-      return "Haiku";
-    case "gemini":
-      return "Gemini";
-    case "deepseek":
-    case "deepseek-reasoner":
-      return "DeepSeek";
-    case "local-gemma":
-      return "Local Gemma";
-  }
-}
-
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -884,9 +880,7 @@ export function isAnthropicCreditError(error: unknown): boolean {
   return /credit balance is too low/i.test(errorText(error));
 }
 
-let fakeComplete:
-  | ((params: CompleteParams) => Promise<CompleteResult>)
-  | undefined;
+export { getFallbackChain, isCreditOrAuthError } from "./llm_fallback.js";
 
 export function setCompleteForTests(
   fake: ((params: CompleteParams) => Promise<CompleteResult>) | undefined,
@@ -904,63 +898,78 @@ function messagesHavePdf(params: CompleteParams): boolean {
   );
 }
 
+function messagesHaveImage(params: CompleteParams): boolean {
+  return params.messages.some(
+    (message) =>
+      message.role === "user" &&
+      Array.isArray(message.content) &&
+      message.content.some((part) => part.type === "image"),
+  );
+}
+
+export function setNamedBackendCompleteForTests(
+  fake:
+    | ((backend: LlmBackend, params: CompleteParams) => Promise<CompleteResult>)
+    | undefined,
+): void {
+  assertTestSeam("setNamedBackendCompleteForTests");
+  namedBackendOverride = fake;
+}
+
 export async function complete(
   params: CompleteParams,
 ): Promise<CompleteResult> {
   if (fakeComplete) {
     return fakeComplete(params);
   }
-  const backend = params.backend ?? getTaskBackend("chat");
-  try {
-    return await completeWithNamedBackend(backend, params);
-  } catch (error) {
-    if (backend === "claude" || isAnthropicCreditError(error)) {
-      throw error;
+  const primary = params.backend ?? getTaskBackend("chat");
+  const chain = getFallbackChain(primary, {
+    hasImage: messagesHaveImage(params),
+    hasPdf: messagesHavePdf(params),
+  });
+  if (chain.length === 0) {
+    throw new Error("All LLM backends failed: none usable");
+  }
+  const failures: string[] = [];
+  for (const backend of chain) {
+    if (!isBackendUsable(backend)) {
+      continue;
     }
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(
-      `Backend ${backend} failed (${errorType}); retrying on Claude.`,
-    );
     try {
-      return await completeWithNamedBackend("claude", {
+      const result = await completeWithNamedBackend(backend, {
         ...params,
-        backend: "claude",
-        model: config.claudeModel,
-        effort: undefined,
+        backend,
+        model: backend === primary ? params.model : undefined,
+        jsonSchema:
+          backend === "deepseek" || backend === "deepseek-reasoner"
+            ? undefined
+            : params.jsonSchema,
+        effort:
+          backend === "claude" || backend === "haiku"
+            ? params.effort
+            : undefined,
       });
-    } catch (fallbackError) {
-      throw new Error(
-        `Primary (${backendFailureName(backend)}) failed: ${errorText(error)}. Fallback (Claude) failed: ${errorText(fallbackError)}.`,
-      );
+      if (failures.length > 0) {
+        console.error(`LLM: using ${backend}.`);
+      }
+      return result;
+    } catch (error) {
+      const reason = shortBackendReason(error);
+      console.error(`Backend ${backend} failed (${reason}); trying next.`);
+      if (isCreditOrAuthError(error)) {
+        flagLlmBackend(backend, reason);
+      }
+      failures.push(`${backend}:${reason}`);
     }
   }
+  throw new Error(`All LLM backends failed: [${failures.join("; ")}]`);
 }
 
-/** Haiku/Claude first; if Anthropic credit is empty, DeepSeek for text-only calls. */
+/** Same cascade as complete(); kept so job/document callers stay stable. */
 export async function completeWithCreditFallback(
   params: CompleteParams,
 ): Promise<CompleteResult> {
-  const backend = params.backend ?? getTaskBackend("chat");
-  try {
-    return await complete(params);
-  } catch (error) {
-    if (
-      config.deepseekApiKey &&
-      backend !== "deepseek" &&
-      backend !== "deepseek-reasoner" &&
-      isAnthropicCreditError(error) &&
-      !messagesHavePdf(params)
-    ) {
-      console.error("Anthropic credit too low; using deepseek.");
-      return await complete({
-        ...params,
-        backend: "deepseek",
-        model: undefined,
-        jsonSchema: undefined,
-      });
-    }
-    throw error;
-  }
+  return complete(params);
 }
 
 export async function completeBackground(

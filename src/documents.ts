@@ -109,10 +109,16 @@ async function downloadTelegramFile(
   return data;
 }
 
-function documentKeyboard(documentId: number): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("Add as tasks", `document:tasks:${documentId}`)
-    .text("Skip", `document:skip:${documentId}`);
+export function documentKeyboard(
+  documentId: number,
+  addTasks = false,
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  if (addTasks) {
+    keyboard.text("Add as tasks", `document:tasks:${documentId}`);
+  }
+  keyboard.text("Skip", `document:skip:${documentId}`);
+  return keyboard;
 }
 
 function persistAnalysis(
@@ -433,13 +439,11 @@ export async function processIncomingDocument(
       tag: "personal",
       userPrompt: userPrompt || undefined,
     });
-    const keyboard = result.pendingActionItems
-      ? documentKeyboard(result.documentId)
-      : undefined;
-    await ctx.reply(
-      result.reply,
-      keyboard ? { reply_markup: keyboard } : undefined,
+    const keyboard = documentKeyboard(
+      result.documentId,
+      Boolean(result.pendingActionItems?.length),
     );
+    await ctx.reply(result.reply, { reply_markup: keyboard });
     return {
       documentId: result.documentId,
       answeredPrompt: result.answeredPrompt === true,
@@ -587,8 +591,8 @@ export async function processIncomingPhoto(
         : null;
     const answeredPrompt = Boolean(userPrompt) && photo.source === "ocr";
     if (answeredPrompt) {
-      const keyboard = pending ? documentKeyboard(record.id) : undefined;
-      await ctx.reply(photo.reply, keyboard ? { reply_markup: keyboard } : undefined);
+      const keyboard = documentKeyboard(record.id, Boolean(pending?.length));
+      await ctx.reply(photo.reply, { reply_markup: keyboard });
       return { documentId: record.id, answeredPrompt: true };
     }
     if (userPrompt) {
@@ -599,8 +603,8 @@ export async function processIncomingPhoto(
       photo.source === "ocr"
         ? `${photo.reply}\n\nDocument id: ${record.id} (use read_document for follow-ups)`
         : formatDocumentReply(record.id, photo.analysis);
-    const keyboard = pending ? documentKeyboard(record.id) : undefined;
-    await ctx.reply(reply, keyboard ? { reply_markup: keyboard } : undefined);
+    const keyboard = documentKeyboard(record.id, Boolean(pending?.length));
+    await ctx.reply(reply, { reply_markup: keyboard });
     return { documentId: record.id, answeredPrompt: false };
   } catch (error) {
     console.error(

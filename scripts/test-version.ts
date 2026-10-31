@@ -54,6 +54,10 @@ function testReadAndHealth(): void {
       "health includes version line",
     );
     assert(
+      report.includes("llm credit:"),
+      "health includes llm credit line",
+    );
+    assert(
       formatHealthReport(new Date(), join(dir, "missing-subdir")).includes(
         "version: unknown, deployed unknown",
       ),

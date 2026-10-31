@@ -392,6 +392,12 @@ db.exec(`
     value TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS llm_backend_flags (
+    backend TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    flagged_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS builds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task TEXT NOT NULL,
@@ -2159,6 +2165,50 @@ export function setSetting(key: string, value: string): void {
 
 export function deleteSetting(key: string): void {
   db.prepare("DELETE FROM settings WHERE key = ?").run(key);
+}
+
+export interface LlmBackendFlagRow {
+  backend: string;
+  reason: string;
+  flagged_at: string;
+}
+
+export function upsertLlmBackendFlag(
+  backend: string,
+  reason: string,
+  flaggedAt: string,
+): void {
+  db.prepare(
+    `INSERT INTO llm_backend_flags (backend, reason, flagged_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(backend) DO UPDATE SET
+       reason = excluded.reason,
+       flagged_at = excluded.flagged_at`,
+  ).run(backend, reason, flaggedAt);
+}
+
+export function getLlmBackendFlag(backend: string): LlmBackendFlagRow | undefined {
+  return db
+    .prepare(
+      `SELECT backend, reason, flagged_at FROM llm_backend_flags WHERE backend = ?`,
+    )
+    .get(backend) as LlmBackendFlagRow | undefined;
+}
+
+export function listLlmBackendFlags(): LlmBackendFlagRow[] {
+  return db
+    .prepare(
+      `SELECT backend, reason, flagged_at FROM llm_backend_flags ORDER BY backend`,
+    )
+    .all() as LlmBackendFlagRow[];
+}
+
+export function deleteLlmBackendFlag(backend: string): void {
+  db.prepare(`DELETE FROM llm_backend_flags WHERE backend = ?`).run(backend);
+}
+
+export function deleteAllLlmBackendFlags(): void {
+  db.prepare(`DELETE FROM llm_backend_flags`).run();
 }
 
 export type MeetingNudgeStatus =

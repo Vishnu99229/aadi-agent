@@ -1,4 +1,5 @@
 import { InlineKeyboard, type Api, type Context } from "grammy";
+import { getTaskBackend } from "./chat_backend.js";
 import { everyClock, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import { complete } from "./llm.js";
@@ -127,7 +128,7 @@ export async function draftWishMessage(
   record: ImportantDateRecord,
 ): Promise<string> {
   const response = await complete({
-    backend: "haiku",
+    backend: getTaskBackend("meetings"),
     effort: "low",
     cacheTtl: "5m",
     task: "other",

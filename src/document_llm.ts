@@ -8,6 +8,7 @@ import {
   type LlmBackend,
   type LlmContentPart,
 } from "./llm.js";
+import { getFallbackChain } from "./llm_fallback.js";
 import { isHaiku55Model } from "./usage.js";
 
 const MAX_PDF_PAGES = 50;
@@ -50,6 +51,8 @@ const analysisSchema = {
     risks: { type: "array", items: { type: "string" } },
     action_items: {
       type: "array",
+      description:
+        "Concrete action items. Return [] when there are none. Never punctuation or filler.",
       items: {
         type: "object",
         properties: {
@@ -77,6 +80,7 @@ const analysisSchema = {
 const analysisPrompt = `Analyze this document for Vishnu. Tag it work or personal.
 Give exactly up to 5 short summary bullets, every key date or deadline (include the event date if this is a brochure or invitation), amounts mentioned, and risks or obligations.
 List concrete action items with work/personal tags and ISO8601 due_at with offset, or null due_at when unclear.
+If there are no action items, return []. Never punctuation, placeholders, or filler (for example ";;;;").
 Do not dump the full document. Keep each string short. Never invent figures or dates not present.`;
 
 const fallbackPrompt = `Summarize this document for Vishnu in short plain-text bullets: what it is, key dates, amounts, and anything needing his action. Plain text only, no JSON. Never invent figures or dates not present.`;
@@ -85,6 +89,42 @@ function documentsModel(): string {
   return getTaskBackend("documents") === "claude"
     ? config.claudeModel
     : config.backgroundModel;
+}
+
+export function sanitizeActionItems(raw: unknown): DocumentActionItem[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const items: DocumentActionItem[] = [];
+  for (const item of raw) {
+    const text =
+      typeof item === "string"
+        ? item
+        : item && typeof item === "object" && "text" in item
+          ? String((item as { text?: unknown }).text ?? "")
+          : "";
+    if (isJunkActionText(text)) {
+      continue;
+    }
+    const entry =
+      item && typeof item === "object"
+        ? (item as Record<string, unknown>)
+        : {};
+    items.push({
+      text: text.trim(),
+      tag: entry.tag === "work" ? "work" : "personal",
+      due_at: typeof entry.due_at === "string" ? entry.due_at : null,
+    });
+  }
+  return items;
+}
+
+function isJunkActionText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return true;
+  }
+  return /^[^A-Za-z0-9]+$/.test(trimmed);
 }
 
 function uniqueStrings(items: string[]): string[] {
@@ -110,16 +150,7 @@ function normalizeAnalysis(parsed: unknown): Omit<DocumentAnalysis, "pages_proce
     Array.isArray(input)
       ? input.filter((item): item is string => typeof item === "string")
       : [];
-  const actionItems = Array.isArray(value.action_items)
-    ? value.action_items.map((item) => {
-        const entry = item as Record<string, unknown>;
-        return {
-          text: typeof entry.text === "string" ? entry.text : "",
-          tag: entry.tag === "work" ? "work" : "personal",
-          due_at: typeof entry.due_at === "string" ? entry.due_at : null,
-        } satisfies DocumentActionItem;
-      })
-    : [];
+  const actionItems = sanitizeActionItems(value.action_items);
   const summary_bullets = strings(value.summary_bullets).slice(0, 5);
   const dates = strings(value.dates);
   const money = strings(value.money);
@@ -444,8 +475,10 @@ export async function analyzePdf(
   return withPages(merged, pagesProcessed, truncated, parts.some((part) => part.fallback_summary));
 }
 
-/** Image OCR never follows the Chat /model picker. DeepSeek has no vision. */
-export const IMAGE_VISION_BACKENDS: readonly LlmBackend[] = ["haiku", "gemini"];
+/** Photos: Gemini first (OpenAI-compat image_url). Haiku only if Anthropic is usable. DeepSeek has no vision. Scanned PDFs still need Anthropic document blocks. */
+export function imageVisionBackends(): LlmBackend[] {
+  return getFallbackChain("gemini", { hasImage: true });
+}
 
 function parseJsonObject(text: string): unknown {
   const trimmed = text
@@ -467,71 +500,58 @@ export async function analyzeImage(
       text: `${analysisPrompt}\nThis is a photo of a document.`,
     },
   ];
-  let lastError: unknown;
-  for (const backend of IMAGE_VISION_BACKENDS) {
-    try {
-      const result = await complete({
-        backend,
-        tools: [],
-        task: "document",
-        system: {
-          cacheable:
-            "Extract facts from this image for Vishnu. Reply with JSON only.",
-        },
-        messages: [{ role: "user", content: userContent }],
-        jsonSchema: backend === "gemini" ? undefined : analysisSchema,
-      });
-      const text = result.textParts.join("\n").trim();
-      if (!text) {
-        throw new Error("Vision model returned empty text.");
-      }
-      const usage = {
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
-        estimatedCostUsd: result.usage.estimatedCostUsd,
-      };
-      try {
-        return withPages(
-          { analysis: normalizeAnalysis(parseJsonObject(text)), usage },
-          1,
-          false,
-          false,
-        );
-      } catch {
-        const bullets = text
-          .split("\n")
-          .map((line) => line.replace(/^[-•\s]+/, "").trim())
-          .filter(Boolean)
-          .slice(0, 5);
-        return withPages(
-          {
-            analysis: {
-              tag: "personal",
-              document_type: "document",
-              summary_bullets: bullets,
-              dates: [],
-              money: [],
-              risks: [],
-              action_items: [],
-              extracted_text: text,
-            },
-            usage,
-          },
-          1,
-          false,
-          true,
-        );
-      }
-    } catch (error) {
-      lastError = error;
-      console.error(
-        `Image vision (${backend}) failed (${error instanceof Error ? error.message : String(error)}).`,
-      );
-    }
+  const result = await complete({
+    backend: "gemini",
+    tools: [],
+    task: "document",
+    system: {
+      cacheable:
+        "Extract facts from this image for Vishnu. Reply with JSON only.",
+    },
+    messages: [{ role: "user", content: userContent }],
+    jsonSchema: analysisSchema,
+  });
+  const text = result.textParts.join("\n").trim();
+  if (!text) {
+    throw new Error("Vision model returned empty text.");
   }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Image vision failed on every vision backend.");
+  const usage = {
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    estimatedCostUsd: result.usage.estimatedCostUsd,
+  };
+  try {
+    return withPages(
+      { analysis: normalizeAnalysis(parseJsonObject(text)), usage },
+      1,
+      false,
+      false,
+    );
+  } catch {
+    const bullets = text
+      .split("\n")
+      .map((line) => line.replace(/^[-•\s]+/, "").trim())
+      .filter(Boolean)
+      .slice(0, 5);
+    return withPages(
+      {
+        analysis: {
+          tag: "personal",
+          document_type: "document",
+          summary_bullets: bullets,
+          dates: [],
+          money: [],
+          risks: [],
+          action_items: [],
+          extracted_text: text,
+        },
+        usage,
+      },
+      1,
+      false,
+      true,
+    );
+  }
 }
 
 export async function analyzeText(

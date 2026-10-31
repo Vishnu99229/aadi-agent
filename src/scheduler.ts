@@ -9,6 +9,7 @@ import {
 } from "./heartbeat.js";
 import { formatVersionLine, readDeployVersion } from "./version.js";
 import { formatTurnsHealthLine } from "./turns.js";
+import { formatCreditHealthLine } from "./llm_fallback.js";
 
 export const GOOGLE_API_TIMEOUT_MS = 30_000;
 const JOB_TIMEOUT_MS = 5 * 60 * 1000;
@@ -557,6 +558,7 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
     "Aadi health",
     formatVersionLine(readDeployVersion(cwd)),
     formatTurnsHealthLine(now),
+    formatCreditHealthLine(now.getTime()),
   ];
   const beatPath = heartbeatPath(cwd);
   if (existsSync(beatPath)) {
