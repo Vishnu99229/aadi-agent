@@ -305,7 +305,7 @@ const HAIKU_55_COST_DEFAULTS: ModelCostRates = {
   cacheReadCostPerMillion: 0.01,
 };
 
-/** Gemini 1.5 Flash — ai.google.dev/pricing */
+/** Gemini 3.6 Flash — ai.google.dev/pricing (OpenAI-compat). */
 const GEMINI_FLASH_COST_DEFAULTS: ModelCostRates = {
   inputCostPerMillion: 0.075,
   outputCostPerMillion: 0.3,
@@ -399,7 +399,10 @@ export const config = {
   backgroundModel:
     process.env.BACKGROUND_MODEL?.trim() || "claude-haiku-5-5",
   geminiApiKey: process.env.GEMINI_API_KEY?.trim() ?? "",
-  geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-1.5-flash",
+  // 1.5 Flash is shut down. OpenAI-compat docs currently show gemini-3.8-flash;
+  // that id 503'd with high demand on a new key, so the code default is 3.6 Flash
+  // (still production, image+PDF). Override with GEMINI_MODEL.
+  geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-3.6-flash",
   deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() ?? "",
   // Current DeepSeek API ids (api-docs.deepseek.com). Legacy deepseek-chat /
   // deepseek-reasoner names are retired; override via env if needed.

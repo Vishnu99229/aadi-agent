@@ -153,6 +153,7 @@ const gemini = config.geminiApiKey
   ? new OpenAI({
       apiKey: config.geminiApiKey,
       baseURL: GEMINI_BASE_URL,
+      timeout: 45_000,
     })
   : undefined;
 
@@ -804,7 +805,9 @@ async function completeWithOpenAiCompatible(
           }
         : isDeepSeekLabel(label)
           ? { thinking: { type: "disabled" } }
-          : {}),
+          : label === "gemini"
+            ? { reasoning_effort: "low" as const }
+            : {}),
     } as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
     params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
   );

@@ -74,7 +74,7 @@ export function modelDisplayName(backend: ChatBackend): string {
   if (backend === "deepseek") {
     return "DeepSeek Flash";
   }
-  return "Gemini 1.5 Flash";
+  return "Gemini 3.6 Flash";
 }
 
 const DEFAULTS_GENERATION = "v3-gemini-migration";
@@ -242,7 +242,7 @@ export function formatModelSetupText(options?: {
 
 function backendNeedsKey(backend: ChatBackend): string | undefined {
   if (backend === "gemini" && !config.geminiApiKey) {
-    return "Gemini 1.5 Flash needs GEMINI_API_KEY in .env.";
+    return "Gemini 3.6 Flash needs GEMINI_API_KEY in .env.";
   }
   if (backend === "deepseek" && !config.deepseekApiKey) {
     return "DeepSeek Flash needs DEEPSEEK_API_KEY in .env.";
@@ -340,6 +340,6 @@ export function applyAllTasks(backend: ChatBackend): {
           ? "All tasks now use Fast (Haiku 5.5)."
           : backend === "deepseek"
             ? "All tasks now use DeepSeek Flash."
-            : "All tasks now use Gemini 1.5 Flash.",
+            : "All tasks now use Gemini 3.6 Flash.",
   };
 }

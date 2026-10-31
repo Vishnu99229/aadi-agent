@@ -103,7 +103,7 @@ assert(getTaskEffort("chat") === "low", "default effort is low");
 assert(getTaskEffort("drafting") === "low", "drafting effort defaults low");
 assert(modelDisplayName("haiku") === "Haiku 5.5", "haiku display name");
 assert(modelDisplayName("claude") === "Claude Sonnet 5.5", "sonnet display name");
-assert(modelDisplayName("gemini") === "Gemini 1.5 Flash", "gemini display name");
+assert(modelDisplayName("gemini") === "Gemini 3.6 Flash", "gemini display name");
 assert(modelDisplayName("deepseek") === "DeepSeek Flash", "deepseek display name");
 assert(isChatBackend("deepseek"), "deepseek is a chat backend");
 assert(!supportsEffort("deepseek"), "deepseek has no Anthropic effort");
@@ -122,7 +122,7 @@ assert(getTaskBackend("drafting") === "gemini", "drafting uses gemini too");
 assert(
   formatModelSetupText({
     updatedTasks: ["chat"],
-  }).includes("Chat and questions — Gemini 1.5 Flash ✅ updated"),
+  }).includes("Chat and questions — Gemini 3.6 Flash ✅ updated"),
   "updated gemini line",
 );
 
