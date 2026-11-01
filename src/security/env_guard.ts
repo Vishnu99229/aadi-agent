@@ -2,8 +2,12 @@ const SECRET_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
   { name: "cursor", pattern: /crsr_[A-Za-z0-9_-]+/g },
   { name: "bearer", pattern: /Bearer\s+\S+/gi },
   { name: "github", pattern: /ghp_[A-Za-z0-9]+/g },
+  { name: "github_oauth", pattern: /gho_[A-Za-z0-9]+/g },
+  { name: "github_app", pattern: /ghs_[A-Za-z0-9]+/g },
   { name: "github_pat", pattern: /github_pat_[A-Za-z0-9_]+/g },
   { name: "anthropic", pattern: /sk-ant-[A-Za-z0-9_-]+/g },
+  // Tight on purpose: 32 hex after sk- only. Do not widen to
+  // sk-[A-Za-z0-9_-]{20,} — that false-positives on benign strings.
   { name: "deepseek", pattern: /sk-[a-f0-9]{32}/gi },
 ];
 

@@ -41,9 +41,10 @@ import {
 } from "./web_search.js";
 import {
   SUMMARISE_SYSTEM,
+  buildSummarizerInput,
   historyLimits,
   planHistoryWindow,
-  redactSecrets,
+  redactAllSecrets,
   stubLongToolOutputs,
 } from "./chat_history.js";
 
@@ -150,10 +151,6 @@ async function summariseOlderMessages(
   older: StoredMessage[],
   previous: string,
 ): Promise<string> {
-  const lines = older.map((message) => {
-    const body = redactSecrets(message.content).slice(0, 400);
-    return `${message.role}: ${body}`;
-  });
   const result = await complete({
     backend: getTaskBackend("chat"),
     effort: "low",
@@ -167,13 +164,11 @@ async function summariseOlderMessages(
     messages: [
       {
         role: "user",
-        content: redactSecrets(
-          `${previous ? `Previous summary:\n${previous}\n\n` : ""}New turns:\n${lines.join("\n")}`,
-        ),
+        content: buildSummarizerInput(older, previous),
       },
     ],
   });
-  return redactSecrets(result.textParts.join("\n").trim() || previous);
+  return redactAllSecrets(result.textParts.join("\n").trim() || previous);
 }
 
 function storedToLlmMessages(stored: StoredMessage[]): LlmMessage[] {

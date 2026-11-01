@@ -1,4 +1,5 @@
 import type { StoredMessage } from "./db.js";
+import { redactSecrets as redactApiKeys } from "./security/env_guard.js";
 import { assertTestSeam } from "./test_seam.js";
 
 export const HISTORY_KEEP_MAX = 30;
@@ -39,6 +40,26 @@ export function redactSecrets(text: string): string {
     .replace(/\b(password|passwd|passcode)\b[:\s=]*\S+/gi, "$1 [redacted]")
     .replace(/\b(account(?:\s+number)?|a\/c|acct)[:\s#.-]*\d{6,}\b/gi, "$1 [redacted]")
     .replace(/\b(?:\d[ -]*){12,19}\b/g, "[redacted]");
+}
+
+// PII first, then API keys. PII rules anchor on labels (password/otp/account);
+// Bearer greedily eats the next token, so running it first would swallow
+// "password" in "Bearer password hunter2" and leave the value bare.
+export function redactAllSecrets(text: string): string {
+  return redactApiKeys(redactSecrets(text));
+}
+
+export function buildSummarizerInput(
+  older: StoredMessage[],
+  previous: string,
+): string {
+  const lines = older.map((message) => {
+    const body = redactAllSecrets(message.content).slice(0, TOOL_STUB_MIN_CHARS);
+    return `${message.role}: ${body}`;
+  });
+  return redactAllSecrets(
+    `${previous ? `Previous summary:\n${previous}\n\n` : ""}New turns:\n${lines.join("\n")}`,
+  );
 }
 
 export function userMessagesAfter(

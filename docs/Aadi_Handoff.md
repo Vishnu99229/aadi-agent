@@ -19,7 +19,7 @@ Aadi is Vishnu’s personal Telegram agent. One process, one owner, one SQLite f
 
 ### Agent loop (`src/agent.ts`)
 
-1. Load system prompt, memories, history (fold older turns into a summary).
+1. Load system prompt, memories, and conversation history (`historyForAgent`: last **80** `messages` rows, then fold; see Conversation history).
 2. Call `complete()` with **all** `TOOL_ORDER` function tools. Chat backend comes from `/model` (`getTaskBackend`) unless the caller passed one.
 3. If `stopReason === "tool_use"`, run **client** tools in `src/tools/*`. Provider-side tools are not used on the default path.
 4. Guards before accepting a final reply:
@@ -77,7 +77,19 @@ Anthropic prompt cache, **three** breakpoints per request (`src/llm.ts`): tools,
 - **1h** TTL for chat-like usage tasks.
 - **5m** TTL for brief, classification, document, contract review, memory extraction, `other`.
 
-DeepSeek reports cache-read tokens; Gemini cache rates are zero in config. History folding (`src/chat_history.ts`): keep last **30** messages, fold **10** at a time, ~**8000** token budget; long tool outputs stubbed after **1500** chars. Tool list order is frozen so the cached tools prefix stays stable.
+DeepSeek reports cache-read tokens; Gemini cache rates are zero in config. Tool list order is frozen so the cached tools prefix stays stable. Conversation history is a separate mechanism (next section), not Anthropic prompt cache.
+
+### Conversation history (`src/chat_history.ts`, `historyForAgent` in `src/agent.ts`)
+
+**(a) Raw-message window — not “keep last 30” as the fetch.** `HISTORY_KEEP_MAX = 30` is the **post-fold keep target**, not how many rows are read from SQLite. `HISTORY_FOLD = 10`. `HISTORY_TOKEN_BUDGET = 8000`.
+
+`historyForAgent` in `src/agent.ts` loads `keepMax + fold * 5` = **80** rows via `getRecentMessages` in `src/db.ts` (newest `ORDER BY id DESC LIMIT`, then reverse). The default `limit = 10` is unused by the agent; the agent always passes that lookback. `storeOutboundText` calls `getRecentMessages(1)`.
+
+`planHistoryWindow` in `src/chat_history.ts` then shrinks that window until `remaining.length <= keepMax` **and** estimated tokens `<= 8000`, taking up to `HISTORY_FOLD` (10) oldest remaining rows per block and always leaving at least one. So the **raw** turns in the LLM request are at most 30 messages **and** under ~8000 estimated tokens (4 chars ≈ 1 token). Already-folded ids (`conversation_summary_until_id`) are excluded via `message.id > untilId` before that loop. Tool rows longer than `TOOL_STUB_MIN_CHARS` (1500) are stubbed unless two or fewer user messages follow them.
+
+**(b) Fold behaviour — re-folded (summary-of-summary), not truncated.** `summariseOlderMessages` in `src/agent.ts` summarises each successful block **together with the previous stored summary** (`buildSummarizerInput` in `src/chat_history.ts` prefixes `Previous summary:` when one exists, then `New turns:`), then the result **replaces** `conversation_summary` and advances `conversation_summary_until_id`. Older raw rows are not truncated in place; they stay in `messages` but are skipped on later turns by `until_id`. Before summarising, `buildSummarizerInput` caps each message at `TOOL_STUB_MIN_CHARS` (1500) characters and applies `redactAllSecrets` per message and to the joined input; the summary output is also passed through `redactAllSecrets`. The merged summary is injected as `Earlier conversation summary:` in `system.dynamic`. If a fold LLM call fails, later blocks in that turn are skipped (`break`); already-written summary/`until_id` stay.
+
+**(c) `messages` is not searchable.** Runtime reads of the `messages` table go only through `getRecentMessages` (agent lookback; outbound last-assistant check). There is no SQL search, FTS, or tool that queries chat history. `search_memories` / `search_notes` / `search_qa_bank` hit other tables. `/reset` (`clearMessages`) deletes all `messages` rows and the two summary settings.
 
 ---
 
@@ -256,7 +268,7 @@ Not env: `google-credentials.json`, `google-token.json` (personal Gmail), `googl
 
 ### Env / secrets
 
-`.env` gitignored. `redactSecrets` strips Anthropic / DeepSeek / GitHub / Cursor / Bearer patterns. Tests use `AADI_DB_PATH=:memory:` and `scripts/fixtures/test.env`. `test-security.ts` refuses running against `aadi.db`.
+`.env` gitignored. Fold path uses `redactAllSecrets` (PII-first `chat_history.redactSecrets`, then `env_guard.redactSecrets` for Anthropic / DeepSeek hex / GitHub / Cursor / Bearer). Tests use `AADI_DB_PATH=:memory:` and `scripts/fixtures/test.env`. `test-security.ts` refuses running against `aadi.db`.
 
 ### CI
 
@@ -319,7 +331,7 @@ Live file: phone `aadi.db`. Created/migrated in `src/db.ts`.
 
 | Table | Purpose |
 | --- | --- |
-| `messages` | Chat history: user / assistant / tool rows (`tool_name` on tool rows) |
+| `messages` | Chat log (user / assistant / tool). Read only via `getRecentMessages` (newest `LIMIT`, then reverse). No search/query tool. Folded into `settings.conversation_summary` |
 | `pending_actions` | Draft Send cards and Create Event cards (account, headers, expiry) |
 | `tasks` | Open/done tasks; extra columns for promises (`kind`, `source_thread_id`, `deadline`, `recipient`, …) |
 | `reminders` | One-off / daily / weekly / weekdays; may link task or bill |
@@ -335,7 +347,7 @@ Live file: phone `aadi.db`. Created/migrated in `src/db.ts`.
 | `usage_log` | Token/cost rows (ids, not bodies) |
 | `bills` | Upcoming / paid / ignored renewals |
 | `important_dates` | Birthdays etc. (`month_day`) |
-| `settings` | Key/value: `/model`, morning brief on/off, keyboard, web-search daily counts, wrap-up pending, … |
+| `settings` | Key/value: `/model`, morning brief on/off, keyboard, web-search daily counts, wrap-up pending, `conversation_summary` + `conversation_summary_until_id`, … |
 | `llm_backend_flags` | 6h credit/auth flags |
 | `builds` | `/build` pipeline state |
 | `meeting_briefs` | Pre-meeting briefs + wrap-up state |
