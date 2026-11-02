@@ -4,7 +4,9 @@ import {
   beginChatTurn as insertChatTurn,
   countChatTurnsToday as countTurns,
   finishChatTurn as updateChatTurn,
+  getChatTurnForwarded as readForwarded,
   getChatTurnRetryText as readRetryText,
+  setChatTurnForwarded as writeForwarded,
   setChatTurnRetryText as writeRetryText,
   type ChatTurnOutcome,
 } from "./db.js";
@@ -47,6 +49,14 @@ export function attachRetryText(gate: TurnGate, text: string): void {
 
 export function retryTextFor(turnId: number): string | undefined {
   return readRetryText(turnId);
+}
+
+export function markTurnForwarded(gate: TurnGate, forwarded: boolean): void {
+  writeForwarded(gate.id, forwarded);
+}
+
+export function turnWasForwarded(turnId: number): boolean {
+  return readForwarded(turnId);
 }
 
 export function closeTurn(

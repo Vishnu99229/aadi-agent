@@ -642,12 +642,19 @@ db.exec(`
     outcome TEXT NOT NULL DEFAULT 'running'
       CHECK (outcome IN ('running', 'ok', 'failed', 'timeout', 'empty')),
     error TEXT,
-    retry_text TEXT
+    retry_text TEXT,
+    forwarded INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE INDEX IF NOT EXISTS idx_chat_turns_started
     ON chat_turns (started_at, outcome);
 `);
+
+if (!tableHasColumn("chat_turns", "forwarded")) {
+  db.exec(
+    `ALTER TABLE chat_turns ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0`,
+  );
+}
 
 {
   const schema = db
@@ -3740,6 +3747,20 @@ export function getChatTurnRetryText(id: number): string | undefined {
     .prepare(`SELECT retry_text FROM chat_turns WHERE id = ?`)
     .get(id) as { retry_text: string | null } | undefined;
   return row?.retry_text ?? undefined;
+}
+
+export function setChatTurnForwarded(id: number, forwarded: boolean): void {
+  db.prepare(`UPDATE chat_turns SET forwarded = ? WHERE id = ?`).run(
+    forwarded ? 1 : 0,
+    id,
+  );
+}
+
+export function getChatTurnForwarded(id: number): boolean {
+  const row = db
+    .prepare(`SELECT forwarded FROM chat_turns WHERE id = ?`)
+    .get(id) as { forwarded: number | null } | undefined;
+  return row?.forwarded === 1;
 }
 
 export function finishChatTurn(

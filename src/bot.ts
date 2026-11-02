@@ -1,5 +1,6 @@
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { runAgent } from "./agent.js";
+import { FORWARDED_TOOLS } from "./tools/index.js";
 import { reactToSimpleGratitude } from "./gratitude.js";
 import {
   createReactionSession,
@@ -23,7 +24,12 @@ import {
 } from "./approvals.js";
 import { sendMorningBrief } from "./brief.js";
 import { config } from "./config.js";
-import { ownerOnly } from "./security/owner_lock.js";
+import {
+  allowInboundCommands,
+  isForwardedMessage,
+  ownerOnly,
+  wrapForwardedContent,
+} from "./security/owner_lock.js";
 import {
   claimTelegramMessage,
   clearMessages,
@@ -135,8 +141,10 @@ import {
   beginTurn,
   closeTurn,
   formatTurnFailure,
+  markTurnForwarded,
   retryKeyboard,
   retryTextFor,
+  turnWasForwarded,
   settleChatWork,
   turnTimeoutMs,
   type TurnGate,
@@ -228,9 +236,14 @@ async function completeChatReply(
   ctx: Context,
   userText: string,
   work: () => Promise<string>,
+  forwarded = false,
+  retryText?: string,
 ): Promise<void> {
   const gate = beginTurn();
-  attachRetryText(gate, userText);
+  attachRetryText(gate, retryText ?? userText);
+  if (forwarded) {
+    markTurnForwarded(gate, true);
+  }
   const startedAt = Date.now();
   const stopTyping = startTyping(ctx);
   try {
@@ -260,6 +273,23 @@ async function completeChatReply(
   } finally {
     stopTyping();
   }
+}
+
+/** One path for every forwarded update: labelled text, no send confirmation, read and draft tools only. */
+async function handleForwardedContent(ctx: Context, content: string): Promise<void> {
+  const wrapped = wrapForwardedContent(content);
+  await completeChatReply(
+    ctx,
+    wrapped,
+    () =>
+      runAgent(wrapped, {
+        toolNames: FORWARDED_TOOLS,
+        sendConfirmation: undefined,
+        guardText: wrapped,
+      }),
+    true,
+    content,
+  );
 }
 
 function shortError(error: unknown): string {
@@ -516,6 +546,10 @@ bot.callbackQuery(/^retry:(\d+)$/, async (ctx) => {
     return;
   }
   console.log(`turn id=${turnId} outcome=retry`);
+  if (turnWasForwarded(turnId)) {
+    await handleForwardedContent(ctx, retryText);
+    return;
+  }
   await handleUserText(ctx, ctx.from.id, retryText);
 });
 
@@ -776,6 +810,7 @@ async function handleUserText(
   ctx: Context,
   userId: number,
   userText: string,
+  options: { forwarded?: boolean } = {},
 ): Promise<void> {
   if (await tryGratitudeReaction(ctx, userText)) {
     return;
@@ -835,11 +870,14 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   if (await tryHandleMeetingChat(ctx, userText)) {
     return;
   }
-  // Vishnu's own message (typed, or a voice transcript routed here). Any
-  // other way of saying "send it" is read by the model, which can only signal
-  // intent through confirm_send_pending_draft.
+  // Vishnu's own message (typed, or a voice transcript routed here). A
+  // forward is content he shared, not an instruction, so it cannot confirm
+  // a send or book. Retry of a forwarded turn stays blocked even though the
+  // Retry tap itself is not a forward.
+  const forwarded =
+    options.forwarded === true || isForwardedMessage(ctx.message);
   const confirmation: SendConfirmation | undefined =
-    ctx.chat && ctx.message
+    !forwarded && ctx.chat && ctx.message
       ? { chatId: ctx.chat.id, messageId: ctx.message.message_id }
       : undefined;
   const reactionCtx =
@@ -929,6 +967,7 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       ctx: reactionCtx,
       reactions: session,
     }),
+    forwarded,
   );
   void captureFromUserMessage(userText).catch((error: unknown) => {
     const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -956,6 +995,10 @@ bot.on("message:voice", async (ctx) => {
 
   try {
     await sendPlainText(ctx, `Heard: ${transcript}`);
+    if (!allowInboundCommands(ctx.message)) {
+      await handleForwardedContent(ctx, transcript);
+      return;
+    }
     const buildFollowupId = consumeBuildFollowup(ctx.from.id);
     if (buildFollowupId !== undefined) {
       await submitBuildFollowup(ctx, buildFollowupId, transcript);
@@ -1002,6 +1045,23 @@ bot.on("message:document", async (ctx) => {
   }
   const fileName = doc.file_name ?? "document.bin";
   const caption = ctx.message.caption?.trim() ?? "";
+  if (!allowInboundCommands(ctx.message)) {
+    try {
+      await whileTyping(ctx, () =>
+        processIncomingDocument(ctx, fileName, doc.file_id, doc.mime_type, {
+          useCaption: false,
+        }),
+      );
+      if (caption) {
+        await handleForwardedContent(ctx, caption);
+      }
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Document processing failed (${errorType}).`);
+      await ctx.reply(documentFailureReply(error));
+    }
+    return;
+  }
   try {
     const ingested = await whileTyping(ctx, () =>
       processIncomingDocument(ctx, fileName, doc.file_id, doc.mime_type),
@@ -1027,7 +1087,20 @@ bot.on("message:document", async (ctx) => {
 });
 
 bot.on("message:photo", async (ctx) => {
-  const caption = ctx.message.caption?.trim();
+  const caption = ctx.message.caption?.trim() ?? "";
+  if (!allowInboundCommands(ctx.message)) {
+    try {
+      await whileTyping(ctx, () => processIncomingPhoto(ctx, { useCaption: false }));
+      if (caption) {
+        await handleForwardedContent(ctx, caption);
+      }
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Document photo failed (${errorType}).`);
+      await ctx.reply(IMAGE_READ_ERROR);
+    }
+    return;
+  }
   if (caption) {
     if (isWrapUpText(caption)) {
       try {
@@ -1075,6 +1148,10 @@ bot.on("message:text", async (ctx) => {
     if (await tryGratitudeReaction(ctx, text)) {
       return;
     }
+    if (!allowInboundCommands(ctx.message)) {
+      await handleForwardedContent(ctx, text);
+      return;
+    }
     if ((QUICK_ACTIONS as readonly string[]).includes(text)) {
       if (text === "Menu") {
         await sendMenu(ctx);
@@ -1104,6 +1181,9 @@ bot.on("message:text", async (ctx) => {
     console.error(`Agent error: ${safeErrorText(error)}`);
     const gate = beginTurn();
     attachRetryText(gate, ctx.message.text);
+    if (isForwardedMessage(ctx.message)) {
+      markTurnForwarded(gate, true);
+    }
     closeTurn(gate, "failed", Date.now(), shortError(error));
     await sendTurnFailure(ctx, gate, shortError(error));
   }

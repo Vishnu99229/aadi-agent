@@ -421,6 +421,7 @@ export async function processIncomingDocument(
   fileName: string,
   fileId: string,
   mimeType?: string,
+  options?: { useCaption?: boolean },
 ): Promise<{ documentId: number; answeredPrompt: boolean } | null> {
   if (!isSupportedAttachment(fileName, mimeType)) {
     await ctx.reply(
@@ -430,7 +431,8 @@ export async function processIncomingDocument(
   }
 
   try {
-    const userPrompt = ctx.message?.caption?.trim() ?? "";
+    const userPrompt =
+      options?.useCaption === false ? "" : (ctx.message?.caption?.trim() ?? "");
     const bytes = await downloadTelegramFile(ctx, fileId);
     const result = await ingestDocumentBytes({
       fileName,
@@ -558,13 +560,15 @@ export async function analyzePhotoBytes(
 
 export async function processIncomingPhoto(
   ctx: Context,
+  options?: { useCaption?: boolean },
 ): Promise<{ documentId: number; answeredPrompt: boolean } | null> {
   const photos = ctx.message?.photo;
   if (!photos?.length) {
     return null;
   }
 
-  const userPrompt = ctx.message?.caption?.trim() ?? "";
+  const userPrompt =
+    options?.useCaption === false ? "" : (ctx.message?.caption?.trim() ?? "");
 
   // Store first so follow-up questions work even if analysis fails.
   const record = createDocument("photo-document.jpg", "personal", "", null);

@@ -85,7 +85,16 @@ function sendIntentContext(confirmation: SendConfirmation | undefined): string {
 async function runTool(
   call: ToolCall,
   turn: ToolTurn,
+  allowed?: ReadonlySet<string>,
 ): Promise<Extract<LlmMessage, { role: "tool" }>> {
+  if (allowed && !allowed.has(call.name)) {
+    return {
+      role: "tool",
+      toolCallId: call.id,
+      content: "Tool is not available for a forwarded message.",
+      isError: true,
+    };
+  }
   const intercepted = toolInterceptor?.(call, turn);
   if (intercepted !== undefined) {
     return { role: "tool", toolCallId: call.id, content: intercepted };
@@ -145,6 +154,8 @@ export interface RunAgentOptions {
   ctx?: { react: (emoji: string) => Promise<unknown> };
   /** Parallel 👀 / 👍 on Vishnu's message when this turn uses tools. */
   reactions?: ReactionSession;
+  /** When set, only these tools are offered and executed. */
+  toolNames?: readonly string[];
 }
 
 async function summariseOlderMessages(
@@ -292,6 +303,16 @@ export async function runAgent(
   let calendarRetryUsed = false;
   const toolsUsed = new Set<string>();
   const guardText = options.guardText ?? userText;
+  const allowedTools = options.toolNames ? new Set(options.toolNames) : undefined;
+  const activeTools: LlmTool[] = options.toolNames
+    ? options.toolNames.map((name) => {
+        const tool = customTools[name];
+        if (!tool) {
+          throw new Error(`Unknown tool: ${name}`);
+        }
+        return tool.definition;
+      })
+    : toolDefinitions;
   let succeeded = false;
   let toolFailed = false;
   let receiptRetryUsed = false;
@@ -302,7 +323,7 @@ export async function runAgent(
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     const response = await complete({
       system,
-      tools: toolDefinitions,
+      tools: activeTools,
       messages,
       backend,
       task: options.usageTask ?? usageTaskForAgent(options.task),
@@ -350,7 +371,7 @@ export async function runAgent(
         ctx: options.ctx,
       };
       const toolResults = await Promise.all(
-        clientToolCalls.map((call) => runTool(call, turn)),
+        clientToolCalls.map((call) => runTool(call, turn, allowedTools)),
       );
       if (toolResults.some((result) => result.isError)) {
         toolFailed = true;

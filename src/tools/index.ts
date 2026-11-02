@@ -194,3 +194,36 @@ export const TOOL_ORDER = [
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(
   TOOL_ORDER.map((name) => [name, modules[name]]),
 );
+
+/** Read and draft tools a forwarded message may use. Nothing here sends, books, or writes. */
+export const FORWARDED_TOOLS = [
+  "account_status",
+  "draft_mom",
+  "draft_reply",
+  "get_current_time",
+  "list_accounts",
+  "list_attachments",
+  "list_bills",
+  "list_dates",
+  "list_events",
+  "list_upcoming_dates",
+  "list_reminders",
+  "list_tasks",
+  "list_memories",
+  "list_waiting",
+  "propose_calendar_event",
+  "read_attachment",
+  "read_document",
+  "read_drive_file",
+  "read_email",
+  "read_sheet",
+  "search_drive",
+  "search_emails",
+  "search_memories",
+  "search_notes",
+  "search_qa_bank",
+  "web_search",
+  "read_draft",
+  "draft_new_email",
+  "search_history",
+] as const;

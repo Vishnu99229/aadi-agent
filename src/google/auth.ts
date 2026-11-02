@@ -300,6 +300,12 @@ export function parseGoogleAccountFilter(
 export async function accountsForFilter(
   filter: GoogleAccountId | undefined,
 ): Promise<LoadedGoogleAccount[]> {
+  if (testAccountHook && filter) {
+    const override = testAccountHook(filter);
+    if (override) {
+      return [override];
+    }
+  }
   const loaded = await loadGoogleAccounts();
   if (!filter) {
     return loaded;
