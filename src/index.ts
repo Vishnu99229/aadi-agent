@@ -26,6 +26,7 @@ import {
   onMeetingDraftSent,
   registerMeetingBookingJobs,
 } from "./meeting_book.js";
+import { registerShadowJobs } from "./shadow_inbox.js";
 import { registerMessageEmbed } from "./embeddings.js";
 import { registerJobWorker } from "./job_worker.js";
 
@@ -46,6 +47,7 @@ const meetingScanTask = registerMeetingScan(bot.api);
 const weeklyBackupTask = registerWeeklyBackup(bot.api);
 const attachmentAlertTask = registerAttachmentAlertScan(bot.api);
 const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
+const shadowJobs = registerShadowJobs(bot.api);
 setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
 const jobQueueTask = registerJobWorker(bot.api);
@@ -102,6 +104,8 @@ process.once("SIGINT", () => {
   meetingBookingJobs.inbox.stop();
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
+  shadowJobs.evening.stop();
+  clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();
   messageEmbedTask.stop();
@@ -123,6 +127,8 @@ process.once("SIGTERM", () => {
   meetingBookingJobs.inbox.stop();
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
+  shadowJobs.evening.stop();
+  clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();
   messageEmbedTask.stop();

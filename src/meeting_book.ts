@@ -2413,6 +2413,10 @@ export function registerMeetingBookingJobs(api: Api): {
     10 * 60 * 1000,
     async () => {
       await runMeetingInboxScan(api);
+      // Shadow drafts are log-only; dynamic import keeps send paths out of
+      // shadow's static graph while still running after the inbox scan.
+      const { runShadowInboxScan } = await import("./shadow_inbox.js");
+      await runShadowInboxScan();
     },
     { runImmediately: true },
   );

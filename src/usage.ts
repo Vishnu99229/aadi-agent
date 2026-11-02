@@ -19,6 +19,7 @@ export const USAGE_TASKS = [
   "memory_extraction",
   "classification",
   "embedding",
+  "shadow",
   "other",
 ] as const;
 
