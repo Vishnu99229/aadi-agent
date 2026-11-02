@@ -139,8 +139,8 @@ Reading / searching / drafting is free. Side effects:
 | `delete_calendar_event` | Owner chat/voice (`allowOwnerChatDeleteEvent`); never from email text |
 | `add_calendar_attendee` | Owner chat/voice (`allowOwnerChatAddAttendee`); `sendUpdates=all`; never from email text |
 | `draft_mom` | New work email, still Send / Edit / Discard |
-| Auto-scheduling email (`sendSchedulingEmail`) | **No tap.** Only the three fixed templates (proposal / clarify / confirm) with a validated opening line; may create/patch calendar for booked meetings |
-| Auto-book from Epicode inbox | Address gate + confidence + daily caps (`AUTO_BOOK_DAILY_CAP`, `AUTO_SEND_DAILY_CAP`); template body must match; `scripts/test-security.ts` forges From/Cc |
+| Auto-scheduling email (`sendSchedulingEmail`) | **No tap** for a lone prospect. Only the three fixed templates (proposal / clarify / confirm) with a validated opening line. `autoSendBlockedParty` blocks the three automatic paths when the sender, reply From, or a non-self attendee/Cc is a partner domain or `epicode.in`: first proposal (`processInboundMeetingMessage`) becomes the not-replying card; a reply (`processReplyOnProposal`) is handed over; a delayed confirm (`processDuePendingBookings`) is not sent and the private calendar event is left in place. `handleMeetingBookCallback` ("Actually, offer slots") and `sendCreatedDraftNow` (send-it) are not blocked |
+| Auto-book from Epicode inbox | Prospects only (`AUTO_HANDLE_SENDER_TYPES`). Confidence `AUTO_BOOK_MIN_CONFIDENCE`, daily caps (`AUTO_BOOK_DAILY_CAP`, `AUTO_SEND_DAILY_CAP`); template body must match. Domain block is `blockedAutoSendDomains`: `PARTNER_DOMAINS`, `email_domains` on partner and end-client accounts, and `epicode.in`. `scripts/test-security.ts` forges From/Cc; `scripts/test-stage12.ts` covers the partner guard |
 | Voice notes | Needs `SARVAM_API_KEY`; ≤30s; transcript is treated as Vishnu’s chat (same sendConfirmation) |
 | Photos / PDFs / Drive | Ingest to `documents` (7-day expiry); analysis via document backends |
 | Jobs (RFP / every-question) | Plan from **owner text only**; forbidden step types `send` / `book` / calendar writes; done-checks; $0.50 default budget; 3 attempts; stuck 10 min |
@@ -153,14 +153,14 @@ Self-scheduling `setTimeout`, Asia/Kolkata. Last success in `job_runs`. Catch-up
 | --- | --- | --- |
 | `morning-brief` | `BRIEF_TIME` (default 08:00) | Off until setting `morning_brief=on` |
 | `bill-scan` | `BILL_SCAN_TIME` (default 09:00); prefers DeepSeek off-peak | Classify only; no send |
-| `followup-scan` | `FOLLOWUP_SCAN_TIME` (default 10:00) | Nudge Telegram; no auto-send mail |
+| `followup-scan` | `FOLLOWUP_SCAN_TIME` (default 10:00) | Nudge Telegram; no auto-send mail. `sendOverdueFollowupNudge` buttons: Draft follow-up, Ignore (`stopTrackingFollowup`), Snooze 3 days (`snoozeFollowupThreeDays`). `getDueFollowups` sets an elapsed snooze back to `waiting` so it pings again |
 | `important-dates` | 09:00 daily | Telegram ping |
 | `promise-scan` | Weekdays 09:00; DeepSeek off-peak preferred | Creates open tasks from work Sent; not a mail send |
 | `weekly-review` | `WEEKLY_REVIEW_TIME` default 19:00 Sundays | Telegram only |
 | `weekly-backup` | Sundays 21:00 | Encrypted file to Telegram if `BACKUP_PASSWORD` set |
-| `meeting-inbox` | every 10 min | Auto-schedule templates only |
+| `meeting-inbox` | every 10 min | `processInboundMeetingMessage`. `gatherMeetingContext` (thread, sender's recent mail, memories, `searchHistory`, accounts) runs before `detectMeetingRequest`. Auto-send only for `prospect_enquiry` (`AUTO_HANDLE_SENDER_TYPES`). Partner / own domains get the not-replying card instead |
 | `meeting-poll` | every 2 min | Same |
-| `meeting-pending` | every 1 min | Delayed auto-book after `AUTO_BOOK_DELAY_MINUTES` |
+| `meeting-pending` | every 1 min | `processDuePendingBookings` after `AUTO_BOOK_DELAY_MINUTES`. A blocked partner/own confirm is not patched and not mailed; the event inserted with `sendUpdates: "none"` stays on the calendar |
 | `meeting-prebrief` | every 5 min | Telegram brief `PRE_MEETING_MINUTES` before work meetings with externals |
 | `attachment-alerts` | every 10 min | Review / Ignore buttons; no analyse until Review |
 | `build-poll` | every 1 min | CI + protected areas |
@@ -220,6 +220,8 @@ Required at process start (`src/security/env_guard.ts`): `TELEGRAM_BOT_TOKEN`, `
 | `AUTO_SEND_DAILY_CAP` | Max auto scheduling emails / day |
 | `AUTO_BOOK_MIN_CONFIDENCE` | Classifier threshold |
 | `MEETING_TEST_SENDERS` | Extra From addresses treated as prospects |
+| `SELF_EMAIL_ADDRESSES` | Extra mailboxes treated as Vishnu by `loadFollowupSelfAddresses` (plus both accounts' profile and send-as aliases). A follow-up whose To is only those addresses is dropped by `isAlgorithmicallyExcluded` |
+| `PARTNER_DOMAINS` | Comma-separated. Default `supertroninfotech.com,pinnacle.in` when unset. `pinnacle.in` is the From domain on Pinnacle Teleservices mail and that account's `email_domains` |
 | `WEB_SEARCH_ORDER` | Default `deepseek,gemini,claude` |
 | `WEB_SEARCH_PROVIDER` | Optional pin, tried first |
 | `WEB_SEARCH_DAILY_CAP` | Default 100 |

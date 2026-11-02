@@ -135,10 +135,10 @@ export async function sendOverdueFollowupNudge(api: Api): Promise<void> {
       "",
     );
     const text = buildNudgeMessage(followup, recipientLabel);
-    const keyboard = new InlineKeyboard().text(
-      "Draft follow-up",
-      `fu:d:${followup.id}`,
-    );
+    const keyboard = new InlineKeyboard()
+      .text("Draft follow-up", `fu:d:${followup.id}`)
+      .text("Ignore", `fu:t:${followup.id}`)
+      .text("Snooze 3 days", `fu:z:${followup.id}`);
     try {
       await api.sendMessage(config.ownerTelegramId, text, {
         reply_markup: keyboard,

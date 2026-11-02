@@ -98,10 +98,59 @@ export function recipientDomain(recipientHeader: string): string | undefined {
 /** Pure-TypeScript gatekeeper (Phase 2). Returns `true` when the thread must
  *  be dropped BEFORE any LLM call: no recipient, internal domain, hard-coded
  *  ignore list, self-only, or a no-reply/mailer-daemon-only address. */
+/** Profile addresses, send-as aliases, and SELF_EMAIL_ADDRESSES, lowercased. */
+export function mergeSelfAddresses(
+  ...groups: Array<Iterable<string>>
+): Set<string> {
+  const self = new Set<string>();
+  for (const group of groups) {
+    for (const item of group) {
+      const email = item.trim().toLowerCase();
+      if (email.includes("@")) {
+        self.add(email);
+      }
+    }
+  }
+  return self;
+}
+
+export async function loadFollowupSelfAddresses(): Promise<Set<string>> {
+  const found = [...config.selfEmailAddresses];
+  let accounts: LoadedGoogleAccount[] = [];
+  try {
+    accounts = await loadGoogleAccounts();
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Follow-up self addresses: accounts failed (${errorType})`);
+  }
+  for (const account of accounts) {
+    try {
+      const gmail = gmailClient(account);
+      const profile = await gmail.users.getProfile({ userId: "me" });
+      if (profile.data.emailAddress) {
+        found.push(profile.data.emailAddress);
+      }
+      const aliases = await gmail.users.settings.sendAs.list({ userId: "me" });
+      for (const alias of aliases.data.sendAs ?? []) {
+        if (alias.sendAsEmail) {
+          found.push(alias.sendAsEmail);
+        }
+      }
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(
+        `Follow-up self addresses: ${account.id} lookup failed (${errorType})`,
+      );
+    }
+  }
+  return mergeSelfAddresses(found);
+}
+
 export function isAlgorithmicallyExcluded(
   recipient: string,
   cc: string,
   ownAddress: string,
+  selfAddresses?: ReadonlySet<string>,
 ): boolean {
   const recipientAddresses = addresses(recipient);
   if (recipientAddresses.length === 0) {
@@ -110,9 +159,16 @@ export function isAlgorithmicallyExcluded(
   if (isSelfSentRecipient(recipient)) {
     return true;
   }
+  const self = new Set<string>();
+  if (ownAddress.trim()) {
+    self.add(ownAddress.trim().toLowerCase());
+  }
+  for (const address of selfAddresses ?? []) {
+    self.add(address.trim().toLowerCase());
+  }
   if (
     recipientAddresses.every(
-      (address) => address === ownAddress || isSelfEmail(address),
+      (address) => self.has(address) || isSelfEmail(address),
     )
   ) {
     return true;
@@ -354,11 +410,16 @@ async function listSentThreadIds(gmail: gmail_v1.Gmail): Promise<string[]> {
   return [...threadIds];
 }
 
-function isHardExcluded(candidate: SentCandidate, ownAddress: string): boolean {
+function isHardExcluded(
+  candidate: SentCandidate,
+  ownAddress: string,
+  selfAddresses?: ReadonlySet<string>,
+): boolean {
   return isAlgorithmicallyExcluded(
     candidate.recipient,
     candidate.cc,
     ownAddress,
+    selfAddresses,
   );
 }
 
@@ -366,6 +427,7 @@ async function collectCandidates(
   gmail: gmail_v1.Gmail,
   ownAddress: string,
   googleAccount: LoadedGoogleAccount["id"],
+  selfAddresses?: ReadonlySet<string>,
 ): Promise<SentCandidate[]> {
   const existingByThread = new Map(
     getFollowups()
@@ -386,7 +448,7 @@ async function collectCandidates(
     const candidate = candidateFromMessage(latest);
     if (
       !candidate ||
-      isHardExcluded(candidate, ownAddress) ||
+      isHardExcluded(candidate, ownAddress, selfAddresses) ||
       isCalendarMessage(latest, candidate.subject)
     ) {
       continue;
@@ -547,6 +609,7 @@ export async function runFollowupScan(): Promise<void> {
   let totalTracked = 0;
   let totalDropped = 0;
 
+  const selfAddresses = await loadFollowupSelfAddresses();
   for (const account of accounts) {
     const gmail = gmailClient(account);
     await reconcileTrackedThreads(gmail, account.id);
@@ -557,7 +620,12 @@ export async function runFollowupScan(): Promise<void> {
       throw new Error("Gmail profile did not return an email address.");
     }
 
-    const candidates = await collectCandidates(gmail, ownAddress, account.id);
+    const candidates = await collectCandidates(
+      gmail,
+      ownAddress,
+      account.id,
+      selfAddresses,
+    );
     totalCandidates += candidates.length;
 
     // Phase 3: one DeepSeek Flash call per candidate that survived Phase 2.

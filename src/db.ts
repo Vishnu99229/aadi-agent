@@ -1632,6 +1632,16 @@ export function restartFollowup(
 }
 
 export function getDueFollowups(nowIso: string): FollowupRecord[] {
+  const woken = db
+    .prepare(
+      `UPDATE followups
+       SET status = 'waiting'
+       WHERE status = 'snoozed' AND next_check_at <= ?`,
+    )
+    .run(nowIso);
+  if (woken.changes > 0) {
+    console.log(`Follow-up snooze elapsed: woken=${woken.changes}`);
+  }
   return db
     .prepare(
       `SELECT ${FOLLOWUP_COLUMNS}
@@ -3020,6 +3030,16 @@ export function getPendingMemoryConfirm(
 
 export function deletePendingMemoryConfirm(id: number): void {
   db.prepare(`DELETE FROM pending_memory_confirms WHERE id = ?`).run(id);
+}
+
+export function listPendingMemoryConfirms(): PendingMemoryConfirm[] {
+  return db
+    .prepare(
+      `SELECT id, content, category, tag, event_date, update_of_id, created_at
+       FROM pending_memory_confirms
+       ORDER BY id ASC`,
+    )
+    .all() as PendingMemoryConfirm[];
 }
 
 export type BuildStatus =

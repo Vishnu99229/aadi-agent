@@ -2,8 +2,13 @@ import { randomUUID } from "node:crypto";
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import { everyMs, type IntervalJob } from "./scheduler.js";
 import { google, type gmail_v1 } from "googleapis";
+import { decodedAccounts } from "./accounts.js";
+import { accountMatchesEmail } from "./account_logic.js";
 import { queueDraftApproval } from "./approvals.js";
 import { config } from "./config.js";
+import { searchHistory } from "./embeddings.js";
+import { offerRelationshipMemory } from "./memory.js";
+import { buildRelationshipFact } from "./memory_logic.js";
 import {
   countMeetingAutoSendsToday,
   createMeetingPendingBooking,
@@ -25,6 +30,7 @@ import {
   listMeetingThreads,
   listOpenMeetingProposals,
   recordMeetingAutoSend,
+  searchMemories,
   setMeetingCardState,
   setMeetingInboundProcessedAs,
   setMeetingProposalHolds,
@@ -84,7 +90,11 @@ import {
 } from "./security/auto_book.js";
 
 export interface MeetingTestHooks {
-  detect?: (input: { subject: string; body: string }) => Promise<MeetingDetection>;
+  detect?: (input: {
+    subject: string;
+    body: string;
+    context?: string;
+  }) => Promise<MeetingDetection>;
   mapReply?: (input: {
     slotCount: number;
     body: string;
@@ -256,6 +266,42 @@ function companyFromEmail(email: string): string {
   }
   const base = domain.split(".")[0] ?? domain;
   return base.charAt(0).toUpperCase() + base.slice(1);
+}
+
+const OWN_AUTO_SEND_DOMAIN = "epicode.in";
+
+function emailDomain(email: string): string {
+  const normalized = email.trim().toLowerCase();
+  const at = normalized.lastIndexOf("@");
+  return at >= 0 ? normalized.slice(at + 1) : "";
+}
+
+/** Partner and end-client account domains, PARTNER_DOMAINS, and epicode.in.
+ *  Vishnu's own address on a calendar invite is ignored by the caller. */
+export function blockedAutoSendDomains(): Set<string> {
+  const domains = new Set<string>([OWN_AUTO_SEND_DOMAIN, ...config.partnerDomains]);
+  for (const account of decodedAccounts()) {
+    if (account.relationship !== "partner" && account.relationship !== "end_client") {
+      continue;
+    }
+    for (const domain of account.email_domains) {
+      const cleaned = domain.trim().toLowerCase();
+      if (cleaned.includes(".")) {
+        domains.add(cleaned);
+      }
+    }
+  }
+  return domains;
+}
+
+/** True when this address must not receive an automatic scheduling email.
+ *  Vishnu's own mailbox is not a reason to block: it is always on the invite. */
+export function autoSendBlockedParty(email: string): boolean {
+  const normalized = email.trim().toLowerCase();
+  if (!normalized.includes("@") || isSelfEmail(normalized)) {
+    return false;
+  }
+  return blockedAutoSendDomains().has(emailDomain(normalized));
 }
 
 function firstNameFrom(name: string, email: string): string {
@@ -488,10 +534,28 @@ function askKeyboard(proposalId: number, slotCount: number): InlineKeyboard {
   return keyboard;
 }
 
+export function notReplyingText(fromName: string, confidence: number): string {
+  return `${fromName} might be asking to meet (confidence ${confidence}).`;
+}
+
+export function meetingCardAlreadySent(
+  thread: { status: string; sender_type: string; last_kind: string | null } | undefined,
+  kind: string,
+  senderType: string,
+): boolean {
+  if (!thread) {
+    return false;
+  }
+  if (thread.status !== "handed_over" && thread.status !== "ignored") {
+    return false;
+  }
+  return thread.sender_type === senderType && thread.last_kind === kind;
+}
+
 function vendorFyiKeyboard(inboundId: number): InlineKeyboard {
   return new InlineKeyboard()
-    .text("Reply with slots", `meet:autoslots:${inboundId}`)
-    .text("Ignore", `meet:ignore:${inboundId}`);
+    .text("Ignore", `meet:ignore:${inboundId}`)
+    .text("Actually, offer slots", `meet:autoslots:${inboundId}`);
 }
 
 function handoverKeyboard(
@@ -573,9 +637,24 @@ function cardText(card: CardPayload, slots: TimeSlot[]): string {
   return lines.join("\n");
 }
 
-async function sendMeetingCard(api: Api, inboundId: number, card: CardPayload): Promise<void> {
+async function sendMeetingCard(
+  api: Api,
+  inboundId: number,
+  card: CardPayload,
+  senderType: SenderType,
+): Promise<void> {
   const slots = await computeSlots(card);
   setMeetingCardState(inboundId, JSON.stringify(card));
+  upsertMeetingThread({
+    threadId: card.threadId,
+    recipientEmail: card.fromEmail,
+    recipientName: card.fromName,
+    company: companyFromEmail(card.fromEmail),
+    senderType,
+    status: "handed_over",
+    lastKind: card.kind,
+    subject: card.subject,
+  });
   await sendOwner(api, cardText(card, slots), cardKeyboard(inboundId, slots, card.kind));
   console.log(`Meeting card sent: inbound=${inboundId} kind=${card.kind} slots=${slots.length}`);
 }
@@ -589,6 +668,7 @@ async function sendVendorFyi(
   inboundId: number,
   card: CardPayload,
   senderType: SenderType,
+  confidence: number,
 ): Promise<void> {
   setMeetingCardState(inboundId, JSON.stringify(card));
   upsertMeetingThread({
@@ -598,11 +678,12 @@ async function sendVendorFyi(
     company: companyFromEmail(card.fromEmail),
     senderType,
     status: "handed_over",
+    lastKind: card.kind,
     subject: card.subject,
   });
   await sendOwner(
     api,
-    `${card.fromName} asked for a call (${senderType}). Not replying.`,
+    notReplyingText(card.fromName, confidence),
     vendorFyiKeyboard(inboundId),
   );
   console.log(`Meeting fyi: inbound=${inboundId} sender_type=${senderType}`);
@@ -1111,6 +1192,14 @@ async function processReplyOnProposal(input: {
   fromEmail: string;
   now: Date;
 }): Promise<void> {
+  if (autoSendBlockedParty(input.fromEmail)) {
+    await handOverThread({
+      api: input.api,
+      proposal: input.proposal,
+      reason: "partner_or_own_domain",
+    });
+    return;
+  }
   const toCc = [
     ...parseAddressList(messageHeader(input.message, "To")),
     ...parseAddressList(messageHeader(input.message, "Cc")),
@@ -1406,6 +1495,111 @@ async function processOwnerSentReply(input: {
   }
 }
 
+function clipText(text: string, max: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean.length <= max) {
+    return clean;
+  }
+  return `${clean.slice(0, max)}…`;
+}
+
+export async function gatherMeetingContext(
+  gmail: gmail_v1.Gmail,
+  input: { threadId: string; fromEmail: string; fromName: string },
+): Promise<string> {
+  const parts: string[] = [];
+  try {
+    const thread = await gmail.users.threads.get({
+      userId: "me",
+      id: input.threadId,
+      format: "full",
+    });
+    const messages = [...(thread.data.messages ?? [])].sort(
+      (left, right) => Number(left.internalDate ?? 0) - Number(right.internalDate ?? 0),
+    );
+    const lines = messages.map((message) => {
+      const from = messageHeader(message, "From");
+      const subject = messageHeader(message, "Subject");
+      const body = clipText(collectPlain(message.payload), 400);
+      return `From: ${from}\nSubject: ${subject}\n${body}`;
+    });
+    parts.push(`Thread (oldest first):\n${clipText(lines.join("\n---\n"), 4500)}`);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`Meeting context: thread failed (${errorType})`);
+  }
+
+  try {
+    const listed = await gmail.users.messages.list({
+      userId: "me",
+      q: `from:${input.fromEmail}`,
+      maxResults: 8,
+    });
+    const others = (listed.data.messages ?? [])
+      .filter((item) => item.id && item.threadId && item.threadId !== input.threadId)
+      .slice(0, 3);
+    const lines: string[] = [];
+    for (const item of others) {
+      const message = await gmail.users.messages.get({
+        userId: "me",
+        id: item.id!,
+        format: "metadata",
+        metadataHeaders: ["Subject"],
+      });
+      const subject = messageHeader(message.data, "Subject");
+      lines.push(`Subject: ${subject}\n${clipText(message.data.snippet ?? "", 180)}`);
+    }
+    parts.push(`Other emails from this sender:\n${lines.join("\n---\n") || "(none)"}`);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`Meeting context: other mail failed (${errorType})`);
+  }
+
+  const company = companyFromEmail(input.fromEmail);
+  const memories = searchMemories(`${input.fromName} ${company} ${input.fromEmail}`, 5)
+    .map((memory) => clipText(memory.content, 160));
+  parts.push(`Memories:\n${memories.join("\n") || "(none)"}`);
+
+  try {
+    const history = await searchHistory(`${input.fromName} ${company}`, 3);
+    parts.push(`Past chat:\n${clipText(history, 800)}`);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`Meeting context: history failed (${errorType})`);
+  }
+
+  const accounts = decodedAccounts().filter(
+    (account) =>
+      accountMatchesEmail(account, input.fromEmail) ||
+      account.name.toLowerCase() === company.toLowerCase(),
+  );
+  const accountLines = accounts.map(
+    (account) =>
+      `${account.name} (${account.relationship}) domains=${account.email_domains.join(",")}`,
+  );
+  parts.push(`Accounts:\n${accountLines.join("\n") || "(none)"}`);
+  console.log(`Meeting context: thread=${input.threadId} sections=${parts.length}`);
+  return parts.join("\n\n");
+}
+
+async function alertNotReplying(
+  api: Api,
+  inboundId: number,
+  card: CardPayload,
+  senderType: SenderType,
+  confidence: number,
+): Promise<void> {
+  if (meetingCardAlreadySent(getMeetingThread(card.threadId), card.kind, senderType)) {
+    setMeetingInboundProcessedAs(inboundId, "skip");
+    console.log(
+      `Meeting card suppressed: inbound=${inboundId} kind=${card.kind} sender_type=${senderType}`,
+    );
+    return;
+  }
+  setMeetingInboundProcessedAs(inboundId, "ask");
+  await sendVendorFyi(api, inboundId, card, senderType, confidence);
+}
+
 export async function processInboundMeetingMessage(
   api: Api,
   work: LoadedGoogleAccount,
@@ -1517,14 +1711,45 @@ export async function processInboundMeetingMessage(
     return;
   }
   const bodyText = collectPlain(message.payload);
+  const context = testHooks.detect
+    ? ""
+    : await gatherMeetingContext(gmailClient(work), {
+        threadId,
+        fromEmail,
+        fromName: senderDisplay(fromHeader),
+      });
   const detection = await (testHooks.detect ?? detectMeetingRequest)({
     subject,
     body: bodyText,
+    context,
   });
   setMeetingInboundProcessedAs(inbound.id, "detect");
   console.log(
     `Meeting inbound: message=${messageId} inbound=${inbound.id} skip=- kind=${detection.kind} sender_type=${detection.sender_type} confidence=${detection.confidence}`,
   );
+  if (
+    !testHooks.detect &&
+    (detection.sender_type === "prospect_enquiry" ||
+      detection.sender_type === "existing_customer_or_partner")
+  ) {
+    const company = companyFromEmail(fromEmail);
+    const name = senderDisplay(fromHeader);
+    try {
+      await offerRelationshipMemory(api, {
+        content: buildRelationshipFact({
+          name,
+          company,
+          senderType: detection.sender_type,
+          subject,
+        }),
+        name,
+        company,
+      });
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Relationship memory failed (${errorType})`);
+    }
+  }
   if (detection.kind === "none") {
     return;
   }
@@ -1551,20 +1776,45 @@ export async function processInboundMeetingMessage(
     detection.confidence >= config.autoBookMinConfidence &&
     detection.kind !== "calendly_link";
   if (config.meetingMode === "auto" && !autoHandle) {
-    setMeetingInboundProcessedAs(inbound.id, "ask");
-    await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+    await alertNotReplying(
+      api,
+      inbound.id,
+      card,
+      detection.sender_type,
+      detection.confidence,
+    );
+    return;
+  }
+  if (autoHandle && autoSendBlockedParty(card.fromEmail)) {
+    await alertNotReplying(
+      api,
+      inbound.id,
+      card,
+      detection.sender_type,
+      detection.confidence,
+    );
     return;
   }
   if (autoHandle) {
     if (countMeetingAutoSendsToday(now) >= config.autoSendDailyCap) {
-      setMeetingInboundProcessedAs(inbound.id, "ask");
-      await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+      await alertNotReplying(
+        api,
+        inbound.id,
+        card,
+        detection.sender_type,
+        detection.confidence,
+      );
       return;
     }
     const slots = await computeSlots(card);
     if (slots.length === 0) {
-      setMeetingInboundProcessedAs(inbound.id, "ask");
-      await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+      await alertNotReplying(
+        api,
+        inbound.id,
+        card,
+        detection.sender_type,
+        detection.confidence,
+      );
       return;
     }
     setMeetingInboundProcessedAs(inbound.id, "card");
@@ -1578,12 +1828,31 @@ export async function processInboundMeetingMessage(
       threadStatus: "proposed",
     });
     if (!created) {
-      await sendVendorFyi(api, inbound.id, card, detection.sender_type);
+      await alertNotReplying(
+        api,
+        inbound.id,
+        card,
+        detection.sender_type,
+        detection.confidence,
+      );
     }
     return;
   }
+  if (
+    meetingCardAlreadySent(
+      getMeetingThread(card.threadId),
+      card.kind,
+      detection.sender_type,
+    )
+  ) {
+    setMeetingInboundProcessedAs(inbound.id, "skip");
+    console.log(
+      `Meeting card suppressed: inbound=${inbound.id} kind=${card.kind} sender_type=${detection.sender_type}`,
+    );
+    return;
+  }
   setMeetingInboundProcessedAs(inbound.id, "card");
-  await sendMeetingCard(api, inbound.id, card);
+  await sendMeetingCard(api, inbound.id, card, detection.sender_type);
 }
 
 export async function runMeetingInboxScan(api: Api, now = new Date()): Promise<number> {
@@ -1723,6 +1992,27 @@ export async function processDuePendingBookings(
       endTime: formatConfirmClock(slot.end),
       otherZone: formatOtherZoneRange(slot, proposal.sender_timezone),
     };
+    const confirmTo = hooks.confirmSend
+      ? proposal.recipient_email
+      : (await latestThreadHeaders(proposal.thread_id)).to || proposal.recipient_email;
+    const ccEmails = JSON.parse(proposal.cc_emails) as string[];
+    if (
+      [confirmTo, proposal.recipient_email, ...ccEmails].some((address) =>
+        autoSendBlockedParty(address),
+      )
+    ) {
+      transitionMeetingPendingBooking(booking.id, "pending", "cancelled");
+      const text = `Did not notify ${proposal.recipient_name}: partner or own domain. Confirmation not sent. The calendar event stays on your calendar; it was not deleted and was never sent to them.`;
+      if (hooks.notify) {
+        await hooks.notify(text);
+      } else if (hooks.api) {
+        await sendOwner(hooks.api, text);
+      } else {
+        await sendOwnerTelegram(text);
+      }
+      console.log(`Pending booking held: id=${booking.id} reason=partner_or_own_domain`);
+      continue;
+    }
     const body = renderBookingConfirmBody(template);
     try {
       await (hooks.patchInvite ?? defaultPatchInvite)(booking.event_id);
@@ -2079,7 +2369,7 @@ export async function tryHandleMeetingChat(
     references: "",
     proposedTimes: [],
   };
-  await sendMeetingCard(ctx.api, inbound.id, card);
+  await sendMeetingCard(ctx.api, inbound.id, card, "other");
   return true;
 }
 

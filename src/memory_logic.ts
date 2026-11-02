@@ -101,6 +101,72 @@ export function isSensitiveMemoryText(text: string): boolean {
   return SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+const PHONE_RE = /(?:\+?\d[\d\s().-]{7,}\d)/;
+const ADDRESS_RE =
+  /\b(street|road|avenue|lane|pincode|pin code|zip code|signature)\b/i;
+
+/** A relationship fact may name a person, role, company, and thread topic.
+ *  It must not carry an email body, a phone number, a postal address, or a signature. */
+export function relationshipFactIsSafe(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 180) {
+    return false;
+  }
+  if (isSensitiveMemoryText(trimmed)) {
+    return false;
+  }
+  if (trimmed.includes("@") || PHONE_RE.test(trimmed) || ADDRESS_RE.test(trimmed)) {
+    return false;
+  }
+  return true;
+}
+
+export function hasEquivalentRelationshipMemory(
+  fact: { name: string; company: string },
+  memories: ReadonlyArray<{ content: string }>,
+): boolean {
+  const name = fact.name.trim().toLowerCase();
+  const company = fact.company.trim().toLowerCase();
+  if (!name) {
+    return false;
+  }
+  return memories.some((memory) => {
+    const text = memory.content.toLowerCase();
+    if (!text.includes(name)) {
+      return false;
+    }
+    if (!company || company === "personal") {
+      return true;
+    }
+    return text.includes(company);
+  });
+}
+
+export function buildRelationshipFact(input: {
+  name: string;
+  company: string;
+  senderType: string;
+  subject: string;
+}): string {
+  const phrase =
+    input.senderType === "existing_customer_or_partner"
+      ? "an existing partner"
+      : input.senderType === "prospect_enquiry"
+        ? "a prospect"
+        : `a ${input.senderType.replaceAll("_", " ")}`;
+  const topic = input.subject
+    .replace(/^(?:re|fwd|fw)\s*:\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  const company = input.company.trim();
+  const who =
+    company && company.toLowerCase() !== "personal"
+      ? `${input.name.trim()} at ${company}`
+      : input.name.trim();
+  return `${who} is ${phrase}. Thread topic: ${topic}.`;
+}
+
 export function parseExplicitRemember(
   text: string,
 ): { matched: true; body: string } | { matched: false } {

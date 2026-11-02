@@ -6,6 +6,8 @@ import {
   createMeetingPendingBooking,
   createMeetingProposal,
   getJobRun,
+  insertMeetingInbound,
+  setMeetingCardState,
   getMeetingPendingBooking,
   getMeetingProposal,
   getMeetingThread,
@@ -25,6 +27,7 @@ import {
   withTimeout,
 } from "../src/scheduler.ts";
 import {
+  handleMeetingBookCallback,
   inboundSkipReason,
   processDuePendingBookings,
   processInboundMeetingMessage,
@@ -602,6 +605,198 @@ await processInboundMeetingMessage(
   new Date(),
 );
 assert(recruiterSends === 0, "recruiter must not get an auto-reply");
+resetMeetingTestHooks();
+
+let partnerSends = 0;
+const partnerCard = capturingApi();
+setMeetingTestHooks({
+  detect: async () => ({
+    kind: "asks_availability",
+    proposed_times: [],
+    window_hint: "next week",
+    duration_minutes: 30,
+    sender_timezone: null,
+    sender_type: "prospect_enquiry",
+    confidence: 0.95,
+  }),
+  sendImpl: async () => {
+    partnerSends += 1;
+    return { messageId: "partner" };
+  },
+  loadBusy: async () => [],
+  slotIsFree: async () => true,
+});
+await processInboundMeetingMessage(
+  partnerCard.api,
+  fakeWork(),
+  fakeInbound({
+    messageId: "partner-1",
+    threadId: "thread-partner",
+    from: "Sujoy <sujoy@supertroninfotech.com>",
+    subject: "Voicebot",
+    body: "Which lead statuses should trigger bot calls?",
+  }),
+  new Date(),
+);
+assert(partnerSends === 0, "a partner domain classified as a prospect at 0.95 does not auto-send");
+assert(
+  partnerCard.messages.some(
+    (message) =>
+      message.text.includes("might be asking to meet (confidence 0.95)") &&
+      message.buttons.includes("Ignore") &&
+      message.buttons.includes("Actually, offer slots"),
+  ),
+  "a partner domain classified as a prospect at 0.95 gets the not-replying card",
+);
+resetMeetingTestHooks();
+
+createMeetingProposal({
+  threadId: "thread-partner-reply",
+  sentMessageId: "partner-reply-sent",
+  recipientEmail: "ada@acme.com",
+  recipientName: "Ada",
+  ccEmails: [],
+  slots: [
+    {
+      start: istDateTime("2026-10-21", "11:00").toISOString(),
+      end: istDateTime("2026-10-21", "11:30").toISOString(),
+    },
+  ],
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+let partnerReplySends = 0;
+const partnerReply = capturingApi();
+setMeetingTestHooks({
+  sendImpl: async () => {
+    partnerReplySends += 1;
+    return { messageId: "partner-reply" };
+  },
+});
+await processInboundMeetingMessage(
+  partnerReply.api,
+  fakeWork(),
+  fakeInbound({
+    messageId: "partner-reply-1",
+    threadId: "thread-partner-reply",
+    from: "Sujoy <sujoy@supertroninfotech.com>",
+    subject: "Re: Demo",
+    body: "Tuesday works",
+    internalDate: String(Date.now() + 120_000),
+  }),
+  new Date(Date.now() + 120_000),
+);
+assert(partnerReplySends === 0, "a partner reply on an open proposal does not send");
+assert(
+  partnerReply.messages.some(
+    (message) => message.text.includes("needs you") && message.text.includes("partner_or_own_domain"),
+  ),
+  "a partner reply is handed over",
+);
+assert(
+  getMeetingThread("thread-partner-reply")?.status === "handed_over",
+  "a partner reply marks the thread handed over",
+);
+resetMeetingTestHooks();
+
+const partnerConfirm = createMeetingProposal({
+  threadId: "thread-partner-confirm",
+  sentMessageId: "partner-confirm-sent",
+  recipientEmail: "armaan@pinnacle.in",
+  recipientName: "Armaan",
+  ccEmails: [],
+  slots: [
+    {
+      start: istDateTime("2026-10-21", "16:00").toISOString(),
+      end: istDateTime("2026-10-21", "16:30").toISOString(),
+    },
+  ],
+  durationMinutes: 30,
+  senderTimezone: null,
+});
+const partnerDue = createMeetingPendingBooking({
+  proposalId: partnerConfirm.id,
+  eventId: "stage12-partner-event",
+  slotIndex: 0,
+  sendAt: new Date(Date.now() - 60 * 1000).toISOString(),
+});
+let partnerPatches = 0;
+let partnerConfirms = 0;
+const partnerNotes: string[] = [];
+await processDuePendingBookings({
+  now: new Date(),
+  eventExists: async () => true,
+  patchInvite: async () => {
+    partnerPatches += 1;
+  },
+  confirmSend: async () => {
+    partnerConfirms += 1;
+    return { messageId: "partner-confirm" };
+  },
+  notify: async (text) => {
+    partnerNotes.push(text);
+  },
+});
+assert(partnerPatches === 0, "a partner attendee does not get a calendar update");
+assert(partnerConfirms === 0, "a partner attendee does not get the confirm email");
+assert(
+  getMeetingPendingBooking(partnerDue.id)?.status === "cancelled",
+  "a blocked confirm is not left pending",
+);
+assert(
+  partnerNotes.some(
+    (text) =>
+      text.includes("Confirmation not sent") &&
+      text.includes("stays on your calendar"),
+  ),
+  "the owner is told the confirm was held and the event stays on the calendar",
+);
+
+const offerInbound = insertMeetingInbound({
+  messageId: "offer-partner",
+  threadId: "thread-offer-partner",
+  processedAs: "ask",
+});
+assert(offerInbound !== undefined, "offer-slots inbound stored");
+setMeetingCardState(
+  offerInbound!.id,
+  JSON.stringify({
+    fromEmail: "sujoy@supertroninfotech.com",
+    fromName: "Sujoy",
+    subject: "Voicebot",
+    ccEmails: [],
+    kind: "asks_availability",
+    windowHint: "next week",
+    durationMinutes: 30,
+    senderTimezone: null,
+    calendlyUrl: null,
+    slotOffset: 0,
+    messageId: "offer-partner",
+    threadId: "thread-offer-partner",
+    inReplyTo: "<offer-partner@mail>",
+    references: "",
+    proposedTimes: [],
+  }),
+);
+let offerSends = 0;
+setMeetingTestHooks({
+  sendImpl: async () => {
+    offerSends += 1;
+    return { messageId: "offered" };
+  },
+  openingLine: async () => FALLBACK_OPENING,
+  signatureHtml: "<div>SIG</div>",
+  loadBusy: async () => [],
+  slotIsFree: async () => true,
+});
+await handleMeetingBookCallback(
+  {
+    api: silentApi(),
+    answerCallbackQuery: async () => undefined,
+  } as unknown as Parameters<typeof handleMeetingBookCallback>[0],
+  `meet:autoslots:${offerInbound!.id}`,
+);
+assert(offerSends === 1, "Actually, offer slots still sends for a partner card");
 resetMeetingTestHooks();
 
 const autoBodies: string[] = [];

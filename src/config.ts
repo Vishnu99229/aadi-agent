@@ -277,6 +277,19 @@ const meetingTestSenders = (process.env.MEETING_TEST_SENDERS ?? "")
   .split(",")
   .map((item) => item.trim().toLowerCase())
   .filter(Boolean);
+const selfEmailAddresses = (process.env.SELF_EMAIL_ADDRESSES ?? "")
+  .split(",")
+  .map((item) => item.trim().toLowerCase())
+  .filter((item) => item.includes("@"));
+const DEFAULT_PARTNER_DOMAINS = ["supertroninfotech.com", "pinnacle.in"];
+const partnerDomains = (
+  process.env.PARTNER_DOMAINS?.trim()
+    ? process.env.PARTNER_DOMAINS
+    : DEFAULT_PARTNER_DOMAINS.join(",")
+)
+  .split(",")
+  .map((item) => item.trim().toLowerCase())
+  .filter((item) => item.includes("."));
 
 export const WEB_SEARCH_PROVIDERS = ["deepseek", "gemini", "claude"] as const;
 export type WebSearchProvider = (typeof WEB_SEARCH_PROVIDERS)[number];
@@ -510,6 +523,8 @@ export const config = {
   autoSendDailyCap,
   autoBookMinConfidence,
   meetingTestSenders,
+  selfEmailAddresses,
+  partnerDomains,
   webSearchOrder,
   webSearchProvider,
   webSearchDailyCap,

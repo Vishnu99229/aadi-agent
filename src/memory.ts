@@ -1,7 +1,9 @@
-import { InlineKeyboard, type Context } from "grammy";
+import { InlineKeyboard, type Api, type Context } from "grammy";
+import { config } from "./config.js";
 import {
   createMemory,
   createPendingAccountUpdate,
+  createPendingMemoryConfirm,
   createReminder,
   deleteAllMemories,
   deleteMemory,
@@ -9,6 +11,7 @@ import {
   getMemory,
   getPendingMemoryConfirm,
   listMemories,
+  listPendingMemoryConfirms,
   memoriesWithEventDateBetween,
   searchMemories,
   updateMemory,
@@ -31,7 +34,9 @@ import {
   findMemoryToUpdate,
   formatMemoryContextBlock,
   groupedMemoryText,
+  hasEquivalentRelationshipMemory,
   isSensitiveMemoryText,
+  relationshipFactIsSafe,
   kolkataYmd,
   looksLikeDatedEvent,
   parseEventDateFromText,
@@ -311,6 +316,53 @@ export async function captureFromUserMessage(userText: string): Promise<void> {
       `Memory ${memory.id}: auto-${updated ? "updated" : "saved"} (${fact.weight})`,
     );
   }
+}
+
+export function queueRelationshipMemory(input: {
+  content: string;
+  name: string;
+  company: string;
+}): { status: "queued"; id: number } | { status: "skipped"; reason: "unsafe" | "duplicate" } {
+  if (!relationshipFactIsSafe(input.content)) {
+    return { status: "skipped", reason: "unsafe" };
+  }
+  const known = [
+    ...searchMemories(`${input.name} ${input.company}`, 10),
+    ...listPendingMemoryConfirms(),
+  ];
+  if (
+    hasEquivalentRelationshipMemory(
+      { name: input.name, company: input.company },
+      known,
+    )
+  ) {
+    return { status: "skipped", reason: "duplicate" };
+  }
+  const pending = createPendingMemoryConfirm({
+    content: input.content,
+    category: "person",
+    tag: "work",
+  });
+  return { status: "queued", id: pending.id };
+}
+
+/** One Yes/No card. Saving happens only after the Yes tap. */
+export async function offerRelationshipMemory(
+  api: Api,
+  input: { content: string; name: string; company: string },
+): Promise<void> {
+  const queued = queueRelationshipMemory(input);
+  if (queued.status !== "queued") {
+    console.log(`Relationship memory skipped: reason=${queued.reason}`);
+    return;
+  }
+  const keyboard = new InlineKeyboard()
+    .text("Yes", `mem:yes:${queued.id}`)
+    .text("No", `mem:no:${queued.id}`);
+  await api.sendMessage(config.ownerTelegramId, `Remember this?\n${input.content}`, {
+    reply_markup: keyboard,
+  });
+  console.log(`Relationship memory offered: id=${queued.id}`);
 }
 
 export async function handleMemoryConfirmCallback(
