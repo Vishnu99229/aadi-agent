@@ -88,6 +88,6 @@ case "$COMMIT" in
     ;;
 esac
 
-rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude backups --exclude 'google-token*.json' --exclude .git --exclude VERSION --exclude test-fixtures --exclude .env.bak --exclude .env.phone --exclude .aadi-heartbeat --exclude .aadi-deploy-result.json -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
+rsync -av --exclude node_modules --exclude dist --exclude '*.db' --exclude backups --exclude 'google-token*.json' --exclude .git --exclude VERSION --exclude test-fixtures --exclude .env.bak --exclude .env.phone --exclude .aadi-heartbeat --exclude .aadi-deploy-result.json --exclude local -e "ssh -p $PHONE_PORT" ./ "$PHONE:~/aadi-agent/"
 ssh -p "$PHONE_PORT" "$PHONE" "cd ~/aadi-agent && npm install --no-audit --no-fund; sh scripts/write-version.sh . '$COMMIT'; pkill -f '[t]sx' || true; pkill -f '[n]ode.*src/index.ts' || true"
 echo "Deployed. Aadi restarts on the phone in about 5 seconds."
