@@ -338,6 +338,11 @@ const webSearchDailyCap = parsePositiveNumber(
   100,
   "WEB_SEARCH_DAILY_CAP",
 );
+const embedDailyTokenCap = parsePositiveNumber(
+  process.env.EMBED_DAILY_TOKEN_CAP,
+  200_000,
+  "EMBED_DAILY_TOKEN_CAP",
+);
 
 export interface ModelCostRates {
   inputCostPerMillion: number;
@@ -508,4 +513,5 @@ export const config = {
   webSearchOrder,
   webSearchProvider,
   webSearchDailyCap,
+  embedDailyTokenCap,
 } as const;

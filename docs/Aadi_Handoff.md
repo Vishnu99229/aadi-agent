@@ -165,9 +165,12 @@ Self-scheduling `setTimeout`, Asia/Kolkata. Last success in `job_runs`. Catch-up
 | `attachment-alerts` | every 10 min | Review / Ignore buttons; no analyse until Review |
 | `build-poll` | every 1 min | CI + protected areas |
 | `job-queue` | every 1 min | Done-checks; no send/book steps |
+| `message-embed` | every 5 min, including once at startup | `registerMessageEmbed` / `runMessageEmbed`. Embeds user and assistant rows only, outside the chat turn |
 | Reminder tick | every 1 min | Telegram reminders |
 | Document expiry | daily | Deletes `documents` older than 7 days |
 | Approval expiry | hourly | Draft cards 3h; create-event cards 24h |
+
+`runMessageEmbed` redacts with `redactAllSecrets`, caps at `TOOL_STUB_MIN_CHARS`, and skips text shorter than `EMBED_MIN_CHARS` (`skip_reason` `short`, null vector). Stored text is `documentEmbedText` (`title: none | text: …`). Queries use `queryEmbedText` (`task: search result | query: …`). `searchHistory` scores only the current `EMBED_MODEL` and `EMBED_SCHEME`, drops the newest `HISTORY_KEEP_MAX` messages, and returns `SEARCH_HISTORY_NO_MATCH` when nothing reaches `SEARCH_HISTORY_MIN_SCORE` (0.68). The tool is `search_history`, last in `TOOL_ORDER`.
 
 ---
 
@@ -220,6 +223,7 @@ Required at process start (`src/security/env_guard.ts`): `TELEGRAM_BOT_TOKEN`, `
 | `WEB_SEARCH_ORDER` | Default `deepseek,gemini,claude` |
 | `WEB_SEARCH_PROVIDER` | Optional pin, tried first |
 | `WEB_SEARCH_DAILY_CAP` | Default 100 |
+| `EMBED_DAILY_TOKEN_CAP` | Kolkata-day cap for `runMessageEmbed`. Default 200000 |
 | `FALLBACK_CHAIN` | Override LLM rest chain (not in `.env.example`) |
 | `AADI_DB_PATH` | SQLite path; tests use `:memory:` |
 | `LOCAL_LLM_BASE_URL` / `LOCAL_LLM_MODEL` | Ollama; Mac-only |
@@ -331,7 +335,7 @@ Live file: phone `aadi.db`. Created/migrated in `src/db.ts`.
 
 | Table | Purpose |
 | --- | --- |
-| `messages` | Chat log (user / assistant / tool). Read only via `getRecentMessages` (newest `LIMIT`, then reverse). No search/query tool. Folded into `settings.conversation_summary` |
+| `messages` | Chat log (user / assistant / tool). Recent rows via `getRecentMessages`. Older rows via `searchHistory` / `search_history` |
 | `pending_actions` | Draft Send cards and Create Event cards (account, headers, expiry) |
 | `tasks` | Open/done tasks; extra columns for promises (`kind`, `source_thread_id`, `deadline`, `recipient`, …) |
 | `reminders` | One-off / daily / weekly / weekdays; may link task or bill |
@@ -359,6 +363,7 @@ Live file: phone `aadi.db`. Created/migrated in `src/db.ts`.
 | `meeting_draft_intents` | Intent attached to a Gmail draft id |
 | `meeting_card_state` | Telegram card payload for an inbound |
 | `job_runs` | Scheduler last success/attempt |
+| `message_embeddings` | One row per embedded or skipped message. `runMessageEmbed` writes it. `listSearchableEmbeddings` reads vectors for the current model and scheme |
 | `meeting_threads` | Auto-schedule conversation state |
 | `meeting_auto_sends` | Count of proposal/clarify/confirm sends |
 | `processed_messages` | Telegram update idempotency |

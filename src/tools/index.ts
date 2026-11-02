@@ -47,6 +47,7 @@ import * as removeAccount from "./remove_account.js";
 import * as readEmail from "./read_email.js";
 import * as readSheet from "./read_sheet.js";
 import * as searchDrive from "./search_drive.js";
+import * as searchHistory from "./search_history.js";
 import * as searchEmails from "./search_emails.js";
 import * as searchNotes from "./search_notes.js";
 import * as setReminder from "./set_reminder.js";
@@ -117,6 +118,7 @@ const modules = {
   remember,
   read_sheet: readSheet,
   search_drive: searchDrive,
+  search_history: searchHistory,
   search_emails: searchEmails,
   search_memories: searchMemories,
   search_notes: searchNotes,
@@ -186,6 +188,7 @@ export const TOOL_ORDER = [
   "confirm_send_pending_draft",
   "discard_pending_draft",
   "resend_draft_card",
+  "search_history",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(

@@ -590,6 +590,16 @@ db.exec(`
     last_status TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    model TEXT NOT NULL,
+    scheme TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    vector BLOB,
+    skip_reason TEXT
+  );
+
   CREATE TABLE IF NOT EXISTS meeting_threads (
     thread_id TEXT PRIMARY KEY,
     recipient_email TEXT NOT NULL,
@@ -1005,9 +1015,85 @@ export const CONVERSATION_SUMMARY_UNTIL_KEY = "conversation_summary_until_id";
 
 export function clearMessages(): void {
   db.prepare("DELETE FROM messages").run();
+  db.prepare("DELETE FROM message_embeddings").run();
   db.prepare("DELETE FROM settings WHERE key IN (?, ?)").run(
     CONVERSATION_SUMMARY_KEY,
     CONVERSATION_SUMMARY_UNTIL_KEY,
+  );
+}
+
+export interface AwaitingEmbedMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+}
+
+export function listMessagesAwaitingEmbedding(limit: number): AwaitingEmbedMessage[] {
+  const safeLimit = Math.max(0, Math.floor(limit));
+  return db
+    .prepare(
+      `SELECT m.id, m.role, m.content, m.created_at
+       FROM messages m
+       LEFT JOIN message_embeddings e ON e.message_id = m.id
+       WHERE e.message_id IS NULL
+         AND m.role IN ('user', 'assistant')
+       ORDER BY m.id ASC
+       LIMIT ?`,
+    )
+    .all(safeLimit) as AwaitingEmbedMessage[];
+}
+
+export interface SearchableEmbedding {
+  message_id: number;
+  role: string;
+  content: string;
+  created_at: string;
+  vector: Buffer;
+}
+
+export function listSearchableEmbeddings(
+  model: string,
+  scheme: string,
+  excludeNewest: number,
+): SearchableEmbedding[] {
+  const skip = Math.max(0, Math.floor(excludeNewest));
+  return db
+    .prepare(
+      `SELECT e.message_id, m.role, m.content, m.created_at, e.vector
+       FROM message_embeddings e
+       JOIN messages m ON m.id = e.message_id
+       WHERE e.model = ?
+         AND e.scheme = ?
+         AND e.vector IS NOT NULL
+         AND e.message_id NOT IN (
+           SELECT id FROM messages ORDER BY id DESC LIMIT ?
+         )`,
+    )
+    .all(model, scheme, skip) as SearchableEmbedding[];
+}
+
+export function insertMessageEmbedding(row: {
+  messageId: number;
+  createdAt: string;
+  model: string;
+  scheme: string;
+  dims: number;
+  vector: Buffer | null;
+  skipReason: string | null;
+}): void {
+  db.prepare(
+    `INSERT INTO message_embeddings (
+       message_id, created_at, model, scheme, dims, vector, skip_reason
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    row.messageId,
+    row.createdAt,
+    row.model,
+    row.scheme,
+    row.dims,
+    row.vector,
+    row.skipReason,
   );
 }
 

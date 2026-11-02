@@ -48,6 +48,7 @@ export const HEALTH_JOBS = [
   "weekly-review",
   "weekly-backup",
   "job-queue",
+  "message-embed",
 ] as const;
 
 /**

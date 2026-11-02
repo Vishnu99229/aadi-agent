@@ -26,6 +26,7 @@ import {
   onMeetingDraftSent,
   registerMeetingBookingJobs,
 } from "./meeting_book.js";
+import { registerMessageEmbed } from "./embeddings.js";
 import { registerJobWorker } from "./job_worker.js";
 
 installOutboundHistory(bot.api);
@@ -48,6 +49,7 @@ const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
 setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
 const jobQueueTask = registerJobWorker(bot.api);
+const messageEmbedTask = registerMessageEmbed();
 await applyPendingDeployResult();
 const MENU_COMMANDS = [
   { command: "followups", description: "Scan and list emails waiting on a reply" },
@@ -102,6 +104,7 @@ process.once("SIGINT", () => {
   meetingBookingJobs.pending.stop();
   buildPollTask.stop();
   jobQueueTask.stop();
+  messageEmbedTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
@@ -122,6 +125,7 @@ process.once("SIGTERM", () => {
   meetingBookingJobs.pending.stop();
   buildPollTask.stop();
   jobQueueTask.stop();
+  messageEmbedTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
