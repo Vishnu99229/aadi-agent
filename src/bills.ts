@@ -12,6 +12,7 @@ import {
   getRecentBills,
   markBillSuspectedDuplicate,
   transitionBillStatus,
+  updateBillDetails,
   type BillRecord,
 } from "./db.js";
 import { findNearDuplicate } from "./dedupe.js";
@@ -20,6 +21,11 @@ import { gmailClient } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
 import { stripSensitive } from "./sensitive.js";
 import { extractBillDeterministic } from "./bill_extract.js";
+import { billersMatch, canonicalBiller } from "./bill_aliases.js";
+import {
+  classifyBillMail,
+  paymentStatusFyiLine,
+} from "./bill_status.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const SCAN_QUERY =
@@ -309,6 +315,96 @@ export function detectDuplicateBill(input: {
   return match?.record ?? null;
 }
 
+/** Match payable bills by canonical biller + due_date + currency (not amount). */
+export function findMatchingPayableBill(input: {
+  biller: string;
+  currency: string;
+  dueDate: string;
+}): BillRecord | null {
+  const currency = input.currency.trim().toUpperCase();
+  const dueDate = input.dueDate;
+  const upcoming = getBills().filter((row) => row.status === "upcoming");
+  for (const row of upcoming) {
+    if (row.due_date !== dueDate) {
+      continue;
+    }
+    if (row.currency.trim().toUpperCase() !== currency) {
+      continue;
+    }
+    if (billersMatch(row.biller, input.biller)) {
+      return row;
+    }
+  }
+  return null;
+}
+
+export type TrackBillResult =
+  | { action: "created"; bill: BillRecord }
+  | { action: "updated"; bill: BillRecord }
+  | { action: "kept"; bill: BillRecord }
+  | { action: "skipped" };
+
+/**
+ * Insert or merge a genuine invoice. Canonical biller + due_date + currency
+ * match updates an amount-unknown row; already-amounted rows are kept.
+ */
+export function trackPayableBill(input: {
+  biller: string;
+  amount: number | null;
+  currency: string;
+  dueDate: string;
+  threadId: string;
+  snippet: string;
+}): TrackBillResult {
+  const biller = canonicalBiller(input.biller);
+  const currency = input.currency.trim().toUpperCase() || "INR";
+  const existing = findMatchingPayableBill({
+    biller,
+    currency,
+    dueDate: input.dueDate,
+  });
+  if (existing) {
+    if (
+      existing.amount === null &&
+      typeof input.amount === "number" &&
+      Number.isFinite(input.amount)
+    ) {
+      const updated = updateBillDetails(existing.id, {
+        biller,
+        amount: input.amount,
+        currency,
+        threadId: input.threadId,
+        sourceText: input.snippet,
+      });
+      if (!updated) {
+        return { action: "skipped" };
+      }
+      return { action: "updated", bill: updated };
+    }
+    return { action: "kept", bill: existing };
+  }
+  const soft = detectDuplicateBill({
+    biller,
+    amount: input.amount,
+    currency,
+    dueDate: input.dueDate,
+    snippet: input.snippet,
+  });
+  const bill = createBill(
+    biller,
+    input.amount,
+    currency,
+    input.dueDate,
+    input.threadId,
+    input.snippet,
+    soft?.id ?? null,
+  );
+  if (!bill) {
+    return { action: "skipped" };
+  }
+  return { action: "created", bill };
+}
+
 async function sendDuplicateAlert(
   api: Api,
   newBill: BillRecord,
@@ -355,12 +451,13 @@ export async function runBillScan(api: Api): Promise<void> {
     console.log("Bill scan complete: candidates=0, tracked=0");
     return;
   }
-  // Regex-first: anything with amount + due_date + biller findable from the
-  // metadata skips the LLM entirely. Only the leftovers (image receipts,
-  // unusual phrasings) go to DeepSeek.
+  // Amount-first: deterministic extract with an amount is always an invoice.
+  // Status patterns apply only to amountless mail (actionable FYI vs noise).
   const direct: Array<{ candidate: BillCandidate; biller: string;
     amount: number; currency: string; dueDate: string }> = [];
   const needsLlm: BillCandidate[] = [];
+  let skippedStatus = 0;
+  let actionableFyi = 0;
   for (const candidate of candidates) {
     const extracted = extractBillDeterministic({
       fromHeader: candidate.fromHeader,
@@ -368,6 +465,7 @@ export async function runBillScan(api: Api): Promise<void> {
       snippet: candidate.snippet,
     });
     if (extracted) {
+      // Parseable amount (+ due + biller) → invoice, never status.
       direct.push({
         candidate,
         biller: extracted.biller,
@@ -375,41 +473,72 @@ export async function runBillScan(api: Api): Promise<void> {
         currency: extracted.currency,
         dueDate: extracted.due_date,
       });
-    } else {
-      needsLlm.push(candidate);
+      continue;
     }
+    const kind = classifyBillMail({
+      subject: candidate.subject,
+      snippet: candidate.snippet,
+    });
+    if (kind === "noise_status") {
+      skippedStatus += 1;
+      console.log(
+        `Bill scan: skip=payment_status message=${candidate.messageId}`,
+      );
+      continue;
+    }
+    if (kind === "actionable_status") {
+      skippedStatus += 1;
+      actionableFyi += 1;
+      console.log(
+        `Bill scan: skip=payment_status_actionable message=${candidate.messageId}`,
+      );
+      await api.sendMessage(
+        config.ownerTelegramId,
+        paymentStatusFyiLine({
+          subject: candidate.subject,
+          fromHeader: candidate.fromHeader,
+        }),
+      );
+      continue;
+    }
+    needsLlm.push(candidate);
   }
   console.log(
-    `Bill scan partition: direct=${direct.length}, llm=${needsLlm.length} (saved ${direct.length} LLM calls)`,
+    `Bill scan partition: direct=${direct.length}, llm=${needsLlm.length}, skipped_status=${skippedStatus}, actionable_fyi=${actionableFyi}`,
   );
 
   let tracked = 0;
   for (const item of direct) {
-    const existing = detectDuplicateBill({
+    const result = trackPayableBill({
       biller: item.biller,
       amount: item.amount,
       currency: item.currency,
       dueDate: item.dueDate,
+      threadId: item.candidate.threadId,
       snippet: item.candidate.snippet,
     });
-    const bill = createBill(
-      item.biller,
-      item.amount,
-      item.currency,
-      item.dueDate,
-      item.candidate.threadId,
-      item.candidate.snippet,
-      existing?.id ?? null,
-    );
-    if (!bill) continue;
-    console.log(
-      `Bill ${bill.id}: status -> upcoming (deterministic)` +
-        (existing ? ` dupe_of=${existing.id}` : ""),
-    );
-    scheduleBillReminders(bill);
-    await notifyNewBill(api, bill);
-    if (existing) await sendDuplicateAlert(api, bill, existing);
-    tracked += 1;
+    if (result.action === "skipped") {
+      continue;
+    }
+    if (result.action === "created") {
+      console.log(`Bill ${result.bill.id}: status -> upcoming (deterministic)`);
+      scheduleBillReminders(result.bill);
+      await notifyNewBill(api, result.bill);
+      tracked += 1;
+      continue;
+    }
+    if (result.action === "updated") {
+      console.log(
+        `Bill ${result.bill.id}: merged amount=${result.bill.amount} (deterministic)`,
+      );
+      await api.sendMessage(
+        config.ownerTelegramId,
+        `Bill updated\n\n${formatBillLine(result.bill)}`,
+      );
+      tracked += 1;
+      continue;
+    }
+    console.log(`Bill ${result.bill.id}: kept existing (deterministic)`);
   }
 
   if (needsLlm.length > 0) {
@@ -424,39 +553,75 @@ export async function runBillScan(api: Api): Promise<void> {
         continue;
       }
       const candidate = needsLlm[item.candidate_id - 1]!;
-      const biller = item.biller.trim();
+      const llmAmount =
+        typeof item.amount === "number" && Number.isFinite(item.amount)
+          ? item.amount
+          : null;
+      // Amount from LLM wins: never status. Amountless → re-check status.
+      const kind = classifyBillMail({
+        subject: candidate.subject,
+        snippet: candidate.snippet,
+        amount: llmAmount,
+      });
+      if (kind === "noise_status") {
+        skippedStatus += 1;
+        console.log(
+          `Bill scan: skip=payment_status message=${candidate.messageId}`,
+        );
+        continue;
+      }
+      if (kind === "actionable_status") {
+        skippedStatus += 1;
+        actionableFyi += 1;
+        console.log(
+          `Bill scan: skip=payment_status_actionable message=${candidate.messageId}`,
+        );
+        await api.sendMessage(
+          config.ownerTelegramId,
+          paymentStatusFyiLine({
+            subject: candidate.subject,
+            fromHeader: candidate.fromHeader,
+          }),
+        );
+        continue;
+      }
       const currency =
         (typeof item.currency === "string" && item.currency.trim()) || "INR";
-      const existing = detectDuplicateBill({
-        biller,
-        amount: item.amount,
+      const result = trackPayableBill({
+        biller: item.biller.trim(),
+        amount: llmAmount,
         currency,
         dueDate: item.due_date,
+        threadId: candidate.threadId,
         snippet: candidate.snippet,
       });
-      const bill = createBill(
-        biller,
-        item.amount,
-        currency,
-        item.due_date,
-        candidate.threadId,
-        candidate.snippet,
-        existing?.id ?? null,
-      );
-      if (!bill) continue;
-      console.log(
-        `Bill ${bill.id}: status -> upcoming (llm)` +
-          (existing ? ` dupe_of=${existing.id}` : ""),
-      );
-      scheduleBillReminders(bill);
-      await notifyNewBill(api, bill);
-      if (existing) await sendDuplicateAlert(api, bill, existing);
-      tracked += 1;
+      if (result.action === "skipped") {
+        continue;
+      }
+      if (result.action === "created") {
+        console.log(`Bill ${result.bill.id}: status -> upcoming (llm)`);
+        scheduleBillReminders(result.bill);
+        await notifyNewBill(api, result.bill);
+        tracked += 1;
+        continue;
+      }
+      if (result.action === "updated") {
+        console.log(
+          `Bill ${result.bill.id}: merged amount=${result.bill.amount} (llm)`,
+        );
+        await api.sendMessage(
+          config.ownerTelegramId,
+          `Bill updated\n\n${formatBillLine(result.bill)}`,
+        );
+        tracked += 1;
+        continue;
+      }
+      console.log(`Bill ${result.bill.id}: kept existing (llm)`);
     }
   }
 
   console.log(
-    `Bill scan complete: candidates=${candidates.length}, tracked=${tracked}`,
+    `Bill scan complete: candidates=${candidates.length}, tracked=${tracked}, skipped_status=${skippedStatus}, actionable_fyi=${actionableFyi}`,
   );
 }
 

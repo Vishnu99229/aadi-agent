@@ -2138,6 +2138,36 @@ export function markBillSuspectedDuplicate(
   ).run(of, id);
 }
 
+/** Fill in amount/source on an amount-unknown bill (merge path). */
+export function updateBillDetails(
+  id: number,
+  update: {
+    biller?: string;
+    amount?: number | null;
+    currency?: string;
+    threadId?: string;
+    sourceText?: string | null;
+  },
+): BillRecord | undefined {
+  const current = getBill(id);
+  if (!current) {
+    return undefined;
+  }
+  db.prepare(
+    `UPDATE bills
+     SET biller = ?, amount = ?, currency = ?, thread_id = ?, source_text = ?
+     WHERE id = ?`,
+  ).run(
+    update.biller ?? current.biller,
+    update.amount !== undefined ? update.amount : current.amount,
+    update.currency ?? current.currency,
+    update.threadId ?? current.thread_id,
+    update.sourceText !== undefined ? update.sourceText : current.source_text,
+    id,
+  );
+  return getBill(id);
+}
+
 export function getRecentPromiseTasks(sinceIso: string): TaskRecord[] {
   return db
     .prepare(
