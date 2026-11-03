@@ -4,6 +4,10 @@ import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js
 import { shouldForceCalendarTool } from "./calendar_guard.js";
 import { looksLikeDeferredAction } from "./deferred_action.js";
 import {
+  documentRewriteRetryPrompt,
+  looksLikeDocumentRewrite,
+} from "./document_rewrite.js";
+import {
   CONVERSATION_SUMMARY_KEY,
   CONVERSATION_SUMMARY_UNTIL_KEY,
   getRecentMessages,
@@ -15,7 +19,7 @@ import {
 import { complete } from "./llm.js";
 import type { UsageTask } from "./usage.js";
 import { memoryContextLine } from "./memory.js";
-import { recentUploadLine } from "./recent_upload.js";
+import { getRecentUpload, recentUploadLine } from "./recent_upload.js";
 import {
   TOOL_ORDER,
   tools as customTools,
@@ -301,6 +305,7 @@ export async function runAgent(
       : undefined;
   let deferredRetryUsed = false;
   let calendarRetryUsed = false;
+  let documentRewriteRetryUsed = false;
   const toolsUsed = new Set<string>();
   const guardText = options.guardText ?? userText;
   const allowedTools = options.toolNames ? new Set(options.toolNames) : undefined;
@@ -439,6 +444,30 @@ export async function runAgent(
         role: "user",
         content:
           "Do that now. Call the necessary tool in this turn and reply with the result. Do not say you will do it later.",
+      });
+      continue;
+    }
+
+    const recentUpload = getRecentUpload();
+    if (
+      !documentRewriteRetryUsed &&
+      response.toolCalls.length === 0 &&
+      !toolsUsed.has("read_document") &&
+      looksLikeDocumentRewrite(guardText) &&
+      recentUpload
+    ) {
+      documentRewriteRetryUsed = true;
+      console.log(
+        `Document-rewrite retry: iteration=${iteration} document_id=${recentUpload.documentId}`,
+      );
+      messages.push({
+        role: "assistant",
+        textParts: response.textParts,
+        toolCalls: [],
+      });
+      messages.push({
+        role: "user",
+        content: documentRewriteRetryPrompt(recentUpload.documentId),
       });
       continue;
     }

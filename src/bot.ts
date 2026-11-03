@@ -1063,15 +1063,15 @@ bot.on("message:document", async (ctx) => {
     return;
   }
   try {
+    // Non-forwarded caption (not wrap-up) is the instruction: ingest + one
+    // agent answer. Skip formatDocumentReply. No caption → keep auto-summary.
+    const captionIsInstruction = Boolean(caption) && !isWrapUpText(caption);
     const ingested = await whileTyping(ctx, () =>
-      processIncomingDocument(ctx, fileName, doc.file_id, doc.mime_type),
+      processIncomingDocument(ctx, fileName, doc.file_id, doc.mime_type, {
+        skipAutoReply: captionIsInstruction,
+      }),
     );
-    if (
-      ingested &&
-      caption &&
-      !isWrapUpText(caption) &&
-      !ingested.answeredPrompt
-    ) {
+    if (ingested && captionIsInstruction && !ingested.answeredPrompt) {
       await answerDocumentCaption(
         ctx,
         caption,

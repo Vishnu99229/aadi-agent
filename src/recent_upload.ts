@@ -1,6 +1,8 @@
 /** Tracks the most recent document upload so "the document" resolves without an id. */
 
-const RECENT_WINDOW_MS = 30 * 60 * 1_000;
+/** Four hours: long enough for a realistic same-session follow-up ("make it concise"). */
+export const RECENT_UPLOAD_WINDOW_MS = 4 * 60 * 60 * 1_000;
+const RECENT_WINDOW_MS = RECENT_UPLOAD_WINDOW_MS;
 
 export interface RecentUpload {
   documentId: number;

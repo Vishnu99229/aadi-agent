@@ -172,6 +172,8 @@ export async function ingestDocumentBytes(params: {
   tag: ItemTag;
   hint?: string;
   userPrompt?: string;
+  /** Extract + store only (PDF/DOCX/XLSX). Skip detect/review/analyzeText. */
+  skipSummaryAnalysis?: boolean;
 }): Promise<{
   documentId: number;
   reply: string;
@@ -258,6 +260,24 @@ export async function ingestDocumentBytes(params: {
         extractedText: storedText,
         pendingActionItems: null,
       });
+    }
+
+    if (
+      params.skipSummaryAnalysis &&
+      (kind === "pdf" || kind === "docx" || kind === "xlsx")
+    ) {
+      if (!storedText.trim()) {
+        throw new Error("No text found in that document.");
+      }
+      console.log(
+        `Document ${record.id}: stored for caption answer, skipped summary analysis`,
+      );
+      return {
+        documentId: record.id,
+        reply: "",
+        pendingActionItems: null,
+        answeredPrompt: false,
+      };
     }
 
     const detected = detectDocumentKind(
@@ -421,7 +441,7 @@ export async function processIncomingDocument(
   fileName: string,
   fileId: string,
   mimeType?: string,
-  options?: { useCaption?: boolean },
+  options?: { useCaption?: boolean; skipAutoReply?: boolean },
 ): Promise<{ documentId: number; answeredPrompt: boolean } | null> {
   if (!isSupportedAttachment(fileName, mimeType)) {
     await ctx.reply(
@@ -440,15 +460,22 @@ export async function processIncomingDocument(
       bytes,
       tag: "personal",
       userPrompt: userPrompt || undefined,
+      skipSummaryAnalysis: options?.skipAutoReply === true,
     });
-    const keyboard = documentKeyboard(
-      result.documentId,
-      Boolean(result.pendingActionItems?.length),
-    );
-    await ctx.reply(result.reply, { reply_markup: keyboard });
+    const answeredPrompt = result.answeredPrompt === true;
+    // Caption-as-instruction (PDF/DOCX/XLSX): store text, skip the template
+    // summary — the bot answers the caption via answerDocumentCaption instead.
+    // Image/OCR that already answered the caption still sends its reply here.
+    if (!(options?.skipAutoReply && !answeredPrompt)) {
+      const keyboard = documentKeyboard(
+        result.documentId,
+        Boolean(result.pendingActionItems?.length),
+      );
+      await ctx.reply(result.reply, { reply_markup: keyboard });
+    }
     return {
       documentId: result.documentId,
-      answeredPrompt: result.answeredPrompt === true,
+      answeredPrompt,
     };
   } catch (error) {
     console.error(
