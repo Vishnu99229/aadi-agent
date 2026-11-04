@@ -1823,6 +1823,20 @@ export function getDocument(id: number): DocumentRecord | undefined {
     .get(id) as DocumentRecord | undefined;
 }
 
+/** Non-expired documents (same 7-day rule as deleteExpiredDocuments), newest first. */
+export function listDocuments(limit = 10): DocumentRecord[] {
+  const safe = Math.max(1, Math.min(25, Math.floor(limit)));
+  return db
+    .prepare(
+      `SELECT id, file_name, tag, extracted_text, pending_action_items, created_at
+       FROM documents
+       WHERE created_at > datetime('now', '-7 days')
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(safe) as DocumentRecord[];
+}
+
 export function updateDocument(
   id: number,
   update: {

@@ -27,6 +27,7 @@ import * as listAccounts from "./list_accounts.js";
 import * as listBills from "./list_bills.js";
 import * as listEvents from "./list_events.js";
 import * as listDates from "./list_dates.js";
+import * as listDocuments from "./list_documents.js";
 import * as listUpcomingDates from "./list_upcoming_dates.js";
 import * as listReminders from "./list_reminders.js";
 import * as listTasks from "./list_tasks.js";
@@ -98,6 +99,7 @@ const modules = {
   list_attachments: listAttachments,
   list_bills: listBills,
   list_dates: listDates,
+  list_documents: listDocuments,
   list_events: listEvents,
   list_upcoming_dates: listUpcomingDates,
   list_reminders: listReminders,
@@ -189,6 +191,7 @@ export const TOOL_ORDER = [
   "discard_pending_draft",
   "resend_draft_card",
   "search_history",
+  "list_documents",
 ] as const;
 
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(
@@ -226,4 +229,5 @@ export const FORWARDED_TOOLS = [
   "read_draft",
   "draft_new_email",
   "search_history",
+  "list_documents",
 ] as const;

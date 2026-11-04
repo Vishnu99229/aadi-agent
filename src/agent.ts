@@ -4,8 +4,10 @@ import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js
 import { shouldForceCalendarTool } from "./calendar_guard.js";
 import { looksLikeDeferredAction } from "./deferred_action.js";
 import {
+  documentMultiReadRetryPrompt,
   documentRewriteRetryPrompt,
   looksLikeDocumentRewrite,
+  resolveReferencedDocumentIds,
 } from "./document_rewrite.js";
 import {
   CONVERSATION_SUMMARY_KEY,
@@ -19,7 +21,11 @@ import {
 import { complete } from "./llm.js";
 import type { UsageTask } from "./usage.js";
 import { memoryContextLine } from "./memory.js";
-import { getRecentUpload, recentUploadLine } from "./recent_upload.js";
+import {
+  getRecentUpload,
+  getRecentUploads,
+  recentUploadLine,
+} from "./recent_upload.js";
 import {
   TOOL_ORDER,
   tools as customTools,
@@ -306,7 +312,9 @@ export async function runAgent(
   let deferredRetryUsed = false;
   let calendarRetryUsed = false;
   let documentRewriteRetryUsed = false;
+  let documentMultiReadRetryUsed = false;
   const toolsUsed = new Set<string>();
+  const documentsRead = new Set<number>();
   const guardText = options.guardText ?? userText;
   const allowedTools = options.toolNames ? new Set(options.toolNames) : undefined;
   const activeTools: LlmTool[] = options.toolNames
@@ -389,6 +397,12 @@ export async function runAgent(
           name: call.name,
           success,
         });
+        if (call.name === "read_document") {
+          const id = (call.input as { id?: unknown }).id;
+          if (typeof id === "number" && Number.isSafeInteger(id) && id > 0) {
+            documentsRead.add(id);
+          }
+        }
         if (call.name === "web_search" && success) {
           const hits = parseSearchSources(result.content);
           if (hits.length > 0) {
@@ -444,6 +458,33 @@ export async function runAgent(
         role: "user",
         content:
           "Do that now. Call the necessary tool in this turn and reply with the result. Do not say you will do it later.",
+      });
+      continue;
+    }
+
+    const neededDocIds = resolveReferencedDocumentIds(
+      guardText,
+      getRecentUploads(),
+    );
+    const missingDocIds = neededDocIds.filter((id) => !documentsRead.has(id));
+    if (
+      !documentMultiReadRetryUsed &&
+      response.toolCalls.length === 0 &&
+      neededDocIds.length > 0 &&
+      missingDocIds.length > 0
+    ) {
+      documentMultiReadRetryUsed = true;
+      console.log(
+        `Document-multi-read retry: iteration=${iteration} ids=${missingDocIds.join(",")}`,
+      );
+      messages.push({
+        role: "assistant",
+        textParts: response.textParts,
+        toolCalls: [],
+      });
+      messages.push({
+        role: "user",
+        content: documentMultiReadRetryPrompt(missingDocIds),
       });
       continue;
     }
