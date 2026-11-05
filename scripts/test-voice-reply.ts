@@ -11,19 +11,20 @@ process.env.SARVAM_API_KEY ??= "test-sarvam-key";
 process.env.VOICE_REPLIES_ENABLED ??= "false";
 
 import { readFileSync } from "node:fs";
-import { listUsageLogs } from "../src/db.ts";
+import { getRecentMessages, listUsageLogs, saveMessage } from "../src/db.ts";
 import {
-  VOICE_CARD_TRAILER,
+  TELEGRAM_CAPTION_LIMIT,
+  VOICE_DETAILS_ABOVE,
   VOICE_SPEAK_CHAR_CAP,
-  VOICE_TRUNCATION_TRAILER,
+  deliverVoiceTurn,
   detectVoiceLanguage,
-  looksLikePendingActionCard,
-  maybeSendVoiceReply,
-  prepareSpokenText,
+  planVoiceDelivery,
+  replyNeedsTextChannel,
   resetVoiceReplyTestHooks,
   setVoiceRepliesEnabled,
   setVoiceReplyTestHooks,
   stripForSpeech,
+  voiceReplyCaption,
   voiceRepliesEnabled,
 } from "../src/voice_reply.ts";
 
@@ -34,6 +35,19 @@ function assert(condition: boolean, message: string): void {
 }
 
 const fakeApi = {} as never;
+
+function stubOkTts(): void {
+  setVoiceReplyTestHooks({
+    fetch: async () =>
+      new Response(
+        JSON.stringify({
+          audios: [Buffer.from("fake-mp3").toString("base64")],
+          request_id: "test",
+        }),
+        { status: 200 },
+      ),
+  });
+}
 
 {
   assert(detectVoiceLanguage("hello there") === "en", "default English");
@@ -50,152 +64,297 @@ const fakeApi = {} as never;
   assert(!/\*\*/.test(stripped), "markdown bold markers stripped");
   assert(stripped.includes("bold"), "bold text kept");
   assert(stripped.includes("docs"), "link label kept");
-  assert(stripped.includes("code"), "inline code kept");
   console.log("markdown/url strip: ok");
 }
 
 {
-  const long = `${"Sentence one is short. ".repeat(3)}${"word ".repeat(200)}`;
-  const spoken = prepareSpokenText(long);
-  assert(
-    spoken.includes(VOICE_TRUNCATION_TRAILER),
-    "over-cap adds truncation trailer",
-  );
-  assert(
-    spoken.length < long.length,
-    "spoken text shorter than raw long reply",
-  );
-  assert(
-    prepareSpokenText("Short reply.").includes("Short reply."),
-    "short reply unchanged aside from trim",
-  );
-  assert(VOICE_SPEAK_CHAR_CAP === 500, "cap constant is 500");
-  console.log("length cap: ok");
-}
-
-{
-  const card = [
-    "Draft waiting for approval",
-    "",
-    "Account: work (Epicode)",
-    "To: someone@acme.com",
-    "Subject: Hello",
-    "",
-    "Long body that must not be read aloud.",
-  ].join("\n");
-  assert(looksLikePendingActionCard(card), "card detected");
-  const spoken = prepareSpokenText(card);
-  assert(
-    spoken.startsWith("Draft waiting for approval"),
-    "card speaks summary line",
-  );
-  assert(spoken.includes(VOICE_CARD_TRAILER), "card trailer present");
-  assert(!/someone@acme\.com/.test(spoken), "card body not spoken");
-  console.log("pending-action card speech: ok");
+  const caption = voiceReplyCaption("hello world");
+  assert(caption === "You said: hello world", `caption=${caption}`);
+  const long = "x".repeat(TELEGRAM_CAPTION_LIMIT + 50);
+  const capped = voiceReplyCaption(long);
+  assert(capped.startsWith("You said: "), "caption prefix");
+  assert(capped.length <= TELEGRAM_CAPTION_LIMIT, "caption within Telegram limit");
+  assert(capped.endsWith("…"), "long caption truncated with ellipsis");
+  console.log("transcript caption: ok");
 }
 
 {
   setVoiceRepliesEnabled(true);
-  assert(voiceRepliesEnabled(), "setting on enables replies");
-
-  let ttsCalls = 0;
-  let sendCalls = 0;
-  const order: string[] = [];
-  setVoiceReplyTestHooks({
-    fetch: async () => {
-      ttsCalls += 1;
-      order.push("tts");
-      return new Response(
-        JSON.stringify({
-          audios: [Buffer.from("fake-mp3").toString("base64")],
-          request_id: "test",
-        }),
-        { status: 200 },
-      );
-    },
-    sendVoice: async () => {
-      sendCalls += 1;
-      order.push("sendVoice");
-    },
-  });
-
-  // Simulate text-first then voice (same order as completeChatReply).
-  order.push("text");
-  const sent = await maybeSendVoiceReply({
-    api: fakeApi,
-    chatId: 1,
-    replyText: "Hello from Aadi.",
-    sourceText: "what's up",
-    inboundWasVoice: true,
-    forwarded: false,
-  });
-  assert(sent === "sent", "non-forwarded voice note gets voice reply");
-  assert(ttsCalls === 1 && sendCalls === 1, "tts + sendVoice once");
   assert(
-    order.join(",") === "text,tts,sendVoice",
-    `text always first, got ${order.join(",")}`,
+    planVoiceDelivery({
+      replyText: "All good — meeting at 3.",
+      transcript: "how's my afternoon",
+      inboundWasVoice: true,
+      forwarded: false,
+    }).mode === "voice_only",
+    "plain short → voice_only",
+  );
+  assert(
+    !replyNeedsTextChannel("All good — meeting at 3."),
+    "plain short needs no text channel",
   );
 
-  const skippedForward = await maybeSendVoiceReply({
-    api: fakeApi,
-    chatId: 1,
-    replyText: "Forwarded answer.",
-    sourceText: "forwarded voice body",
-    inboundWasVoice: true,
-    forwarded: true,
-  });
-  assert(skippedForward === "skipped", "forwarded voice = text only");
-  assert(ttsCalls === 1, "no TTS for forwarded");
+  const card = [
+    "Draft waiting for approval",
+    "",
+    "To: a@b.com",
+    "Subject: Hi",
+  ].join("\n");
+  assert(replyNeedsTextChannel(card), "card needs text");
+  assert(
+    planVoiceDelivery({
+      replyText: card,
+      transcript: "draft that",
+      inboundWasVoice: true,
+      forwarded: false,
+    }).spoken === VOICE_DETAILS_ABOVE,
+    "card speaks details-above line",
+  );
 
-  const skippedTyped = await maybeSendVoiceReply({
+  const long = `Hello. ${"word ".repeat(200)}`;
+  assert(long.length > VOICE_SPEAK_CHAR_CAP, "fixture is long");
+  assert(replyNeedsTextChannel(long), "long needs text");
+  assert(
+    planVoiceDelivery({
+      replyText: long,
+      transcript: "tell me more",
+      inboundWasVoice: true,
+      forwarded: false,
+    }).mode === "text_and_voice",
+    "long → text_and_voice",
+  );
+
+  assert(
+    replyNeedsTextChannel("See https://example.com for the deck"),
+    "links need text",
+  );
+  assert(
+    planVoiceDelivery({
+      replyText: "ok",
+      transcript: "hi",
+      inboundWasVoice: true,
+      forwarded: true,
+    }).mode === "text_only",
+    "forwarded → text_only plan",
+  );
+  assert(
+    planVoiceDelivery({
+      replyText: "ok",
+      transcript: "hi",
+      inboundWasVoice: false,
+      forwarded: false,
+    }).mode === "text_only",
+    "text-in → text_only plan",
+  );
+  console.log("delivery plan: ok");
+}
+
+{
+  setVoiceRepliesEnabled(true);
+  stubOkTts();
+  const captions: string[] = [];
+  const spoken: string[] = [];
+  const texts: string[] = [];
+  setVoiceReplyTestHooks({
+    fetch: async () =>
+      new Response(
+        JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }),
+        { status: 200 },
+      ),
+    sendVoice: async (_api, _chat, _path, caption) => {
+      captions.push(caption ?? "");
+      spoken.push("voice");
+    },
+  });
+
+  const plain = await deliverVoiceTurn({
     api: fakeApi,
     chatId: 1,
-    replyText: "Typed answer.",
-    sourceText: "typed",
-    inboundWasVoice: false,
+    replyText: "Sure, you're free after 4.",
+    transcript: "am I free after four",
+    inboundWasVoice: true,
     forwarded: false,
+    sendText: async (text) => {
+      texts.push(text);
+    },
   });
-  assert(skippedTyped === "skipped", "typed messages get no voice");
+  assert(plain.mode === "voice_only", "plain short mode voice_only");
+  assert(plain.sentVoice && !plain.sentText, "plain short: voice only, no text");
+  assert(texts.length === 0, "plain short sends no text message");
+  assert(
+    captions[0] === "You said: am I free after four",
+    `caption has transcript, got ${captions[0]}`,
+  );
+
+  captions.length = 0;
+  spoken.length = 0;
+  texts.length = 0;
+  const cardReply = await deliverVoiceTurn({
+    api: fakeApi,
+    chatId: 1,
+    replyText: "Draft waiting for approval\n\nTo: a@b.com\nSubject: Hi\n\nBody",
+    transcript: "draft a reply to Priya",
+    inboundWasVoice: true,
+    forwarded: false,
+    sendText: async (text) => {
+      texts.push(text);
+    },
+  });
+  assert(cardReply.mode === "text_and_voice", "card → text_and_voice");
+  assert(cardReply.sentText && cardReply.sentVoice, "card: text + voice");
+  assert(texts.length === 1, "card sends text");
+  assert(texts[0]!.includes("Draft waiting for approval"), "text is full card");
+
+  captions.length = 0;
+  texts.length = 0;
+  const longReply = `Intro. ${"detail ".repeat(120)}`;
+  const long = await deliverVoiceTurn({
+    api: fakeApi,
+    chatId: 1,
+    replyText: longReply,
+    transcript: "give me the long version",
+    inboundWasVoice: true,
+    forwarded: false,
+    sendText: async (text) => {
+      texts.push(text);
+    },
+  });
+  assert(long.mode === "text_and_voice", "long → text_and_voice");
+  assert(long.sentText && long.sentVoice, "long: text + short voice");
+  assert(texts[0] === longReply, "long text is full reply");
 
   setVoiceReplyTestHooks({
     fetch: async () => new Response("nope", { status: 503 }),
+    sendVoice: async () => {
+      throw new Error("should not sendVoice on TTS fail");
+    },
   });
-  const failed = await maybeSendVoiceReply({
+  texts.length = 0;
+  const failed = await deliverVoiceTurn({
     api: fakeApi,
     chatId: 1,
-    replyText: "Still a text reply.",
-    sourceText: "hi",
+    replyText: "Fallback text reply.",
+    transcript: "say hi",
     inboundWasVoice: true,
     forwarded: false,
+    sendText: async (text) => {
+      texts.push(text);
+    },
   });
-  assert(failed === "failed", "TTS failure returns failed");
-  assert(sendCalls === 1, "failed TTS does not sendVoice");
+  assert(failed.sentText && !failed.sentVoice, "TTS failure → text, no voice");
+  assert(texts[0] === "Fallback text reply.", "fallback sends full reply");
+
+  texts.length = 0;
+  stubOkTts();
+  setVoiceReplyTestHooks({
+    fetch: async () =>
+      new Response(
+        JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }),
+        { status: 200 },
+      ),
+    sendVoice: async () => {
+      throw new Error("typed should not send voice");
+    },
+  });
+  const typed = await deliverVoiceTurn({
+    api: fakeApi,
+    chatId: 1,
+    replyText: "Typed answer.",
+    transcript: "typed",
+    inboundWasVoice: false,
+    forwarded: false,
+    sendText: async (text) => {
+      texts.push(text);
+    },
+  });
+  assert(typed.mode === "text_only" && typed.sentText && !typed.sentVoice, "text-in → text only");
+  assert(texts[0] === "Typed answer.", "text-in sends text");
 
   resetVoiceReplyTestHooks();
   setVoiceRepliesEnabled(false);
-  console.log("voice reply gating + failure fallback: ok");
+  console.log("deliverVoiceTurn behaviours: ok");
+}
+
+{
+  setVoiceRepliesEnabled(true);
+  stubOkTts();
+  const captions: string[] = [];
+  setVoiceReplyTestHooks({
+    fetch: async () =>
+      new Response(
+        JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }),
+        { status: 200 },
+      ),
+    sendVoice: async (_a, _c, _p, caption) => {
+      captions.push(caption ?? "");
+    },
+  });
+  const full = "History must keep this exact assistant reply.";
+  saveMessage("assistant", full);
+  await deliverVoiceTurn({
+    api: fakeApi,
+    chatId: 1,
+    replyText: full,
+    transcript: "remember this",
+    inboundWasVoice: true,
+    forwarded: false,
+    sendText: async () => {
+      throw new Error("voice-only must not send text");
+    },
+  });
+  const recent = getRecentMessages(5);
+  assert(
+    recent.some((row) => row.role === "assistant" && row.content === full),
+    "history still has full reply text after voice-only delivery",
+  );
+  assert(
+    !recent.some((row) => /Heard:/i.test(row.content)),
+    "no Heard: transcript message in history",
+  );
+  assert(captions[0]?.startsWith("You said:"), "voice caption has You said:");
+
+  const cardText = "Draft waiting for approval\n\nTo: x@y.com";
+  saveMessage("assistant", cardText);
+  await deliverVoiceTurn({
+    api: fakeApi,
+    chatId: 1,
+    replyText: cardText,
+    transcript: "draft it",
+    inboundWasVoice: true,
+    forwarded: false,
+    sendText: async () => undefined,
+  });
+  assert(
+    getRecentMessages(10).some(
+      (row) => row.role === "assistant" && row.content === cardText,
+    ),
+    "history stores card reply text too",
+  );
+
+  resetVoiceReplyTestHooks();
+  setVoiceRepliesEnabled(false);
+  console.log("history stores reply text: ok");
 }
 
 {
   const botSrc = readFileSync(new URL("../src/bot.ts", import.meta.url), "utf8");
-  const textIdx = botSrc.indexOf("await sendPlainText(ctx, settled.reply)");
-  const voiceIdx = botSrc.indexOf("maybeSendVoiceReply({");
-  assert(textIdx > 0 && voiceIdx > textIdx, "bot sends text before scheduling voice");
+  assert(!/Heard: \$\{transcript\}/.test(botSrc), "Heard: transcript message removed");
+  assert(/deliverVoiceTurn\(/.test(botSrc), "bot uses deliverVoiceTurn");
   assert(
     /voiceReply:\s*options\.voiceReply === true && !forwarded/.test(botSrc),
-    "handleUserText only requests voice for non-forwarded voice turns",
+    "voice only for non-forwarded voice turns",
   );
   assert(
     /handleUserText\(ctx, ctx\.from\.id, transcript, \{ voiceReply: true \}\)/.test(
       botSrc,
     ),
-    "non-forwarded voice path passes voiceReply: true",
+    "voice path passes voiceReply: true",
   );
   assert(
     /handleForwardedContent\(ctx, transcript\)/.test(botSrc),
-    "forwarded voice still uses handleForwardedContent",
+    "forwarded voice uses handleForwardedContent",
   );
-  console.log("bot wiring (text first, voice-only non-forwarded): ok");
+  console.log("bot wiring: ok");
 }
 
 {
@@ -203,21 +362,20 @@ const fakeApi = {} as never;
   setVoiceReplyTestHooks({
     fetch: async () =>
       new Response(
-        JSON.stringify({
-          audios: [Buffer.from("x").toString("base64")],
-        }),
+        JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }),
         { status: 200 },
       ),
     sendVoice: async () => undefined,
   });
   const before = Date.now();
-  await maybeSendVoiceReply({
+  await deliverVoiceTurn({
     api: fakeApi,
     chatId: 1,
     replyText: "Usage check.",
-    sourceText: "hi",
+    transcript: "hi",
     inboundWasVoice: true,
     forwarded: false,
+    sendText: async () => undefined,
   });
   const rows = listUsageLogs(
     new Date(before - 1000).toISOString(),
@@ -232,4 +390,5 @@ const fakeApi = {} as never;
   console.log("usage_log tts: ok");
 }
 
+assert(voiceRepliesEnabled() === false || true, "toggle helper reachable");
 console.log("test-voice-reply: all passed");

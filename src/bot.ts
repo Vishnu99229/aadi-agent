@@ -92,7 +92,7 @@ import {
 import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
 import { transcribeTelegramVoice } from "./voice.js";
 import {
-  maybeSendVoiceReply,
+  deliverVoiceTurn,
   setVoiceRepliesEnabled,
   voiceRepliesEnabled,
 } from "./voice_reply.js";
@@ -281,20 +281,25 @@ async function completeChatReply(
       return;
     }
     closeTurn(gate, "ok", startedAt);
-    await sendPlainText(ctx, settled.reply);
     if (options.voiceReply && ctx.chat) {
-      void maybeSendVoiceReply({
-        api: ctx.api,
-        chatId: ctx.chat.id,
-        replyText: settled.reply,
-        sourceText: options.voiceSourceText ?? userText,
-        inboundWasVoice: true,
-        forwarded,
-      }).catch((error: unknown) => {
+      try {
+        await deliverVoiceTurn({
+          api: ctx.api,
+          chatId: ctx.chat.id,
+          replyText: settled.reply,
+          transcript: options.voiceSourceText ?? userText,
+          inboundWasVoice: true,
+          forwarded,
+          sendText: (text) => sendPlainText(ctx, text),
+        });
+      } catch (error) {
         const status =
           error instanceof Error ? error.name : "UnknownError";
         console.error(`Voice reply failed: provider=sarvam status=${status}`);
-      });
+        await sendPlainText(ctx, settled.reply);
+      }
+    } else {
+      await sendPlainText(ctx, settled.reply);
     }
   } finally {
     stopTyping();
@@ -1046,7 +1051,6 @@ bot.on("message:voice", async (ctx) => {
   }
 
   try {
-    await sendPlainText(ctx, `Heard: ${transcript}`);
     if (!allowInboundCommands(ctx.message)) {
       await handleForwardedContent(ctx, transcript);
       return;

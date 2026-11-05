@@ -1,6 +1,8 @@
 /**
- * Optional spoken replies after a non-forwarded owner voice note.
- * Text reply is always sent first; TTS is best-effort and never blocks it.
+ * Spoken replies for non-forwarded owner voice notes.
+ * Plain short answers: voice only (transcript as caption).
+ * Cards / links / long replies: text first, then a short voice pointer.
+ * TTS failure never leaves silence — text is sent instead.
  */
 
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -14,9 +16,10 @@ import { logLlmUsage } from "./usage.js";
 
 export const VOICE_REPLIES_SETTING = "voice_replies";
 export const VOICE_SPEAK_CHAR_CAP = 500;
-export const VOICE_CARD_TRAILER =
-  "Details and buttons are in the message above.";
-export const VOICE_TRUNCATION_TRAILER = "the rest is in the text";
+/** Telegram Bot API caption limit for sendVoice / sendPhoto / etc. */
+export const TELEGRAM_CAPTION_LIMIT = 1024;
+export const VOICE_DETAILS_ABOVE =
+  "I've put the details in the message above.";
 
 const SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech";
 const TTS_PACE = 1.0;
@@ -52,16 +55,31 @@ export const VOICE_PERSONAS: Record<VoiceReplyLang, VoicePersona> = {
   },
 };
 
+export type VoiceDeliveryMode = "voice_only" | "text_and_voice" | "text_only";
+
+export interface VoiceDeliveryPlan {
+  mode: VoiceDeliveryMode;
+  /** Text to synthesize, if any. */
+  spoken: string;
+  /** sendVoice caption (You said: …), if any. */
+  caption: string;
+}
+
 type TtsFetch = typeof fetch;
 type SendVoiceFn = (
   api: Api,
   chatId: number,
   audioPath: string,
+  caption?: string,
 ) => Promise<void>;
 
 let ttsFetch: TtsFetch = fetch;
-let sendVoiceFn: SendVoiceFn = async (api, chatId, audioPath) => {
-  await api.sendVoice(chatId, new InputFile(audioPath));
+let sendVoiceFn: SendVoiceFn = async (api, chatId, audioPath, caption) => {
+  await api.sendVoice(
+    chatId,
+    new InputFile(audioPath),
+    caption ? { caption } : {},
+  );
 };
 
 export function setVoiceReplyTestHooks(hooks: {
@@ -80,8 +98,12 @@ export function setVoiceReplyTestHooks(hooks: {
 export function resetVoiceReplyTestHooks(): void {
   assertTestSeam("resetVoiceReplyTestHooks");
   ttsFetch = fetch;
-  sendVoiceFn = async (api, chatId, audioPath) => {
-    await api.sendVoice(chatId, new InputFile(audioPath));
+  sendVoiceFn = async (api, chatId, audioPath, caption) => {
+    await api.sendVoice(
+      chatId,
+      new InputFile(audioPath),
+      caption ? { caption } : {},
+    );
   };
 }
 
@@ -124,6 +146,39 @@ export function looksLikePendingActionCard(text: string): boolean {
   );
 }
 
+export function replyHasLinks(text: string): boolean {
+  return (
+    /https?:\/\/\S+/i.test(text) ||
+    /\bwww\.\S+/i.test(text) ||
+    /\[[^\]]+\]\(https?:\/\/[^)]+\)/i.test(text)
+  );
+}
+
+/** True when the Telegram text channel is required (card / draft / buttons / links / long). */
+export function replyNeedsTextChannel(replyText: string): boolean {
+  if (looksLikePendingActionCard(replyText)) {
+    return true;
+  }
+  if (replyHasLinks(replyText)) {
+    return true;
+  }
+  if (
+    /\b(tap|taps|button|buttons|inline)\b/i.test(replyText) ||
+    /\b(send|edit|discard)\b.*\b(send|edit|discard)\b/i.test(replyText) ||
+    /\bapproval\b/i.test(replyText)
+  ) {
+    return true;
+  }
+  if (
+    /\bdraft\b/i.test(replyText) &&
+    /\b(send|edit|waiting|approval|gmail|discard)\b/i.test(replyText)
+  ) {
+    return true;
+  }
+  const stripped = stripForSpeech(replyText);
+  return stripped.length > VOICE_SPEAK_CHAR_CAP;
+}
+
 /** Strip markdown, links, and bare URLs before TTS. */
 export function stripForSpeech(text: string): string {
   let out = text.replace(/\r\n/g, "\n");
@@ -142,50 +197,50 @@ export function stripForSpeech(text: string): string {
   return out.trim();
 }
 
-function firstSentences(text: string, maxChars: number): string {
-  const parts = text.match(/[^.!?।…]+[.!?।…]*/gu) ?? [text];
-  let out = "";
-  for (const part of parts) {
-    const next = `${out}${part}`.trim();
-    if (out && next.length > maxChars) {
-      break;
-    }
-    out = next;
-    if (out.length >= Math.min(maxChars, 80) && /[.!?।…]/.test(part)) {
-      const sentenceCount = (out.match(/[.!?।…]/g) ?? []).length;
-      if (sentenceCount >= 2 || out.length >= maxChars * 0.6) {
-        break;
-      }
-    }
+/** Caption on the voice bubble: "You said: …" truncated to Telegram's limit. */
+export function voiceReplyCaption(transcript: string): string {
+  const prefix = "You said: ";
+  const body = transcript.replace(/\s+/g, " ").trim();
+  const budget = TELEGRAM_CAPTION_LIMIT - prefix.length;
+  if (budget <= 0) {
+    return prefix.slice(0, TELEGRAM_CAPTION_LIMIT);
   }
-  return out.trim() || text.slice(0, maxChars).trim();
+  if (body.length <= budget) {
+    return `${prefix}${body}`;
+  }
+  if (budget <= 1) {
+    return `${prefix}${body.slice(0, budget)}`;
+  }
+  return `${prefix}${body.slice(0, budget - 1)}…`;
 }
 
 /**
- * Build the spoken string: card summary, or stripped+capped reply.
+ * Decide how to deliver a reply for a voice-in turn.
+ * History storage is the caller's job (runAgent) — this only plans Telegram I/O.
  */
-export function prepareSpokenText(replyText: string): string {
-  const stripped = stripForSpeech(replyText);
-  if (!stripped) {
-    return "";
+export function planVoiceDelivery(input: {
+  replyText: string;
+  transcript: string;
+  inboundWasVoice: boolean;
+  forwarded: boolean;
+}): VoiceDeliveryPlan {
+  const empty: VoiceDeliveryPlan = { mode: "text_only", spoken: "", caption: "" };
+  if (!input.inboundWasVoice || input.forwarded || !voiceRepliesEnabled()) {
+    return empty;
   }
-  if (looksLikePendingActionCard(stripped)) {
-    const firstLine =
-      stripped
-        .split("\n")
-        .map((line) => line.trim())
-        .find((line) => line.length > 0) ?? "Draft waiting for approval";
-    return `${firstLine}. ${VOICE_CARD_TRAILER}`;
+  const caption = voiceReplyCaption(input.transcript);
+  if (replyNeedsTextChannel(input.replyText)) {
+    return {
+      mode: "text_and_voice",
+      spoken: VOICE_DETAILS_ABOVE,
+      caption,
+    };
   }
-  if (stripped.length <= VOICE_SPEAK_CHAR_CAP) {
-    return stripped;
+  const spoken = stripForSpeech(input.replyText);
+  if (!spoken) {
+    return empty;
   }
-  const head = firstSentences(stripped, VOICE_SPEAK_CHAR_CAP);
-  const clipped =
-    head.length > VOICE_SPEAK_CHAR_CAP
-      ? head.slice(0, VOICE_SPEAK_CHAR_CAP).trim()
-      : head;
-  return `${clipped} ${VOICE_TRUNCATION_TRAILER}`.trim();
+  return { mode: "voice_only", spoken, caption };
 }
 
 interface SarvamTtsResponse {
@@ -231,60 +286,115 @@ export async function synthesizeSpeech(
   };
 }
 
-/**
- * After the text reply has already been sent: synthesize and sendVoice.
- * Failures log provider/status only and leave the text reply as-is.
- */
-export async function maybeSendVoiceReply(input: {
+/** Synthesize + sendVoice. Does not send text. */
+export async function sendSpokenReply(input: {
   api: Api;
   chatId: number;
-  replyText: string;
-  /** Inbound transcript (or source text) for language detection. */
+  spoken: string;
+  caption: string;
   sourceText: string;
-  inboundWasVoice: boolean;
-  forwarded: boolean;
-}): Promise<"sent" | "skipped" | "failed"> {
-  if (!input.inboundWasVoice || input.forwarded) {
+}): Promise<"sent" | "failed" | "skipped"> {
+  if (!input.spoken.trim()) {
     return "skipped";
   }
-  if (!voiceRepliesEnabled()) {
-    return "skipped";
-  }
-  // Only require a real key when calling the live Sarvam endpoint.
   if (ttsFetch === fetch && !config.sarvamApiKey) {
     console.error("Voice reply skipped: Sarvam TTS status=no_key");
-    return "skipped";
-  }
-  const spoken = prepareSpokenText(input.replyText);
-  if (!spoken) {
-    return "skipped";
+    return "failed";
   }
   const lang = detectVoiceLanguage(input.sourceText);
   const tempDirectory = await mkdtemp(join(tmpdir(), "aadi-tts-"));
   const audioPath = join(tempDirectory, "reply.mp3");
   try {
-    const { audio, model } = await synthesizeSpeech(spoken, lang);
+    const { audio, model } = await synthesizeSpeech(input.spoken, lang);
     await writeFile(audioPath, audio);
-    await sendVoiceFn(input.api, input.chatId, audioPath);
+    await sendVoiceFn(
+      input.api,
+      input.chatId,
+      audioPath,
+      input.caption || undefined,
+    );
     logLlmUsage({
       task: "tts",
       model,
-      inputTokens: spoken.length,
+      inputTokens: input.spoken.length,
       cacheWriteTokens: 0,
       cacheReadTokens: 0,
       outputTokens: 0,
       costUsd: 0,
     });
     console.log(
-      `Voice reply sent: lang=${lang} model=${model} chars=${spoken.length} bytes=${audio.length}`,
+      `Voice reply sent: lang=${lang} model=${model} chars=${input.spoken.length} bytes=${audio.length}`,
     );
     return "sent";
   } catch (error) {
     const status =
-      error instanceof Error ? error.message.replace(/\s+/g, " ").slice(0, 120) : "UnknownError";
+      error instanceof Error
+        ? error.message.replace(/\s+/g, " ").slice(0, 120)
+        : "UnknownError";
     console.error(`Voice reply failed: provider=sarvam status=${status}`);
     return "failed";
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
   }
+}
+
+/**
+ * Deliver a voice-in turn to Telegram. Caller has already persisted the
+ * full reply in messages/history. Returns what was sent on the wire.
+ */
+export async function deliverVoiceTurn(input: {
+  api: Api;
+  chatId: number;
+  replyText: string;
+  transcript: string;
+  inboundWasVoice: boolean;
+  forwarded: boolean;
+  sendText: (text: string) => Promise<void>;
+}): Promise<{
+  mode: VoiceDeliveryMode;
+  sentText: boolean;
+  sentVoice: boolean;
+}> {
+  const plan = planVoiceDelivery({
+    replyText: input.replyText,
+    transcript: input.transcript,
+    inboundWasVoice: input.inboundWasVoice,
+    forwarded: input.forwarded,
+  });
+
+  if (plan.mode === "text_only") {
+    await input.sendText(input.replyText);
+    return { mode: "text_only", sentText: true, sentVoice: false };
+  }
+
+  if (plan.mode === "voice_only") {
+    const voice = await sendSpokenReply({
+      api: input.api,
+      chatId: input.chatId,
+      spoken: plan.spoken,
+      caption: plan.caption,
+      sourceText: input.transcript,
+    });
+    if (voice === "sent") {
+      return { mode: "voice_only", sentText: false, sentVoice: true };
+    }
+    // Never silence: fall back to the full text reply.
+    await input.sendText(input.replyText);
+    return { mode: "voice_only", sentText: true, sentVoice: false };
+  }
+
+  // text_and_voice: text first (with any keyboard from the reply path), then short voice.
+  await input.sendText(input.replyText);
+  const voice = await sendSpokenReply({
+    api: input.api,
+    chatId: input.chatId,
+    spoken: plan.spoken,
+    caption: plan.caption,
+    sourceText: input.transcript,
+  });
+  return {
+    mode: "text_and_voice",
+    sentText: true,
+    sentVoice: voice === "sent",
+  };
 }
