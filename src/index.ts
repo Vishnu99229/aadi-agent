@@ -63,6 +63,7 @@ const MENU_COMMANDS = [
   { command: "meetings", description: "List auto-handled meeting threads" },
   { command: "reset", description: "Clear conversation history" },
   { command: "jobs", description: "List running and recent big jobs" },
+  { command: "voice", description: "Turn spoken replies to voice notes on or off" },
 ] as const;
 
 const COMMAND_SCOPES = [

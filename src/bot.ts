@@ -92,6 +92,11 @@ import {
 import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
 import { transcribeTelegramVoice } from "./voice.js";
 import {
+  maybeSendVoiceReply,
+  setVoiceRepliesEnabled,
+  voiceRepliesEnabled,
+} from "./voice_reply.js";
+import {
   consumePendingMeetingWrapUp,
   formatWrapUpPrefill,
   handleMeetingCallback,
@@ -236,11 +241,18 @@ async function completeChatReply(
   ctx: Context,
   userText: string,
   work: () => Promise<string>,
-  forwarded = false,
-  retryText?: string,
+  options: {
+    forwarded?: boolean;
+    retryText?: string;
+    /** Non-forwarded owner voice note: also synthesize a spoken reply. */
+    voiceReply?: boolean;
+    /** Language detection source (usually the voice transcript). */
+    voiceSourceText?: string;
+  } = {},
 ): Promise<void> {
+  const forwarded = options.forwarded === true;
   const gate = beginTurn();
-  attachRetryText(gate, retryText ?? userText);
+  attachRetryText(gate, options.retryText ?? userText);
   if (forwarded) {
     markTurnForwarded(gate, true);
   }
@@ -270,6 +282,20 @@ async function completeChatReply(
     }
     closeTurn(gate, "ok", startedAt);
     await sendPlainText(ctx, settled.reply);
+    if (options.voiceReply && ctx.chat) {
+      void maybeSendVoiceReply({
+        api: ctx.api,
+        chatId: ctx.chat.id,
+        replyText: settled.reply,
+        sourceText: options.voiceSourceText ?? userText,
+        inboundWasVoice: true,
+        forwarded,
+      }).catch((error: unknown) => {
+        const status =
+          error instanceof Error ? error.name : "UnknownError";
+        console.error(`Voice reply failed: provider=sarvam status=${status}`);
+      });
+    }
   } finally {
     stopTyping();
   }
@@ -287,8 +313,7 @@ async function handleForwardedContent(ctx: Context, content: string): Promise<vo
         sendConfirmation: undefined,
         guardText: wrapped,
       }),
-    true,
-    content,
+    { forwarded: true, retryText: content },
   );
 }
 
@@ -459,6 +484,26 @@ bot.command("builds", async (ctx) => {
 
 bot.command("showkeyboard", async (ctx) => {
   await setReplyKeyboard(ctx, true);
+});
+
+bot.command("voice", async (ctx) => {
+  const arg = (ctx.message?.text ?? "")
+    .replace(/^\/voice(?:@\w+)?\s*/i, "")
+    .trim()
+    .toLowerCase();
+  if (arg === "on") {
+    setVoiceRepliesEnabled(true);
+    await ctx.reply("Voice replies on. I'll speak after your voice notes.");
+    return;
+  }
+  if (arg === "off") {
+    setVoiceRepliesEnabled(false);
+    await ctx.reply("Voice replies off. Text only after voice notes.");
+    return;
+  }
+  await ctx.reply(
+    `Voice replies are ${voiceRepliesEnabled() ? "on" : "off"}. Use /voice on or /voice off.`,
+  );
 });
 
 bot.command("hidekeyboard", async (ctx) => {
@@ -810,7 +855,7 @@ async function handleUserText(
   ctx: Context,
   userId: number,
   userText: string,
-  options: { forwarded?: boolean } = {},
+  options: { forwarded?: boolean; voiceReply?: boolean } = {},
 ): Promise<void> {
   if (await tryGratitudeReaction(ctx, userText)) {
     return;
@@ -954,20 +999,27 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       : "chat";
   const quoted = quotedMessageText(ctx.message?.reply_to_message);
   const modelText = withQuotedContext(userText, quoted);
-  await completeChatReply(ctx, userText, () =>
-    runAgent(modelText, {
-      guardText: userText,
-      task,
-      usageTask: drafting
-        ? "drafting"
-        : accountQuestion
-          ? "account_status"
-          : undefined,
-      sendConfirmation: confirmation,
-      ctx: reactionCtx,
-      reactions: session,
-    }),
-    forwarded,
+  await completeChatReply(
+    ctx,
+    userText,
+    () =>
+      runAgent(modelText, {
+        guardText: userText,
+        task,
+        usageTask: drafting
+          ? "drafting"
+          : accountQuestion
+            ? "account_status"
+            : undefined,
+        sendConfirmation: confirmation,
+        ctx: reactionCtx,
+        reactions: session,
+      }),
+    {
+      forwarded,
+      voiceReply: options.voiceReply === true && !forwarded,
+      voiceSourceText: userText,
+    },
   );
   void captureFromUserMessage(userText).catch((error: unknown) => {
     const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -1016,7 +1068,7 @@ bot.on("message:voice", async (ctx) => {
       );
       return;
     }
-    await handleUserText(ctx, ctx.from.id, transcript);
+    await handleUserText(ctx, ctx.from.id, transcript, { voiceReply: true });
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Voice agent request failed (${errorType}).`);

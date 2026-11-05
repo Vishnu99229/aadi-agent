@@ -208,7 +208,7 @@ for (const text of ["ok", "👍"]) {
   const voiceHandler = botSrc.slice(voiceStart, voiceEnd);
   assert(voiceStart >= 0 && voiceEnd > voiceStart, "voice handler found");
   assert(
-    voiceHandler.includes("handleUserText(ctx, ctx.from.id, transcript)"),
+    /handleUserText\(ctx, ctx\.from\.id, transcript/.test(voiceHandler),
     "voice transcript goes through handleUserText",
   );
   assert(

@@ -499,6 +499,8 @@ export const config = {
   deepseekReasonerModel:
     process.env.DEEPSEEK_REASONER_MODEL?.trim() || "deepseek-flash",
   sarvamApiKey: process.env.SARVAM_API_KEY?.trim() ?? "",
+  /** Default for spoken replies after owner voice notes; /voice on|off overrides. */
+  voiceRepliesEnabled: parseBool(process.env.VOICE_REPLIES_ENABLED, false),
   localLlmBaseUrl:
     process.env.LOCAL_LLM_BASE_URL?.trim() || "http://127.0.0.1:11434/v1",
   localLlmModel: process.env.LOCAL_LLM_MODEL?.trim() || "gemma4:e4b",
