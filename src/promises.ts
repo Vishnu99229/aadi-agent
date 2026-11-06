@@ -7,6 +7,7 @@ import {
 import { everyClock, type IntervalJob } from "./scheduler.js";
 import { config } from "./config.js";
 import {
+  isSalesSequenceSentMessage,
   cancelPendingRemindersForTask,
   createPromiseTask,
   createReminder,
@@ -490,6 +491,10 @@ export async function runPromiseScan(api?: Api): Promise<void> {
   let dropped = 0;
 
   for (const id of ids) {
+    // A sequence follow-up is Aadi's wording, not a commitment Vishnu made.
+    if (isSalesSequenceSentMessage(id)) {
+      continue;
+    }
     try {
       const response = await gmail.users.messages.get({
         userId: "me",

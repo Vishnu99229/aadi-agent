@@ -44,6 +44,7 @@ export const HEALTH_JOBS = [
   "morning-brief",
   "bill-scan",
   "followup-scan",
+  "sequence-send",
   "important-dates",
   "weekly-review",
   "weekly-backup",
@@ -578,6 +579,10 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
   }
   for (const name of HEALTH_JOBS) {
     if (name === "morning-brief" && !isMorningBriefEnabled()) {
+      lines.push(`${name}: off`);
+      continue;
+    }
+    if (name === "sequence-send" && !config.sequencesEnabled) {
       lines.push(`${name}: off`);
       continue;
     }

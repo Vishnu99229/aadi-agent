@@ -1,6 +1,8 @@
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { runAgent } from "./agent.js";
 import { FORWARDED_TOOLS } from "./tools/index.js";
+import { handleSequenceCallback, handleSequenceCommand } from "./sequences.js";
+import { handleSequencesCommand, handleSequenceStopCallback } from "./sequence_runner.js";
 import { reactToSimpleGratitude } from "./gratitude.js";
 import {
   createReactionSession,
@@ -522,6 +524,14 @@ bot.command("followups", async (ctx) => {
   });
 });
 
+bot.command("sequence", async (ctx) => {
+  await whileTyping(ctx, () => handleSequenceCommand(ctx));
+});
+
+bot.command("sequences", async (ctx) => {
+  await handleSequencesCommand(ctx);
+});
+
 bot.command("jobs", async (ctx) => {
   await ctx.reply(jobsListText());
 });
@@ -713,6 +723,14 @@ bot.callbackQuery(/^meet:(wrap|remind|skip):(\d+)$/, async (ctx) => {
 
 bot.callbackQuery(/^md:/, async (ctx) => {
   await handleModelCallback(ctx);
+});
+
+bot.callbackQuery(/^seq:stop:/, async (ctx) => {
+  await handleSequenceStopCallback(ctx);
+});
+
+bot.callbackQuery(/^seq:/, async (ctx) => {
+  await handleSequenceCallback(ctx);
 });
 
 bot.callbackQuery(/^fu:/, async (ctx) => {

@@ -115,6 +115,8 @@ Gates in one line: **owner lock** = ignore anyone except `OWNER_TELEGRAM_ID`. **
 | `/jobs` | Running/recent multi-step jobs; cancel from chat | Owner lock; jobs cannot send/book |
 | `/health` | Version, turns, LLM credit flags, heartbeat, last-success per job | Owner lock |
 | `/meetings` | Auto-handled meeting threads | Owner lock |
+| `/sequence <who>` | Offer a follow-up sequence: shows the Start card only (`handleSequenceCommand`, `requestSequenceCard`) | Owner lock; refuses forwarded; enrols only on tapping Start |
+| `/sequences` | Active sequences with step, next send time and a Stop button each (`handleSequencesCommand`, `handleSequenceStopCallback`) | Owner lock; refuses forwarded |
 | `/cost` | Token cost report | Owner lock |
 | `/accounts` | Deal list | Owner lock |
 | `/backup` | Encrypted `aadi.db` to Telegram | Owner lock; requires `BACKUP_PASSWORD`; AES-256-CBC |
@@ -139,6 +141,10 @@ Reading / searching / drafting is free. Side effects:
 | `delete_calendar_event` | Owner chat/voice (`allowOwnerChatDeleteEvent`); never from email text |
 | `add_calendar_attendee` | Owner chat/voice (`allowOwnerChatAddAttendee`); `sendUpdates=all`; never from email text |
 | `draft_mom` | New work email, still Send / Edit / Discard |
+| `start_sequence` | Owner chat/voice (`allowOwnerChatStartSequence`) plus a clear phrase (`isExplicitSequenceRequest`). Only shows the Start card. Not in `FORWARDED_TOOLS` |
+| `stop_sequence` | Owner chat/voice (`allowOwnerChatStopSequence`). `matchSequencesForStop` by name, company, address or "all"; asks first when more than one matches; the result says exactly what stopped. Not in `FORWARDED_TOOLS` |
+| Sequence follow-up email (`sendSequenceStep`, `src/security/sequence_send.ts`) | **No tap per email**, a deliberate exception: Vishnu taps Start once. `evaluateSequenceSendGate`: `SEQUENCES_ENABLED`; `salesFactsStatus` ready (no TODO markers); work account and work sender; recipient exactly the enrolled `prospect_email`; no Cc or Bcc; never `blockedAutoSendDomains` (partner, end client, `epicode.in`), self or do-not-contact; `SEQUENCE_TEST_RECIPIENTS` when set; one open sequence per company; manual bumps count toward the 4; body is the stored draft that passed `checkDraftDeterministic` and the Sonnet second check; live Message-ID present; Mon-Fri 10:00-17:00 in the prospect's zone and 09:00-19:00 IST (`inSendWindow`; -03:30 and further west never overlap, so those sequences hold and `/sequences` says so); `SEQUENCE_DAILY_SEND_CAP`; `SEQUENCE_MIN_SPACING_MINUTES`. `claimSalesStepSending` runs before the Gmail call, so a crash can't double-send. `scripts/test-security.ts` allows `messages.send` in exactly this file and `auto_book.ts`; `scripts/test-sequence-send.ts` covers the gate |
+| Blocked sequence step | Normal Send / Edit / Discard card (`blockStep`, `queueDraftApproval`), same `allowSendDraft` gate. Send continues (`resolveBlockedSalesStep`), Discard stops. The card doesn't expire while the step waits, but chat "send it" can't reach it after 3h. Step 3 also comes here when fewer than 2 offered times fall in 08:00-20:00 their time (`slotsInProspectDay`, reason `slots_off_hours`). `setDraftRefresher(refreshSequenceDraftSlots)` rebuilds Aadi's time lines before Send and Edit unless he changed or removed one; if it can't get real times, nothing is sent. `retireSequenceDraftCard` expires the card when the sequence stops |
 | Auto-scheduling email (`sendSchedulingEmail`) | **No tap** for a lone prospect. Only the three fixed templates (proposal / clarify / confirm) with a validated opening line. `autoSendBlockedParty` blocks the three automatic paths when the sender, reply From, or a non-self attendee/Cc is a partner domain or `epicode.in`: first proposal (`processInboundMeetingMessage`) becomes the not-replying card; a reply (`processReplyOnProposal`) is handed over; a delayed confirm (`processDuePendingBookings`) is not sent and the private calendar event is left in place. `handleMeetingBookCallback` ("Actually, offer slots") and `sendCreatedDraftNow` (send-it) are not blocked |
 | Auto-book from Epicode inbox | Prospects only (`AUTO_HANDLE_SENDER_TYPES`). Confidence `AUTO_BOOK_MIN_CONFIDENCE`, daily caps (`AUTO_BOOK_DAILY_CAP`, `AUTO_SEND_DAILY_CAP`); template body must match. Domain block is `blockedAutoSendDomains`: `PARTNER_DOMAINS`, `email_domains` on partner and end-client accounts, and `epicode.in`. `scripts/test-security.ts` forges From/Cc; `scripts/test-stage12.ts` covers the partner guard |
 | Voice notes | Needs `SARVAM_API_KEY`; ≤30s; transcript is treated as Vishnu’s chat (same sendConfirmation) |
@@ -158,6 +164,8 @@ Self-scheduling `setTimeout`, Asia/Kolkata. Last success in `job_runs`. Catch-up
 | `promise-scan` | Weekdays 09:00; DeepSeek off-peak preferred | Creates open tasks from work Sent; not a mail send |
 | `weekly-review` | `WEEKLY_REVIEW_TIME` default 19:00 Sundays | Telegram only |
 | `weekly-backup` | Sundays 21:00 | Encrypted file to Telegram if `BACKUP_PASSWORD` set |
+| `sequence-detect` | every 30 min when `SEQUENCES_ENABLED` | `runSequenceDetection`: offers a Start card only, creates no active sequence |
+| `sequence-send` | every 5 min when `SEQUENCES_ENABLED` | `runSequenceTick`: `evaluateStopRules` on every active sequence (out-of-office sorted first by `classifyInbound`), the 5-day ping (`pingWaitingCards`), then at most one send, with all stop rules checked again right before it. Also a line on `/health` (`off` when disabled). No per-send message and no digest |
 | `meeting-inbox` | every 10 min | `processInboundMeetingMessage`. `gatherMeetingContext` (thread, sender's recent mail, memories, `searchHistory`, accounts) runs before `detectMeetingRequest`. Auto-send only for `prospect_enquiry` (`AUTO_HANDLE_SENDER_TYPES`). Partner / own domains get the not-replying card instead |
 | `meeting-poll` | every 2 min | Same |
 | `meeting-pending` | every 1 min | `processDuePendingBookings` after `AUTO_BOOK_DELAY_MINUTES`. A blocked partner/own confirm is not patched and not mailed; the event inserted with `sendUpdates: "none"` stays on the calendar |
@@ -221,7 +229,10 @@ Required at process start (`src/security/env_guard.ts`): `TELEGRAM_BOT_TOKEN`, `
 | `AUTO_BOOK_MIN_CONFIDENCE` | Classifier threshold |
 | `MEETING_TEST_SENDERS` | Extra From addresses treated as prospects |
 | `SELF_EMAIL_ADDRESSES` | Extra mailboxes treated as Vishnu by `loadFollowupSelfAddresses` (plus both accounts' profile and send-as aliases). A follow-up whose To is only those addresses is dropped by `isAlgorithmicallyExcluded` |
-| `PARTNER_DOMAINS` | Comma-separated. Default `supertroninfotech.com,pinnacle.in` when unset. `pinnacle.in` is the From domain on Pinnacle Teleservices mail and that account's `email_domains` |
+| `PARTNER_DOMAINS` | Comma-separated. Default `supertroninfotech.com,supertronindia.com,pinnacle.in` when unset; setting it replaces the default, it doesn't add to it. `pinnacle.in` is the From domain on Pinnacle Teleservices mail and that account's `email_domains` |
+| `SEQUENCES_ENABLED` | Kill switch for sequence detection and sending. Default off |
+| `SEQUENCE_STEP_DAYS`, `SEQUENCE_PITCH_MIN_CONFIDENCE`, `SEQUENCE_DAILY_SEND_CAP`, `SEQUENCE_MIN_SPACING_MINUTES` | Defaults 2 days, 0.75, 15 a day, 3 minutes |
+| `SEQUENCE_TEST_RECIPIENTS` | While set, only these addresses get a card or an email. Vishnu's own addresses never do, so it needs a separate mailbox |
 | `WEB_SEARCH_ORDER` | Default `deepseek,gemini,claude` |
 | `WEB_SEARCH_PROVIDER` | Optional pin, tried first |
 | `WEB_SEARCH_DAILY_CAP` | Default 100 |
@@ -254,7 +265,9 @@ Not env: `google-credentials.json`, `google-token.json` (personal Gmail), `googl
 - `allowCreateEvent` — Create button `approval:create:<id>`.
 - Owner-chat exceptions: `allowOwnerChatSendDraft`, `allowOwnerChatCreateEvent`, `allowOwnerChatDeleteEvent`, `allowOwnerChatAddAttendee` — require a real `chatId` + `messageId` from Vishnu’s turn.
 
-`approvals.ts` `sendDraft` must call `allowSendDraft` **before** `performDraftSend`. Text “send it” goes through `sendPendingDraftByText` → same `performDraftSend`. Auto-scheduling mail is **not** this gate; it is `sendSchedulingEmail` with a frozen template.
+Sequence stop rules live in `evaluateStopRules` (`src/sequence_rules.ts`) and run in `applyStopRules` (`src/sequence_runner.ts`). `colleagueWroteOnThread` stops a sequence when anyone else at `epicode.in` writes on its thread after enrolment, to the prospect or to Vishnu; the `SENT` label keeps his own aliases out of it. Other scans stay out of sequences: `collectCandidates` skips threads where `salesSequenceOwnsThread`, `dueFollowupsNow` / `activeFollowups` / `overdueFollowups` hide threads with an active sequence, and `runPromiseScan` skips `isSalesSequenceSentMessage`. The second check in `prepareSequenceStep` runs on Sonnet with `noFallback` under usage task `sequence_check`: if Claude is unavailable the step waits and retries hourly.
+
+`approvals.ts` `sendDraft` must call `allowSendDraft` **before** `performDraftSend`. Text “send it” goes through `sendPendingDraftByText` → same `performDraftSend`. Auto-scheduling mail is **not** this gate; it is `sendSchedulingEmail` with a frozen template. Sequence follow-ups aren't either: they go through `sendSequenceStep` and `evaluateSequenceSendGate`.
 
 `test-security.ts` also: no `messages.send` / `drafts.send` / `events.insert|patch|delete` in model tool files; tools index has no `send_email` / `book_meeting`; forged inbox From/Cc cannot book; auto-book daily cap; template mismatch refuses send.
 
@@ -367,6 +380,10 @@ Live file: phone `aadi.db`. Created/migrated in `src/db.ts`.
 | `job_runs` | Scheduler last success/attempt |
 | `message_embeddings` | One row per embedded or skipped message. `runMessageEmbed` writes it. `listSearchableEmbeddings` reads vectors for the current model and scheme |
 | `meeting_threads` | Auto-schedule conversation state |
+| `sales_sequences` | One row per pitch thread: prospect, `prospect_timezone` (UTC offset from `readProspectTimezone`), status, step, `next_step_at`. Partial unique index: one open sequence per company domain, or per address on free mail |
+| `sales_sequence_steps` | Each step's draft, check result, status (`planned`, `sending`, `sent`, `blocked`, `skipped`), `sent_message_id`, `claimed_at`, `blocked_at`, `waiting_ping_at`, `slot_lines` |
+| `sales_do_not_contact` | Addresses that said no, or that Vishnu marked Never |
+| `sales_pitch_scans` | Cached classifier answers per sent message |
 | `meeting_auto_sends` | Count of proposal/clarify/confirm sends |
 | `processed_messages` | Telegram update idempotency |
 | `chat_turns` | Per-turn ok/failed/timeout + retry text |

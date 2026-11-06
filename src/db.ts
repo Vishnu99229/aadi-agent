@@ -624,6 +624,77 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
+  CREATE TABLE IF NOT EXISTS sales_sequences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT 'work' CHECK (account = 'work'),
+    prospect_email TEXT NOT NULL,
+    prospect_domain TEXT NOT NULL,
+    prospect_key TEXT NOT NULL,
+    prospect_name TEXT NOT NULL DEFAULT '',
+    prospect_company TEXT NOT NULL DEFAULT '',
+    prospect_timezone TEXT,
+    subject TEXT NOT NULL DEFAULT '',
+    original_message_id TEXT NOT NULL,
+    original_sent_at TEXT NOT NULL,
+    status TEXT NOT NULL
+      CHECK (status IN ('proposed', 'active', 'stopped', 'completed')),
+    stop_reason TEXT,
+    current_step INTEGER NOT NULL DEFAULT 1 CHECK (current_step BETWEEN 1 AND 4),
+    steps_sent INTEGER NOT NULL DEFAULT 0 CHECK (steps_sent BETWEEN 0 AND 4),
+    manual_followups INTEGER NOT NULL DEFAULT 0 CHECK (manual_followups BETWEEN 0 AND 3),
+    original_ask TEXT CHECK (original_ask IN ('demo', 'partnership_call', 'meeting')),
+    next_step_at TEXT,
+    enrolled_at TEXT,
+    classifier_confidence REAL,
+    classifier_reason TEXT,
+    card_message_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (account, thread_id)
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_sequences_open_prospect
+    ON sales_sequences (prospect_key)
+    WHERE status IN ('proposed', 'active');
+
+  CREATE TABLE IF NOT EXISTS sales_sequence_steps (
+    sequence_id INTEGER NOT NULL REFERENCES sales_sequences (id),
+    step_no INTEGER NOT NULL CHECK (step_no BETWEEN 1 AND 4),
+    scheduled_at TEXT,
+    draft_text TEXT,
+    check_result TEXT,
+    status TEXT NOT NULL DEFAULT 'planned'
+      CHECK (status IN ('planned', 'sending', 'sent', 'blocked', 'skipped')),
+    sent_message_id TEXT,
+    sent_at TEXT,
+    reason TEXT,
+    draft_id TEXT,
+    claimed_at TEXT,
+    blocked_at TEXT,
+    waiting_ping_at TEXT,
+    slot_lines TEXT,
+    PRIMARY KEY (sequence_id, step_no)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_sales_sequence_steps_sent_message
+    ON sales_sequence_steps (sent_message_id);
+
+  CREATE TABLE IF NOT EXISTS sales_do_not_contact (
+    email TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS sales_pitch_scans (
+    message_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    is_sales_pitch INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS processed_messages (
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
@@ -4313,4 +4384,720 @@ export function listShadowSkipCountsBetween(
        ORDER BY reason ASC`,
     )
     .all(fromYmd, toYmd) as Array<{ reason: string; count: number }>;
+}
+
+export type SalesSequenceStatus = "proposed" | "active" | "stopped" | "completed";
+export type SalesSequenceStepStatus =
+  | "planned"
+  | "sending"
+  | "sent"
+  | "blocked"
+  | "skipped";
+
+export type SalesOriginalAsk = "demo" | "partnership_call" | "meeting";
+
+export interface SalesSequenceRecord {
+  id: number;
+  thread_id: string;
+  account: "work";
+  prospect_email: string;
+  prospect_domain: string;
+  prospect_key: string;
+  prospect_name: string;
+  prospect_company: string;
+  prospect_timezone: string | null;
+  subject: string;
+  original_message_id: string;
+  original_sent_at: string;
+  status: SalesSequenceStatus;
+  stop_reason: string | null;
+  current_step: number;
+  steps_sent: number;
+  manual_followups: number;
+  original_ask: SalesOriginalAsk | null;
+  next_step_at: string | null;
+  enrolled_at: string | null;
+  classifier_confidence: number | null;
+  classifier_reason: string | null;
+  card_message_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SalesSequenceStepRecord {
+  sequence_id: number;
+  step_no: number;
+  scheduled_at: string | null;
+  draft_text: string | null;
+  check_result: string | null;
+  status: SalesSequenceStepStatus;
+  sent_message_id: string | null;
+  sent_at: string | null;
+  reason: string | null;
+  draft_id: string | null;
+  claimed_at: string | null;
+  blocked_at: string | null;
+  waiting_ping_at: string | null;
+  slot_lines: string | null;
+}
+
+export interface SalesPitchScanRecord {
+  message_id: string;
+  thread_id: string;
+  is_sales_pitch: number;
+  confidence: number;
+  reason: string;
+  scanned_at: string;
+}
+
+export const SALES_SEQUENCE_STEP_COUNT = 4;
+export const SALES_SEQUENCE_DECLINED = "declined";
+
+export function getSalesSequence(id: number): SalesSequenceRecord | undefined {
+  return db
+    .prepare(`SELECT * FROM sales_sequences WHERE id = ?`)
+    .get(id) as SalesSequenceRecord | undefined;
+}
+
+export function getSalesSequenceByThread(
+  threadId: string,
+): SalesSequenceRecord | undefined {
+  return db
+    .prepare(`SELECT * FROM sales_sequences WHERE account = 'work' AND thread_id = ?`)
+    .get(threadId) as SalesSequenceRecord | undefined;
+}
+
+/** The key is the company domain, or the exact address on a free-mail domain. */
+export function getOpenSalesSequenceForKey(
+  prospectKey: string,
+): SalesSequenceRecord | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM sales_sequences
+       WHERE prospect_key = ? AND status IN ('proposed', 'active')`,
+    )
+    .get(prospectKey.trim().toLowerCase()) as SalesSequenceRecord | undefined;
+}
+
+export function listSalesSequenceSteps(
+  sequenceId: number,
+): SalesSequenceStepRecord[] {
+  return db
+    .prepare(
+      `SELECT * FROM sales_sequence_steps WHERE sequence_id = ? ORDER BY step_no`,
+    )
+    .all(sequenceId) as SalesSequenceStepRecord[];
+}
+
+/** The partial unique index makes a second open row for a company or free-mail
+ *  address, or any second row for a thread, a no-op: the caller gets undefined
+ *  and sends no card. */
+export function createProposedSalesSequence(input: {
+  threadId: string;
+  prospectEmail: string;
+  prospectDomain: string;
+  prospectKey: string;
+  prospectName: string;
+  prospectCompany: string;
+  subject: string;
+  originalMessageId: string;
+  originalSentAt: string;
+  manualFollowups: number;
+  classifierConfidence: number | null;
+  classifierReason: string | null;
+}): SalesSequenceRecord | undefined {
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO sales_sequences (
+         thread_id, prospect_email, prospect_domain, prospect_key, prospect_name,
+         prospect_company, subject, original_message_id, original_sent_at,
+         manual_followups, status, classifier_confidence, classifier_reason
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)`,
+    )
+    .run(
+      input.threadId,
+      input.prospectEmail.trim().toLowerCase(),
+      input.prospectDomain.trim().toLowerCase(),
+      input.prospectKey.trim().toLowerCase(),
+      input.prospectName,
+      input.prospectCompany,
+      input.subject,
+      input.originalMessageId,
+      input.originalSentAt,
+      input.manualFollowups,
+      input.classifierConfidence,
+      input.classifierReason,
+    );
+  return result.changes > 0
+    ? getSalesSequence(Number(result.lastInsertRowid))
+    : undefined;
+}
+
+export function setSalesSequenceCardMessage(id: number, messageId: number): void {
+  db.prepare(
+    `UPDATE sales_sequences
+     SET card_message_id = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(messageId, id);
+}
+
+export function deleteProposedSalesSequence(id: number): void {
+  db.prepare(
+    `DELETE FROM sales_sequences WHERE id = ? AND status = 'proposed'`,
+  ).run(id);
+}
+
+/** Back to proposed so an explicit owner request can show a new Start card.
+ *  It never activates anything. */
+export function reproposeDeclinedSalesSequence(
+  id: number,
+): SalesSequenceRecord | undefined {
+  const updated = db
+    .prepare(
+      `UPDATE sales_sequences
+       SET status = 'proposed', stop_reason = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND status = 'stopped' AND steps_sent = 0 AND stop_reason = ?`,
+    )
+    .run(id, SALES_SEQUENCE_DECLINED);
+  return updated.changes > 0 ? getSalesSequence(id) : undefined;
+}
+
+/** The only way a sequence becomes active, and only ever from a proposed row
+ *  when Vishnu taps Start. */
+export function activateSalesSequence(
+  id: number,
+  input: { nextStepAt: string; enrolledAt: string; manualFollowups: number },
+): boolean {
+  return db.transaction(() => {
+    const updated = db
+      .prepare(
+        `UPDATE sales_sequences
+         SET status = 'active', stop_reason = NULL, enrolled_at = ?,
+             next_step_at = ?, current_step = ?, manual_followups = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'proposed'`,
+      )
+      .run(
+        input.enrolledAt,
+        input.nextStepAt,
+        input.manualFollowups + 1,
+        input.manualFollowups,
+        id,
+      );
+    if (updated.changes === 0) {
+      return false;
+    }
+    const insertStep = db.prepare(
+      `INSERT INTO sales_sequence_steps (sequence_id, step_no, scheduled_at, status, reason)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (let step = 1; step <= SALES_SEQUENCE_STEP_COUNT; step += 1) {
+      const manual = step <= input.manualFollowups;
+      insertStep.run(
+        id,
+        step,
+        step === input.manualFollowups + 1 ? input.nextStepAt : null,
+        manual ? "skipped" : "planned",
+        manual ? "manual_followup" : null,
+      );
+    }
+    return true;
+  })();
+}
+
+export function stopProposedSalesSequence(id: number, reason: string): boolean {
+  return (
+    db
+      .prepare(
+        `UPDATE sales_sequences
+         SET status = 'stopped', stop_reason = ?, next_step_at = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'proposed'`,
+      )
+      .run(reason, id).changes > 0
+  );
+}
+
+export function addSalesDoNotContact(email: string, reason: string): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO sales_do_not_contact (email, reason) VALUES (?, ?)`,
+  ).run(email.trim().toLowerCase(), reason);
+}
+
+export function isSalesDoNotContact(email: string): boolean {
+  return (
+    db
+      .prepare(`SELECT 1 FROM sales_do_not_contact WHERE email = ?`)
+      .get(email.trim().toLowerCase()) !== undefined
+  );
+}
+
+export function getSalesPitchScan(
+  messageId: string,
+): SalesPitchScanRecord | undefined {
+  return db
+    .prepare(`SELECT * FROM sales_pitch_scans WHERE message_id = ?`)
+    .get(messageId) as SalesPitchScanRecord | undefined;
+}
+
+export function recordSalesPitchScan(input: {
+  messageId: string;
+  threadId: string;
+  isSalesPitch: boolean;
+  confidence: number;
+  reason: string;
+}): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO sales_pitch_scans (
+       message_id, thread_id, is_sales_pitch, confidence, reason
+     ) VALUES (?, ?, ?, ?, ?)`,
+  ).run(
+    input.messageId,
+    input.threadId,
+    input.isSalesPitch ? 1 : 0,
+    input.confidence,
+    input.reason,
+  );
+}
+
+export function getSalesSequenceStep(
+  sequenceId: number,
+  stepNo: number,
+): SalesSequenceStepRecord | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM sales_sequence_steps WHERE sequence_id = ? AND step_no = ?`,
+    )
+    .get(sequenceId, stepNo) as SalesSequenceStepRecord | undefined;
+}
+
+export function setSalesSequenceOriginalAsk(
+  id: number,
+  ask: SalesOriginalAsk,
+): void {
+  db.prepare(
+    `UPDATE sales_sequences
+     SET original_ask = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(ask, id);
+}
+
+/** A draft that passed every check. The step stays planned until it is sent. */
+export function setSalesStepPrepared(
+  sequenceId: number,
+  stepNo: number,
+  draftText: string,
+  checkResult: string,
+): void {
+  db.prepare(
+    `UPDATE sales_sequence_steps
+     SET draft_text = ?, check_result = ?, reason = NULL
+     WHERE sequence_id = ? AND step_no = ? AND status = 'planned'`,
+  ).run(draftText, checkResult, sequenceId, stepNo);
+}
+
+/** Pauses the sequence: with no next_step_at nothing is due until Vishnu acts
+ *  on the approval card. */
+export function setSalesStepBlocked(input: {
+  sequenceId: number;
+  stepNo: number;
+  draftText: string;
+  checkResult: string;
+  reason: string;
+  draftId: string;
+  slotLines?: string[];
+  blockedAt?: string;
+}): void {
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE sales_sequence_steps
+       SET status = 'blocked', draft_text = ?, check_result = ?, reason = ?, draft_id = ?,
+           slot_lines = ?, blocked_at = ?
+       WHERE sequence_id = ? AND step_no = ? AND status = 'planned'`,
+    ).run(
+      input.draftText,
+      input.checkResult,
+      input.reason,
+      input.draftId,
+      JSON.stringify(input.slotLines ?? []),
+      input.blockedAt ?? new Date().toISOString(),
+      input.sequenceId,
+      input.stepNo,
+    );
+    db.prepare(
+      `UPDATE sales_sequences
+       SET next_step_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+    ).run(input.sequenceId);
+  })();
+}
+
+function advanceSalesSequenceAfterSend(
+  sequenceId: number,
+  sentAt: string,
+  stepDays: number,
+): void {
+  db.prepare(
+    `UPDATE sales_sequences
+     SET steps_sent = steps_sent + 1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(sequenceId);
+  const sequence = getSalesSequence(sequenceId);
+  if (sequence?.status !== "active") {
+    return;
+  }
+  const next = db
+    .prepare(
+      `SELECT step_no FROM sales_sequence_steps
+       WHERE sequence_id = ? AND status = 'planned'
+       ORDER BY step_no LIMIT 1`,
+    )
+    .get(sequenceId) as { step_no: number } | undefined;
+  if (!next) {
+    db.prepare(
+      `UPDATE sales_sequences
+       SET status = 'completed', next_step_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+    ).run(sequenceId);
+    return;
+  }
+  const nextAt = new Date(
+    new Date(sentAt).getTime() + stepDays * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  db.prepare(
+    `UPDATE sales_sequence_steps SET scheduled_at = ?
+     WHERE sequence_id = ? AND step_no = ?`,
+  ).run(nextAt, sequenceId, next.step_no);
+  db.prepare(
+    `UPDATE sales_sequences
+     SET current_step = ?, next_step_at = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(next.step_no, nextAt, sequenceId);
+}
+
+export type BlockedSalesStepOutcome =
+  | { kind: "sent"; sentMessageId: string; sentAt: string; stepDays: number }
+  | { kind: "discarded" };
+
+export function isBlockedSalesDraft(draftId: string): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM sales_sequence_steps WHERE draft_id = ? AND status = 'blocked'`,
+      )
+      .get(draftId) !== undefined
+  );
+}
+
+/** Records one sent step and moves the sequence on. */
+export function recordSalesStepSent(input: {
+  sequenceId: number;
+  stepNo: number;
+  sentMessageId: string;
+  sentAt: string;
+  stepDays: number;
+}): void {
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE sales_sequence_steps
+       SET status = 'sent', sent_message_id = ?, sent_at = ?
+       WHERE sequence_id = ? AND step_no = ?`,
+    ).run(input.sentMessageId, input.sentAt, input.sequenceId, input.stepNo);
+    advanceSalesSequenceAfterSend(input.sequenceId, input.sentAt, input.stepDays);
+  })();
+}
+
+/** Send continues the sequence and Discard stops it. A draft that belongs to no
+ *  blocked step is left alone. */
+export function resolveBlockedSalesStep(
+  draftId: string,
+  outcome: BlockedSalesStepOutcome,
+): boolean {
+  return db.transaction(() => {
+    const step = db
+      .prepare(
+        `SELECT * FROM sales_sequence_steps WHERE draft_id = ? AND status = 'blocked'`,
+      )
+      .get(draftId) as SalesSequenceStepRecord | undefined;
+    if (!step) {
+      return false;
+    }
+    if (outcome.kind === "sent") {
+      recordSalesStepSent({
+        sequenceId: step.sequence_id,
+        stepNo: step.step_no,
+        sentMessageId: outcome.sentMessageId,
+        sentAt: outcome.sentAt,
+        stepDays: outcome.stepDays,
+      });
+      return true;
+    }
+    db.prepare(
+      `UPDATE sales_sequence_steps SET status = 'skipped', reason = 'discarded'
+       WHERE sequence_id = ? AND step_no = ?`,
+    ).run(step.sequence_id, step.step_no);
+    db.prepare(
+      `UPDATE sales_sequences
+       SET status = 'stopped', stop_reason = 'discarded', next_step_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND status = 'active'`,
+    ).run(step.sequence_id);
+    return true;
+  })();
+}
+
+export function listActiveSalesSequences(): SalesSequenceRecord[] {
+  return db
+    .prepare(
+      `SELECT * FROM sales_sequences WHERE status = 'active'
+       ORDER BY next_step_at IS NULL, next_step_at, id`,
+    )
+    .all() as SalesSequenceRecord[];
+}
+
+export function setSalesSequenceTimezone(id: number, timezone: string): void {
+  db.prepare(
+    `UPDATE sales_sequences
+     SET prospect_timezone = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(timezone, id);
+}
+
+/** Claimed before the send call, so a crash can never lead to a second send: a
+ *  step stuck in sending is never picked up again. */
+export function claimSalesStepSending(
+  sequenceId: number,
+  stepNo: number,
+  claimedAt: string,
+): boolean {
+  return (
+    db
+      .prepare(
+        `UPDATE sales_sequence_steps
+         SET status = 'sending', claimed_at = ?
+         WHERE sequence_id = ? AND step_no = ? AND status = 'planned'
+           AND sent_message_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM sales_sequences
+             WHERE id = ? AND status = 'active' AND current_step = ?
+           )`,
+      )
+      .run(claimedAt, sequenceId, stepNo, sequenceId, stepNo).changes > 0
+  );
+}
+
+/** Only for a send Gmail definitely refused. */
+export function releaseSalesStepClaim(sequenceId: number, stepNo: number): void {
+  db.prepare(
+    `UPDATE sales_sequence_steps
+     SET status = 'planned', claimed_at = NULL
+     WHERE sequence_id = ? AND step_no = ? AND status = 'sending'`,
+  ).run(sequenceId, stepNo);
+}
+
+/** Stops an active sequence. A blocked step's card is the caller's to retire. */
+export function stopActiveSalesSequence(id: number, reason: string): boolean {
+  return db.transaction(() => {
+    const stopped =
+      db
+        .prepare(
+          `UPDATE sales_sequences
+           SET status = 'stopped', stop_reason = ?, next_step_at = NULL,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND status = 'active'`,
+        )
+        .run(reason, id).changes > 0;
+    if (stopped) {
+      db.prepare(
+        `UPDATE sales_sequence_steps
+         SET status = 'skipped', reason = ?
+         WHERE sequence_id = ? AND status = 'blocked'`,
+      ).run(reason, id);
+    }
+    return stopped;
+  })();
+}
+
+/** A crashed send that later showed up in Gmail: record it so nothing else takes
+ *  it for his own email, and stop rather than carry on from an unknown state. */
+export function recoverSalesStepSent(input: {
+  sequenceId: number;
+  stepNo: number;
+  sentMessageId: string;
+  sentAt: string;
+  reason: string;
+}): void {
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE sales_sequence_steps
+       SET status = 'sent', sent_message_id = ?, sent_at = ?
+       WHERE sequence_id = ? AND step_no = ? AND status = 'sending'`,
+    ).run(input.sentMessageId, input.sentAt, input.sequenceId, input.stepNo);
+    db.prepare(
+      `UPDATE sales_sequences
+       SET steps_sent = steps_sent + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+    ).run(input.sequenceId);
+    stopActiveSalesSequence(input.sequenceId, input.reason);
+  })();
+}
+
+/** Moves the next step later, never earlier. A paused sequence stays paused. */
+export function postponeSalesSequence(id: number, nextAt: string): boolean {
+  return db.transaction(() => {
+    const moved =
+      db
+        .prepare(
+          `UPDATE sales_sequences
+           SET next_step_at = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND status = 'active' AND next_step_at IS NOT NULL
+             AND next_step_at < ?`,
+        )
+        .run(nextAt, id, nextAt).changes > 0;
+    if (moved) {
+      db.prepare(
+        `UPDATE sales_sequence_steps SET scheduled_at = ?
+         WHERE sequence_id = ? AND step_no = (
+           SELECT current_step FROM sales_sequences WHERE id = ?
+         )`,
+      ).run(nextAt, id, id);
+    }
+    return moved;
+  })();
+}
+
+export function isSalesSequenceSentMessage(messageId: string): boolean {
+  return (
+    db
+      .prepare(`SELECT 1 FROM sales_sequence_steps WHERE sent_message_id = ?`)
+      .get(messageId) !== undefined
+  );
+}
+
+/** Sends and in-flight claims since the given time, for the daily cap. */
+export function countSalesSendsSince(sinceIso: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM sales_sequence_steps
+       WHERE (status = 'sent' AND sent_at >= ?)
+          OR (status = 'sending' AND claimed_at >= ?)`,
+    )
+    .get(sinceIso, sinceIso) as { count: number };
+  return row.count;
+}
+
+export function lastSalesSendAt(): string | undefined {
+  const row = db
+    .prepare(
+      `SELECT MAX(COALESCE(sent_at, claimed_at)) AS last FROM sales_sequence_steps
+       WHERE status IN ('sent', 'sending')`,
+    )
+    .get() as { last: string | null };
+  return row.last ?? undefined;
+}
+
+export function hasActiveSalesSequenceOnThread(threadId: string): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM sales_sequences
+         WHERE account = 'work' AND thread_id = ? AND status = 'active'`,
+      )
+      .get(threadId) !== undefined
+  );
+}
+
+/** Running or finished: the follow-up scan doesn't start tracking this thread, and
+ *  a sequence that said "last note" isn't followed by a nudge to write another. */
+export function salesSequenceOwnsThread(threadId: string): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM sales_sequences
+         WHERE account = 'work' AND thread_id = ? AND status IN ('active', 'completed')`,
+      )
+      .get(threadId) !== undefined
+  );
+}
+
+export function getBlockedSalesStepForDraft(
+  draftId: string,
+): SalesSequenceStepRecord | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM sales_sequence_steps WHERE draft_id = ? AND status = 'blocked'`,
+    )
+    .get(draftId) as SalesSequenceStepRecord | undefined;
+}
+
+export function setSalesStepSlots(
+  sequenceId: number,
+  stepNo: number,
+  draftText: string,
+  slotLines: string[],
+): void {
+  db.prepare(
+    `UPDATE sales_sequence_steps
+     SET draft_text = ?, slot_lines = ?
+     WHERE sequence_id = ? AND step_no = ?`,
+  ).run(draftText, JSON.stringify(slotLines), sequenceId, stepNo);
+}
+
+/** Blocked steps waiting since before the cutoff that have not been chased yet. */
+export function listSalesStepsWaitingOnCard(
+  beforeIso: string,
+): SalesSequenceStepRecord[] {
+  return db
+    .prepare(
+      `SELECT steps.* FROM sales_sequence_steps AS steps
+       JOIN sales_sequences AS seq ON seq.id = steps.sequence_id
+       WHERE steps.status = 'blocked' AND seq.status = 'active'
+         AND steps.blocked_at <= ? AND steps.waiting_ping_at IS NULL`,
+    )
+    .all(beforeIso) as SalesSequenceStepRecord[];
+}
+
+export function markSalesStepWaitingPing(
+  sequenceId: number,
+  stepNo: number,
+  at: string,
+): void {
+  db.prepare(
+    `UPDATE sales_sequence_steps SET waiting_ping_at = ?
+     WHERE sequence_id = ? AND step_no = ?`,
+  ).run(at, sequenceId, stepNo);
+}
+
+/** A meeting already in motion with this address: an open offer, a booking about
+ *  to confirm, or an event card waiting for his tap. */
+export function hasPendingMeetingWithEmail(email: string): boolean {
+  const address = email.trim().toLowerCase();
+  const proposal = db
+    .prepare(
+      `SELECT 1 FROM meeting_proposals
+       WHERE status = 'open' AND lower(recipient_email) = ?`,
+    )
+    .get(address);
+  if (proposal) {
+    return true;
+  }
+  const booking = db
+    .prepare(
+      `SELECT 1 FROM meeting_pending_bookings AS booking
+       JOIN meeting_proposals AS proposal ON proposal.id = booking.proposal_id
+       WHERE booking.status = 'pending' AND lower(proposal.recipient_email) = ?`,
+    )
+    .get(address);
+  if (booking) {
+    return true;
+  }
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM pending_actions
+         WHERE type = 'create_event' AND status = 'pending'
+           AND instr(lower(COALESCE(event_attendees, '')), ?) > 0`,
+      )
+      .get(`"${address}"`) !== undefined
+  );
 }

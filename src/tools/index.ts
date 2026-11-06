@@ -52,6 +52,8 @@ import * as searchHistory from "./search_history.js";
 import * as searchEmails from "./search_emails.js";
 import * as searchNotes from "./search_notes.js";
 import * as setReminder from "./set_reminder.js";
+import * as startSequence from "./start_sequence.js";
+import * as stopSequence from "./stop_sequence.js";
 import * as stopTracking from "./stop_tracking.js";
 import * as trackThread from "./track_thread.js";
 import * as updateAccount from "./update_account.js";
@@ -127,6 +129,8 @@ const modules = {
   search_qa_bank: searchQa,
   web_search: webSearch,
   set_reminder: setReminder,
+  start_sequence: startSequence,
+  stop_sequence: stopSequence,
   stop_tracking: stopTracking,
   track_thread: trackThread,
   update_account: updateAccount,
@@ -191,6 +195,8 @@ export const TOOL_ORDER = [
   "discard_pending_draft",
   "resend_draft_card",
   "search_history",
+  "start_sequence",
+  "stop_sequence",
   "list_documents",
 ] as const;
 

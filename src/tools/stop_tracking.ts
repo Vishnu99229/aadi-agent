@@ -8,7 +8,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "stop_tracking",
   description:
-    "Stop tracking one email follow-up using its numeric ID from list_waiting. This does not modify or delete any Gmail message.",
+    "Stop tracking one email follow-up using its numeric ID from list_waiting. This does not modify or delete any Gmail message. For an automatic follow-up sequence that emails a prospect, use stop_sequence.",
   inputSchema: {
     type: "object",
     properties: {
