@@ -130,6 +130,8 @@ export interface CompleteParams {
   /** Prompt-cache TTL. Omitted: 1h for chat-like tasks, 5m for one-burst jobs. */
   cacheTtl?: "5m" | "1h";
   skipUsageLog?: boolean;
+  /** Only the named backend: fail rather than fall back to another model. */
+  noFallback?: boolean;
   /**
    * Structured output. Anthropic uses output_config.format json_schema.
    * DeepSeek only supports response_format json_object (not json_schema);
@@ -948,10 +950,12 @@ export async function complete(
     return fakeComplete(params);
   }
   const primary = params.backend ?? getTaskBackend("chat");
-  const chain = getFallbackChain(primary, {
-    hasImage: messagesHaveImage(params),
-    hasPdf: messagesHavePdf(params),
-  });
+  const chain = params.noFallback
+    ? [primary]
+    : getFallbackChain(primary, {
+        hasImage: messagesHaveImage(params),
+        hasPdf: messagesHavePdf(params),
+      });
   if (chain.length === 0) {
     throw new Error("All LLM backends failed: none usable");
   }

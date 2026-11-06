@@ -619,8 +619,27 @@ for (const file of srcFiles) {
   }
 }
 assert(
-  messageSendFiles.length === 1 && messageSendFiles[0]!.endsWith("/security/auto_book.ts"),
-  `messages.send only allowed in auto_book.ts, found ${messageSendFiles.join(", ") || "none"}`,
+  messageSendFiles.length === 2 &&
+    messageSendFiles.some((file) => file.endsWith("/security/auto_book.ts")) &&
+    messageSendFiles.some((file) => file.endsWith("/security/sequence_send.ts")),
+  `messages.send only allowed in auto_book.ts and security/sequence_send.ts, found ${messageSendFiles.join(", ") || "none"}`,
+);
+const sequenceSendSrc = await readFile(join(root, "src/security/sequence_send.ts"), "utf8");
+assert(
+  (sequenceSendSrc.match(/messages\.send/g) ?? []).length === 1,
+  "sequence_send.ts has exactly one send call",
+);
+assert(
+  sequenceSendSrc.indexOf("evaluateSequenceSendGate({") <
+    sequenceSendSrc.indexOf("claimSalesStepSending(params") &&
+    sequenceSendSrc.indexOf("claimSalesStepSending(params") <
+      sequenceSendSrc.indexOf("users.messages.send"),
+  "sequence send runs the gate, then claims the step, then calls Gmail",
+);
+assert(
+  !(FORWARDED_TOOLS as readonly string[]).includes("stop_sequence") &&
+    !(FORWARDED_TOOLS as readonly string[]).includes("start_sequence"),
+  "forwarded messages can't start or stop a sequence",
 );
 assert(
   draftSendFiles.length === 1 && draftSendFiles[0]!.endsWith("/approvals.ts"),

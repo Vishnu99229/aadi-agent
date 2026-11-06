@@ -277,11 +277,40 @@ const meetingTestSenders = (process.env.MEETING_TEST_SENDERS ?? "")
   .split(",")
   .map((item) => item.trim().toLowerCase())
   .filter(Boolean);
+const sequencesEnabled = process.env.SEQUENCES_ENABLED?.trim().toLowerCase() === "true";
+const sequenceStepDays = parsePositiveNumber(
+  process.env.SEQUENCE_STEP_DAYS,
+  2,
+  "SEQUENCE_STEP_DAYS",
+);
+const sequencePitchMinConfidence = parsePositiveNumber(
+  process.env.SEQUENCE_PITCH_MIN_CONFIDENCE,
+  0.75,
+  "SEQUENCE_PITCH_MIN_CONFIDENCE",
+);
+const sequenceDailySendCap = parsePositiveNumber(
+  process.env.SEQUENCE_DAILY_SEND_CAP,
+  15,
+  "SEQUENCE_DAILY_SEND_CAP",
+);
+const sequenceMinSpacingMinutes = parsePositiveNumber(
+  process.env.SEQUENCE_MIN_SPACING_MINUTES,
+  3,
+  "SEQUENCE_MIN_SPACING_MINUTES",
+);
+const sequenceTestRecipients = (process.env.SEQUENCE_TEST_RECIPIENTS ?? "")
+  .split(",")
+  .map((item) => item.trim().toLowerCase())
+  .filter((item) => item.includes("@"));
 const selfEmailAddresses = (process.env.SELF_EMAIL_ADDRESSES ?? "")
   .split(",")
   .map((item) => item.trim().toLowerCase())
   .filter((item) => item.includes("@"));
-const DEFAULT_PARTNER_DOMAINS = ["supertroninfotech.com", "pinnacle.in"];
+const DEFAULT_PARTNER_DOMAINS = [
+  "supertroninfotech.com",
+  "supertronindia.com",
+  "pinnacle.in",
+];
 const partnerDomains = (
   process.env.PARTNER_DOMAINS?.trim()
     ? process.env.PARTNER_DOMAINS
@@ -533,6 +562,12 @@ export const config = {
   autoBookDelayMinutes,
   autoBookDailyCap,
   autoSendDailyCap,
+  sequencesEnabled,
+  sequenceStepDays,
+  sequencePitchMinConfidence,
+  sequenceDailySendCap,
+  sequenceMinSpacingMinutes,
+  sequenceTestRecipients,
   autoBookMinConfidence,
   meetingTestSenders,
   selfEmailAddresses,

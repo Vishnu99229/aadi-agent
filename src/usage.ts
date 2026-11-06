@@ -20,6 +20,8 @@ export const USAGE_TASKS = [
   "classification",
   "embedding",
   "shadow",
+  "sequence",
+  "sequence_check",
   "tts",
   "other",
 ] as const;

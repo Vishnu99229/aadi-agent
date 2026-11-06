@@ -101,6 +101,24 @@ export function allowOwnerChatDeleteEvent(confirmation: {
   requireOwnerChatConfirmation(confirmation);
 }
 
+/** start_sequence runs only on Vishnu's own chat/voice turn. It shows a Start
+ *  card and enrols nothing. Never call this from inbound email handling. */
+export function allowOwnerChatStartSequence(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
+/** stop_sequence runs only on Vishnu's own chat/voice turn. A forwarded message
+ *  or an email can never stop a sequence. */
+export function allowOwnerChatStopSequence(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
 /** Vishnu's own chat/voice turn is the approval for add_calendar_attendee.
  *  Never call this from inbound email handling. */
 export function allowOwnerChatAddAttendee(confirmation: {

@@ -2,6 +2,7 @@ import { bot } from "./bot.js";
 import { installOutboundHistory } from "./outbound.js";
 import {
   setAfterDraftSend,
+  setDraftRefresher,
   startApprovalExpirySweep,
 } from "./approvals.js";
 import { registerBillScan } from "./bills.js";
@@ -27,6 +28,8 @@ import {
   registerMeetingBookingJobs,
 } from "./meeting_book.js";
 import { registerShadowJobs } from "./shadow_inbox.js";
+import { registerSequenceDetection } from "./sequences.js";
+import { refreshSequenceDraftSlots, registerSequenceSend } from "./sequence_runner.js";
 import { registerMessageEmbed } from "./embeddings.js";
 import { registerJobWorker } from "./job_worker.js";
 
@@ -48,6 +51,9 @@ const weeklyBackupTask = registerWeeklyBackup(bot.api);
 const attachmentAlertTask = registerAttachmentAlertScan(bot.api);
 const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
 const shadowJobs = registerShadowJobs(bot.api);
+const sequenceDetectTask = registerSequenceDetection(bot.api);
+const sequenceSendTask = registerSequenceSend(bot.api);
+setDraftRefresher(refreshSequenceDraftSlots);
 setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
 const jobQueueTask = registerJobWorker(bot.api);
@@ -61,6 +67,8 @@ const MENU_COMMANDS = [
   { command: "health", description: "Show scheduled job last-run times" },
   { command: "memory", description: "List saved memories and forget any" },
   { command: "meetings", description: "List auto-handled meeting threads" },
+  { command: "sequence", description: "Offer a follow-up sequence for a prospect" },
+  { command: "sequences", description: "List active follow-up sequences, with Stop buttons" },
   { command: "reset", description: "Clear conversation history" },
   { command: "jobs", description: "List running and recent big jobs" },
   { command: "voice", description: "Turn spoken replies to voice notes on or off" },
@@ -106,6 +114,8 @@ process.once("SIGINT", () => {
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
   shadowJobs.evening.stop();
+  sequenceDetectTask?.stop();
+  sequenceSendTask?.stop();
   clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();
@@ -129,6 +139,8 @@ process.once("SIGTERM", () => {
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
   shadowJobs.evening.stop();
+  sequenceDetectTask?.stop();
+  sequenceSendTask?.stop();
   clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();

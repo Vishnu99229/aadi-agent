@@ -124,7 +124,7 @@ export function resetMeetingTestHooks(): void {
 const TIME_ZONE = "Asia/Kolkata";
 const INBOX_QUERY = "in:inbox newer_than:1d -category:promotions -category:social";
 const WORK_EMAIL = "vishnu.rajan@epicode.in";
-const PERSONAL_DOMAINS = new Set([
+export const PERSONAL_DOMAINS = new Set([
   "gmail.com",
   "googlemail.com",
   "yahoo.com",
@@ -618,6 +618,16 @@ async function computeSlots(card: CardPayload, now = new Date()): Promise<TimeSl
       offset: card.slotOffset,
     }),
   );
+}
+
+/** Free slots for an outbound offer. Reads the calendars and books nothing. */
+export async function freeSlotsForOffer(
+  now: Date,
+  durationMinutes: number,
+): Promise<TimeSlot[]> {
+  const options = finderOptions(now, [], { durationMinutes, windowHint: null, offset: 0 });
+  const busy = await loadBusy(now, new Date(now.getTime() + options.horizonDays * 24 * 60 * 60 * 1000));
+  return findSlots(finderOptions(now, busy, { durationMinutes, windowHint: null, offset: 0 }));
 }
 
 function cardText(card: CardPayload, slots: TimeSlot[]): string {

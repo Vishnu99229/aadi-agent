@@ -12,7 +12,9 @@ import {
   getDueFollowups,
   recordFollowupNudge,
   refreshFollowupSentMessage,
+  hasActiveSalesSequenceOnThread,
   restartFollowup,
+  salesSequenceOwnsThread,
   snoozeFollowup,
   transitionFollowupStatus,
   type FollowupImportance,
@@ -272,7 +274,7 @@ function isAllInternal(candidate: SentCandidate): boolean {
   return list.length > 0 && list.every(isInternalAddress);
 }
 
-function isCalendarMessage(
+export function isCalendarMessage(
   message: gmail_v1.Schema$Message,
   subject: string,
 ): boolean {
@@ -314,7 +316,7 @@ function candidateFromMessage(
   };
 }
 
-async function getThread(
+export async function getSentThreadMetadata(
   gmail: gmail_v1.Gmail,
   threadId: string,
 ): Promise<gmail_v1.Schema$Thread> {
@@ -349,7 +351,7 @@ async function reconcileTrackedThreads(
 
   for (const followup of active) {
     try {
-      const thread = await getThread(gmail, followup.thread_id);
+      const thread = await getSentThreadMetadata(gmail, followup.thread_id);
       const latest = latestNonDraftMessage(thread);
       if (!latest || messageTime(latest) <= new Date(followup.last_sent_at).getTime()) {
         continue;
@@ -423,7 +425,7 @@ function isHardExcluded(
   );
 }
 
-async function collectCandidates(
+export async function collectCandidates(
   gmail: gmail_v1.Gmail,
   ownAddress: string,
   googleAccount: LoadedGoogleAccount["id"],
@@ -437,11 +439,16 @@ async function collectCandidates(
   const candidates: SentCandidate[] = [];
 
   for (const threadId of await listSentThreadIds(gmail)) {
-    const thread = await getThread(gmail, threadId);
+    const thread = await getSentThreadMetadata(gmail, threadId);
     const latest = latestNonDraftMessage(thread);
     // Phase 2 hard filter: thread must have a latest message that is still
     // our last sent (i.e. no external reply yet).
     if (!latest || !isSent(latest)) {
+      continue;
+    }
+
+    // An automatic sequence owns this thread: no second, manual nudge on it.
+    if (googleAccount === "work" && salesSequenceOwnsThread(threadId)) {
       continue;
     }
 
@@ -654,11 +661,15 @@ export async function runFollowupScan(): Promise<void> {
   );
 }
 
+function notOwnedBySequence(followup: FollowupRecord): boolean {
+  return !(followup.google_account === "work" && hasActiveSalesSequenceOnThread(followup.thread_id));
+}
+
 /** Phase 4 — deterministic backoff dispatcher. Pure SQL, no LLM.
  *  Returns the follow-up rows that are due RIGHT NOW; the caller sends the
  *  contextual Telegram message and then calls `markFollowupNudged`. */
 export function dueFollowupsNow(now: Date = new Date()): FollowupRecord[] {
-  return getDueFollowups(now.toISOString());
+  return getDueFollowups(now.toISOString()).filter(notOwnedBySequence);
 }
 
 export function buildNudgeMessage(
@@ -692,7 +703,8 @@ export function markFollowupNudged(
 export function activeFollowups(): FollowupRecord[] {
   return getFollowups().filter(
     (followup) =>
-      followup.status === "waiting" || followup.status === "snoozed",
+      (followup.status === "waiting" || followup.status === "snoozed") &&
+      notOwnedBySequence(followup),
   );
 }
 
@@ -701,7 +713,8 @@ export function overdueFollowups(): FollowupRecord[] {
   return getFollowups().filter(
     (followup) =>
       followup.status === "waiting" &&
-      new Date(followup.next_check_at).getTime() <= now,
+      new Date(followup.next_check_at).getTime() <= now &&
+      notOwnedBySequence(followup),
   );
 }
 
@@ -710,7 +723,7 @@ async function snippetForFollowup(
 ): Promise<string | undefined> {
   try {
     const account = await getGoogleAccount(followup.google_account);
-    const thread = await getThread(gmailClient(account), followup.thread_id);
+    const thread = await getSentThreadMetadata(gmailClient(account), followup.thread_id);
     const latest = latestNonDraftMessage(thread);
     return latest?.snippet?.trim();
   } catch (error) {
@@ -951,9 +964,12 @@ export async function createFollowupDraftForApproval(
   ) {
     throw new Error("That follow-up is no longer being tracked.");
   }
+  if (!notOwnedBySequence(followup)) {
+    throw new Error("That thread is on an automatic follow-up sequence.");
+  }
   const account = await getGoogleAccount(followup.google_account);
   const gmail = gmailClient(account);
-  const thread = await getThread(gmail, followup.thread_id);
+  const thread = await getSentThreadMetadata(gmail, followup.thread_id);
   const sentMessages = [...(thread.messages ?? [])]
     .filter((message) => isSent(message) && !message.labelIds?.includes("DRAFT"))
     .sort((left, right) => messageTime(right) - messageTime(left));
@@ -1124,7 +1140,7 @@ export async function trackLatestSentTo(
   }
 
   const { account, gmail, candidate } = best;
-  const thread = await getThread(gmail, candidate.threadId);
+  const thread = await getSentThreadMetadata(gmail, candidate.threadId);
   const latestInThread = latestNonDraftMessage(thread);
   if (
     latestInThread &&
