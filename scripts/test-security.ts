@@ -659,6 +659,17 @@ assert(
     !(FORWARDED_TOOLS as readonly string[]).includes("start_sequence"),
   "forwarded messages can't start or stop a sequence",
 );
+{
+  const agentSrc = await readFile(join(root, "src/agent.ts"), "utf8");
+  assert(
+    agentSrc.includes("options.sendConfirmation && !options.toolNames ? commandIntents(guardText) : []"),
+    "commands are only detected on his own, non-forwarded message",
+  );
+  assert(
+    agentSrc.includes("const result = await runTool(call, turn, allowedTools);"),
+    "a start_sequence run in code goes through runTool and the tool's own owner check",
+  );
+}
 for (const tool of ["set_sequence_timezone", "add_sales_fact", "list_sales_facts", "remove_sales_fact"]) {
   assert(
     !(FORWARDED_TOOLS as readonly string[]).includes(tool),
