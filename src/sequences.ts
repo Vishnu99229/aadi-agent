@@ -195,9 +195,6 @@ function assessThread(
     isAccountEmail: (email) =>
       accounts.some((account) => accountMatchesEmail(account, email)),
     isDoNotContact: isSalesDoNotContact,
-    isOutsideTestList: (email) =>
-      config.sequenceTestRecipients.length > 0 &&
-      !config.sequenceTestRecipients.includes(email.trim().toLowerCase()),
     threadHasSequence:
       existing !== undefined && !(options.ignoreSequence?.(existing) ?? false),
     prospectHasOpenSequence: (email) => {

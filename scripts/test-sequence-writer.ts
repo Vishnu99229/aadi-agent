@@ -132,18 +132,12 @@ const blockedCases: Array<[string, string, Partial<DraftCheckInput>, string]> = 
   ["percentage", "Hi Priya, teams save 25% on calls.", {}, "percentage"],
   ["spelled percentage", "Hi Priya, teams save twenty percent on calls.", {}, "percentage"],
   ["number", "Hi Priya, we handle 99 calls a minute.", {}, "unknown_number"],
-  ["unknown name", "Hi Priya, we also work with Contoso today.", {}, "unknown_name"],
-  ["unknown name opening a sentence", "Hi Priya. Contoso cut its call volume.", {}, "unknown_name"],
   ["other customer", "Hi Priya, Zeta Corp uses this.", {}, "other_customer"],
-  ["bad url", "Hi Priya, see https://evil.example.com/x for more.", {}, "link_not_allowed"],
-  ["www link", "Hi Priya, see www.contoso.com for more.", {}, "link_not_allowed"],
-  ["bare domain", "Hi Priya, see contoso.com for more.", {}, "link_not_allowed"],
-  ["wrong path", "Hi Priya, see https://epicode.in/pricing for more.", {}, "link_not_allowed"],
-  ["lookalike host", "Hi Priya, see https://epicode.in.evil.com/demo for more.", {}, "link_not_allowed"],
-  ["email address", "Hi Priya, write to sales@contoso.com.", {}, "link_not_allowed"],
   ["attachment", "Hi Priya, I've attached a deck.", {}, "attachment"],
-  ["never say", "Hi Priya, results are guaranteed.", {}, "never_say"],
-  ["never say phrase", "Hi Priya, this is a limited time idea.", {}, "never_say"],
+  ["guarantee", "Hi Priya, results are guaranteed.", {}, "timeline"],
+  ["sla", "Hi Priya, we meet a strict SLA.", {}, "timeline"],
+  ["deadline", "Hi Priya, the deadline is next Friday.", {}, "timeline"],
+  ["commitment", "Hi Priya, we will ensure your team is live in a week.", {}, "commitment"],
   ["demo on a partnership", "Hi Mira, could I give you a demo?", { ask: "partnership_call", prospectName: "Mira" }, "wrong_ask"],
   ["demo on a meeting", "Hi Priya, could I give you a demo?", { ask: "meeting" }, "wrong_ask"],
   ["missing slots", "Hi Priya, does next week work?", { slotLines: ["- Tue 10 Nov, 3:00 PM IST"] }, "missing_slots"],
@@ -154,9 +148,22 @@ for (const [label, body, overrides, expected] of blockedCases) {
 }
 {
   const long = `Hi Priya, ${"calls ".repeat(150)}`;
-  assert(checkDraftDeterministic(input(long)).includes("too_long"), "over 150 words is blocked");
-  const exact = `Hi Priya, ${"calls ".repeat(148)}`;
-  assert(!checkDraftDeterministic(input(exact)).includes("too_long"), "150 words is allowed");
+  assert(
+    !checkDraftDeterministic(input(long)).includes("too_long" as never),
+    "over 150 words is no longer blocked",
+  );
+  assert(
+    checkDraftDeterministic(input("Hi Priya, we also work with Contoso today.")).length === 0,
+    "a company name not in sales_facts no longer blocks",
+  );
+  assert(
+    checkDraftDeterministic(input("Hi Priya, see https://evil.example.com/x for more.")).length === 0,
+    "a link not on the allowlist no longer blocks",
+  );
+  assert(
+    checkDraftDeterministic(input("Hi Priya, this is a limited time idea.")).length === 0,
+    "the never-say list no longer blocks",
+  );
 }
 {
   const allowed = checkDraftDeterministic(
@@ -165,7 +172,7 @@ for (const [label, body, overrides, expected] of blockedCases) {
   assert(allowed.length === 0, `a fact-sheet result passes: ${allowed.join(",")}`);
   assert(
     checkDraftDeterministic(input("Hi Priya, the walkthrough is at https://epicode.in/demo.")).length === 0,
-    "an allowlisted link passes",
+    "a link still passes",
   );
   const slots = checkDraftDeterministic(
     input("Hi Priya, would a 15-20 minute demo suit?\n- Tue 10 Nov, 3:00 PM IST\n- Wed 11 Nov, 11:30 AM IST", {
@@ -607,7 +614,10 @@ const PRICED = JSON.stringify({ body: "Hi Priya,\n\nIt starts at $500 a month.\n
   const blocked = await prepareSequenceStep(id, { factsPath: READY_FACTS });
   assert(blocked.kind === "blocked", "an injected draft is blocked");
   assert(blocked.kind === "blocked" && blocked.reasons.includes("discount"), "the discount is caught");
-  assert(blocked.kind === "blocked" && blocked.reasons.includes("link_not_allowed"), "the link is caught");
+  assert(
+    blocked.kind === "blocked" && !blocked.reasons.includes("link_not_allowed" as never),
+    "links are no longer a fixed-check reason",
+  );
   const raw = mail.created[mail.created.length - 1]!;
   assert(/^To: Ira <i@inject\.example>$/m.test(raw), "the recipient comes from the sequence, not the thread");
   assert(!/^(?:To|Cc|Bcc):.*evil\.example/m.test(raw), "the injected address is on no header");

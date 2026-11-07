@@ -27,7 +27,6 @@ import { inSendWindow, istDayStart } from "../sequence_rules.js";
 const HOLD_REASONS = new Set([
   "disabled",
   "facts_not_ready",
-  "outside_test_list",
   "daily_cap",
   "spacing",
   "outside_window",
@@ -62,7 +61,6 @@ export class SequenceSendUnconfirmedError extends Error {
 export interface SequenceSendGateInput {
   enabled: boolean;
   factsReady: boolean;
-  testRecipients: readonly string[];
   accountId: string;
   fromAddress: string;
   sequence:
@@ -178,9 +176,6 @@ export function evaluateSequenceSendGate(
   if (input.doNotContact) {
     return refuse("do_not_contact");
   }
-  if (input.testRecipients.length > 0 && !input.testRecipients.includes(enrolled)) {
-    return refuse("outside_test_list");
-  }
   const step = input.step;
   if (
     !step ||
@@ -263,7 +258,6 @@ export async function sendSequenceStep(
   const gate = evaluateSequenceSendGate({
     enabled: config.sequencesEnabled,
     factsReady: salesFactsStatus(params.factsPath).ready,
-    testRecipients: config.sequenceTestRecipients,
     accountId: params.account.id,
     fromAddress: params.fromAddress,
     sequence,

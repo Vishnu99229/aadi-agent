@@ -298,10 +298,6 @@ const sequenceMinSpacingMinutes = parsePositiveNumber(
   3,
   "SEQUENCE_MIN_SPACING_MINUTES",
 );
-const sequenceTestRecipients = (process.env.SEQUENCE_TEST_RECIPIENTS ?? "")
-  .split(",")
-  .map((item) => item.trim().toLowerCase())
-  .filter((item) => item.includes("@"));
 const selfEmailAddresses = (process.env.SELF_EMAIL_ADDRESSES ?? "")
   .split(",")
   .map((item) => item.trim().toLowerCase())
@@ -567,7 +563,7 @@ export const config = {
   sequencePitchMinConfidence,
   sequenceDailySendCap,
   sequenceMinSpacingMinutes,
-  sequenceTestRecipients,
+
   autoBookMinConfidence,
   meetingTestSenders,
   selfEmailAddresses,

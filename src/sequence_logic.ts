@@ -14,7 +14,6 @@ export type PitchExclusion =
   | "account_match"
   | "noreply_or_ignored"
   | "do_not_contact"
-  | "not_test_recipient"
   | "replied"
   | "bounced"
   | "other_sender"
@@ -35,7 +34,6 @@ export const EXCLUSION_LABELS: Record<PitchExclusion, string> = {
   account_match: "that domain is an account in your list",
   noreply_or_ignored: "that address is no-reply or on the ignore list",
   do_not_contact: "that person is marked do-not-contact",
-  not_test_recipient: "test mode is on and that address isn't on SEQUENCE_TEST_RECIPIENTS",
   replied: "they already replied on that thread",
   bounced: "that thread has a delivery failure",
   other_sender: "someone else has written on that thread",
@@ -75,8 +73,6 @@ export interface PitchEnvironment {
   personalDomains: ReadonlySet<string>;
   isAccountEmail(email: string): boolean;
   isDoNotContact(email: string): boolean;
-  /** While SEQUENCE_TEST_RECIPIENTS is set, anyone not on it. */
-  isOutsideTestList?(email: string): boolean;
   /** Any sequence row on this thread that still counts against enrolling it. */
   threadHasSequence: boolean;
   /** Same company domain, or the exact address on a free-mail domain. */
@@ -226,9 +222,6 @@ export function evaluatePitchExclusion(
   }
   if (env.isDoNotContact(prospect.email)) {
     return "do_not_contact";
-  }
-  if (env.isOutsideTestList?.(prospect.email)) {
-    return "not_test_recipient";
   }
   for (const sender of facts.threadSenders) {
     if (isBounceSender(sender)) {

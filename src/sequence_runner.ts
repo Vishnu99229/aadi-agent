@@ -555,12 +555,6 @@ export async function runSequenceTick(
     ) {
       continue;
     }
-    if (
-      config.sequenceTestRecipients.length > 0 &&
-      !config.sequenceTestRecipients.includes(listed.prospect_email)
-    ) {
-      continue;
-    }
     let row = listed;
     if (!row.prospect_timezone) {
       try {

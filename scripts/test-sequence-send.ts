@@ -737,7 +737,6 @@ function gateInput(overrides: Partial<SequenceSendGateInput> = {}): SequenceSend
   return {
     enabled: true,
     factsReady: true,
-    testRecipients: [],
     accountId: "work",
     fromAddress: ME,
     sequence: {
@@ -795,7 +794,6 @@ const refusals: Array<[string, Partial<SequenceSendGateInput>, string]> = [
   ["epicode", { sequence: sequenceWith({ prospect_email: "sam@epicode.in" }), to: "sam@epicode.in" }, "blocked_recipient"],
   ["self", { sequence: sequenceWith({ prospect_email: "me@gmail.com" }), to: "me@gmail.com" }, "blocked_recipient"],
   ["do not contact", { doNotContact: true }, "do_not_contact"],
-  ["test list", { testRecipients: ["other@acme.com"] }, "outside_test_list"],
   ["stopped", { sequence: sequenceWith({ status: "stopped" }) }, "sequence_not_active"],
   ["no row", { sequence: undefined }, "sequence_not_active"],
   ["wrong thread", { sequenceThreadId: "other" }, "wrong_thread"],
@@ -1209,22 +1207,23 @@ function afternoonsBusy(from: Date): Array<{ start: Date; end: Date }> {
   settings.sequenceDailySendCap = 15;
 }
 
-// ======== the test allowlist ========
+// ======== SEQUENCE_TEST_RECIPIENTS gate removed ========
 {
   nextScenario();
   const before = sends.length;
-  const listed = enrol({ first: "Lata" });
-  const other = enrol({ first: "Omar" });
-  settings.sequenceTestRecipients = [listed.email];
+  const first = enrol({ first: "Lata" });
+  const second = enrol({ first: "Omar" });
   const result = await tick();
-  assert(result.sent === 1 && sends.length === before + 1, "one email");
-  assert(sends[before]!.parsed.headers.to!.includes(listed.email), "only the listed address gets it");
-  assert((await tick(after(10 * MIN))).sent === 0, "the other stays unsent");
-  assert(getSalesSequence(other.id)!.status === "active", "and isn't stopped");
-  assert(getSalesSequence(other.id)!.steps_sent === 0, "and nothing went to it");
+  assert(result.sent >= 1 && sends.length > before, "real prospects can receive without a test allowlist");
+  const recipients = sends.slice(before).map((send) => send.parsed.headers.to ?? "");
+  assert(
+    recipients.some((to) => to.includes(first.email)) ||
+      recipients.some((to) => to.includes(second.email)),
+    "an enrolled prospect is eligible to send",
+  );
   const pitch = evaluatePitchExclusion(
     {
-      to: [{ name: "Omar", email: other.email }],
+      to: [{ name: "Omar", email: second.email }],
       cc: [],
       threadSenders: [],
       earlierRecipients: [],
@@ -1238,14 +1237,12 @@ function afternoonsBusy(from: Date): Array<{ start: Date; end: Date }> {
       personalDomains: PERSONAL_DOMAINS,
       isAccountEmail: () => false,
       isDoNotContact: () => false,
-      isOutsideTestList: () => true,
       threadHasSequence: false,
       prospectHasOpenSequence: () => false,
       threadInMeetingFlow: false,
     },
   );
-  assert(pitch === "not_test_recipient", "and they get no card either");
-  settings.sequenceTestRecipients = [];
+  assert(pitch === null, "pitch exclusion no longer has a test-recipient gate");
 }
 
 // ======== the fact sheet ========
