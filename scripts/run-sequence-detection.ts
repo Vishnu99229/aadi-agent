@@ -6,7 +6,6 @@
  */
 import { config } from "../src/config.js";
 import { DB_PATH } from "../src/db.js";
-import { PERSONAL_DOMAINS } from "../src/meeting_book.js";
 import { prospectKey } from "../src/sequence_logic.js";
 import { detectPitches } from "../src/sequences.js";
 
@@ -68,7 +67,7 @@ const cards = new Set(
         row.prospect &&
         row.classification!.confidence >= config.sequencePitchMinConfidence,
     )
-    .map((row) => prospectKey(row.prospect!.email, PERSONAL_DOMAINS)),
+    .map((row) => prospectKey(row.prospect!.email)),
 );
 console.log(
   `\nthreads=${rows.length} classified=${classified.length} pitches=${pitches.length} cards=${cards.size}`,

@@ -2,7 +2,6 @@ import { bot } from "./bot.js";
 import { installOutboundHistory } from "./outbound.js";
 import {
   setAfterDraftSend,
-  setDraftRefresher,
   startApprovalExpirySweep,
 } from "./approvals.js";
 import { registerBillScan } from "./bills.js";
@@ -29,7 +28,7 @@ import {
 } from "./meeting_book.js";
 import { registerSequenceDetection } from "./sequences.js";
 import { registerScheduledSends } from "./scheduled_sends.js";
-import { refreshSequenceDraftSlots, registerSequenceSend } from "./sequence_runner.js";
+import { registerSequenceSend } from "./sequence_runner.js";
 import { registerMessageEmbed } from "./embeddings.js";
 import { registerJobWorker } from "./job_worker.js";
 
@@ -53,7 +52,6 @@ const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
 const sequenceDetectTask = registerSequenceDetection(bot.api);
 const sequenceSendTask = registerSequenceSend(bot.api);
 const scheduledSendTask = registerScheduledSends();
-setDraftRefresher(refreshSequenceDraftSlots);
 setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
 const jobQueueTask = registerJobWorker(bot.api);

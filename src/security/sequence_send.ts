@@ -14,7 +14,6 @@ import type { LoadedGoogleAccount } from "../google/auth.js";
 import { buildThreadReplyMime, gmailClient, mimeHeaderBlock } from "../google/mail.js";
 import { blockedAutoSendDomains } from "../meeting_book.js";
 import { isSelfEmail } from "../mom_logic.js";
-import { salesFactsStatus } from "../sales_facts.js";
 import {
   domainInSet,
   domainOf,
@@ -26,7 +25,6 @@ import { inSendWindow, istDayStart } from "../sequence_rules.js";
 /** Refusals that say nothing about this prospect. The step just waits. */
 const HOLD_REASONS = new Set([
   "disabled",
-  "facts_not_ready",
   "daily_cap",
   "spacing",
   "outside_window",
@@ -60,7 +58,6 @@ export class SequenceSendUnconfirmedError extends Error {
 
 export interface SequenceSendGateInput {
   enabled: boolean;
-  factsReady: boolean;
   accountId: string;
   fromAddress: string;
   sequence:
@@ -75,14 +72,13 @@ export interface SequenceSendGateInput {
         prospect_timezone: string | null;
       }
     | undefined;
-  /** The open sequence for this company, which must be this one. */
+  /** The open sequence for this person, which must be this one. */
   openSequenceId: number | undefined;
   stepNo: number;
   step:
     | {
         status: string;
         draft_text: string | null;
-        check_result: string | null;
         sent_message_id: string | null;
       }
     | undefined;
@@ -109,35 +105,12 @@ function addressesIn(header: string): string[] {
   return (header.match(ADDRESS) ?? []).map((item) => item.toLowerCase());
 }
 
-/** Passed both checks at writing time. An unchecked draft can't reach Gmail. */
-function draftPassedChecks(checkResult: string | null): boolean {
-  if (!checkResult) {
-    return false;
-  }
-  try {
-    const parsed = JSON.parse(checkResult) as {
-      deterministic?: unknown[];
-      model?: { pass?: unknown } | null;
-    };
-    return (
-      Array.isArray(parsed.deterministic) &&
-      parsed.deterministic.length === 0 &&
-      parsed.model?.pass === true
-    );
-  } catch {
-    return false;
-  }
-}
-
 export function evaluateSequenceSendGate(
   input: SequenceSendGateInput,
 ): { ok: true } | { ok: false; reason: string } {
   const refuse = (reason: string) => ({ ok: false as const, reason });
   if (!input.enabled) {
     return refuse("disabled");
-  }
-  if (!input.factsReady) {
-    return refuse("facts_not_ready");
   }
   if (input.accountId !== "work") {
     return refuse("not_work_account");
@@ -153,7 +126,7 @@ export function evaluateSequenceSendGate(
     return refuse("wrong_thread");
   }
   if (input.openSequenceId !== sequence.id) {
-    return refuse("company_has_other_sequence");
+    return refuse("prospect_has_other_sequence");
   }
   if (input.cc?.trim()) {
     return refuse("cc_not_allowed");
@@ -192,10 +165,7 @@ export function evaluateSequenceSendGate(
     return refuse("followups_used_up");
   }
   if (!input.body.trim() || input.body !== step.draft_text) {
-    return refuse("body_not_the_checked_draft");
-  }
-  if (!draftPassedChecks(step.check_result)) {
-    return refuse("draft_not_checked");
+    return refuse("body_not_the_written_draft");
   }
   if (!input.inReplyTo.trim()) {
     return refuse("no_thread_headers");
@@ -231,7 +201,6 @@ export interface SendSequenceStepParams {
   signatureHtml?: string;
   selfAddresses: ReadonlySet<string>;
   now?: Date;
-  factsPath?: string;
 }
 
 function httpStatus(error: unknown): number | undefined {
@@ -257,7 +226,6 @@ export async function sendSequenceStep(
   const last = lastSalesSendAt();
   const gate = evaluateSequenceSendGate({
     enabled: config.sequencesEnabled,
-    factsReady: salesFactsStatus(params.factsPath).ready,
     accountId: params.account.id,
     fromAddress: params.fromAddress,
     sequence,

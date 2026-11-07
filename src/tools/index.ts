@@ -9,6 +9,7 @@ import * as createMeeting from "./create_meeting.js";
 import * as discardPendingDraft from "./discard_pending_draft.js";
 import * as resendDraftCard from "./resend_draft_card.js";
 import * as addAccount from "./add_account.js";
+import * as addSalesFact from "./add_sales_fact.js";
 import * as addCalendarAttendee from "./add_calendar_attendee.js";
 import * as addTask from "./add_task.js";
 import * as markBillPaid from "./mark_bill_paid.js";
@@ -34,6 +35,7 @@ import * as listDates from "./list_dates.js";
 import * as listDocuments from "./list_documents.js";
 import * as listUpcomingDates from "./list_upcoming_dates.js";
 import * as listReminders from "./list_reminders.js";
+import * as listSalesFacts from "./list_sales_facts.js";
 import * as listTasks from "./list_tasks.js";
 import * as learnQa from "./learn_qa.js";
 import * as listMemories from "./list_memories.js";
@@ -49,6 +51,7 @@ import * as readDocument from "./read_document.js";
 import * as readDraft from "./read_draft.js";
 import * as readDriveFile from "./read_drive_file.js";
 import * as removeAccount from "./remove_account.js";
+import * as removeSalesFact from "./remove_sales_fact.js";
 import * as readEmail from "./read_email.js";
 import * as readSheet from "./read_sheet.js";
 import * as searchDrive from "./search_drive.js";
@@ -57,6 +60,7 @@ import * as searchEmails from "./search_emails.js";
 import * as searchNotes from "./search_notes.js";
 import * as sendEmail from "./send_email.js";
 import * as setReminder from "./set_reminder.js";
+import * as setSequenceTimezone from "./set_sequence_timezone.js";
 import * as startSequence from "./start_sequence.js";
 import * as stopSequence from "./stop_sequence.js";
 import * as stopTracking from "./stop_tracking.js";
@@ -85,6 +89,7 @@ export interface RegisteredTool {
 const modules = {
   account_status: accountStatus,
   add_account: addAccount,
+  add_sales_fact: addSalesFact,
   add_calendar_attendee: addCalendarAttendee,
   add_date: addDate,
   add_task: addTask,
@@ -113,6 +118,7 @@ const modules = {
   list_events: listEvents,
   list_upcoming_dates: listUpcomingDates,
   list_reminders: listReminders,
+  list_sales_facts: listSalesFacts,
   list_tasks: listTasks,
   list_memories: listMemories,
   list_waiting: listWaiting,
@@ -126,6 +132,7 @@ const modules = {
   read_draft: readDraft,
   read_drive_file: readDriveFile,
   remove_account: removeAccount,
+  remove_sales_fact: removeSalesFact,
   remove_date: removeDate,
   read_email: readEmail,
   remember,
@@ -139,6 +146,7 @@ const modules = {
   web_search: webSearch,
   send_email: sendEmail,
   set_reminder: setReminder,
+  set_sequence_timezone: setSequenceTimezone,
   start_sequence: startSequence,
   stop_sequence: stopSequence,
   stop_tracking: stopTracking,
@@ -212,6 +220,10 @@ export const TOOL_ORDER = [
   "book_meeting",
   "move_event",
   "cancel_scheduled_send",
+  "set_sequence_timezone",
+  "add_sales_fact",
+  "list_sales_facts",
+  "remove_sales_fact",
   "list_documents",
 ] as const;
 

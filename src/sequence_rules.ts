@@ -1,119 +1,67 @@
 import * as chrono from "chrono-node";
+import { IST_ZONE, localClock, zoneOffsetMinutes } from "./sequence_timezone.js";
 const DAY_MS = 24 * 60 * 60 * 1000;
-const IST_OFFSET = "+05:30";
-const WINDOW_START_HOUR = 10;
+/** Sends go out Mon-Fri in these hours of the prospect's own day. */
+const WINDOW_START_HOUR = 9;
 const WINDOW_END_HOUR = 17;
-/** No sequence email leaves outside these IST hours, whatever the prospect's zone. */
-const IST_FLOOR_START_HOUR = 9;
-const IST_FLOOR_END_HOUR = 19;
-/** Their hours for a slot worth offering without him choosing it. */
-const DAY_START_HOUR = 8;
-const DAY_END_HOUR = 20;
+/** Step 3 offers only meeting times inside these hours of their day. */
+const SLOT_START_HOUR = 9;
+const SLOT_END_HOUR = 18;
+/** Every zone's offset is a whole number of quarter hours, so a window opens on one. */
+const SCAN_STEP_MINUTES = 15;
 /** The pattern repeats weekly, so a week and a day finds any window there is. */
 const WINDOW_SCAN_MINUTES = 8 * 24 * 60;
 const OOO_DEFAULT_DAYS = 3;
 const OOO_MAX_DAYS = 90;
 /** A step stuck in sending this long with nothing in Gmail never went out. */
 export const STALE_CLAIM_MS = 30 * 60 * 1000;
-/** Time for an approved blocked step to be recorded before it can look like his
- *  own email. */
-const BLOCKED_SEND_GRACE_MS = 2 * 60 * 1000;
 
-function parseOffset(value: string): number | undefined {
-  const match = /^([+-])(\d{2}):(\d{2})$/.exec(value);
-  if (!match) {
-    return undefined;
-  }
-  const minutes = Number(match[2]) * 60 + Number(match[3]);
-  return match[1] === "-" ? -minutes : minutes;
-}
-
-/** "+HH:MM" from an RFC 5322 Date header, taken literally, +0000 included. -0000
- *  means no information by definition (RFC 5322 3.3), and a named zone such as
- *  "GMT" has no numeric offset to read, so both are unknown. */
-export function parseDateHeaderOffset(date: string): string | undefined {
-  const match = /([+-])(\d{2})(\d{2})\s*(?:\([^)]*\)\s*)?$/.exec(date.trim());
-  if (!match) {
-    return undefined;
-  }
-  const hours = Number(match[2]);
-  const minutes = Number(match[3]);
-  if (hours > 14 || minutes > 59 || (match[1] === "-" && hours === 0 && minutes === 0)) {
-    return undefined;
-  }
-  return `${match[1]}${match[2]}:${match[3]}`;
-}
-
-function offsetMinutes(timezone: string | null | undefined): number {
-  return parseOffset(timezone ?? "") ?? (parseOffset(IST_OFFSET) as number);
-}
-
-/** The zone to show beside IST on a slot line. None when it would repeat IST. */
-export function slotDisplayZone(timezone: string | null | undefined): string | null {
-  return timezone && timezone !== IST_OFFSET && parseOffset(timezone) !== undefined
-    ? timezone
-    : null;
-}
-
-function localClock(at: Date, offset: number): { weekday: number; minutes: number } {
-  const local = new Date(at.getTime() + offset * 60_000);
-  return { weekday: local.getUTCDay(), minutes: local.getUTCHours() * 60 + local.getUTCMinutes() };
-}
-
-/** Mon-Fri 10:00-17:00 in the prospect's zone (IST when it is unknown), and also
- *  09:00-19:00 IST, whatever their zone. */
+/** Mon-Fri 09:00-17:00 in the prospect's zone (IST when it is unknown). */
 export function inSendWindow(at: Date, timezone: string | null | undefined): boolean {
-  const theirs = localClock(at, offsetMinutes(timezone));
-  const ist = localClock(at, offsetMinutes(IST_OFFSET));
+  const theirs = localClock(at, timezone);
   return (
     theirs.weekday >= 1 &&
     theirs.weekday <= 5 &&
     theirs.minutes >= WINDOW_START_HOUR * 60 &&
-    theirs.minutes < WINDOW_END_HOUR * 60 &&
-    ist.minutes >= IST_FLOOR_START_HOUR * 60 &&
-    ist.minutes < IST_FLOOR_END_HOUR * 60
+    theirs.minutes < WINDOW_END_HOUR * 60
   );
 }
 
-/** The first moment at or after this one that a step may go out. Undefined when
- *  their working day never meets the IST floor, which is -03:30 and further west. */
-export function nextSendWindow(
-  at: Date,
-  timezone: string | null | undefined,
-): Date | undefined {
+/** The first moment at or after this one that a step may go out. */
+export function nextSendWindow(at: Date, timezone: string | null | undefined): Date {
   if (inSendWindow(at, timezone)) {
     return at;
   }
-  const firstMinute = Math.floor(at.getTime() / 60_000) + 1;
-  for (let minute = 0; minute < WINDOW_SCAN_MINUTES; minute += 1) {
-    const candidate = new Date((firstMinute + minute) * 60_000);
+  const step = SCAN_STEP_MINUTES * 60_000;
+  const first = Math.floor(at.getTime() / step) * step + step;
+  for (let index = 0; index * SCAN_STEP_MINUTES < WINDOW_SCAN_MINUTES; index += 1) {
+    const candidate = new Date(first + index * step);
     if (inSendWindow(candidate, timezone)) {
       return candidate;
     }
   }
-  return undefined;
+  return at;
 }
 
-/** How many of these slots sit wholly inside 08:00-20:00 in their zone. */
-export function slotsInProspectDay(
-  slots: ReadonlyArray<{ start: Date; end: Date }>,
+/** A meeting slot wholly inside 09:00-18:00 on a weekday of their own. */
+export function slotInProspectHours(
+  slot: { start: Date; end: Date },
   timezone: string | null | undefined,
-): number {
-  const offset = offsetMinutes(timezone);
-  return slots.filter((slot) => {
-    const start = localClock(slot.start, offset);
-    const end = localClock(slot.end, offset);
-    return (
-      start.weekday === end.weekday &&
-      start.minutes >= DAY_START_HOUR * 60 &&
-      end.minutes <= DAY_END_HOUR * 60
-    );
-  }).length;
+): boolean {
+  const start = localClock(slot.start, timezone);
+  const end = localClock(slot.end, timezone);
+  return (
+    start.weekday === end.weekday &&
+    start.weekday >= 1 &&
+    start.weekday <= 5 &&
+    start.minutes >= SLOT_START_HOUR * 60 &&
+    end.minutes <= SLOT_END_HOUR * 60
+  );
 }
 
 /** Midnight IST at the start of this moment's IST day, for the daily cap. */
 export function istDayStart(at: Date): Date {
-  const offset = offsetMinutes(IST_OFFSET);
+  const offset = zoneOffsetMinutes(IST_ZONE, at);
   const local = new Date(at.getTime() + offset * 60_000);
   return new Date(
     Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) -
@@ -197,7 +145,6 @@ export function outOfOfficeUntil(
     .split(/(?<=[.!?])\s+|\n+/)
     .filter((sentence) => /\b(?:until|till|return|back|resum|away|out of)/i.test(sentence));
   let latest: Date | undefined;
-  const offset = offsetMinutes(timezone);
   for (const sentence of sentences) {
     for (const parsed of chrono.parse(sentence, reference, { forwardDate: true })) {
       const end = parsed.end ?? parsed.start;
@@ -207,8 +154,9 @@ export function outOfOfficeUntil(
       if (year === null || month === null || day === null) {
         continue;
       }
+      const localTen = Date.UTC(year, month - 1, day, 10);
       const at = new Date(
-        Date.UTC(year, month - 1, day, WINDOW_START_HOUR) - offset * 60_000,
+        localTen - zoneOffsetMinutes(timezone, new Date(localTen)) * 60_000,
       );
       if (at.getTime() > message.at && (!latest || at > latest)) {
         latest = at;
@@ -243,8 +191,6 @@ export interface StopFacts {
   colleagueOnThread: boolean;
   /** A step claimed for sending that never got recorded. */
   claimed?: { stepNo: number; claimedAt: number };
-  /** Paused on a blocked card. */
-  pausedOnCard: boolean;
 }
 
 export type StopDecision =
@@ -296,10 +242,7 @@ export function evaluateStopRules(facts: StopFacts): StopDecision {
   if (facts.meeting) {
     return { action: "stop", reason: "meeting_booked" };
   }
-  const graceFloor = facts.now.getTime() - BLOCKED_SEND_GRACE_MS;
-  const own = facts.pausedOnCard
-    ? facts.ownSends.filter((message) => message.at <= graceFloor)
-    : facts.ownSends;
+  const own = facts.ownSends;
   if (facts.claimed) {
     const { stepNo, claimedAt } = facts.claimed;
     const delivered = own.find(

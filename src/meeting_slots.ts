@@ -26,6 +26,8 @@ export interface SlotFinderOptions {
   timezone: string;
   window?: SlotWindow;
   offset?: number;
+  /** Keeps only the slots this returns true for. */
+  accept?: (slot: TimeSlot) => boolean;
 }
 
 const WEEKDAY_INDEX: Record<string, number> = {
@@ -299,7 +301,7 @@ export function findSlots(options: SlotFinderOptions): TimeSlot[] {
         continue;
       }
       const blocked = busy.some((item) => overlaps(item, slot));
-      if (!blocked) {
+      if (!blocked && (options.accept?.(slot) ?? true)) {
         collected.push(slot);
       }
     }

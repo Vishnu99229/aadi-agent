@@ -1,12 +1,7 @@
 import "dotenv/config";
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import {
-  consumeDraftEdit,
-  handleApprovalCallback,
-  setApprovalsTestHooks,
-  setDraftRefresher,
-} from "../src/approvals.ts";
+import { setApprovalsTestHooks } from "../src/approvals.ts";
 import { config } from "../src/config.ts";
 import {
   activateSalesSequence,
@@ -17,7 +12,6 @@ import {
   createPendingEventAction,
   createProposedSalesSequence,
   getMeetingThread,
-  getPendingActionForDraft,
   getPromiseByMessageId,
   getSalesSequence,
   getSalesSequenceStep,
@@ -49,7 +43,6 @@ import {
   SequenceSendRefusedError,
   type SequenceSendGateInput,
 } from "../src/security/sequence_send.ts";
-import { MODEL_CHECK_SYSTEM } from "../src/sequence_check.ts";
 import { domainInSet, evaluatePitchExclusion, prospectKey } from "../src/sequence_logic.ts";
 import {
   classifyInbound,
@@ -58,22 +51,32 @@ import {
   matchSequencesForStop,
   nextSendWindow,
   outOfOfficeUntil,
-  parseDateHeaderOffset,
-  slotsInProspectDay,
-  slotDisplayZone,
+  slotInProspectHours,
   topReplyText,
   type InboundFact,
 } from "../src/sequence_rules.ts";
 import {
   handleSequencesCommand,
   handleSequenceStopCallback,
-  refreshSequenceDraftSlots,
   registerSequenceSend,
   runSequenceTick,
   sequencesPanel,
   setSequenceRunnerTestHooks,
+  setSequenceTimezoneFromTool,
   stopSequenceFromTool,
 } from "../src/sequence_runner.ts";
+import {
+  chooseProspectZone,
+  LOCATION_SYSTEM,
+  parseDateHeaderOffset,
+  parseLocationGuess,
+  slotDisplayZone,
+  zoneDisplay,
+  zoneForHeaderOffset,
+  zoneFromWords,
+  zoneLabel,
+  zoneOffsetMinutes,
+} from "../src/sequence_timezone.ts";
 import { ASK_SYSTEM, offerSlots, prepareSequenceStep, SLOTS_TOKEN, WRITER_SYSTEM } from "../src/sequence_writer.ts";
 import { handleSequenceCallback } from "../src/sequences.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
@@ -95,7 +98,6 @@ console.log = quiet;
 console.error = quiet;
 
 const ME = "vishnu.rajan@epicode.in";
-const FACTS = "scripts/fixtures/sales_facts_ready.md";
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
@@ -364,7 +366,9 @@ setSequenceRunnerTestHooks({
 
 // ---- the models ----
 const modelCalls: CompleteParams[] = [];
-let checkAnswer = '{"pass":true,"reason":"ok"}';
+const NO_LOCATION = '{"timezone":"","basis":"none"}';
+let locationAnswer = NO_LOCATION;
+let writerBody: string | undefined;
 let duringWrite: (() => void) | undefined;
 
 function answer(text: string): CompleteResult {
@@ -376,33 +380,38 @@ function answer(text: string): CompleteResult {
   } as CompleteResult;
 }
 
-setCompleteForTests(async (params: CompleteParams) => {
-  modelCalls.push(params);
-  const system = (params.system as { cacheable?: string }).cacheable ?? "";
-  if (system === WRITER_SYSTEM) {
-    duringWrite?.();
-    const content = String((params.messages[0] as { content: unknown }).content);
-    const first = /RECIPIENT: (\S+)/.exec(content)?.[1]?.replace(/,$/, "") ?? "there";
-    const slots = content.includes(SLOTS_TOKEN);
-    return answer(
-      JSON.stringify({
-        body: slots
-          ? `Hi ${first},\n\nJust a quick follow-up on a short demo.\n\n${SLOTS_TOKEN}\n\nDo any of these suit you?`
-          : `Hi ${first},\n\nJust a quick follow-up on my earlier note. IraVoice answers inbound support calls in Hindi and English.\n\nWould a short demo next week work?`,
-      }),
-    );
-  }
-  if (system === MODEL_CHECK_SYSTEM) {
-    return answer(checkAnswer);
-  }
-  if (system === ASK_SYSTEM) {
-    return answer('{"ask":"demo"}');
-  }
-  if (system.includes("has_promise")) {
-    return answer('{"has_promise":true,"promise":"send the deck","confidence":"high"}');
-  }
-  return answer('{"needs_followup":true,"reason":"Asked for a demo","importance":"high"}');
-});
+function restoreModels(): void {
+  setCompleteForTests(async (params: CompleteParams) => {
+    modelCalls.push(params);
+    const system = (params.system as { cacheable?: string }).cacheable ?? "";
+    if (system === WRITER_SYSTEM) {
+      duringWrite?.();
+      const content = String((params.messages[0] as { content: unknown }).content);
+      const first = /RECIPIENT: (\S+)/.exec(content)?.[1]?.replace(/,$/, "") ?? "there";
+      const slots = content.includes(SLOTS_TOKEN);
+      return answer(
+        JSON.stringify({
+          body:
+            writerBody ??
+            (slots
+              ? `Hi ${first},\n\nJust a quick follow-up on a short demo.\n\n${SLOTS_TOKEN}\n\nDo any of these suit you?`
+              : `Hi ${first},\n\nJust a quick follow-up on my earlier note. IraVoice answers inbound support calls in Hindi and English.\n\nWould a short demo next week work?`),
+        }),
+      );
+    }
+    if (system === LOCATION_SYSTEM) {
+      return answer(locationAnswer);
+    }
+    if (system === ASK_SYSTEM) {
+      return answer('{"ask":"demo"}');
+    }
+    if (system.includes("has_promise")) {
+      return answer('{"has_promise":true,"promise":"send the deck","confidence":"high"}');
+    }
+    return answer('{"needs_followup":true,"reason":"Asked for a demo","importance":"high"}');
+  });
+}
+restoreModels();
 
 // ---- scenario helpers ----
 function nextTuesdayMorning(): Date {
@@ -426,7 +435,8 @@ function nextScenario(): void {
   }
   clock.setUTCHours(6, 0, 0, 0);
   sendMode = "ok";
-  checkAnswer = '{"pass":true,"reason":"ok"}';
+  locationAnswer = NO_LOCATION;
+  writerBody = undefined;
   duringWrite = undefined;
   busy = [];
   modelCalls.length = 0;
@@ -484,7 +494,7 @@ function enrol(options: {
     threadId,
     prospectEmail: email,
     prospectDomain: domain,
-    prospectKey: prospectKey(email, PERSONAL_DOMAINS),
+    prospectKey: prospectKey(email),
     prospectName: `${first} Shah`,
     prospectCompany: company,
     subject,
@@ -500,14 +510,14 @@ function enrol(options: {
     manualFollowups: manual,
   });
   if (options.timezone) {
-    setSalesSequenceTimezone(row.id, options.timezone);
+    setSalesSequenceTimezone(row.id, options.timezone, "email");
   }
   return { id: row.id, threadId, email, domain, pitch, first };
 }
 
-function tick(at: Date = clock, factsPath: string | undefined = FACTS) {
+function tick(at: Date = clock) {
   clock = at;
-  return runSequenceTick(api, { now: at, factsPath });
+  return runSequenceTick(api, { now: at });
 }
 
 /** To the first send window on or after the sequence's next step. */
@@ -532,108 +542,160 @@ function reply(item: Enrolled, body: string, extra: Partial<Msg> = {}): Msg {
   });
 }
 
-function approvalCtx(data: string, notes: { edited: string[]; alerts: string[] } = { edited: [], alerts: [] }): Context {
-  return {
-    callbackQuery: { data, message: { text: "Draft waiting for approval" } },
-    answerCallbackQuery: async (value: unknown) => {
-      const text = typeof value === "string" ? value : (value as { text?: string } | undefined)?.text;
-      if (text) {
-        notes.alerts.push(text);
-      }
-      return true;
-    },
-    editMessageText: async (text: string) => {
-      notes.edited.push(text);
-      return true;
-    },
-    reply: async () => ({}),
-  } as unknown as Context;
-}
-
 const confirmation = { chatId: 1, messageId: 42 };
 
 // ======== timezones and the send window (pure) ========
 assert(parseDateHeaderOffset("Thu, 5 Nov 2026 10:00:00 -0500") === "-05:00", "reads a negative offset");
 assert(parseDateHeaderOffset("Thu, 5 Nov 2026 10:00:00 +0530 (IST)") === "+05:30", "reads an offset before a comment");
-assert(parseDateHeaderOffset("Thu, 5 Nov 2026 10:00:00 +0000") === "+00:00", "+0000 is taken literally");
+assert(parseDateHeaderOffset("Thu, 5 Nov 2026 10:00:00 +0000") === "+00:00", "+0000 is read");
 assert(parseDateHeaderOffset("Thu, 5 Nov 2026 10:00:00 -0000") === undefined, "-0000 is unknown by definition");
 assert(parseDateHeaderOffset("Thu, 5 Nov 2026 10:00:00 GMT") === undefined, "a named zone is unknown");
 assert(parseDateHeaderOffset("not a date") === undefined, "garbage is unknown");
-assert(slotDisplayZone(null) === null && slotDisplayZone("+05:30") === null, "IST isn't shown twice");
-assert(slotDisplayZone("-05:00") === "-05:00", "another zone is shown");
+assert(slotDisplayZone(null) === null && slotDisplayZone("+05:30") === null && slotDisplayZone("Asia/Kolkata") === null, "IST isn't shown twice");
+assert(slotDisplayZone("-05:00") === "-05:00" && slotDisplayZone("America/Chicago") === "America/Chicago", "another zone is shown");
+
+// Daylight saving comes from the zone, not a stored offset.
+assert(zoneOffsetMinutes("America/New_York", new Date("2026-11-10T12:00:00Z")) === -300, "New York is UTC-5 in November");
+assert(zoneOffsetMinutes("America/New_York", new Date("2026-07-10T12:00:00Z")) === -240, "and UTC-4 in July");
+assert(zoneOffsetMinutes("Asia/Kolkata", new Date()) === 330 && zoneOffsetMinutes(null, new Date()) === 330, "IST, and unknown means IST");
+assert(zoneOffsetMinutes("-07:00", new Date()) === -420, "a fixed offset is used as it is");
+assert(zoneOffsetMinutes("Not/AZone", new Date()) === 330, "an invalid zone falls back to IST");
 
 const ist = (value: string): Date => new Date(`${value}+05:30`);
-assert(inSendWindow(ist("2026-11-10T10:00:00"), null), "10:00 IST Tuesday is in the window");
-assert(!inSendWindow(ist("2026-11-10T09:59:00"), null), "09:59 is before it");
+const utc = (value: string): Date => new Date(`${value}Z`);
+assert(inSendWindow(ist("2026-11-10T09:00:00"), null), "09:00 IST Tuesday is in the window");
+assert(!inSendWindow(ist("2026-11-10T08:59:00"), null), "08:59 is before it");
 assert(inSendWindow(ist("2026-11-10T16:59:00"), null), "16:59 is in it");
 assert(!inSendWindow(ist("2026-11-10T17:00:00"), null), "17:00 is after it");
 assert(!inSendWindow(ist("2026-11-14T11:00:00"), null), "Saturday is out");
 assert(!inSendWindow(ist("2026-11-15T11:00:00"), null), "Sunday is out");
-assert(!inSendWindow(ist("2026-11-10T11:00:00"), "-05:00"), "11:00 IST is 00:30 in New York");
-// The window has to satisfy their hours and 09:00-19:00 IST at once.
-assert(!inSendWindow(ist("2026-11-10T21:00:00"), "-05:00"), "10:30 in New York is 21:00 IST, past the floor");
-assert(!inSendWindow(ist("2026-11-10T15:29:00"), "+00:00"), "09:59 in London is before their window");
-assert(inSendWindow(ist("2026-11-10T15:30:00"), "+00:00"), "10:00 in London is 15:30 IST");
-assert(inSendWindow(ist("2026-11-10T18:59:00"), "+00:00"), "18:59 IST is inside the floor");
-assert(!inSendWindow(ist("2026-11-10T19:00:00"), "+00:00"), "19:00 IST is out, though it's 13:30 in London");
-assert(!inSendWindow(ist("2026-11-10T08:59:00"), "+08:00"), "08:59 IST is out, though it's 11:29 in Singapore");
-assert(inSendWindow(ist("2026-11-10T09:00:00"), "+08:00"), "09:00 IST is in, at 11:30 in Singapore");
-assert(inSendWindow(ist("2026-11-10T14:29:00"), "+08:00"), "16:59 in Singapore is in");
-assert(!inSendWindow(ist("2026-11-10T14:30:00"), "+08:00"), "17:00 in Singapore is out");
+// US prospects get mail in their morning, whatever the hour in India.
+const usZones: Array<[string, string, string]> = [
+  ["America/New_York", "2026-11-10T14:00:00", "US Eastern"],
+  ["America/Chicago", "2026-11-10T15:00:00", "US Central"],
+  ["America/Denver", "2026-11-10T16:00:00", "US Mountain"],
+  ["America/Phoenix", "2026-11-10T16:00:00", "US Mountain (Arizona)"],
+  ["America/Los_Angeles", "2026-11-10T17:00:00", "US Pacific"],
+  ["America/Anchorage", "2026-11-10T18:00:00", "Alaska"],
+  ["Pacific/Honolulu", "2026-11-10T19:00:00", "Hawaii"],
+];
+for (const [zone, nineAm, label] of usZones) {
+  assert(inSendWindow(utc(nineAm), zone), `09:00 in ${label} is in the window`);
+  assert(!inSendWindow(new Date(utc(nineAm).getTime() - MIN), zone), `08:59 in ${label} is not`);
+  assert(inSendWindow(new Date(utc(nineAm).getTime() + 8 * HOUR - MIN), zone), `16:59 in ${label} is in`);
+  assert(!inSendWindow(new Date(utc(nineAm).getTime() + 8 * HOUR), zone), `17:00 in ${label} is out`);
+  assert(
+    nextSendWindow(ist("2026-11-10T11:00:00"), zone).getTime() === utc(nineAm).getTime(),
+    `from 11:00 IST the next ${label} window opens at their 09:00`,
+  );
+  assert(zoneLabel(zone) === label, `${zone} is labelled ${label}`);
+}
+assert(inSendWindow(utc("2026-07-14T13:00:00"), "America/New_York"), "09:00 EDT in July is in, an hour earlier in UTC");
+assert(!inSendWindow(utc("2026-11-10T13:00:00"), "America/New_York"), "the same UTC hour in November is 08:00 EST");
+assert(inSendWindow(ist("2026-11-10T21:00:00"), "America/New_York"), "21:00 IST is 10:30 in New York: no IST floor");
+assert(inSendWindow(ist("2026-11-10T21:00:00"), "-05:00"), "a fixed offset works the same");
 assert(
-  nextSendWindow(ist("2026-11-13T18:00:00"), null).getTime() === ist("2026-11-16T10:00:00").getTime(),
-  "Friday evening rolls to Monday 10:00",
+  nextSendWindow(utc("2026-11-13T22:30:00"), "America/Los_Angeles").getTime() === utc("2026-11-13T22:30:00").getTime(),
+  "Friday 14:30 Pacific is still in, though it's Saturday in India",
 );
 assert(
-  nextSendWindow(ist("2026-11-14T12:00:00"), null).getTime() === ist("2026-11-16T10:00:00").getTime(),
-  "Saturday rolls to Monday 10:00",
+  nextSendWindow(utc("2026-11-14T01:00:00"), "America/Los_Angeles").getTime() === utc("2026-11-16T17:00:00").getTime(),
+  "Friday evening Pacific rolls to Monday 09:00 Pacific",
 );
 assert(
-  nextSendWindow(ist("2026-11-10T08:00:00"), null).getTime() === ist("2026-11-10T10:00:00").getTime(),
-  "early morning rolls to 10:00 the same day",
+  nextSendWindow(ist("2026-11-13T18:00:00"), null).getTime() === ist("2026-11-16T09:00:00").getTime(),
+  "Friday evening rolls to Monday 09:00",
+);
+assert(
+  nextSendWindow(ist("2026-11-10T08:00:00"), null).getTime() === ist("2026-11-10T09:00:00").getTime(),
+  "early morning rolls to 09:00 the same day",
 );
 assert(
   nextSendWindow(ist("2026-11-10T11:00:00"), null).getTime() === ist("2026-11-10T11:00:00").getTime(),
   "a moment inside the window stays put",
 );
 assert(
-  nextSendWindow(ist("2026-11-10T19:10:00"), "+00:00")?.getTime() === ist("2026-11-11T15:30:00").getTime(),
-  "past the floor rolls to the next day's overlap",
+  nextSendWindow(ist("2026-11-10T17:00:00"), "+05:45").getTime() === ist("2026-11-11T08:45:00").getTime(),
+  "a quarter-hour zone opens on its own 09:00",
 );
-assert(
-  nextSendWindow(ist("2026-11-13T19:10:00"), "+00:00")?.getTime() === ist("2026-11-16T15:30:00").getTime(),
-  "past the floor on a Friday rolls to Monday",
-);
-assert(
-  nextSendWindow(ist("2026-11-10T14:30:00"), "+08:00")?.getTime() === ist("2026-11-11T09:00:00").getTime(),
-  "the next Singapore window opens at the floor, not at 10:00 their time",
-);
-assert(
-  nextSendWindow(ist("2026-11-10T11:00:00"), "-03:00")?.getTime() === ist("2026-11-10T18:30:00").getTime(),
-  "-03:00 still has half an hour",
-);
-assert(nextSendWindow(ist("2026-11-10T11:00:00"), "-03:30") === undefined, "-03:30 never meets the floor");
-assert(nextSendWindow(ist("2026-11-10T11:00:00"), "-05:00") === undefined, "New York never meets the floor");
-assert(nextSendWindow(ist("2026-11-10T11:00:00"), "-08:00") === undefined, "nor does California");
-// Offered slots against 08:00-20:00 their time.
+
+// Step 3 offers only times inside 09:00-18:00 on their weekday.
 {
-  const slot = (start: string) => ({
-    start: new Date(`${start}Z`),
-    end: new Date(new Date(`${start}Z`).getTime() + 20 * 60_000),
-  });
-  const count = (start: string, timezone: string | null) => slotsInProspectDay([slot(start)], timezone);
-  assert(count("2026-11-10T08:00:00", "+00:00") === 1, "08:00 their time counts");
-  assert(count("2026-11-10T07:59:00", "+00:00") === 0, "07:59 doesn't");
-  assert(count("2026-11-10T19:40:00", "+00:00") === 1, "a slot ending at 20:00 counts");
-  assert(count("2026-11-10T19:50:00", "+00:00") === 0, "one running past 20:00 doesn't");
-  assert(count("2026-11-10T04:30:00", "-05:00") === 0, "10:00 IST is 23:30 in New York");
-  assert(count("2026-11-10T23:50:00", "+00:00") === 0, "one crossing midnight doesn't");
-  assert(count("2026-11-10T04:30:00", null) === 1, "unknown means IST");
+  const slot = (start: Date) => ({ start, end: new Date(start.getTime() + 20 * MIN) });
+  assert(slotInProspectHours(slot(ist("2026-11-10T10:00:00")), "Asia/Kolkata"), "10:00 IST suits an Indian prospect");
+  assert(slotInProspectHours(slot(utc("2026-11-10T09:00:00")), "Europe/London"), "09:00 London counts");
+  assert(!slotInProspectHours(slot(utc("2026-11-10T08:59:00")), "Europe/London"), "08:59 London doesn't");
+  assert(slotInProspectHours(slot(utc("2026-11-10T17:40:00")), "Europe/London"), "a slot ending at 18:00 counts");
+  assert(!slotInProspectHours(slot(utc("2026-11-10T17:50:00")), "Europe/London"), "one running past 18:00 doesn't");
+  assert(!slotInProspectHours(slot(ist("2026-11-10T18:00:00")), "America/New_York"), "18:00 IST is 07:30 in New York");
+  assert(!slotInProspectHours(slot(utc("2026-11-14T10:00:00")), "Europe/London"), "their Saturday doesn't");
+  assert(slotInProspectHours(slot(ist("2026-11-10T10:00:00")), null), "unknown means IST");
 }
-assert(
-  nextSendWindow(ist("2026-11-10T11:00:00"), "+04:00")?.toISOString() === "2026-11-10T06:00:00.000Z",
-  "rolling uses their 10:00",
-);
+
+// The zone from a Date header, named when it matches a US or Indian zone that day.
+assert(zoneForHeaderOffset("-05:00", utc("2026-11-10T15:00:00")) === "America/New_York", "-0500 in November is US Eastern");
+assert(zoneForHeaderOffset("-05:00", utc("2026-07-10T15:00:00")) === "America/Chicago", "-0500 in July is US Central");
+assert(zoneForHeaderOffset("-07:00", utc("2026-07-10T15:00:00")) === "America/Los_Angeles", "-0700 in July is US Pacific");
+assert(zoneForHeaderOffset("-07:00", utc("2026-11-10T15:00:00")) === "America/Denver", "-0700 in November is US Mountain");
+assert(zoneForHeaderOffset("-10:00", utc("2026-11-10T15:00:00")) === "Pacific/Honolulu", "-1000 is Hawaii");
+assert(zoneForHeaderOffset("+05:30", utc("2026-11-10T15:00:00")) === "Asia/Kolkata", "+0530 is India");
+assert(zoneForHeaderOffset("-04:00", utc("2026-11-10T15:00:00")) === "-04:00", "an offset no zone matches stays an offset");
+
+// The lookup order.
+{
+  const header = (offset: string, at = utc("2026-11-05T15:00:00")) => ({ offset, at });
+  const pacific = { zone: "America/Los_Angeles", basis: "signature" as const };
+  const hq = { zone: "America/Los_Angeles", basis: "company" as const };
+  assert(chooseProspectZone(header("-08:00"), undefined).zone === "America/Los_Angeles", "(a) their Date header comes first");
+  assert(chooseProspectZone(header("-08:00"), undefined).source === "email", "and says so");
+  assert(chooseProspectZone(header("-05:00"), pacific).zone === "America/New_York", "a header beats a signature that disagrees");
+  assert(chooseProspectZone(header("-07:00"), { zone: "America/Phoenix", basis: "signature" }).zone === "America/Phoenix", "a signature that agrees names the zone");
+  assert(chooseProspectZone(undefined, pacific).zone === "America/Los_Angeles" && chooseProspectZone(undefined, pacific).source === "signature", "(b) a signature next");
+  assert(chooseProspectZone(undefined, hq).source === "company", "(c) the company's location next");
+  const none = chooseProspectZone(undefined, undefined);
+  assert(none.zone === "Asia/Kolkata" && none.source === "default", "(d) IST by default");
+  assert(chooseProspectZone(header("+00:00"), undefined).zone === "+00:00", "+0000 alone is taken literally");
+  assert(chooseProspectZone(header("+00:00"), pacific).zone === "America/Los_Angeles", "a place they name beats +0000, often a server's clock");
+}
+assert(parseLocationGuess('{"timezone":"America/New_York","basis":"signature"}')?.zone === "America/New_York", "a location answer parses");
+assert(parseLocationGuess('{"timezone":"","basis":"none"}') === undefined, "no answer is no location");
+assert(parseLocationGuess('{"timezone":"Mars/Base","basis":"company"}') === undefined, "an invalid zone is ignored");
+assert(parseLocationGuess('{"timezone":"-05:00","basis":"company"}') === undefined, "the model must name a zone, not an offset");
+assert(parseLocationGuess("New York") === undefined, "prose is ignored");
+
+// What he says, as a zone.
+for (const [words, zone] of [
+  ["Pacific", "America/Los_Angeles"],
+  ["US Pacific time", "America/Los_Angeles"],
+  ["PST", "America/Los_Angeles"],
+  ["San Francisco", "America/Los_Angeles"],
+  ["New York", "America/New_York"],
+  ["Eastern", "America/New_York"],
+  ["ET", "America/New_York"],
+  ["Central", "America/Chicago"],
+  ["Austin", "America/Chicago"],
+  ["Mountain", "America/Denver"],
+  ["Arizona", "America/Phoenix"],
+  ["Alaska", "America/Anchorage"],
+  ["Hawaii", "Pacific/Honolulu"],
+  ["IST", "Asia/Kolkata"],
+  ["Bangalore", "Asia/Kolkata"],
+  ["London", "Europe/London"],
+  ["America/Chicago", "America/Chicago"],
+  ["Europe/Berlin", "Europe/Berlin"],
+  ["UTC-5", "-05:00"],
+  ["GMT+5:30", "+05:30"],
+  ["UTC", "+00:00"],
+] as const) {
+  assert(zoneFromWords(words) === zone, `"${words}" is ${zone}, got ${zoneFromWords(words)}`);
+}
+assert(zoneFromWords("Atlantis") === undefined && zoneFromWords("") === undefined, "an unknown place is no zone");
+assert(zoneLabel("+00:00") === "UTC" && zoneLabel("-05:00") === "UTC-05:00", "offsets are labelled as UTC offsets");
+assert(zoneLabel("Europe/London") === "London" && zoneLabel("America/Sao_Paulo") === "Sao Paulo", "other zones show their city");
+assert(zoneDisplay("America/Los_Angeles", "company") === "US Pacific (from company HQ)", "a company guess says so");
+assert(zoneDisplay("Asia/Kolkata", "default") === "India (default)", "the default says so");
+assert(zoneDisplay("America/Los_Angeles", "owner") === "US Pacific", "his own setting is plain");
+assert(zoneDisplay(null, null) === "time zone not checked yet", "an unchecked zone says so");
 
 // ======== sorting inbound mail (pure) ========
 function inbound(overrides: Partial<InboundFact> = {}): InboundFact {
@@ -698,7 +760,6 @@ const stopBase = {
   meeting: false,
   ownSends: [],
   colleagueOnThread: false,
-  pausedOnCard: false,
 };
 assert(evaluateStopRules(stopBase).action === "none", "nothing happened, nothing changes");
 {
@@ -736,7 +797,6 @@ assert(evaluateStopRules(stopBase).action === "none", "nothing happened, nothing
 function gateInput(overrides: Partial<SequenceSendGateInput> = {}): SequenceSendGateInput {
   return {
     enabled: true,
-    factsReady: true,
     accountId: "work",
     fromAddress: ME,
     sequence: {
@@ -754,7 +814,6 @@ function gateInput(overrides: Partial<SequenceSendGateInput> = {}): SequenceSend
     step: {
       status: "planned",
       draft_text: "Hello",
-      check_result: JSON.stringify({ deterministic: [], model: { pass: true, reason: "ok" } }),
       sent_message_id: null,
     },
     to: "Priya <priya@acme.com>",
@@ -780,7 +839,6 @@ const sequenceWith = (patch: object) => ({ ...gateInput().sequence!, ...patch })
 const stepWith = (patch: object) => ({ ...gateInput().step!, ...patch });
 const refusals: Array<[string, Partial<SequenceSendGateInput>, string]> = [
   ["kill switch", { enabled: false }, "disabled"],
-  ["TODO fact sheet", { factsReady: false }, "facts_not_ready"],
   ["personal account", { accountId: "personal" }, "not_work_account"],
   ["personal sender", { fromAddress: "me@gmail.com" }, "not_work_sender"],
   ["other recipient", { to: "x@acme.com" }, "recipient_mismatch"],
@@ -797,20 +855,18 @@ const refusals: Array<[string, Partial<SequenceSendGateInput>, string]> = [
   ["stopped", { sequence: sequenceWith({ status: "stopped" }) }, "sequence_not_active"],
   ["no row", { sequence: undefined }, "sequence_not_active"],
   ["wrong thread", { sequenceThreadId: "other" }, "wrong_thread"],
-  ["another at the company", { openSequenceId: 8 }, "company_has_other_sequence"],
+  ["another open for this person", { openSequenceId: 8 }, "prospect_has_other_sequence"],
   ["already claimed", { step: stepWith({ status: "sending" }) }, "step_not_ready"],
   ["already sent", { step: stepWith({ sent_message_id: "m" }) }, "step_not_ready"],
   ["wrong step", { stepNo: 2 }, "step_not_ready"],
   ["manual bump used it", { sequence: sequenceWith({ manual_followups: 1 }) }, "step_used_by_manual_followup"],
   ["all four used", { stepNo: 4, sequence: sequenceWith({ current_step: 4, manual_followups: 1, steps_sent: 3 }) }, "followups_used_up"],
-  ["different body", { body: "Something else" }, "body_not_the_checked_draft"],
-  ["empty body", { body: " " }, "body_not_the_checked_draft"],
-  ["never checked", { step: stepWith({ check_result: null }) }, "draft_not_checked"],
-  ["failed model check", { step: stepWith({ check_result: JSON.stringify({ deterministic: [], model: { pass: false } }) }) }, "draft_not_checked"],
-  ["failed fixed check", { step: stepWith({ check_result: JSON.stringify({ deterministic: ["price"], model: null }) }) }, "draft_not_checked"],
+  ["different body", { body: "Something else" }, "body_not_the_written_draft"],
+  ["empty body", { body: " " }, "body_not_the_written_draft"],
   ["no thread header", { inReplyTo: "" }, "no_thread_headers"],
   ["weekend", { now: ist("2026-11-14T11:00:00") }, "outside_window"],
   ["after hours", { now: ist("2026-11-10T18:00:00") }, "outside_window"],
+  ["their night", { now: ist("2026-11-10T11:00:00"), sequence: sequenceWith({ prospect_timezone: "America/Los_Angeles" }) }, "outside_window"],
   ["daily cap", { sendsToday: 15 }, "daily_cap"],
   ["spacing", { minutesSinceLastSend: 2.9 }, "spacing"],
 ];
@@ -818,12 +874,20 @@ for (const [label, overrides, reason] of refusals) {
   const gate = evaluateSequenceSendGate(gateInput(overrides));
   assert(!gate.ok && gate.reason === reason, `${label}: expected ${reason}, got ${JSON.stringify(gate)}`);
 }
+assert(
+  evaluateSequenceSendGate(gateInput({ now: ist("2026-11-10T21:00:00"), sequence: sequenceWith({ prospect_timezone: "America/New_York" }) })).ok,
+  "21:00 IST passes for New York: their 10:30",
+);
+assert(
+  evaluateSequenceSendGate(gateInput({ step: stepWith({ check_result: null }) } as never)).ok,
+  "a written draft needs no check result",
+);
 
 // ======== the send function refuses before touching Gmail ========
 {
   nextScenario();
   const item = enrol();
-  const prepared = await prepareSequenceStep(item.id, { now: clock, factsPath: FACTS });
+  const prepared = await prepareSequenceStep(item.id, { now: clock });
   assert(prepared.kind === "ready", "the step is ready");
   const body = prepared.kind === "ready" ? prepared.body : "";
   const params = {
@@ -839,7 +903,6 @@ for (const [label, overrides, reason] of refusals) {
     body,
     selfAddresses: new Set([ME]),
     now: clock,
-    factsPath: FACTS,
   };
   const refused = async (overrides: object, reason: string): Promise<void> => {
     const before = sends.length;
@@ -858,12 +921,11 @@ for (const [label, overrides, reason] of refusals) {
   await refused({ bcc: "other@elsewhere.example" }, "bcc_not_allowed");
   await refused({ account: personalAccount }, "not_work_account");
   await refused({ fromAddress: "me@gmail.com" }, "not_work_sender");
-  await refused({ body: "Changed after the check" }, "body_not_the_checked_draft");
-  await refused({ factsPath: "docs/sales_facts.md" }, "facts_not_ready");
+  await refused({ body: "Changed after it was written" }, "body_not_the_written_draft");
   await refused({ threadId: "another-thread" }, "wrong_thread");
   settings.sequencesEnabled = false;
   await refused({}, "disabled");
-  assert((await runSequenceTick(api, { now: clock, factsPath: FACTS })).scanned === 0, "the kill switch stops the whole tick");
+  assert((await runSequenceTick(api, { now: clock })).scanned === 0, "the kill switch stops the whole tick");
   assert(registerSequenceSend(api) === undefined, "the kill switch registers no job");
   assert(formatHealthReport(clock).includes("sequence-send: off"), "/health shows it off");
   settings.sequencesEnabled = true;
@@ -871,7 +933,7 @@ for (const [label, overrides, reason] of refusals) {
   assert(!formatHealthReport(clock).includes("sequence-send: off"), "/health shows it on");
 
   await sendSequenceStep(params);
-  assert(sends.length === 1, "the checked draft goes out");
+  assert(sends.length === 1, "the written draft goes out");
   let repeat = "";
   await sendSequenceStep({ ...params, now: new Date(clock.getTime() + HOUR) }).catch((error: unknown) => {
     repeat = error instanceof SequenceSendRefusedError ? error.reason : "other";
@@ -880,7 +942,7 @@ for (const [label, overrides, reason] of refusals) {
   assert(sends.length === 1, "a repeat doesn't reach Gmail");
 }
 
-// ======== a whole sequence: threading, timing, silence, Sonnet ========
+// ======== a whole sequence: threading, timing, silence, no checker ========
 {
   nextScenario();
   const before = sends.length;
@@ -903,12 +965,8 @@ for (const [label, overrides, reason] of refusals) {
   assert(new Date(row.next_step_at!).getTime() === clock.getTime() + 2 * DAY, "step 2 is due 2 days after the send");
   const dueAt = new Date(row.next_step_at!);
 
-  const check = modelCalls.find((call) => (call.system as { cacheable?: string }).cacheable === MODEL_CHECK_SYSTEM)!;
-  assert(check.backend === "claude", "the second check runs on Claude");
-  assert(check.model === config.claudeModel, "on the configured Sonnet model");
-  assert(check.noFallback === true, "with no fallback to another model");
-  assert(check.effort === "high" && check.maxTokens! >= 4000, "with room to reason before its verdict");
-  assert(check.task === "sequence_check", "and its cost is logged under its own task");
+  assert(!modelCalls.some((call) => call.task === "sequence_check"), "no second check runs");
+  assert(row.prospect_timezone === "Asia/Kolkata" && row.prospect_timezone_source === "default", "with nothing to go on the zone is IST");
 
   assert((await tick(after(MIN))).sent === 0, "nothing is due yet");
   assert((await tick(new Date(dueAt.getTime() - MIN))).sent === 0, "still nothing a minute before it's due");
@@ -968,38 +1026,37 @@ for (const [label, overrides, reason] of refusals) {
 }
 
 // ======== timezone read at Start and used for the window and the slots ========
-{
-  nextScenario();
-  const before = sends.length;
+function proposeWithHistory(options: { email: string; first: string; dateHeader?: string }): number {
   enrolCounter += 1;
-  const email = `sam@us${enrolCounter}.example`;
   const threadId = `tz-${enrolCounter}`;
-  push({
-    threadId: `old-${enrolCounter}`,
-    from: `Sam Lee <${email}>`,
-    to: ME,
-    subject: "Old mail",
-    at: Date.now() - 40 * DAY,
-    sent: false,
-    body: "Hello from long ago",
-    extra: { Date: "Mon, 28 Sep 2026 09:00:00 -0500" },
-  });
+  if (options.dateHeader) {
+    push({
+      threadId: `old-${enrolCounter}`,
+      from: `${options.first} Lee <${options.email}>`,
+      to: ME,
+      subject: "Old mail",
+      at: Date.now() - 4 * DAY,
+      sent: false,
+      body: `Hello from ${options.first}`,
+      extra: { Date: options.dateHeader },
+    });
+  }
   const pitch = push({
     threadId,
     from: `Vishnu Rajan <${ME}>`,
-    to: `Sam Lee <${email}>`,
+    to: `${options.first} Lee <${options.email}>`,
     subject: "IraVoice for Us",
     // Start stamps real time, so this thread has to be in the real past.
     at: Date.now() - 3 * DAY,
     sent: true,
-    body: "Hi Sam,\n\nEpicode builds IraVoice, which answers inbound support calls in Hindi and English. Would you be open to a short demo?",
+    body: `Hi ${options.first},\n\nEpicode builds IraVoice. Would you be open to a short demo?`,
   });
-  const row = createProposedSalesSequence({
+  return createProposedSalesSequence({
     threadId,
-    prospectEmail: email,
-    prospectDomain: email.split("@")[1]!,
-    prospectKey: email.split("@")[1]!,
-    prospectName: "Sam Lee",
+    prospectEmail: options.email,
+    prospectDomain: options.email.split("@")[1]!,
+    prospectKey: options.email,
+    prospectName: `${options.first} Lee`,
     prospectCompany: "Us",
     subject: "IraVoice for Us",
     originalMessageId: pitch.id,
@@ -1007,70 +1064,131 @@ for (const [label, overrides, reason] of refusals) {
     manualFollowups: 0,
     classifierConfidence: 0.9,
     classifierReason: "pitch",
-  })!;
-  let startedReply = "";
+  })!.id;
+}
+
+async function tapStart(id: number): Promise<string> {
+  let text = "";
   await handleSequenceCallback({
-    callbackQuery: { data: `seq:start:${row.id}` },
+    callbackQuery: { data: `seq:start:${id}` },
     answerCallbackQuery: async () => true,
-    editMessageText: async (text: string) => {
-      startedReply = text;
+    editMessageText: async (value: string) => {
+      text = value;
       return true;
     },
     editMessageReplyMarkup: async () => true,
     reply: async () => ({}),
   } as unknown as Context);
-  const started = getSalesSequence(row.id)!;
-  assert(started.status === "active", "Start activates it");
-  assert(started.prospect_timezone === "-05:00", `the offset is stored, got ${started.prospect_timezone}`);
-  assert(startedReply.includes("Nothing will go out") && startedReply.includes("-05:00"), "Start says this one can't send");
-
-  // New York's working day never meets 09:00-19:00 IST, so it holds and says why.
-  const morningIst = clock;
-  assert((await tick(morningIst)).sent === 0, "01:00 their time is out of the window even though it's morning in India");
-  assert((await tick(new Date(morningIst.getTime() + 9.5 * HOUR))).sent === 0, "10:30 their time is past the IST floor");
-  assert(sends.length === before, "nothing goes out");
-  assert(getSalesSequence(row.id)!.status === "active", "it stays active");
-  assert(sequencesPanel(morningIst).text.includes("won't send"), "the list says it won't send");
-
-  nextScenario();
-  const away = enrol({ manual: 2, timezone: "+04:00" });
-  assert(sequencesPanel(clock).text.includes("IST"), "the list shows the next send time");
-  const count = sends.length;
-  await tick();
-  assert(sends.length === count + 1, "step 3 goes out in their window");
-  assert(sends[count]!.parsed.plain.includes("GMT+4"), "the slots show their time as well as IST");
-  assert(getSalesSequence(away.id)!.prospect_timezone === "+04:00", "the zone stays on the row");
+  return text;
 }
 
-// +0000 is taken literally, and the IST floor still applies.
 {
   nextScenario();
+  const before = sends.length;
+  const id = proposeWithHistory({
+    email: `sam@us${enrolCounter + 1}.example`,
+    first: "Sam",
+    dateHeader: new Date(Date.now() - 4 * DAY).toUTCString().replace("GMT", "-0500"),
+  });
+  const reply = await tapStart(id);
+  const started = getSalesSequence(id)!;
+  assert(started.status === "active", "Start activates it");
+  const expected = zoneForHeaderOffset("-05:00", new Date(Date.now() - 4 * DAY));
+  assert(started.prospect_timezone === expected && started.prospect_timezone_source === "email", `the header's zone is stored, got ${started.prospect_timezone}`);
+  assert(reply.includes(`Their time zone: ${zoneLabel(expected)}`), `Start says where they are: ${reply}`);
+  assert(reply.includes("Mon-Fri 9am-5pm their time"), "and when mail goes out");
+  assert(!reply.includes("Nothing will go out"), "a US prospect is never held for the IST floor");
+  assert(startedReplyHasNoAddress(reply), "the hint names them, not a placeholder");
+
+  // Their 09:00 is India's evening: it goes out then.
+  setSalesSequenceTimezone(id, "America/New_York", "email");
+  const morningIst = clock; // 06:00 UTC
+  assert((await tick(morningIst)).sent === 0, "01:00 New York is out of the window though it's morning in India");
+  const nineEastern = nextSendWindow(morningIst, "America/New_York");
+  assert(localHour(nineEastern, "America/New_York") === 9, "the next window is 09:00 their time");
+  assert((await tick(nineEastern)).sent === 1, "it goes out at 09:00 New York, evening in India");
+  assert(sends.length === before + 1, "one email");
+  const panel = sequencesPanel(nineEastern).text;
+  assert(panel.includes("Sam Lee, Us - US Eastern"), `/sequences shows their zone: ${panel}`);
+  assert(/\(9:00 am US Eastern\)/i.test(panel), `and the next send in their time: ${panel}`);
+}
+
+function startedReplyHasNoAddress(text: string): boolean {
+  return text.includes('"Sam is in New York"');
+}
+
+function localHour(at: Date, zone: string): number {
+  return Number(new Intl.DateTimeFormat("en-US", { timeZone: zone, hour: "numeric", hourCycle: "h23" }).format(at));
+}
+
+// (b)-(d): a signature, the company, or IST when nothing says.
+{
+  nextScenario();
+  locationAnswer = '{"timezone":"America/Los_Angeles","basis":"signature"}';
+  const sig = proposeWithHistory({ email: `jeff@west${enrolCounter + 1}.example`, first: "Jeff" });
+  await tapStart(sig);
+  assert(getSalesSequence(sig)!.prospect_timezone === "America/Los_Angeles", "a signature place is used");
+  assert(getSalesSequence(sig)!.prospect_timezone_source === "signature", "and recorded as such");
+  const location = modelCalls.find((call) => (call.system as { cacheable?: string }).cacheable === LOCATION_SYSTEM)!;
+  const content = String((location.messages[0] as { content: unknown }).content);
+  assert(content.includes("<<<UNTRUSTED_THREAD>>>") && content.includes("Would you be open to a short demo?"), "the location reader sees the thread, marked untrusted");
+
+  locationAnswer = '{"timezone":"America/Los_Angeles","basis":"company"}';
+  const hq = proposeWithHistory({ email: `munil@talk${enrolCounter + 1}.example`, first: "Munil" });
+  await tapStart(hq);
+  assert(getSalesSequence(hq)!.prospect_timezone_source === "company", "a company HQ guess is recorded as a guess");
+  assert(sequencesPanel(clock).text.includes("Munil Lee, Us - US Pacific (from company HQ)"), "and /sequences says it's a guess");
+
+  locationAnswer = NO_LOCATION;
+  const plain = proposeWithHistory({ email: `ravi@in${enrolCounter + 1}.example`, first: "Ravi" });
+  await tapStart(plain);
+  assert(getSalesSequence(plain)!.prospect_timezone === "Asia/Kolkata", "nothing to go on means IST");
+  assert(sequencesPanel(clock).text.includes("Ravi Lee, Us - India (default)"), "shown as the default");
+
+  // +0000 from a mail server loses to a place they name.
+  locationAnswer = '{"timezone":"America/New_York","basis":"signature"}';
+  const server = proposeWithHistory({
+    email: `kim@east${enrolCounter + 1}.example`,
+    first: "Kim",
+    dateHeader: new Date(Date.now() - 4 * DAY).toUTCString().replace("GMT", "+0000"),
+  });
+  await tapStart(server);
+  assert(getSalesSequence(server)!.prospect_timezone === "America/New_York", "a named place beats a +0000 header");
+  locationAnswer = NO_LOCATION;
+  const literal = proposeWithHistory({
+    email: `lee@utc${enrolCounter + 1}.example`,
+    first: "Lee",
+    dateHeader: new Date(Date.now() - 4 * DAY).toUTCString().replace("GMT", "+0000"),
+  });
+  await tapStart(literal);
+  assert(getSalesSequence(literal)!.prospect_timezone === "+00:00", "+0000 alone is taken literally");
+}
+
+// A failed lookup is never stored as IST: the runner tries again before sending.
+{
+  nextScenario();
+  const before = sends.length;
   const item = enrol();
-  push({
-    threadId: `old-utc-${item.id}`,
-    from: `Priya Shah <${item.email}>`,
-    to: ME,
-    subject: "Old",
-    at: clock.getTime() - 30 * DAY,
-    sent: false,
-    body: "Old",
-    extra: { Date: "Mon, 5 Oct 2026 09:00:00 +0000" },
+  setCompleteForTests(async (params: CompleteParams) => {
+    if ((params.system as { cacheable?: string }).cacheable === LOCATION_SYSTEM) {
+      throw new Error("model down");
+    }
+    return answer('{"ask":"demo"}');
   });
   await tick();
-  assert(getSalesSequence(item.id)!.prospect_timezone === "+00:00", "+0000 is stored literally");
-  assert(getSalesSequence(item.id)!.steps_sent === 0, "06:00 their time is out, though it's 11:30 IST");
-  const start = clock;
-  assert((await tick(new Date(start.getTime() + 8 * HOUR))).sent === 0, "19:30 IST is past the floor, though it's 14:00 their time");
-  assert(getSalesSequenceStep(item.id, 1)!.status === "planned", "nothing was claimed");
-  assert((await tick(new Date(start.getTime() + 22 * HOUR + 30 * 60_000))).sent === 0, "10:00 IST next day is 04:30 their time");
-  assert((await tick(new Date(start.getTime() + 28 * HOUR))).sent === 1, "the next day's overlap sends it");
+  assert(getSalesSequence(item.id)!.prospect_timezone === null, "nothing is stored on a failed lookup");
+  assert(sends.length === before, "and nothing is sent until it's known");
+  restoreModels();
+  await tick(after(5 * MIN));
+  assert(getSalesSequence(item.id)!.prospect_timezone === "Asia/Kolkata", "the next tick looks it up");
+  assert(sends.length === before + 1, "and sends");
 }
 
-// The send gate holds the floor on its own, whatever the runner did.
+// The send gate holds their window on its own, whatever the runner did.
 {
   nextScenario();
-  const item = enrol({ timezone: "+00:00" });
-  const prepared = await prepareSequenceStep(item.id, { now: clock, factsPath: FACTS });
+  const item = enrol({ timezone: "America/Los_Angeles" });
+  const prepared = await prepareSequenceStep(item.id, { now: clock });
   assert(prepared.kind === "ready", "the step is ready");
   const count = sends.length;
   let refused = "";
@@ -1087,81 +1205,50 @@ for (const [label, overrides, reason] of refusals) {
       references: "",
       body: prepared.kind === "ready" ? prepared.body : "",
       selfAddresses: new Set([ME]),
-      now: new Date(clock.getTime() + 8 * HOUR), // 19:30 IST, 14:00 their time
-      factsPath: FACTS,
+      now: clock, // 11:30 IST is the middle of the night in California
     });
   } catch (error) {
     refused = error instanceof SequenceSendRefusedError ? error.reason : "other";
   }
-  assert(refused === "outside_window", `the gate refuses past the floor, got ${refused}`);
+  assert(refused === "outside_window", `the gate refuses their night, got ${refused}`);
   assert(sends.length === count, "and nothing reaches Gmail");
   assert(getSalesSequenceStep(item.id, 1)!.status === "planned", "and the step isn't claimed");
 }
 
-// ======== step 3 when the offered times fall outside their day ========
-function afternoonsBusy(from: Date): Array<{ start: Date; end: Date }> {
-  const out: Array<{ start: Date; end: Date }> = [];
-  for (let day = -1; day < 60; day += 1) {
-    const base = new Date(from.getTime() + day * DAY);
-    base.setUTCHours(7, 30, 0, 0); // 13:00 IST
-    out.push({ start: base, end: new Date(base.getTime() + 10 * HOUR) });
-  }
-  return out;
-}
-
+// ======== step 3: times that suit both sides, or ask for one ========
 {
   nextScenario();
-  const item = enrol({ manual: 2, timezone: "+00:00" });
-  const at = new Date(clock.getTime() + 4.5 * HOUR); // 16:00 IST, 10:30 their time
-  busy = afternoonsBusy(at);
-  const offer = (await offerSlots(at, "+00:00"))!;
-  assert(offer.inTheirDay < 2, `the only free times are their night, got ${offer.inTheirDay}`);
+  const item = enrol({ manual: 2, timezone: "America/Los_Angeles" });
+  const at = nextSendWindow(clock, "America/Los_Angeles");
+  assert((await offerSlots(at, "America/Los_Angeles")).length === 0, "none of his hours fall in 09:00-18:00 Pacific");
   const count = sends.length;
-  const checksBefore = modelCalls.filter((call) => call.task === "sequence_check").length;
   await tick(at);
-  const step = getSalesSequenceStep(item.id, 3)!;
-  assert(sends.length === count, "nothing auto-sends");
-  assert(step.status === "blocked", "step 3 goes to a card");
-  assert(step.reason?.includes("slots_off_hours") === true, `the card says why, got ${step.reason}`);
-  assert(JSON.parse(step.check_result!).deterministic.includes("slots_off_hours"), "the send gate would refuse it too");
-  assert(modelCalls.filter((call) => call.task === "sequence_check").length === checksBefore, "the second check isn't spent on it");
-  assert((await tick(new Date(at.getTime() + HOUR))).sent === 0, "it stays paused");
-
-  // He removes a time he doesn't want, and it doesn't come back on Send.
-  const stored = JSON.parse(step.slot_lines!) as string[];
-  const action = getPendingActionForDraft(step.draft_id!)!;
-  const kept = stored.slice(0, 1);
-  const body = `Hi Priya,\n\nCould we find 15-20 minutes?\n${kept.join("\n")}`;
-  const draft = drafts.get(step.draft_id!)!;
-  drafts.set(step.draft_id!, {
-    raw: Buffer.from(
-      Buffer.from(draft.raw, "base64url").toString("utf8").replace(
-        /Content-Type: text\/plain[^\r]*\r\nContent-Transfer-Encoding: base64\r\n\r\n[A-Za-z0-9+/=\r\n]+?(?=\r\n--)/,
-        `Content-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(body, "utf8").toString("base64")}`,
-      ),
-    ).toString("base64url"),
-    threadId: draft.threadId,
-  });
-  clock = new Date(clock.getTime() + 2 * DAY);
-  busy = [];
-  const drafted = draftSends.length;
-  await handleApprovalCallback(approvalCtx(`approval:send:${action.id}`), "send", action.id);
-  assert(draftSends.length === drafted + 1, "Send sends what he chose");
-  const sentBody = draftSends[drafted]!.parsed.plain;
-  assert(kept.every((line) => sentBody.includes(line)), "the time he kept went out");
-  assert(stored.slice(1).every((line) => !sentBody.includes(line)), "the time he removed stays out");
-  assert(getSalesSequenceStep(item.id, 3)!.status === "sent", "the step is recorded");
-  assert(getSalesSequence(item.id)!.status === "active" && getSalesSequence(item.id)!.current_step === 4, "and the sequence carries on");
+  assert(sends.length === count + 1, "step 3 still goes out on its own, with no card");
+  const plain = sends[count]!.parsed.plain;
+  assert(!/\d{1,2}:\d{2} [AP]M IST/.test(plain), "with no times in it");
+  const prompt = String((modelCalls.filter((call) => (call.system as { cacheable?: string }).cacheable === WRITER_SYSTEM).at(-1)!.messages[0] as { content: unknown }).content);
+  assert(/a day and time that suits them/.test(prompt), "the writer asked them for a time");
+  assert(telegram.sent.length === 0, "and no card was posted");
 }
-// Two or more in their day: no card, same as ever.
+{
+  nextScenario();
+  const item = enrol({ manual: 2, timezone: "Europe/London" });
+  const at = nextSendWindow(clock, "Europe/London");
+  const lines = await offerSlots(at, "Europe/London");
+  assert(lines.length >= 1 && lines.length <= 3, `London overlaps his afternoon, got ${lines.length}`);
+  const count = sends.length;
+  await tick(at);
+  assert(sends.length === count + 1, "step 3 goes out");
+  assert(lines.every((line) => sends[count]!.parsed.plain.includes(line.slice(2))), "with the times that suit both");
+  void item;
+}
 {
   nextScenario();
   const item = enrol({ manual: 2, timezone: "+04:00" });
-  const offer = (await offerSlots(clock, "+04:00"))!;
-  assert(offer.inTheirDay >= 2, `Dubai's day covers his hours, got ${offer.inTheirDay}`);
   const count = sends.length;
   await tick();
-  assert(sends.length === count + 1, "step 3 goes out automatically");
+  assert(sends.length === count + 1, "step 3 goes out in their window");
+  assert(sends[count]!.parsed.plain.includes("GMT+4"), "the slots show their time as well as IST");
   assert(getSalesSequenceStep(item.id, 3)!.status === "sent", "without a card");
 }
 
@@ -1245,18 +1332,20 @@ function afternoonsBusy(from: Date): Array<{ start: Date; end: Date }> {
   assert(pitch === null, "pitch exclusion no longer has a test-recipient gate");
 }
 
-// ======== the fact sheet ========
+// ======== several people at one company ========
 {
   nextScenario();
   const before = sends.length;
-  const item = enrol();
-  const replied = enrol({ first: "Ravi" });
-  reply(replied, "Yes, tell me more");
-  const result = await tick(clock, "docs/sales_facts.md");
-  assert(result.sent === 0 && sends.length === before, "no send while sales_facts.md has TODO markers");
-  assert(modelCalls.length === 0, "and no model is asked");
-  assert(getSalesSequenceStep(item.id, 1)!.status === "planned", "the step waits");
-  assert(getSalesSequence(replied.id)!.stop_reason === "replied", "stop rules still run");
+  const ana = enrol({ first: "Ana", email: "ana@samecorp.example" });
+  const ben = enrol({ first: "Ben", email: "ben@samecorp.example" });
+  assert(getSalesSequence(ana.id)!.status === "active" && getSalesSequence(ben.id)!.status === "active", "two open sequences at one company");
+  const start = clock;
+  await tick(start);
+  await tick(new Date(start.getTime() + 3 * MIN));
+  assert(sends.length === before + 2, "both colleagues get their follow-up");
+  const recipients = sends.slice(before).map((send) => send.parsed.headers.to ?? "");
+  assert(recipients.some((to) => to.includes(ana.email)) && recipients.some((to) => to.includes(ben.email)), "each to their own address");
+  assert(getSalesSequence(ana.id)!.steps_sent === 1 && getSalesSequence(ben.id)!.steps_sent === 1, "each moves on");
 }
 
 // ======== every stop rule ========
@@ -1535,7 +1624,7 @@ for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertro
     threadId,
     prospectEmail: email,
     prospectDomain: domain,
-    prospectKey: domain,
+    prospectKey: email,
     prospectName: "Sujoy",
     prospectCompany: "Partner",
     subject: "IraVoice",
@@ -1562,7 +1651,7 @@ for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertro
   // An enrolled row can't get there either: the send gate and the scan both refuse.
   nextScenario();
   const item = enrol({ email });
-  const prepared = await prepareSequenceStep(item.id, { now: clock, factsPath: FACTS });
+  const prepared = await prepareSequenceStep(item.id, { now: clock });
   assert(prepared.kind === "ready", `${domain}: the step is ready`);
   const count = sends.length;
   let refused = "";
@@ -1580,7 +1669,6 @@ for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertro
       body: prepared.kind === "ready" ? prepared.body : "",
       selfAddresses: new Set([ME]),
       now: clock,
-      factsPath: FACTS,
     });
   } catch (error) {
     refused = error instanceof SequenceSendRefusedError ? error.reason : "other";
@@ -1661,61 +1749,27 @@ for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertro
   });
 }
 
-// Second check unavailable: wait, never fall back and never send.
+// Writer unavailable: wait an hour, never send.
 {
   nextScenario();
   const before = sends.length;
   const item = enrol();
   setCompleteForTests(async (params: CompleteParams) => {
     const system = (params.system as { cacheable?: string }).cacheable ?? "";
-    if (system === MODEL_CHECK_SYSTEM) {
-      throw new Error("Anthropic down");
+    if (system === WRITER_SYSTEM) {
+      throw new Error("model down");
     }
-    if (system === ASK_SYSTEM) {
-      return answer('{"ask":"demo"}');
+    if (system === LOCATION_SYSTEM) {
+      return answer(NO_LOCATION);
     }
-    return answer(
-      JSON.stringify({
-        body: "Hi Priya,\n\nJust a quick follow-up. IraVoice answers inbound support calls in Hindi and English.\n\nWould a short demo next week work?",
-      }),
-    );
+    return answer('{"ask":"demo"}');
   });
   const result = await tick();
-  assert(result.sent === 0 && sends.length === before, "no check, no send");
+  assert(result.sent === 0 && sends.length === before, "no email, no send");
   const row = getSalesSequence(item.id)!;
   assert(row.status === "active", "the sequence waits");
   assert(new Date(row.next_step_at!).getTime() === clock.getTime() + HOUR, "and retries in an hour");
   restoreModels();
-}
-
-function restoreModels(): void {
-  setCompleteForTests(async (params: CompleteParams) => {
-    modelCalls.push(params);
-    const system = (params.system as { cacheable?: string }).cacheable ?? "";
-    if (system === WRITER_SYSTEM) {
-      duringWrite?.();
-      const content = String((params.messages[0] as { content: unknown }).content);
-      const first = /RECIPIENT: (\S+)/.exec(content)?.[1]?.replace(/,$/, "") ?? "there";
-      const slots = content.includes(SLOTS_TOKEN);
-      return answer(
-        JSON.stringify({
-          body: slots
-            ? `Hi ${first},\n\nJust a quick follow-up on a short demo.\n\n${SLOTS_TOKEN}\n\nDo any of these suit you?`
-            : `Hi ${first},\n\nJust a quick follow-up on my earlier note. IraVoice answers inbound support calls in Hindi and English.\n\nWould a short demo next week work?`,
-        }),
-      );
-    }
-    if (system === MODEL_CHECK_SYSTEM) {
-      return answer(checkAnswer);
-    }
-    if (system === ASK_SYSTEM) {
-      return answer('{"ask":"demo"}');
-    }
-    if (system.includes("has_promise")) {
-      return answer('{"has_promise":true,"promise":"send the deck","confidence":"high"}');
-    }
-    return answer('{"needs_followup":true,"reason":"Asked for a demo","importance":"high"}');
-  });
 }
 
 // ======== "Tuesday 3pm works" stops it and reaches auto-scheduling ========
@@ -1820,39 +1874,19 @@ function restoreModels(): void {
   assert(getPromiseByMessageId(stepId) === undefined, "a sequence email is not");
 }
 
-// 3 and blocked steps: Send continues, Discard stops, and the sent card isn't "his own email".
+// 3. No blocked cards: whatever the writer wrote goes as written, and the
+// sequence's own send isn't taken for his own email.
 {
   nextScenario();
   const before = sends.length;
   const item = enrol();
-  checkAnswer = '{"pass":false,"reason":"Sounds like a promise"}';
+  writerBody = "Hi Priya,\n\nIt starts at $500 a month with a 20% discount, and we guarantee go-live in 2 weeks. Deck attached.";
   await tick();
-  const step = getSalesSequenceStep(item.id, 1)!;
-  assert(step.status === "blocked", "a failed check blocks the step");
-  assert(sends.length === before, "nothing goes out on its own");
-  assert(telegram.sent.at(-1)!.startsWith("Draft waiting for approval"), "it's the normal card");
-  assert(getSalesSequence(item.id)!.next_step_at === null, "the sequence is paused");
-  checkAnswer = '{"pass":true,"reason":"ok"}';
-  await tick(after(10 * MIN));
-  assert(sends.length === before, "a paused sequence stays paused");
-
-  const action = getPendingActionForDraft(step.draft_id!)!;
-  await handleApprovalCallback(approvalCtx(`approval:send:${action.id}`), "send", action.id);
-  const done = getSalesSequenceStep(item.id, 1)!;
-  assert(done.status === "sent" && Boolean(done.sent_message_id), "Send records the step");
-  assert(getSalesSequence(item.id)!.current_step === 2, "and continues the sequence");
+  assert(sends.length === before + 1, "a draft the old checks would have blocked goes out");
+  assert(sends[before]!.parsed.plain.includes("$500 a month with a 20% discount"), "exactly as written");
+  assert(telegram.sent.length === 0, "with no card");
   const result = await tick(after(10 * MIN));
-  assert(result.stopped === 0 && getSalesSequence(item.id)!.status === "active", "his approved step isn't taken for his own email");
-}
-{
-  nextScenario();
-  const item = enrol();
-  checkAnswer = '{"pass":false,"reason":"No"}';
-  await tick();
-  const step = getSalesSequenceStep(item.id, 1)!;
-  const action = getPendingActionForDraft(step.draft_id!)!;
-  await handleApprovalCallback(approvalCtx(`approval:discard:${action.id}`), "discard", action.id);
-  assert(getSalesSequence(item.id)!.stop_reason === "discarded", "Discard stops it");
+  assert(result.stopped === 0 && getSalesSequence(item.id)!.status === "active", "its own send isn't taken for his own email");
 }
 
 // 4. Crash handling: never a second send.
@@ -1912,154 +1946,6 @@ function restoreModels(): void {
   sendMode = "reject_400";
   await tick();
   assert(getSalesSequence(item.id)!.stop_reason === "send_rejected", "an invalid email stops rather than loops");
-}
-
-// ======== blocked cards: fresh slots and the 5-day chase ========
-setDraftRefresher((draftId) => refreshSequenceDraftSlots(draftId, clock));
-
-function draftPlain(draftId: string): string {
-  return parseRaw(drafts.get(draftId)!.raw).plain;
-}
-
-{
-  nextScenario();
-  const item = enrol({ manual: 2 });
-  checkAnswer = '{"pass":false,"reason":"No"}';
-  await tick();
-  const step = getSalesSequenceStep(item.id, 3)!;
-  assert(step.status === "blocked", "step 3 is blocked");
-  const oldLines = JSON.parse(step.slot_lines!) as string[];
-  assert(oldLines.length >= 2, "its times are remembered");
-  assert(oldLines.every((line) => draftPlain(step.draft_id!).includes(line)), "and are in the draft");
-
-  clock = new Date(clock.getTime() + 14 * DAY);
-  const action = getPendingActionForDraft(step.draft_id!)!;
-  const notes = { edited: [] as string[], alerts: [] as string[] };
-  const beforeSend = draftSends.length;
-  await handleApprovalCallback(approvalCtx(`approval:send:${action.id}`, notes), "send", action.id);
-  assert(draftSends.length === beforeSend + 1, "Send sends it");
-  const sentBody = draftSends[beforeSend]!.parsed.plain;
-  assert(oldLines.every((line) => !sentBody.includes(line)), "the stale times are gone");
-  const newLines = JSON.parse(getSalesSequenceStep(item.id, 3)!.slot_lines!) as string[];
-  assert(newLines.length >= 2 && newLines.every((line) => sentBody.includes(line)), "the fresh times went out");
-  assert(notes.edited[0]!.includes("Times refreshed before sending"), "the card shows the new times");
-  assert(draftSends[beforeSend]!.parsed.headers["in-reply-to"]!.startsWith("<"), "threading survives the rewrite");
-  assert(draftSends[beforeSend]!.parsed.headers.to!.includes(item.email), "and so does the recipient");
-  assert(getSalesSequenceStep(item.id, 3)!.status === "sent", "the step is recorded");
-}
-// Edit refreshes too, and his own change is left alone.
-{
-  nextScenario();
-  const item = enrol({ manual: 2 });
-  checkAnswer = '{"pass":false,"reason":"No"}';
-  await tick();
-  const step = getSalesSequenceStep(item.id, 3)!;
-  const oldLines = JSON.parse(step.slot_lines!) as string[];
-  clock = new Date(clock.getTime() + 14 * DAY);
-  const action = getPendingActionForDraft(step.draft_id!)!;
-  await handleApprovalCallback(approvalCtx(`approval:edit:${action.id}`), "edit", action.id);
-  const edit = await consumeDraftEdit(config.ownerTelegramId);
-  assert(edit !== undefined, "the edit starts");
-  assert(oldLines.every((line) => !edit!.body.includes(line)), "the body he edits has no stale times");
-  const fresh = JSON.parse(getSalesSequenceStep(item.id, 3)!.slot_lines!) as string[];
-  assert(fresh.every((line) => edit!.body.includes(line)), "it has the fresh ones");
-
-  const own = "Hi Priya,\n\nWould Tue 8 Dec, 3:00 PM IST work for a short demo?";
-  const draft = drafts.get(step.draft_id!)!;
-  const replaced = Buffer.from(
-    Buffer.from(draft.raw, "base64url").toString("utf8").replace(
-      /Content-Type: text\/plain[^\r]*\r\nContent-Transfer-Encoding: base64\r\n\r\n[A-Za-z0-9+/=\r\n]+?(?=\r\n--)/,
-      `Content-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(own, "utf8").toString("base64")}`,
-    ),
-  ).toString("base64url");
-  drafts.set(step.draft_id!, { raw: replaced, threadId: draft.threadId });
-  clock = new Date(clock.getTime() + 7 * DAY);
-  const count = draftSends.length;
-  await handleApprovalCallback(approvalCtx(`approval:send:${action.id}`), "send", action.id);
-  assert(draftSends.length === count + 1, "Send sends his edit");
-  assert(draftSends[count]!.parsed.plain.includes("3:00 PM IST"), "his own time stays");
-}
-// No free time means no send.
-{
-  nextScenario();
-  const item = enrol({ manual: 2 });
-  checkAnswer = '{"pass":false,"reason":"No"}';
-  await tick();
-  const step = getSalesSequenceStep(item.id, 3)!;
-  clock = new Date(clock.getTime() + 14 * DAY);
-  busy = [{ start: new Date(clock.getTime() - DAY), end: new Date(clock.getTime() + 400 * DAY) }];
-  const action = getPendingActionForDraft(step.draft_id!)!;
-  const notes = { edited: [] as string[], alerts: [] as string[] };
-  const count = draftSends.length;
-  await handleApprovalCallback(approvalCtx(`approval:send:${action.id}`, notes), "send", action.id);
-  assert(draftSends.length === count, "stale times are never sent");
-  assert(notes.alerts[0]!.startsWith("Not sent"), "he's told");
-  assert(getPendingActionForDraft(step.draft_id!)?.status === "pending", "the card stays");
-  busy = [];
-}
-// A Cc he added through Edit survives the refresh.
-{
-  nextScenario();
-  const item = enrol({ manual: 2 });
-  checkAnswer = '{"pass":false,"reason":"No"}';
-  await tick();
-  const step = getSalesSequenceStep(item.id, 3)!;
-  const draft = drafts.get(step.draft_id!)!;
-  const withCc = Buffer.from(
-    Buffer.from(draft.raw, "base64url").toString("utf8").replace("Subject:", "Cc: sam@epicode.in\r\nSubject:"),
-  ).toString("base64url");
-  drafts.set(step.draft_id!, { raw: withCc, threadId: draft.threadId });
-  clock = new Date(clock.getTime() + 14 * DAY);
-  const note = await refreshSequenceDraftSlots(step.draft_id!, clock);
-  assert(note !== undefined, "the times were refreshed");
-  assert(parseRaw(drafts.get(step.draft_id!)!.raw).headers.cc === "sam@epicode.in", "his Cc is kept");
-}
-
-// A draft that isn't a blocked step is untouched.
-assert((await refreshSequenceDraftSlots("no-such-draft", clock)) === undefined, "the refresher ignores other drafts");
-
-// Five days paused: one ping, no send.
-{
-  nextScenario();
-  const before = sends.length;
-  const item = enrol();
-  checkAnswer = '{"pass":false,"reason":"No"}';
-  const start = clock;
-  await tick(start);
-  telegram.sent.length = 0;
-  await tick(new Date(start.getTime() + 4.9 * DAY));
-  assert(telegram.sent.length === 0, "no ping before 5 days");
-  await tick(new Date(start.getTime() + 5 * DAY));
-  assert(telegram.sent.length === 1, "one ping at 5 days");
-  assert(
-    telegram.sent[0] === "Follow-up to Priya Shah has been waiting for your tap for 5 days - Send, Edit or Discard?",
-    `the exact words, got ${telegram.sent[0]}`,
-  );
-  await tick(new Date(start.getTime() + 6 * DAY));
-  await tick(new Date(start.getTime() + 20 * DAY));
-  assert(telegram.sent.length === 1, "only once");
-  assert(sends.length === before, "and nothing is ever sent on its own");
-  assert(getSalesSequence(item.id)!.status === "active", "it stays paused");
-  assert(getSalesSequenceStep(item.id, 1)!.status === "blocked", "on the same card");
-}
-
-// A stop takes the waiting card with it.
-{
-  nextScenario();
-  const item = enrol();
-  checkAnswer = '{"pass":false,"reason":"No"}';
-  await tick();
-  const step = getSalesSequenceStep(item.id, 1)!;
-  const action = getPendingActionForDraft(step.draft_id!)!;
-  reply(item, "Yes, interested", { at: clock.getTime() });
-  await tick(after(5 * MIN));
-  assert(getSalesSequence(item.id)!.stop_reason === "replied", "the reply stops a paused sequence");
-  assert(getPendingActionForDraft(step.draft_id!) === undefined, "the card is retired");
-  assert(telegram.edited.some((text) => text.includes("expired")), "and shows that");
-  const count = draftSends.length;
-  const notes = { edited: [] as string[], alerts: [] as string[] };
-  await handleApprovalCallback(approvalCtx(`approval:send:${action.id}`, notes), "send", action.id);
-  assert(draftSends.length === count, "an old tap can't send it");
 }
 
 // ======== stop_sequence and /sequences ========
@@ -2137,6 +2023,53 @@ assert((await refreshSequenceDraftSlots("no-such-draft", clock)) === undefined, 
   const empty = await handler({ target: "all" }, { confirmation });
   assert(empty.startsWith("Nothing stopped"), "stopping again says so");
   assert(sequencesPanel(clock).keyboard === undefined, "an empty list has no buttons");
+}
+
+// ======== correcting a prospect's time zone by text or voice ========
+{
+  nextScenario();
+  const munil = enrol({ first: "Munil", company: "Talkdesk" });
+  const jeffA = enrol({ first: "Jeff", company: "Alpha" });
+  const jeffB = enrol({ first: "Jeff", company: "Beta", email: `jeff@beta${enrolCounter}.example` });
+  setSalesSequenceTimezone(munil.id, "America/Los_Angeles", "company");
+  const handler = tools.set_sequence_timezone!.handler as (input: unknown, turn: unknown) => string;
+  assert((TOOL_ORDER as readonly string[]).includes("set_sequence_timezone"), "the tool is registered");
+  assert(!(FORWARDED_TOOLS as readonly string[]).includes("set_sequence_timezone"), "it isn't offered on forwarded messages");
+  const description = String(tools.set_sequence_timezone!.definition.description);
+  assert(description.includes("Munil is in New York") && description.includes("set Jeff's timezone to Pacific"), "the description names both phrasings");
+  let threw = false;
+  try {
+    handler({ target: "Munil", timezone: "New York" }, {});
+  } catch {
+    threw = true;
+  }
+  assert(threw, "with no owner confirmation it refuses");
+  assert(getSalesSequence(munil.id)!.prospect_timezone === "America/Los_Angeles", "and changes nothing");
+
+  const set = handler({ target: "Munil", timezone: "New York" }, { confirmation });
+  assert(set.startsWith("Set: Munil Shah, Talkdesk - US Eastern"), `it says what changed: ${set}`);
+  const row = getSalesSequence(munil.id)!;
+  assert(row.prospect_timezone === "America/New_York" && row.prospect_timezone_source === "owner", "the zone is his now");
+  assert(setSequenceTimezoneFromTool({ target: "Munil", timezone: "America/Chicago" }, { confirmation }).includes("US Central"), "an IANA name works");
+
+  const ambiguous = handler({ target: "Jeff", timezone: "Pacific" }, { confirmation });
+  assert(ambiguous.startsWith("Nothing changed yet") && ambiguous.includes("Jeff Shah, Alpha") && ambiguous.includes("Jeff Shah, Beta"), "two Jeffs: it asks which");
+  assert(handler({ target: "Jeff Beta", timezone: "Pacific" }, { confirmation }).startsWith("Nothing changed"), "a name it can't match changes nothing");
+  assert(handler({ target: "Beta", timezone: "Pacific" }, { confirmation }).includes("Jeff Shah, Beta - US Pacific"), "by company it's one");
+  assert(getSalesSequence(jeffA.id)!.prospect_timezone === null, "the other Jeff is untouched");
+  assert(handler({ target: "Munil", timezone: "Atlantis" }, { confirmation }).startsWith("Nothing changed"), "an unknown place changes nothing");
+  assert(handler({ target: "all", timezone: "Pacific" }, { confirmation }).startsWith("Nothing changed yet"), "\"all\" isn't a way to set every zone");
+
+  // His setting is never looked up again, and the window follows it.
+  locationAnswer = '{"timezone":"Asia/Kolkata","basis":"signature"}';
+  await tick();
+  assert(getSalesSequence(munil.id)!.prospect_timezone === "America/Chicago", "a tick doesn't overwrite his correction");
+  assert(getSalesSequence(munil.id)!.steps_sent === 0, "11:30 IST is Chicago's night, so nothing went to Munil");
+  const panel = sequencesPanel(clock).text;
+  assert(panel.includes("- Munil Shah, Talkdesk - US Central\n  step 1 of 4, next "), `/sequences shows each prospect's zone: ${panel}`);
+  assert(/US Central\)/.test(panel), "with the next send in their time");
+  assert(panel.includes("Jeff Shah, Beta - US Pacific"), "Jeff's correction shows too");
+  void jeffB;
 }
 
 // Start stays owner-only too.

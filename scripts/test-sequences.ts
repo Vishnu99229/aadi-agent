@@ -587,7 +587,7 @@ for (const phrase of [
     threadId: "t-revive",
     prospectEmail: "ria@pi.com",
     prospectDomain: "pi.com",
-    prospectKey: "pi.com",
+    prospectKey: "ria@pi.com",
     prospectName: "Ria",
     prospectCompany: "Pi",
     subject: "Pitch",
@@ -605,9 +605,9 @@ for (const phrase of [
   assert(listSalesSequenceSteps(declined.id).length === 0, "re-offering creates no steps");
 }
 
-// ---- one open sequence per company ----
-assert(prospectKey("Mira@CallCloud.com", PERSONAL_DOMAINS) === "callcloud.com", "company key is the domain");
-assert(prospectKey("Ravi@Gmail.com", PERSONAL_DOMAINS) === "ravi@gmail.com", "free-mail key is the address");
+// ---- one open sequence per person, several per company ----
+assert(prospectKey("Mira@CallCloud.com") === "mira@callcloud.com", "the key is the person's address");
+assert(prospectKey("Ravi@Gmail.com") === "ravi@gmail.com", "free-mail key is the address too");
 {
   verdict = { is_sales_pitch: true, confidence: 0.92, reason: "Outbound product pitch" };
   await runSequenceDetection(api);
@@ -615,31 +615,23 @@ assert(prospectKey("Ravi@Gmail.com", PERSONAL_DOMAINS) === "ravi@gmail.com", "fr
   pitch("t-co-2", "Ben <ben@upsilon.com>", "Pitch two");
   const before = telegram.sent.length;
   const offered = await runSequenceDetection(api);
-  assert(offered === 1, `one card for a company with two contacts, got ${offered}`);
-  assert(telegram.sent.length === before + 1, "only one card was posted");
-  const rows = [getSalesSequenceByThread("t-co-1"), getSalesSequenceByThread("t-co-2")];
-  assert(rows.filter(Boolean).length === 1, "only one row exists for the company");
-  const open = rows.find(Boolean)!;
-  const otherThread = open.thread_id === "t-co-1" ? "t-co-2" : "t-co-1";
-  const otherPerson = open.thread_id === "t-co-1" ? "ben@upsilon.com" : "ana@upsilon.com";
-  const refused = await requestSequenceCard(otherPerson, api);
-  assert(refused.startsWith("Not started"), "an explicit request can't open a second one");
-  assert(refused.includes("person or company"), "the refusal says why");
-
+  assert(offered === 2, `a card for each of two contacts at one company, got ${offered}`);
+  assert(telegram.sent.length === before + 2, "two cards were posted");
+  const ana = getSalesSequenceByThread("t-co-1")!;
+  const ben = getSalesSequenceByThread("t-co-2")!;
+  assert(ana.status === "proposed" && ben.status === "proposed", "both colleagues have a row");
   const log = { edits: [] as string[], replies: [] as string[] };
-  await handleSequenceCallback(callbackCtx(`seq:start:${open.id}`, log));
-  assert(getSalesSequenceByThread(open.thread_id)!.status === "active", "the first one starts");
-  assert((await runSequenceDetection(api)) === 0, "no card for a colleague while one is active");
-  assert(getSalesSequenceByThread(otherThread) === undefined, "still no row for the colleague");
+  await handleSequenceCallback(callbackCtx(`seq:start:${ana.id}`, log));
+  await handleSequenceCallback(callbackCtx(`seq:start:${ben.id}`, log));
+  assert(getSalesSequenceByThread("t-co-1")!.status === "active", "the first colleague starts");
+  assert(getSalesSequenceByThread("t-co-2")!.status === "active", "the second colleague starts too");
 }
 {
-  pitch("t-co-3", "Cal <cal@chi.com>", "Pitch");
-  pitch("t-co-4", "Dee <dee@chi.com>", "Pitch");
-  await runSequenceDetection(api);
-  const first = getSalesSequenceByThread("t-co-3") ?? getSalesSequenceByThread("t-co-4");
-  const log = { edits: [] as string[], replies: [] as string[] };
-  await handleSequenceCallback(callbackCtx(`seq:no:${first!.id}`, log));
-  assert((await runSequenceDetection(api)) === 1, "the colleague can be offered once the first is closed");
+  pitch("t-same-1", "Eve <eve@phi.com>", "Pitch one", 2);
+  pitch("t-same-2", "Eve <eve@phi.com>", "Pitch two", 1);
+  assert((await runSequenceDetection(api)) === 1, "one person on two threads gets one card");
+  const rows = [getSalesSequenceByThread("t-same-1"), getSalesSequenceByThread("t-same-2")];
+  assert(rows.filter(Boolean).length === 1, "only one open row for that person");
 }
 {
   pitch("t-free-1", "Ravi <ravi@gmail.com>", "Pitch");
@@ -805,7 +797,7 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
     threadId: "t-dup-a",
     prospectEmail: "dup@sigma.com",
     prospectDomain: "sigma.com",
-    prospectKey: "sigma.com",
+    prospectKey: "dup@sigma.com",
     prospectName: "Dup",
     prospectCompany: "Sigma",
     subject: "A",
@@ -817,9 +809,9 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   });
   const second = createProposedSalesSequence({
     threadId: "t-dup-b",
-    prospectEmail: "other@sigma.com",
+    prospectEmail: "dup@sigma.com",
     prospectDomain: "sigma.com",
-    prospectKey: "sigma.com",
+    prospectKey: "dup@sigma.com",
     prospectName: "Dup",
     prospectCompany: "Sigma",
     subject: "B",
@@ -829,7 +821,22 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
     classifierConfidence: null,
     classifierReason: null,
   });
-  assert(first !== undefined && second === undefined, "the database allows one open sequence per company");
+  const colleague = createProposedSalesSequence({
+    threadId: "t-dup-c",
+    prospectEmail: "other@sigma.com",
+    prospectDomain: "sigma.com",
+    prospectKey: "other@sigma.com",
+    prospectName: "Other",
+    prospectCompany: "Sigma",
+    subject: "C",
+    originalMessageId: "c",
+    originalSentAt: new Date().toISOString(),
+    manualFollowups: 0,
+    classifierConfidence: null,
+    classifierReason: null,
+  });
+  assert(first !== undefined && second === undefined, "the database allows one open sequence per person");
+  assert(colleague !== undefined, "a colleague at the same company gets their own");
 }
 
 // ---- Stage 2 has no send path ----

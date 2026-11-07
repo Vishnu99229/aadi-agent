@@ -63,7 +63,7 @@ import {
   type PitchExclusion,
   type PitchFacts,
 } from "./sequence_logic.js";
-import { nextSendWindow, parseDateHeaderOffset } from "./sequence_rules.js";
+import { resolveProspectTimezone, zoneDisplay } from "./sequence_timezone.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const DETECT_INTERVAL_MS = 30 * 60 * 1000;
@@ -200,7 +200,7 @@ function assessThread(
     threadHasSequence:
       existing !== undefined && !(options.ignoreSequence?.(existing) ?? false),
     prospectHasOpenSequence: (email) => {
-      const open = getOpenSalesSequenceForKey(prospectKey(email, PERSONAL_DOMAINS));
+      const open = getOpenSalesSequenceForKey(prospectKey(email));
       return open !== undefined && !(options.ignoreSequence?.(open) ?? false);
     },
     threadInMeetingFlow:
@@ -263,45 +263,6 @@ export async function ownAddressOf(gmail: gmail_v1.Gmail): Promise<string> {
     throw new Error("Gmail profile did not return an email address.");
   }
   return address;
-}
-
-/** The UTC offset on the newest email this exact person sent Vishnu, on any
- *  thread. Automatic replies are skipped: their Date is the server's, not theirs. */
-export async function readProspectTimezone(
-  gmail: gmail_v1.Gmail,
-  prospectEmail: string,
-): Promise<string | undefined> {
-  const listed = await gmail.users.messages.list({
-    userId: "me",
-    q: `from:${prospectEmail}`,
-    maxResults: 5,
-  });
-  const messages: gmail_v1.Schema$Message[] = [];
-  for (const item of listed.data.messages ?? []) {
-    if (!item.id) {
-      continue;
-    }
-    const response = await gmail.users.messages.get({
-      userId: "me",
-      id: item.id,
-      format: "metadata",
-      metadataHeaders: ["From", "Date", "Auto-Submitted"],
-    });
-    messages.push(response.data);
-  }
-  messages.sort((left, right) => Number(right.internalDate ?? 0) - Number(left.internalDate ?? 0));
-  for (const message of messages) {
-    const from = parseAddressList(messageHeader(message, "From"))[0]?.email;
-    const auto = messageHeader(message, "Auto-Submitted").toLowerCase();
-    if (from !== prospectEmail.trim().toLowerCase() || (auto !== "" && auto !== "no")) {
-      continue;
-    }
-    const offset = parseDateHeaderOffset(messageHeader(message, "Date"));
-    if (offset) {
-      return offset;
-    }
-  }
-  return undefined;
 }
 
 export async function classifySalesPitch(
@@ -473,7 +434,7 @@ export async function runSequenceDetection(api: Api): Promise<number> {
       threadId: row.threadId,
       prospectEmail: row.prospect.email,
       prospectDomain: domain,
-      prospectKey: prospectKey(row.prospect.email, PERSONAL_DOMAINS),
+      prospectKey: prospectKey(row.prospect.email),
       prospectName: row.prospect.name,
       prospectCompany: company,
       subject: row.subject,
@@ -527,16 +488,16 @@ function startedText(
   row: SalesSequenceRecord,
   firstAt: Date,
   manualFollowups: number,
-  timezone?: string,
+  zone?: { zone: string; source: string },
 ): string {
   const scope =
     manualFollowups > 0
       ? `Started follow-ups for ${prospectLabel(row)} ('${row.subject}'): up to ${SEQUENCE_STEPS - manualFollowups} more.`
       : `Started a 4-step sequence for ${prospectLabel(row)} ('${row.subject}').`;
-  if (!nextSendWindow(firstAt, timezone)) {
-    return `${scope} Nothing will go out while their time zone stays ${timezone}: 10:00-17:00 their time never meets 09:00-19:00 IST.${switchedOffNote()}`;
-  }
-  return `${scope} First follow-up goes out at the first send window from ${formatFirstStep(firstAt)}.${switchedOffNote()}`;
+  const where = zone
+    ? ` Their time zone: ${zoneDisplay(zone.zone, zone.source)}. If that's wrong, tell me, e.g. "${row.prospect_name.trim().split(/\s+/)[0] || row.prospect_email} is in New York".`
+    : "";
+  return `${scope} First follow-up goes out Mon-Fri 9am-5pm their time, from ${formatFirstStep(firstAt)} IST.${where}${switchedOffNote()}`;
 }
 
 export async function handleSequenceCallback(ctx: Context): Promise<void> {
@@ -605,17 +566,15 @@ export async function handleSequenceCallback(ctx: Context): Promise<void> {
     return;
   }
   console.log(`Sequence ${id}: status -> active`);
-  let timezone: string | undefined;
+  let zone: { zone: string; source: string } | undefined;
   try {
-    timezone = await readProspectTimezone(liveGmail, row.prospect_email);
-    if (timezone) {
-      setSalesSequenceTimezone(id, timezone);
-    }
+    zone = await resolveProspectTimezone(liveGmail, row);
+    setSalesSequenceTimezone(id, zone.zone, zone.source);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Sequence ${id}: timezone lookup failed (${errorType})`);
+    console.error(`Sequence ${id}: timezone lookup failed (${errorType}); retried before the first send`);
   }
-  await finish(startedText(row, firstAt, assessed.facts.manualFollowups, timezone));
+  await finish(startedText(row, firstAt, assessed.facts.manualFollowups, zone));
 }
 
 function revivable(row: SalesSequenceRecord): boolean {
@@ -697,7 +656,7 @@ export async function requestSequenceCard(
         threadId: chosen.threadId,
         prospectEmail: prospect.email,
         prospectDomain: domain,
-        prospectKey: prospectKey(prospect.email, PERSONAL_DOMAINS),
+        prospectKey: prospectKey(prospect.email),
         prospectName: prospect.name,
         prospectCompany: companyFromDomain(domain, PERSONAL_DOMAINS),
         subject: chosen.subject,
