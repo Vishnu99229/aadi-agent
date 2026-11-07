@@ -26,6 +26,7 @@ import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./followups.js
 import { messageHeader } from "./gmail_attachments.js";
 import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
 import { gmailClient, signatureHtmlFor } from "./google/mail.js";
+import { isSelfEmail } from "./mom_logic.js";
 import { bookResolvedMeeting, freeSlotsText, parseCommandTimes } from "./owner_meeting.js";
 import {
   CommandSendRefusedError,
@@ -219,7 +220,10 @@ export async function writeAndSend(
   const named = new Set([...to, ...cc].map((item) => item.email));
   const leftOff = (thread?.mailboxes ?? []).filter(
     (item) =>
-      !named.has(item.email) && !selfAddresses.has(item.email) && !isAutomatedAddress(item.email),
+      !named.has(item.email) &&
+      !selfAddresses.has(item.email) &&
+      !isSelfEmail(item.email) &&
+      !isAutomatedAddress(item.email),
   );
   if (options.beforeSend && !options.beforeSend()) {
     return { text: "Not sent: it was cancelled.", result: "cancelled" };

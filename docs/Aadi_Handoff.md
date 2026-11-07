@@ -60,7 +60,7 @@ Display names: Haiku 5.5, Claude Sonnet 5.5, DeepSeek Flash, Gemini 3.6 Flash. E
 
 `LLM_PROVIDER` must be `claude` (fail-fast). It does not choose the chat backend; `/model` does.
 
-One override: while `SEND_ON_COMMAND_ENABLED` is on, `handleTextTurn`'s call to `runAgent` passes `backend: "claude"` when `looksLikeCommandTurn` matches his words, so turns that can act with no card run on Sonnet whatever `/model` says. It picks the model and grants nothing. `writeCommandEmail` always uses Sonnet with `noFallback`, at scheduled fire time too.
+One override: while `SEND_ON_COMMAND_ENABLED` is on, `handleUserText`'s call to `runAgent` passes `backend: "claude"` when `looksLikeCommandTurn` matches his words, so turns that can act with no card run on Sonnet whatever `/model` says. It picks the model and grants nothing. `writeCommandEmail` always uses Sonnet with `noFallback`, at scheduled fire time too.
 
 ### Web search tiers (`src/web_search.ts`)
 

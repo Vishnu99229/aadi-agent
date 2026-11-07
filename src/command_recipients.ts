@@ -9,6 +9,7 @@ import {
 import { searchMemories } from "./db.js";
 import { parseAddressList, type ParsedMailbox } from "./followup_logic.js";
 import { messageHeader } from "./gmail_attachments.js";
+import { isSelfEmail } from "./mom_logic.js";
 
 const SEARCH_ROUNDS = 6;
 const SEARCH_RESULTS = 25;
@@ -18,6 +19,12 @@ export type RecipientMatch =
   | { kind: "one"; mailbox: ParsedMailbox }
   | { kind: "none" }
   | { kind: "many"; options: ParsedMailbox[] };
+
+/** The fixed list as well as the looked-up one: the lookup can fail, and an email to
+ *  himself must not be how anyone finds out. */
+function isSelf(email: string, selfAddresses: ReadonlySet<string>): boolean {
+  return selfAddresses.has(email) || isSelfEmail(email);
+}
 
 function fromFound(found: Map<string, string>): RecipientMatch {
   const options = [...found].map(([email, name]) => ({ email, name }));
@@ -82,7 +89,7 @@ async function searchMailHistory(
         for (const mailbox of parseAddressList(messageHeader(message, header))) {
           if (
             mailboxMatches(mailbox, tokens) &&
-            !selfAddresses.has(mailbox.email) &&
+            !isSelf(mailbox.email, selfAddresses) &&
             !isAutomatedAddress(mailbox.email)
           ) {
             note(found, mailbox);
@@ -106,7 +113,7 @@ export async function resolveRecipient(input: {
 }): Promise<RecipientMatch> {
   const typed = addressIn(input.query);
   if (typed) {
-    return input.selfAddresses.has(typed)
+    return isSelf(typed, input.selfAddresses)
       ? { kind: "none" }
       : { kind: "one", mailbox: { email: typed, name: "" } };
   }
@@ -118,7 +125,7 @@ export async function resolveRecipient(input: {
   for (const mailbox of input.threadMailboxes ?? []) {
     if (
       mailboxMatches(mailbox, tokens) &&
-      !input.selfAddresses.has(mailbox.email) &&
+      !isSelf(mailbox.email, input.selfAddresses) &&
       !isAutomatedAddress(mailbox.email)
     ) {
       note(onThread, mailbox);
@@ -136,7 +143,7 @@ export async function resolveRecipient(input: {
       continue;
     }
     for (const email of addressesInMemory(memory.content, tokens)) {
-      if (!input.selfAddresses.has(email)) {
+      if (!isSelf(email, input.selfAddresses)) {
         note(found, { email, name: "" });
       }
     }
