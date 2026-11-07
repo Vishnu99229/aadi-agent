@@ -24,6 +24,7 @@ import {
   setVoiceRepliesEnabled,
   setVoiceReplyTestHooks,
   stripForSpeech,
+  synthesizeSpeech,
   voiceReplyCaption,
   voiceRepliesEnabled,
 } from "../src/voice_reply.ts";
@@ -182,9 +183,78 @@ function stubOkTts(): void {
   assert(plain.sentVoice && !plain.sentText, "plain short: voice only, no text");
   assert(texts.length === 0, "plain short sends no text message");
   assert(
-    captions[0] === "You said: am I free after four",
-    `caption has transcript, got ${captions[0]}`,
+    captions[0] === "You said: am I free after four\n\nSure, you're free after 4.",
+    `caption has the transcript and the reply, got ${captions[0]}`,
   );
+
+  // Markdown is stripped from the caption, as it is from the speech.
+  captions.length = 0;
+  await deliverVoiceTurn({
+    api: fakeApi,
+    chatId: 1,
+    replyText: "**Yes**, you're free.",
+    transcript: "am I free",
+    inboundWasVoice: true,
+    forwarded: false,
+    sendText: async (text) => {
+      texts.push(text);
+    },
+  });
+  assert(captions[0] === "You said: am I free\n\nYes, you're free.", `plain caption, got ${captions[0]}`);
+
+  // At the limit it still fits; one over and the reply follows as a message.
+  const heard = "h".repeat(600);
+  const prefix = "You said: ".length + heard.length + 2;
+  const fits = "y".repeat(TELEGRAM_CAPTION_LIMIT - prefix);
+  assert(fits.length < VOICE_SPEAK_CHAR_CAP, "the reply is short enough to speak");
+  captions.length = 0;
+  texts.length = 0;
+  const exact = await deliverVoiceTurn({
+    api: fakeApi, chatId: 1, replyText: fits, transcript: heard, inboundWasVoice: true, forwarded: false,
+    sendText: async (text) => {
+      texts.push(text);
+    },
+  });
+  assert(captions[0]!.length === TELEGRAM_CAPTION_LIMIT && captions[0]!.endsWith(fits), "exactly at the limit, both are in the caption");
+  assert(exact.sentVoice && !exact.sentText && texts.length === 0, "and no message follows");
+
+  const order: string[] = [];
+  const over = `${fits}y`;
+  captions.length = 0;
+  setVoiceReplyTestHooks({
+    sendVoice: async (_api, _chat, _path, caption) => {
+      captions.push(caption ?? "");
+      order.push("voice");
+    },
+  });
+  const overflow = await deliverVoiceTurn({
+    api: fakeApi, chatId: 1, replyText: over, transcript: heard, inboundWasVoice: true, forwarded: false,
+    sendText: async (text) => {
+      order.push(`text:${text}`);
+    },
+  });
+  assert(captions[0] === `You said: ${heard}`, "over the limit, the caption keeps the transcript");
+  assert(order.join("|") === `voice|text:${over}`, `the voice, then the full reply, got ${order.join("|")}`);
+  assert(overflow.sentVoice && overflow.sentText, "both are reported");
+
+  // If the voice fails, the reply still arrives once.
+  const failedTexts: string[] = [];
+  setVoiceReplyTestHooks({ fetch: async () => new Response("nope", { status: 500 }) });
+  const voiceFailed = await deliverVoiceTurn({
+    api: fakeApi, chatId: 1, replyText: over, transcript: heard, inboundWasVoice: true, forwarded: false,
+    sendText: async (text) => {
+      failedTexts.push(text);
+    },
+  });
+  assert(!voiceFailed.sentVoice && failedTexts.length === 1 && failedTexts[0] === over, "no voice: the text arrives once");
+  setVoiceReplyTestHooks({
+    fetch: async () => new Response(JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }), { status: 200 }),
+    sendVoice: async (_api, _chat, _path, caption) => {
+      captions.push(caption ?? "");
+      spoken.push("voice");
+    },
+  });
+  texts.length = 0;
 
   captions.length = 0;
   spoken.length = 0;
@@ -391,4 +461,23 @@ function stubOkTts(): void {
 }
 
 assert(voiceRepliesEnabled() === false || true, "toggle helper reachable");
+{
+  // The voices: English is Ashwin, energetic; Hindi and Malayalam unchanged.
+  const bodies: Array<Record<string, unknown>> = [];
+  setVoiceReplyTestHooks({
+    fetch: async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }), { status: 200 });
+    },
+  });
+  for (const lang of ["en", "hi", "ml"] as const) {
+    await synthesizeSpeech("hello", lang);
+  }
+  const voice = (index: number) => `${bodies[index]!.model} ${bodies[index]!.speaker} ${bodies[index]!.language_code} ${bodies[index]!.pace}`;
+  assert(voice(0) === "bulbul:v4-flash ashwin_en_sports_energetic en-IN 1", `English voice, got ${voice(0)}`);
+  assert(voice(1) === "bulbul:v4-flash shubh_hi_customer hi-IN 1", `Hindi voice, got ${voice(1)}`);
+  assert(voice(2) === "bulbul:v3 shubh ml-IN 1", `Malayalam voice, got ${voice(2)}`);
+  console.log("voices: ok");
+}
+
 console.log("test-voice-reply: all passed");

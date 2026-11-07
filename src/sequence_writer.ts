@@ -2,7 +2,7 @@ import type { gmail_v1 } from "googleapis";
 import { accountMatchesEmail } from "./account_logic.js";
 import { decodedAccounts } from "./accounts.js";
 import { queueDraftApproval } from "./approvals.js";
-import { apiEffortForTask, getTaskBackend } from "./chat_backend.js";
+import { apiEffortForTask, getTaskBackend, type ChatBackend } from "./chat_backend.js";
 import {
   getSalesSequence,
   getSalesSequenceStep,
@@ -27,7 +27,6 @@ import { config } from "./config.js";
 import { complete, completeBackground } from "./llm.js";
 import { freeSlotsForOffer } from "./meeting_book.js";
 import { formatOfferSlot } from "./meeting_slots.js";
-import { modelIdForDraftingBackend } from "./shadow_inbox.js";
 import { approvedFactsText, salesFactsStatus, type SalesFacts } from "./sales_facts.js";
 import {
   CHECK_LABELS,
@@ -343,6 +342,22 @@ export function writerInput(input: {
     `<<<UNTRUSTED_ORIGINAL_THREAD>>>\n${input.context.threadBlock}\n<<<END_UNTRUSTED_ORIGINAL_THREAD>>>`,
     `<<<UNTRUSTED_BACKGROUND>>>\n${input.context.background}\n<<<END_UNTRUSTED_BACKGROUND>>>`,
   ].join("\n\n");
+}
+
+function modelIdForDraftingBackend(backend: ChatBackend): string {
+  if (backend === "haiku") {
+    return config.backgroundModel;
+  }
+  if (backend === "claude") {
+    return config.claudeModel;
+  }
+  if (backend === "gemini") {
+    return config.geminiModel;
+  }
+  if (backend === "deepseek") {
+    return config.deepseekModel;
+  }
+  return backend;
 }
 
 async function writeDraft(input: {

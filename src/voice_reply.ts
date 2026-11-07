@@ -1,6 +1,7 @@
 /**
  * Spoken replies for non-forwarded owner voice notes.
- * Plain short answers: voice only (transcript as caption).
+ * Plain short answers: voice only, with the transcript and the reply as its caption.
+ * If those don't fit in a caption, the full reply follows as a message.
  * Cards / links / long replies: text first, then a short voice pointer.
  * TTS failure never leaves silence — text is sent instead.
  */
@@ -37,7 +38,7 @@ export interface VoicePersona {
 export const VOICE_PERSONAS: Record<VoiceReplyLang, VoicePersona> = {
   en: {
     model: "bulbul:v4-flash",
-    speaker: "shubh_en_narration_gentle",
+    speaker: "ashwin_en_sports_energetic",
     language_code: "en-IN",
     pace: TTS_PACE,
   },
@@ -61,8 +62,10 @@ export interface VoiceDeliveryPlan {
   mode: VoiceDeliveryMode;
   /** Text to synthesize, if any. */
   spoken: string;
-  /** sendVoice caption (You said: …), if any. */
+  /** sendVoice caption: You said: … and, when it fits, the reply. */
   caption: string;
+  /** The reply didn't fit in the caption, so it follows as a message. */
+  followWithText?: boolean;
 }
 
 type TtsFetch = typeof fetch;
@@ -214,6 +217,12 @@ export function voiceReplyCaption(transcript: string): string {
   return `${prefix}${body.slice(0, budget - 1)}…`;
 }
 
+/** The transcript, then the reply underneath. Undefined when both won't fit. */
+export function voiceCaptionWithReply(transcript: string, spoken: string): string | undefined {
+  const both = `${voiceReplyCaption(transcript)}\n\n${spoken}`;
+  return both.length <= TELEGRAM_CAPTION_LIMIT ? both : undefined;
+}
+
 /**
  * Decide how to deliver a reply for a voice-in turn.
  * History storage is the caller's job (runAgent) — this only plans Telegram I/O.
@@ -240,7 +249,10 @@ export function planVoiceDelivery(input: {
   if (!spoken) {
     return empty;
   }
-  return { mode: "voice_only", spoken, caption };
+  const withReply = voiceCaptionWithReply(input.transcript, spoken);
+  return withReply
+    ? { mode: "voice_only", spoken, caption: withReply }
+    : { mode: "voice_only", spoken, caption, followWithText: true };
 }
 
 interface SarvamTtsResponse {
@@ -376,6 +388,10 @@ export async function deliverVoiceTurn(input: {
       sourceText: input.transcript,
     });
     if (voice === "sent") {
+      if (plan.followWithText) {
+        await input.sendText(input.replyText);
+        return { mode: "voice_only", sentText: true, sentVoice: true };
+      }
       return { mode: "voice_only", sentText: false, sentVoice: true };
     }
     // Never silence: fall back to the full text reply.

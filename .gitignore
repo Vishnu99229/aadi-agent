@@ -16,5 +16,5 @@ VERSION
 .aadi-pr.json
 .aider*
 .claude/worktrees/
-# Local-only shadow retrospective comparisons (never commit or copy off-machine).
+# Local-only files (never commit or copy off-machine).
 local/

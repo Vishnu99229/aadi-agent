@@ -19,7 +19,6 @@ export const USAGE_TASKS = [
   "memory_extraction",
   "classification",
   "embedding",
-  "shadow",
   "sequence",
   "sequence_check",
   "command_send",

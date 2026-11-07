@@ -383,16 +383,6 @@ const embedDailyTokenCap = parsePositiveNumber(
   200_000,
   "EMBED_DAILY_TOKEN_CAP",
 );
-const shadowDailyTokenCap = parsePositiveNumber(
-  process.env.SHADOW_DAILY_TOKEN_CAP,
-  300_000,
-  "SHADOW_DAILY_TOKEN_CAP",
-);
-const shadowRetroTokenCap = parsePositiveNumber(
-  process.env.SHADOW_RETRO_TOKEN_CAP,
-  2_000_000,
-  "SHADOW_RETRO_TOKEN_CAP",
-);
 
 export interface ModelCostRates {
   inputCostPerMillion: number;
@@ -574,6 +564,4 @@ export const config = {
   webSearchProvider,
   webSearchDailyCap,
   embedDailyTokenCap,
-  shadowDailyTokenCap,
-  shadowRetroTokenCap,
 } as const;

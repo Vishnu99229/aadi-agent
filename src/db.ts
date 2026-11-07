@@ -744,37 +744,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_processed_messages_at
     ON processed_messages (processed_at);
 
-  CREATE TABLE IF NOT EXISTS shadow_replies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT NOT NULL,
-    thread_id TEXT NOT NULL,
-    received_at TEXT NOT NULL,
-    sender_domain TEXT NOT NULL DEFAULT '',
-    category TEXT NOT NULL DEFAULT 'other',
-    needs_reply INTEGER NOT NULL DEFAULT 0,
-    send_confidence REAL NOT NULL DEFAULT 0,
-    draft TEXT NOT NULL DEFAULT '',
-    would_book TEXT,
-    reason TEXT NOT NULL DEFAULT '',
-    model TEXT NOT NULL DEFAULT '',
-    actual_reply TEXT,
-    actual_replied_at TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (message_id)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_shadow_replies_created
-    ON shadow_replies (created_at);
-  CREATE INDEX IF NOT EXISTS idx_shadow_replies_received
-    ON shadow_replies (received_at);
-
-  CREATE TABLE IF NOT EXISTS shadow_skip_counts (
-    ymd TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (ymd, reason)
-  );
-
   CREATE TABLE IF NOT EXISTS chat_turns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -846,6 +815,13 @@ if (!tableHasColumn("tasks", "promise_context")) {
 if (!tableHasColumn("tasks", "deadline")) {
   db.exec(`ALTER TABLE tasks ADD COLUMN deadline TEXT`);
 }
+
+// Shadow mode was removed. Its tables and job record go with it.
+db.exec(`
+  DROP TABLE IF EXISTS shadow_replies;
+  DROP TABLE IF EXISTS shadow_skip_counts;
+  DELETE FROM job_runs WHERE name = 'shadow-evening';
+`);
 if (!tableHasColumn("tasks", "recipient")) {
   db.exec(`ALTER TABLE tasks ADD COLUMN recipient TEXT`);
 }
@@ -4279,150 +4255,6 @@ export function recoverStuckJobSteps(olderThanMs: number, now = Date.now()): num
     )
     .run(cutoff);
   return result.changes;
-}
-
-export type ShadowReplyRecord = {
-  id: number;
-  message_id: string;
-  thread_id: string;
-  received_at: string;
-  sender_domain: string;
-  category: string;
-  needs_reply: number;
-  send_confidence: number;
-  draft: string;
-  would_book: string | null;
-  reason: string;
-  model: string;
-  actual_reply: string | null;
-  actual_replied_at: string | null;
-  created_at: string;
-};
-
-export function insertShadowReply(input: {
-  messageId: string;
-  threadId: string;
-  receivedAt: string;
-  senderDomain: string;
-  category: string;
-  needsReply: boolean;
-  sendConfidence: number;
-  draft: string;
-  wouldBook: string | null;
-  reason: string;
-  model: string;
-  actualReply?: string | null;
-  actualRepliedAt?: string | null;
-}): ShadowReplyRecord | undefined {
-  const result = db
-    .prepare(
-      `INSERT OR IGNORE INTO shadow_replies (
-         message_id, thread_id, received_at, sender_domain, category,
-         needs_reply, send_confidence, draft, would_book, reason, model,
-         actual_reply, actual_replied_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      input.messageId,
-      input.threadId,
-      input.receivedAt,
-      input.senderDomain,
-      input.category,
-      input.needsReply ? 1 : 0,
-      input.sendConfidence,
-      input.draft,
-      input.wouldBook,
-      input.reason,
-      input.model,
-      input.actualReply ?? null,
-      input.actualRepliedAt ?? null,
-    );
-  if (result.changes === 0) {
-    return undefined;
-  }
-  return getShadowReplyByMessageId(input.messageId);
-}
-
-export function getShadowReplyByMessageId(
-  messageId: string,
-): ShadowReplyRecord | undefined {
-  return db
-    .prepare(`SELECT * FROM shadow_replies WHERE message_id = ?`)
-    .get(messageId) as ShadowReplyRecord | undefined;
-}
-
-export function updateShadowReplyActual(
-  messageId: string,
-  actualReply: string | null,
-  actualRepliedAt: string | null,
-): void {
-  db.prepare(
-    `UPDATE shadow_replies
-     SET actual_reply = ?, actual_replied_at = ?
-     WHERE message_id = ?`,
-  ).run(actualReply, actualRepliedAt, messageId);
-}
-
-export function listShadowRepliesSince(iso: string): ShadowReplyRecord[] {
-  return db
-    .prepare(
-      `SELECT * FROM shadow_replies
-       WHERE received_at >= ?
-       ORDER BY received_at ASC`,
-    )
-    .all(iso) as ShadowReplyRecord[];
-}
-
-export function listShadowRepliesCreatedSince(iso: string): ShadowReplyRecord[] {
-  return db
-    .prepare(
-      `SELECT * FROM shadow_replies
-       WHERE created_at >= ?
-       ORDER BY created_at ASC`,
-    )
-    .all(iso) as ShadowReplyRecord[];
-}
-
-export function deleteExpiredShadowReplies(days = 30): number {
-  return db
-    .prepare(
-      `DELETE FROM shadow_replies
-       WHERE created_at <= datetime('now', ?)`,
-    )
-    .run(`-${Math.max(1, Math.floor(days))} days`).changes;
-}
-
-export function incrementShadowSkip(ymd: string, reason: string): void {
-  db.prepare(
-    `INSERT INTO shadow_skip_counts (ymd, reason, count) VALUES (?, ?, 1)
-     ON CONFLICT(ymd, reason) DO UPDATE SET count = count + 1`,
-  ).run(ymd, reason);
-}
-
-export function listShadowSkipCounts(
-  ymd: string,
-): Array<{ reason: string; count: number }> {
-  return db
-    .prepare(
-      `SELECT reason, count FROM shadow_skip_counts
-       WHERE ymd = ?
-       ORDER BY reason ASC`,
-    )
-    .all(ymd) as Array<{ reason: string; count: number }>;
-}
-
-export function listShadowSkipCountsBetween(
-  fromYmd: string,
-  toYmd: string,
-): Array<{ reason: string; count: number }> {
-  return db
-    .prepare(
-      `SELECT reason, SUM(count) AS count FROM shadow_skip_counts
-       WHERE ymd >= ? AND ymd <= ?
-       GROUP BY reason
-       ORDER BY reason ASC`,
-    )
-    .all(fromYmd, toYmd) as Array<{ reason: string; count: number }>;
 }
 
 export type SalesSequenceStatus = "proposed" | "active" | "stopped" | "completed";
