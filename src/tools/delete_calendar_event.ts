@@ -1,3 +1,5 @@
+import { notAnEventCommand } from "../command_logic.js";
+import { config } from "../config.js";
 import type { LlmTool } from "../llm.js";
 import { deleteOwnerCalendarEvent } from "../owner_calendar.js";
 import type { ToolTurn } from "./index.js";
@@ -25,6 +27,10 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
 };
 
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
+  const reason = config.sendOnCommandEnabled ? notAnEventCommand(turn.userText ?? "") : undefined;
+  if (reason) {
+    return `Not deleted: ${reason}. Ask him if he wants it deleted now.`;
+  }
   const values = (input ?? {}) as {
     event_title?: unknown;
     date?: unknown;

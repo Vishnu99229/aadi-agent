@@ -472,6 +472,11 @@ export async function sendCreatedDraftNow(params: {
   googleAccount: GoogleAccountId;
   confirmation: SendConfirmation | undefined;
 }): Promise<{ ok: true } | { ok: false; reason: "not_approved" | "send_failed" }> {
+  // While send_email is on it is the only no-tap path, so its recipient check can't
+  // be bypassed. The draft tools fall through to their Send card.
+  if (config.sendOnCommandEnabled) {
+    return { ok: false, reason: "not_approved" };
+  }
   try {
     allowOwnerChatSendDraft(params.confirmation);
   } catch {

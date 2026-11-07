@@ -101,6 +101,24 @@ export function allowOwnerChatDeleteEvent(confirmation: {
   requireOwnerChatConfirmation(confirmation);
 }
 
+/** Vishnu's own chat/voice turn is the approval for move_event.
+ *  Never call this from inbound email handling. */
+export function allowOwnerChatMoveEvent(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
+/** cancel_scheduled_send runs only on Vishnu's own chat/voice turn. A forwarded
+ *  message or an email can't cancel what he scheduled. */
+export function allowOwnerChatCancelScheduledSend(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
 /** start_sequence runs only on Vishnu's own chat/voice turn. It shows a Start
  *  card and enrols nothing. Never call this from inbound email handling. */
 export function allowOwnerChatStartSequence(confirmation: {
@@ -126,6 +144,22 @@ export function allowOwnerChatAddAttendee(confirmation: {
   messageId: number;
 } | undefined): void {
   requireOwnerChatConfirmation(confirmation);
+}
+
+/** Vishnu's own chat or voice turn, or his tap on an address Aadi offered, is the
+ *  approval for send_email. Never call this from inbound email handling. */
+export function allowOwnerChatCommandSend(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  if (
+    !confirmation ||
+    !Number.isSafeInteger(confirmation.chatId) ||
+    !Number.isSafeInteger(confirmation.messageId) ||
+    confirmation.messageId <= 0
+  ) {
+    throw new SendNotApprovedError();
+  }
 }
 
 /** Vishnu's own chat/voice turn is the approval for send_immediately on

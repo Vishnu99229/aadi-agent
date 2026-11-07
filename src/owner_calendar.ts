@@ -4,6 +4,7 @@ import { istInclusiveRange } from "./tools/list_events.js";
 import {
   allowOwnerChatAddAttendee,
   allowOwnerChatDeleteEvent,
+  allowOwnerChatMoveEvent,
 } from "./security/send_approval.js";
 import { assertTestSeam } from "./test_seam.js";
 
@@ -14,6 +15,8 @@ export interface OwnerCalendarEvent {
   eventId: string;
   title: string;
   start: string;
+  /** Empty when the list didn't give one. */
+  end?: string;
   attendeeCount: number;
 }
 
@@ -24,6 +27,7 @@ interface OwnerCalendarHooks {
     accountId?: GoogleAccountId;
   }) => Promise<OwnerCalendarEvent[]>;
   delete?: (event: OwnerCalendarEvent) => Promise<void>;
+  move?: (event: OwnerCalendarEvent, startIso: string, endIso: string) => Promise<void>;
   getAttendees?: (
     event: OwnerCalendarEvent,
   ) => Promise<Array<{ email?: string | null }> | null | undefined>;
@@ -144,6 +148,7 @@ async function listMatchingEvents(
         eventId: event.id,
         title: summary,
         start: startOfEvent(event),
+        end: event.end?.dateTime ?? event.end?.date ?? "",
         attendeeCount: attendees.length,
       });
     }
@@ -408,4 +413,101 @@ export async function addOwnerCalendarAttendee(input: {
   }
   console.log(`add_calendar_attendee: patched eventId=${event.eventId}`);
   return `Added ${email} to ${event.title}.`;
+}
+
+async function moveEvent(event: OwnerCalendarEvent, startIso: string, endIso: string): Promise<void> {
+  if (testHooks.move) {
+    await testHooks.move(event, startIso, endIso);
+    return;
+  }
+  const accounts = await loadGoogleAccounts();
+  const account = accounts.find((item) => item.id === event.accountId);
+  if (!account) {
+    throw new Error(`No ${event.accountId} Google account is connected.`);
+  }
+  const calendar = google.calendar({ version: "v3", auth: account.client });
+  await calendar.events.patch({
+    calendarId: "primary",
+    eventId: event.eventId,
+    sendUpdates: event.attendeeCount > 0 ? "all" : "none",
+    requestBody: {
+      start: { dateTime: startIso, timeZone: TIME_ZONE },
+      end: { dateTime: endIso, timeZone: TIME_ZONE },
+    },
+  });
+}
+
+/** Moves one matched event, keeping its length unless he gave an end. */
+export async function moveOwnerCalendarEvent(input: {
+  eventTitle: string;
+  date?: string;
+  newStart: string;
+  newEnd?: string;
+  confirmation: { chatId: number; messageId: number } | undefined;
+  now?: Date;
+}): Promise<string> {
+  try {
+    allowOwnerChatMoveEvent(input.confirmation);
+  } catch {
+    return "Not moved: only Vishnu's own message can move a calendar event.";
+  }
+  const title = input.eventTitle.trim();
+  if (!title) {
+    return "Not moved: I need the event title.";
+  }
+  if (input.date && !/^\d{4}-\d{2}-\d{2}$/.test(input.date)) {
+    return "Not moved: date must be YYYY-MM-DD.";
+  }
+  const newStart = new Date(input.newStart);
+  if (!Number.isFinite(newStart.getTime())) {
+    return "Not moved: new_start must be ISO 8601 with a +05:30 offset.";
+  }
+  if (newStart.getTime() < (input.now ?? new Date()).getTime() - 5 * 60 * 1000) {
+    return "Not moved: that time has already passed.";
+  }
+  let matches: OwnerCalendarEvent[];
+  try {
+    matches = await listMatchingEvents(title, input.date);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`move_event: list failed (${errorType})`);
+    return "Not moved: I could not search the calendars. Try again.";
+  }
+  if (matches.length === 0) {
+    return `Not moved: no matching event named "${title}".`;
+  }
+  if (matches.length > 1) {
+    const lines = matches.map((event, index) => formatMatch(event, index));
+    return `Not moved: several matches — which one?\n${lines.join("\n")}`;
+  }
+  const event = matches[0]!;
+  if (!event.start.includes("T")) {
+    return `Not moved: ${event.title} is an all-day event, so move it in Google Calendar.`;
+  }
+  const lengthMs = new Date(event.end ?? "").getTime() - new Date(event.start).getTime();
+  const newEnd = input.newEnd ? new Date(input.newEnd) : new Date(newStart.getTime() + lengthMs);
+  if (!Number.isFinite(newEnd.getTime()) || newEnd.getTime() <= newStart.getTime()) {
+    return "Not moved: I couldn't work out when it should end. Ask Vishnu for the end time.";
+  }
+  try {
+    await moveEvent(event, newStart.toISOString(), newEnd.toISOString());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/403|insufficient/i.test(message) && event.accountId === "personal") {
+      return "Not moved: the personal calendar is read-only. Move it in Google Calendar, or add calendar.events to personal (needs re-auth).";
+    }
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`move_event: patch failed (${errorType})`);
+    return "Not moved: Google Calendar refused it. Nothing was changed.";
+  }
+  const clock = new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIME_ZONE,
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(newStart);
+  return `Moved ${event.title} to ${clock} IST.${event.attendeeCount > 0 ? " Attendees were told." : ""}`;
 }

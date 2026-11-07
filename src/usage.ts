@@ -22,6 +22,7 @@ export const USAGE_TASKS = [
   "shadow",
   "sequence",
   "sequence_check",
+  "command_send",
   "tts",
   "other",
 ] as const;

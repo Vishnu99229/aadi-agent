@@ -1,3 +1,5 @@
+import { resolveCommandAttendee } from "../command_email.js";
+import { config } from "../config.js";
 import type { LlmTool } from "../llm.js";
 import { addOwnerCalendarAttendee } from "../owner_calendar.js";
 import type { ToolTurn } from "./index.js";
@@ -36,8 +38,19 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   };
   const eventTitle =
     typeof values.event_title === "string" ? values.event_title : "";
-  const attendeeEmail =
+  let attendeeEmail =
     typeof values.attendee_email === "string" ? values.attendee_email : "";
+  // The invite takes the same path as email while this is on.
+  if (config.sendOnCommandEnabled) {
+    if (!turn.confirmation) {
+      return "Not added: only Vishnu's own message can add a calendar attendee.";
+    }
+    const resolved = await resolveCommandAttendee(attendeeEmail, turn.userText ?? "");
+    if ("refused" in resolved) {
+      return resolved.refused;
+    }
+    attendeeEmail = resolved.email;
+  }
   try {
     return await addOwnerCalendarAttendee({
       eventTitle,

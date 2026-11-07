@@ -20,7 +20,7 @@ Aadi is Vishnu’s personal Telegram agent. One process, one owner, one SQLite f
 ### Agent loop (`src/agent.ts`)
 
 1. Load system prompt, memories, and conversation history (`historyForAgent`: last **80** `messages` rows, then fold; see Conversation history).
-2. Call `complete()` with **all** `TOOL_ORDER` function tools. Chat backend comes from `/model` (`getTaskBackend`) unless the caller passed one.
+2. Call `complete()` with `defaultToolNames` (every `TOOL_ORDER` tool; `SEND_ON_COMMAND_ENABLED` swaps `create_meeting` for `send_email`, `create_event`, `book_meeting`, `move_event` and `cancel_scheduled_send`). Chat backend comes from `/model` (`getTaskBackend`) unless the caller passed one.
 3. If `stopReason === "tool_use"`, run **client** tools in `src/tools/*`. Provider-side tools are not used on the default path.
 4. Guards before accepting a final reply:
    - **Calendar:** if the user asked about schedule and `list_events` was not called, force it once.
@@ -59,6 +59,8 @@ Persisted in SQLite setting `llm_task_backends` (and effort in `llm_task_efforts
 Display names: Haiku 5.5, Claude Sonnet 5.5, DeepSeek Flash, Gemini 3.6 Flash. Effort (`low` / `medium` / `high`) applies only to Haiku and Sonnet. Code model ids: `CLAUDE_MODEL`, `BACKGROUND_MODEL` (default `claude-haiku-5-5`), `DEEPSEEK_MODEL` (default `deepseek-flash`), `GEMINI_MODEL` (default `gemini-3.6-flash`).
 
 `LLM_PROVIDER` must be `claude` (fail-fast). It does not choose the chat backend; `/model` does.
+
+One override: while `SEND_ON_COMMAND_ENABLED` is on, `handleUserText`'s call to `runAgent` passes `backend: "claude"` when `looksLikeCommandTurn` matches his words, so turns that can act with no card run on Sonnet whatever `/model` says. It picks the model and grants nothing. `writeCommandEmail` always uses Sonnet with `noFallback`, at scheduled fire time too.
 
 ### Web search tiers (`src/web_search.ts`)
 
@@ -116,6 +118,7 @@ Gates in one line: **owner lock** = ignore anyone except `OWNER_TELEGRAM_ID`. **
 | `/health` | Version, turns, LLM credit flags, heartbeat, last-success per job | Owner lock |
 | `/meetings` | Auto-handled meeting threads | Owner lock |
 | `/sequence <who>` | Offer a follow-up sequence: shows the Start card only (`handleSequenceCommand`, `requestSequenceCard`) | Owner lock; refuses forwarded; enrols only on tapping Start |
+| `/scheduledsends` | Emails scheduled to send later, with a Cancel button each (`handleScheduledSendsCommand`, `handleScheduledSendCallback`) | Owner lock; refuses forwarded |
 | `/sequences` | Active sequences with step, next send time and a Stop button each (`handleSequencesCommand`, `handleSequenceStopCallback`) | Owner lock; refuses forwarded |
 | `/cost` | Token cost report | Owner lock |
 | `/accounts` | Deal list | Owner lock |
@@ -134,16 +137,21 @@ Reading / searching / drafting is free. Side effects:
 | Tool / flow | Gate |
 | --- | --- |
 | `search_emails`, `read_email`, `list_events`, `read_document`, `search_drive`, `web_search`, lists of tasks/bills/dates/notes/QA | Read-only |
-| `draft_reply`, `draft_new_email` | Default: Send / Edit / Discard card (`pending_actions`). **Exception:** `send_immediately: true` on Vishnu’s own chat/voice turn (`sendConfirmation` present) — `allowOwnerChatSendDraft`. Never from email body text |
+| `draft_reply`, `draft_new_email` | Default: Send / Edit / Discard card (`pending_actions`). **Exception:** `send_immediately: true` on Vishnu’s own chat/voice turn (`sendConfirmation` present) — `allowOwnerChatSendDraft`. Never from email body text | While `SEND_ON_COMMAND_ENABLED` is on, `sendCreatedDraftNow` refuses, so `send_immediately` makes a Send card
 | `confirm_send_pending_draft` | Vishnu’s chat confirmation of a listed draft; still goes through `performDraftSend` |
 | `propose_calendar_event` | Create Event approval card |
-| `create_meeting` | Owner chat/voice is the approval (`allowOwnerChatCreateEvent`); work calendar + Meet; never from email text |
-| `delete_calendar_event` | Owner chat/voice (`allowOwnerChatDeleteEvent`); never from email text |
-| `add_calendar_attendee` | Owner chat/voice (`allowOwnerChatAddAttendee`); `sendUpdates=all`; never from email text |
+| `create_meeting` | Owner chat/voice is the approval (`allowOwnerChatCreateEvent`); work calendar + Meet; never from email text. While `SEND_ON_COMMAND_ENABLED` is on it refuses, and `book_meeting` takes over |
+| `delete_calendar_event` | Owner chat/voice (`allowOwnerChatDeleteEvent`); never from email text. While `SEND_ON_COMMAND_ENABLED` is on, `notAnEventCommand` also applies |
+| `add_calendar_attendee` | Owner chat/voice (`allowOwnerChatAddAttendee`); `sendUpdates=all`; never from email text. While `SEND_ON_COMMAND_ENABLED` is on, the attendee goes through `resolveCommandAttendee`: in his own words, exactly one address |
 | `draft_mom` | New work email, still Send / Edit / Discard |
 | `start_sequence` | Owner chat/voice (`allowOwnerChatStartSequence`) plus a clear phrase (`isExplicitSequenceRequest`). Only shows the Start card. Not in `FORWARDED_TOOLS` |
 | `stop_sequence` | Owner chat/voice (`allowOwnerChatStopSequence`). `matchSequencesForStop` by name, company, address or "all"; asks first when more than one matches; the result says exactly what stopped. Not in `FORWARDED_TOOLS` |
 | Sequence follow-up email (`sendSequenceStep`, `src/security/sequence_send.ts`) | **No tap per email**, a deliberate exception: Vishnu taps Start once. `evaluateSequenceSendGate`: `SEQUENCES_ENABLED`; `salesFactsStatus` ready (no TODO markers); work account and work sender; recipient exactly the enrolled `prospect_email`; no Cc or Bcc; never `blockedAutoSendDomains` (partner, end client, `epicode.in`), self or do-not-contact; `SEQUENCE_TEST_RECIPIENTS` when set; one open sequence per company; manual bumps count toward the 4; body is the stored draft that passed `checkDraftDeterministic` and the Sonnet second check; live Message-ID present; Mon-Fri 10:00-17:00 in the prospect's zone and 09:00-19:00 IST (`inSendWindow`; -03:30 and further west never overlap, so those sequences hold and `/sequences` says so); `SEQUENCE_DAILY_SEND_CAP`; `SEQUENCE_MIN_SPACING_MINUTES`. `claimSalesStepSending` runs before the Gmail call, so a crash can't double-send. `scripts/test-security.ts` allows `messages.send` in exactly this file and `auto_book.ts`; `scripts/test-sequence-send.ts` covers the gate |
+| Email on command (`send_email` → `sendCommandEmail`, `src/security/command_send.ts`) | **No tap and no content check**, a deliberate exception, and only with `SEND_ON_COMMAND_ENABLED`. Fires on Vishnu's own chat or voice turn (`allowOwnerChatCommandSend`); not in `FORWARDED_TOOLS`. `notASendCommand` refuses "draft", "write", "prepare", "remind me", "don't send" and similar; "reply to X" sends. Each recipient must be in his own words (`namedInOwnWords`), or be an address Aadi offered him, then `resolveRecipient` must find exactly one address on the thread, in his mail, or in a memory he gave or confirmed; zero or several asks, by buttons when several. `evaluateCommandSendGate` allows only those addresses, and no email that mentions an attachment. `claimCommandSend` runs before the Gmail call, keyed on the command, so a retry can't double-send. While the toggle is on, `sendCreatedDraftNow` refuses, so `send_immediately` makes a Send card. Written by `writeCommandEmail`, Sonnet only, no fallback; card and account numbers are stripped from its input |
+| Calendar on command (`create_event`, `move_event`, `delete_calendar_event`) | **No tap**, only with `SEND_ON_COMMAND_ENABLED`, on Vishnu's own chat or voice turn; not in `FORWARDED_TOOLS`. `createOwnerCalendarEvent` invites nobody. `moveOwnerCalendarEvent` tells existing attendees. `notAnEventCommand` refuses "don't", "should I", "remind me to", "propose" and similar. Off: `create_event` and `move_event` are hidden and refuse |
+| Meeting on command (`book_meeting` → `bookResolvedMeeting`, `createCommandEvent`) | **No tap**, only with `SEND_ON_COMMAND_ENABLED`. The invite takes the email path: `recipientSlots` needs each attendee in his own words, `resolveRecipient` needs exactly one address, zero or several asks. `evaluateCommandEventGate` then `claimCommandSend` then `events.insert`, so a repeat can't invite twice. A clash is a warning in the reply, not a stop. While on, `create_meeting` refuses and `add_calendar_attendee` resolves through `resolveCommandAttendee` |
+| `cancel_scheduled_send` | Owner chat/voice (`allowOwnerChatCancelScheduledSend`), through `cancelScheduledSendFromTool`. By name, address, subject or "all"; asks first when more than one matches. Closes the task too. Not in `FORWARDED_TOOLS` |
+| Scheduled email on command (`send_email` with `send_on` → `fireScheduledSend`) | Same checks as sending now, on Vishnu's own turn. `createScheduledSend` saves the row and a normal task together; `recheckRecipients` looks the recipients up again at fire time and `holdScheduledSend` holds and asks if they changed. `claimScheduledSend` runs after writing, right before `sendCommandEmail`, and needs the task open, so a cancel by any route stops it. A step stuck in `sending` is reported and never resent. Cancel: `cancel_scheduled_send`, the Cancel button or `/scheduledsends`, or closing the task. Off: nothing fires |
 | Blocked sequence step | Normal Send / Edit / Discard card (`blockStep`, `queueDraftApproval`), same `allowSendDraft` gate. Send continues (`resolveBlockedSalesStep`), Discard stops. The card doesn't expire while the step waits, but chat "send it" can't reach it after 3h. Step 3 also comes here when fewer than 2 offered times fall in 08:00-20:00 their time (`slotsInProspectDay`, reason `slots_off_hours`). `setDraftRefresher(refreshSequenceDraftSlots)` rebuilds Aadi's time lines before Send and Edit unless he changed or removed one; if it can't get real times, nothing is sent. `retireSequenceDraftCard` expires the card when the sequence stops |
 | Auto-scheduling email (`sendSchedulingEmail`) | **No tap** for a lone prospect. Only the three fixed templates (proposal / clarify / confirm) with a validated opening line. `autoSendBlockedParty` blocks the three automatic paths when the sender, reply From, or a non-self attendee/Cc is a partner domain or `epicode.in`: first proposal (`processInboundMeetingMessage`) becomes the not-replying card; a reply (`processReplyOnProposal`) is handed over; a delayed confirm (`processDuePendingBookings`) is not sent and the private calendar event is left in place. `handleMeetingBookCallback` ("Actually, offer slots") and `sendCreatedDraftNow` (send-it) are not blocked |
 | Auto-book from Epicode inbox | Prospects only (`AUTO_HANDLE_SENDER_TYPES`). Confidence `AUTO_BOOK_MIN_CONFIDENCE`, daily caps (`AUTO_BOOK_DAILY_CAP`, `AUTO_SEND_DAILY_CAP`); template body must match. Domain block is `blockedAutoSendDomains`: `PARTNER_DOMAINS`, `email_domains` on partner and end-client accounts, and `epicode.in`. `scripts/test-security.ts` forges From/Cc; `scripts/test-stage12.ts` covers the partner guard |
@@ -165,6 +173,7 @@ Self-scheduling `setTimeout`, Asia/Kolkata. Last success in `job_runs`. Catch-up
 | `weekly-review` | `WEEKLY_REVIEW_TIME` default 19:00 Sundays | Telegram only |
 | `weekly-backup` | Sundays 21:00 | Encrypted file to Telegram if `BACKUP_PASSWORD` set |
 | `sequence-detect` | every 30 min when `SEQUENCES_ENABLED` | `runSequenceDetection`: offers a Start card only, creates no active sequence |
+| `scheduled-send` | every minute when `SEND_ON_COMMAND_ENABLED` | `runScheduledSendTick`: closed tasks cancel, stuck sends are reported, due sends go out, written fresh on Sonnet. Late ones fire when the phone is back |
 | `sequence-send` | every 5 min when `SEQUENCES_ENABLED` | `runSequenceTick`: `evaluateStopRules` on every active sequence (out-of-office sorted first by `classifyInbound`), the 5-day ping (`pingWaitingCards`), then at most one send, with all stop rules checked again right before it. Also a line on `/health` (`off` when disabled). No per-send message and no digest |
 | `meeting-inbox` | every 10 min | `processInboundMeetingMessage`. `gatherMeetingContext` (thread, sender's recent mail, memories, `searchHistory`, accounts) runs before `detectMeetingRequest`. Auto-send only for `prospect_enquiry` (`AUTO_HANDLE_SENDER_TYPES`). Partner / own domains get the not-replying card instead |
 | `meeting-poll` | every 2 min | Same |
@@ -230,6 +239,7 @@ Required at process start (`src/security/env_guard.ts`): `TELEGRAM_BOT_TOKEN`, `
 | `MEETING_TEST_SENDERS` | Extra From addresses treated as prospects |
 | `SELF_EMAIL_ADDRESSES` | Extra mailboxes treated as Vishnu by `loadFollowupSelfAddresses` (plus both accounts' profile and send-as aliases). A follow-up whose To is only those addresses is dropped by `isAlgorithmicallyExcluded` |
 | `PARTNER_DOMAINS` | Comma-separated. Default `supertroninfotech.com,supertronindia.com,pinnacle.in` when unset; setting it replaces the default, it doesn't add to it. `pinnacle.in` is the From domain on Pinnacle Teleservices mail and that account's `email_domains` |
+| `SEND_ON_COMMAND_ENABLED` | Turns on `send_email` (no card, no content check), calendar on command and scheduled sends, routes those turns to Sonnet (`looksLikeCommandTurn`), and makes `send_immediately` a Send card. Default off, which leaves today's behaviour unchanged |
 | `SEQUENCES_ENABLED` | Kill switch for sequence detection and sending. Default off |
 | `SEQUENCE_STEP_DAYS`, `SEQUENCE_PITCH_MIN_CONFIDENCE`, `SEQUENCE_DAILY_SEND_CAP`, `SEQUENCE_MIN_SPACING_MINUTES` | Defaults 2 days, 0.75, 15 a day, 3 minutes |
 | `SEQUENCE_TEST_RECIPIENTS` | While set, only these addresses get a card or an email. Vishnu's own addresses never do, so it needs a separate mailbox |
@@ -263,13 +273,24 @@ Not env: `google-credentials.json`, `google-token.json` (personal Gmail), `googl
 
 - `allowSendDraft` — Send button `approval:send:<id>` on a **pending** row.
 - `allowCreateEvent` — Create button `approval:create:<id>`.
-- Owner-chat exceptions: `allowOwnerChatSendDraft`, `allowOwnerChatCreateEvent`, `allowOwnerChatDeleteEvent`, `allowOwnerChatAddAttendee` — require a real `chatId` + `messageId` from Vishnu’s turn.
+- Owner-chat exceptions: `allowOwnerChatSendDraft`, `allowOwnerChatCommandSend`, `allowOwnerChatCreateEvent`, `allowOwnerChatDeleteEvent`, `allowOwnerChatMoveEvent`, `allowOwnerChatAddAttendee`, `allowOwnerChatCancelScheduledSend` — require a real `chatId` + `messageId` from Vishnu’s turn.
 
 Sequence stop rules live in `evaluateStopRules` (`src/sequence_rules.ts`) and run in `applyStopRules` (`src/sequence_runner.ts`). `colleagueWroteOnThread` stops a sequence when anyone else at `epicode.in` writes on its thread after enrolment, to the prospect or to Vishnu; the `SENT` label keeps his own aliases out of it. Other scans stay out of sequences: `collectCandidates` skips threads where `salesSequenceOwnsThread`, `dueFollowupsNow` / `activeFollowups` / `overdueFollowups` hide threads with an active sequence, and `runPromiseScan` skips `isSalesSequenceSentMessage`. The second check in `prepareSequenceStep` runs on Sonnet with `noFallback` under usage task `sequence_check`: if Claude is unavailable the step waits and retries hourly.
 
 `approvals.ts` `sendDraft` must call `allowSendDraft` **before** `performDraftSend`. Text “send it” goes through `sendPendingDraftByText` → same `performDraftSend`. Auto-scheduling mail is **not** this gate; it is `sendSchedulingEmail` with a frozen template. Sequence follow-ups aren't either: they go through `sendSequenceStep` and `evaluateSequenceSendGate`.
 
-`test-security.ts` also: no `messages.send` / `drafts.send` / `events.insert|patch|delete` in model tool files; tools index has no `send_email` / `book_meeting`; forged inbox From/Cc cannot book; auto-book daily cap; template mismatch refuses send.
+Send-path inventory, enforced by `test-security.ts`:
+
+| Call | Only in | Reached through |
+| --- | --- | --- |
+| `users.drafts.send` | `src/approvals.ts` | `performDraftSend` (Send tap, or "send it" on a shown draft) and `sendCreatedDraftNow` (`send_immediately`, refused while `SEND_ON_COMMAND_ENABLED` is on) |
+| `users.messages.send` | `src/security/auto_book.ts` | `sendSchedulingEmail`, frozen templates |
+| `users.messages.send` | `src/security/sequence_send.ts` | `sendSequenceStep`, after `evaluateSequenceSendGate` and the claim |
+| `users.messages.send` | `src/security/command_send.ts` | `sendCommandEmail`, after `allowOwnerChatCommandSend`, `evaluateCommandSendGate` and `claimCommandSend`. Called from `send_email` and `fireScheduledSend` |
+| `events.insert` | `src/meeting_book.ts`, `src/approvals.ts`, `src/owner_meeting.ts` | Auto-book, the Create tap, and `createOwnerMeeting` or `createCommandEvent` (`create_event`, `book_meeting`) |
+| `events.delete` | `src/meeting_book.ts`, `src/owner_calendar.ts` | Auto-book undo, `delete_calendar_event` |
+
+`test-security.ts` also: no `messages.send` / `drafts.send` / `events.insert|patch|delete` in model tool files. `send_email`, `create_event`, `book_meeting`, `move_event` and `cancel_scheduled_send` are allowed only as wrappers that can't reach Google, aren't in `FORWARDED_TOOLS`, and whose gated call runs owner, then gate, then claim, then the API. `fireScheduledSend` must re-resolve before it writes and claim right before sending. Forged inbox From/Cc cannot book; auto-book daily cap; template mismatch refuses send. `scripts/test-command-send.ts` covers the behaviour of all of these.
 
 ### Receipt check
 
@@ -380,6 +401,9 @@ Live file: phone `aadi.db`. Created/migrated in `src/db.ts`.
 | `job_runs` | Scheduler last success/attempt |
 | `message_embeddings` | One row per embedded or skipped message. `runMessageEmbed` writes it. `listSearchableEmbeddings` reads vectors for the current model and scheme |
 | `meeting_threads` | Auto-schedule conversation state |
+| `command_sends` | One row per `send_email` command: `idem_key`, status (`sending`, `sent`, `unconfirmed`), `sent_message_id`. No bodies |
+| `scheduled_sends` | Emails to send later: `send_at`, `task_id`, status (`scheduled`, `held`, `sending`, `sent`, `cancelled`, `failed`), `request`, `sent_message_id`. The body is written at fire time and never stored |
+| `command_send_choices` | Requests waiting on Vishnu's tap when a name matched several addresses |
 | `sales_sequences` | One row per pitch thread: prospect, `prospect_timezone` (UTC offset from `readProspectTimezone`), status, step, `next_step_at`. Partial unique index: one open sequence per company domain, or per address on free mail |
 | `sales_sequence_steps` | Each step's draft, check result, status (`planned`, `sending`, `sent`, `blocked`, `skipped`), `sent_message_id`, `claimed_at`, `blocked_at`, `waiting_ping_at`, `slot_lines` |
 | `sales_do_not_contact` | Addresses that said no, or that Vishnu marked Never |

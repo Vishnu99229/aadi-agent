@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { google, type calendar_v3, type gmail_v1 } from "googleapis";
 import { config } from "./config.js";
+import {
+  claimCommandSend,
+  markCommandSendUnconfirmed,
+  recordCommandSendSent,
+  releaseCommandSend,
+} from "./db.js";
 import { parseAddressList, type ParsedMailbox } from "./followup_logic.js";
 import { getGoogleAccount, loadGoogleAccounts } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
@@ -44,6 +50,11 @@ interface OwnerMeetingHooks {
   lookup?: (person: string) => Promise<OwnerMeetingLookup>;
   loadBusy?: (timeMin: Date, timeMax: Date) => Promise<BusyInterval[]>;
   insert?: (event: OwnerMeetingInsert) => Promise<{
+    hangoutLink?: string;
+    htmlLink?: string;
+  }>;
+  insertCommand?: (event: CommandEventInsert) => Promise<{
+    id?: string;
     hangoutLink?: string;
     htmlLink?: string;
   }>;
@@ -372,4 +383,292 @@ export async function createOwnerMeeting(
   }
   lines.push("Invite emailed to the attendee.");
   return lines.join("\n");
+}
+
+// ---- Calendar on command, while SEND_ON_COMMAND_ENABLED is on. No card. ----
+
+export interface CommandEventInsert {
+  title: string;
+  startIso?: string;
+  endIso?: string;
+  /** An all-day event: YYYY-MM-DD, with the end day exclusive. */
+  startDate?: string;
+  endDate?: string;
+  attendees: ParsedMailbox[];
+}
+
+const PAST_GRACE_MS = 5 * 60 * 1000;
+
+/** Delivery safety only: the toggle, and an invite can reach only addresses resolved
+ *  from what Vishnu named. */
+export function evaluateCommandEventGate(input: {
+  enabled: boolean;
+  attendees: readonly ParsedMailbox[];
+  resolved: ReadonlySet<string>;
+}): { ok: true } | { ok: false; reason: string } {
+  if (!input.enabled) {
+    return { ok: false, reason: "disabled" };
+  }
+  for (const attendee of input.attendees) {
+    const email = attendee.email.toLowerCase();
+    if (!input.resolved.has(email)) {
+      return { ok: false, reason: "attendee_not_resolved" };
+    }
+    if (isSelfEmail(email)) {
+      return { ok: false, reason: "attendee_is_self" };
+    }
+  }
+  return { ok: true };
+}
+
+/** Exact start and end from what the model passed, or why it can't be used. */
+export function parseCommandTimes(input: {
+  startTime?: string;
+  endTime?: string;
+  durationMinutes?: number;
+  now: Date;
+}): { startIso: string; endIso: string } | { problem: string } {
+  const startIso = input.startTime?.trim() ?? "";
+  if (!isValidIso(startIso)) {
+    return { problem: "start_time must be ISO 8601 with a +05:30 offset." };
+  }
+  const start = new Date(startIso);
+  if (start.getTime() < input.now.getTime() - PAST_GRACE_MS) {
+    return { problem: "that time has already passed." };
+  }
+  const duration =
+    typeof input.durationMinutes === "number" && input.durationMinutes > 0
+      ? Math.round(input.durationMinutes)
+      : config.meetingDefaultMinutes;
+  const endIso = input.endTime?.trim() ?? "";
+  const end =
+    endIso && isValidIso(endIso)
+      ? new Date(endIso)
+      : new Date(start.getTime() + duration * 60_000);
+  if (end.getTime() <= start.getTime()) {
+    return { problem: "end_time must be after start_time." };
+  }
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+export async function freeSlotsText(durationMinutes: number | undefined, now: Date): Promise<string> {
+  const duration =
+    typeof durationMinutes === "number" && durationMinutes > 0
+      ? Math.round(durationMinutes)
+      : config.meetingDefaultMinutes;
+  const horizon = new Date(now.getTime() + config.meetingHorizonDays * 24 * 60 * 60 * 1000);
+  return offerSlots(now, await loadBusy(now, horizon), duration);
+}
+
+async function insertCommandEvent(
+  event: CommandEventInsert,
+): Promise<{ id?: string; hangoutLink?: string; htmlLink?: string }> {
+  if (testHooks.insertCommand) {
+    return testHooks.insertCommand(event);
+  }
+  const account = await getGoogleAccount("work");
+  const calendar = google.calendar({ version: "v3", auth: account.client });
+  const invites = event.attendees.length > 0;
+  const created = await calendar.events.insert({
+    calendarId: "primary",
+    sendUpdates: invites ? "all" : "none",
+    ...(invites ? { conferenceDataVersion: 1 } : {}),
+    requestBody: {
+      summary: event.title,
+      start: event.startDate
+        ? { date: event.startDate }
+        : { dateTime: event.startIso, timeZone: TIME_ZONE },
+      end: event.endDate
+        ? { date: event.endDate }
+        : { dateTime: event.endIso, timeZone: TIME_ZONE },
+      ...(invites
+        ? {
+            attendees: event.attendees.map((item) => ({
+              email: item.email,
+              displayName: item.name || undefined,
+            })),
+            guestsCanSeeOtherGuests: true,
+            conferenceData: {
+              createRequest: {
+                requestId: randomUUID(),
+                conferenceSolutionKey: { type: "hangoutsMeet" },
+              },
+            },
+          }
+        : {}),
+    },
+  });
+  return {
+    id: created.data.id ?? undefined,
+    hangoutLink: meetLinkFromEvent(created.data),
+    htmlLink: created.data.htmlLink ?? undefined,
+  };
+}
+
+function httpStatus(error: unknown): number | undefined {
+  const record = error as { status?: unknown; code?: unknown; response?: { status?: unknown } };
+  for (const value of [record?.response?.status, record?.status, record?.code]) {
+    const status = Number(value);
+    if (Number.isInteger(status) && status >= 100 && status < 600) {
+      return status;
+    }
+  }
+  return undefined;
+}
+
+/** Said alongside the event, because a clash doesn't stop it. A failed lookup just
+ *  means no warning. */
+async function clashNote(startIso: string | undefined, endIso: string | undefined): Promise<string[]> {
+  if (!startIso || !endIso) {
+    return [];
+  }
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  try {
+    const busy = await loadBusy(new Date(start.getTime() - 60_000), new Date(end.getTime() + 60_000));
+    return slotClash(start, end, busy) ? ["Heads up: this overlaps something already on your calendar."] : [];
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`Command event: clash check failed (${errorType})`);
+    return [];
+  }
+}
+
+/** The gated call behind create_event and book_meeting. Own message, then the gate,
+ *  then the claim, then Calendar. The claim means a repeat can't invite twice. */
+export async function createCommandEvent(input: {
+  key: string;
+  confirmation: { chatId: number; messageId: number } | undefined;
+  event: CommandEventInsert;
+  /** The addresses resolved from what he named. */
+  resolved: ReadonlySet<string>;
+}): Promise<
+  | { ok: true; hangoutLink?: string; clash: string[] }
+  | { ok: false; text: string }
+> {
+  try {
+    allowOwnerChatCreateEvent(input.confirmation);
+  } catch {
+    return { ok: false, text: "only Vishnu's own message can do that." };
+  }
+  const gate = evaluateCommandEventGate({
+    enabled: config.sendOnCommandEnabled,
+    attendees: input.event.attendees,
+    resolved: input.resolved,
+  });
+  if (!gate.ok) {
+    return { ok: false, text: `a delivery check refused it (${gate.reason}).` };
+  }
+  if (!claimCommandSend({ key: input.key, account: "work", threadId: null })) {
+    return { ok: false, text: "this command was already handled." };
+  }
+  const clash = await clashNote(input.event.startIso, input.event.endIso);
+  let created: { id?: string; hangoutLink?: string };
+  try {
+    created = await insertCommandEvent(input.event);
+  } catch (error) {
+    const status = httpStatus(error);
+    if (status !== undefined && status >= 400 && status < 500 && status !== 408) {
+      releaseCommandSend(input.key);
+      console.error(`Command event: provider=calendar status=rejected code=${status}`);
+      return { ok: false, text: `Google Calendar refused it (${status}).` };
+    }
+    markCommandSendUnconfirmed(input.key);
+    console.error("Command event: provider=calendar status=unconfirmed");
+    return {
+      ok: false,
+      text: "Google Calendar didn't answer, so it may or may not exist. I won't try again. Check your calendar.",
+    };
+  }
+  recordCommandSendSent(input.key, created.id ?? "unknown");
+  console.log("Command event: provider=calendar status=created");
+  return { ok: true, hangoutLink: created.hangoutLink, clash };
+}
+
+/** Calendar only: nobody is invited or emailed. */
+export async function createOwnerCalendarEvent(input: {
+  title: string;
+  startTime?: string;
+  endTime?: string;
+  durationMinutes?: number;
+  date?: string;
+  confirmation: { chatId: number; messageId: number } | undefined;
+  now: Date;
+}): Promise<string> {
+  const title = input.title.trim();
+  if (!title) {
+    return "Not created: I need a title.";
+  }
+  let event: CommandEventInsert;
+  let when: string;
+  const date = input.date?.trim() ?? "";
+  if (date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return "Not created: date must be YYYY-MM-DD.";
+    }
+    const next = new Date(`${date}T00:00:00Z`);
+    next.setUTCDate(next.getUTCDate() + 1);
+    event = { title, startDate: date, endDate: next.toISOString().slice(0, 10), attendees: [] };
+    when = `${date}, all day`;
+  } else {
+    if (!input.startTime?.trim()) {
+      return "Not created: I need a time. Ask Vishnu when.";
+    }
+    const times = parseCommandTimes({ ...input, now: input.now });
+    if ("problem" in times) {
+      return `Not created: ${times.problem}`;
+    }
+    event = { title, startIso: times.startIso, endIso: times.endIso, attendees: [] };
+    when = formatWhen(times.startIso, times.endIso);
+  }
+  const chat = input.confirmation;
+  const result = await createCommandEvent({
+    key: `event:${chat?.chatId}:${chat?.messageId}:${title}:${event.startIso ?? event.startDate}`,
+    confirmation: input.confirmation,
+    event,
+    resolved: new Set(),
+  });
+  if (!result.ok) {
+    return `Not created: ${result.text}`;
+  }
+  return [`Created: ${title}`, `When: ${when}`, "Nobody was invited.", ...result.clash].join("\n");
+}
+
+/** Called only once every attendee is resolved to exactly one address. */
+export async function bookResolvedMeeting(input: {
+  key: string;
+  confirmation: { chatId: number; messageId: number } | undefined;
+  title?: string;
+  fallbackName: string;
+  startIso: string;
+  endIso: string;
+  attendees: ParsedMailbox[];
+  now: Date;
+}): Promise<{ text: string; booked: boolean }> {
+  if (new Date(input.startIso).getTime() < input.now.getTime() - PAST_GRACE_MS) {
+    return { text: "Not booked: that time has already passed.", booked: false };
+  }
+  const title =
+    input.title?.trim() ||
+    defaultTitle(input.fallbackName, input.attendees[0] ?? { email: "", name: "" });
+  const result = await createCommandEvent({
+    key: `${input.key}:${input.startIso}`,
+    confirmation: input.confirmation,
+    event: { title, startIso: input.startIso, endIso: input.endIso, attendees: input.attendees },
+    resolved: new Set(input.attendees.map((item) => item.email.toLowerCase())),
+  });
+  if (!result.ok) {
+    return { text: `Not booked: ${result.text}`, booked: false };
+  }
+  return {
+    text: [
+      `Booked: ${title}`,
+      `When: ${formatWhen(input.startIso, input.endIso)}`,
+      `Attendees: ${input.attendees.map(formatMailboxOption).join(", ")}`,
+      result.hangoutLink ? `Meet: ${result.hangoutLink}` : "No Meet link came back from Google.",
+      "Invite emailed.",
+      ...result.clash,
+    ].join("\n"),
+    booked: true,
+  };
 }

@@ -16,6 +16,9 @@ const ADD_ATTENDEE_INTENT =
 const CALENDAR_WRITE_TOOLS = new Set([
   "list_events",
   "create_meeting",
+  "create_event",
+  "book_meeting",
+  "move_event",
   "delete_calendar_event",
   "add_calendar_attendee",
   "propose_calendar_event",
