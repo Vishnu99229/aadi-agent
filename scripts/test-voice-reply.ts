@@ -11,22 +11,26 @@ process.env.SARVAM_API_KEY ??= "test-sarvam-key";
 process.env.VOICE_REPLIES_ENABLED ??= "false";
 
 import { readFileSync } from "node:fs";
-import { getRecentMessages, listUsageLogs, saveMessage } from "../src/db.ts";
+import { GrammyError, InlineKeyboard, type Api } from "grammy";
+import { setApprovalsTestHooks, queueDraftApproval } from "../src/approvals.ts";
+import { getPendingActionForDraft, getRecentMessages, listUsageLogs, saveMessage } from "../src/db.ts";
+import { installCaptionEditFallback } from "../src/telegram_io.ts";
+import { collectVoiceCards, holdForVoiceNote, type VoiceCard } from "../src/voice_cards.ts";
 import {
+  SPEECH_CHAR_CAP,
   TELEGRAM_CAPTION_LIMIT,
-  VOICE_DETAILS_ABOVE,
-  VOICE_SPEAK_CHAR_CAP,
+  WRITING_OFFER,
   deliverVoiceTurn,
   detectVoiceLanguage,
-  planVoiceDelivery,
-  replyNeedsTextChannel,
   resetVoiceReplyTestHooks,
   setVoiceRepliesEnabled,
   setVoiceReplyTestHooks,
+  speechText,
   stripForSpeech,
   synthesizeSpeech,
-  voiceReplyCaption,
+  voiceCaption,
   voiceRepliesEnabled,
+  wantsItInWriting,
 } from "../src/voice_reply.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -69,280 +73,182 @@ function stubOkTts(): void {
 }
 
 {
-  const caption = voiceReplyCaption("hello world");
-  assert(caption === "You said: hello world", `caption=${caption}`);
-  const long = "x".repeat(TELEGRAM_CAPTION_LIMIT + 50);
-  const capped = voiceReplyCaption(long);
-  assert(capped.startsWith("You said: "), "caption prefix");
-  assert(capped.length <= TELEGRAM_CAPTION_LIMIT, "caption within Telegram limit");
-  assert(capped.endsWith("…"), "long caption truncated with ellipsis");
-  console.log("transcript caption: ok");
+  // What Aadi says aloud.
+  assert(speechText("**Yes**, you're free.") === "Yes, you're free.", "markdown stripped");
+  assert(speechText("- one\n- two\n1. three") === "one\ntwo\nthree", "list markers stripped");
+  const long = `${"This is a sentence that goes on. ".repeat(80)}`;
+  const said = speechText(long);
+  assert(said.length <= SPEECH_CHAR_CAP + WRITING_OFFER.length + 1, "long speech is cut");
+  assert(said.endsWith(`. ${WRITING_OFFER}`), `cut at a sentence, with the offer, got ...${said.slice(-60)}`);
+  assert(speechText("Short answer.") === "Short answer.", "short speech unchanged");
+  console.log("speech text: ok");
 }
 
 {
-  setVoiceRepliesEnabled(true);
-  assert(
-    planVoiceDelivery({
-      replyText: "All good — meeting at 3.",
-      transcript: "how's my afternoon",
-      inboundWasVoice: true,
-      forwarded: false,
-    }).mode === "voice_only",
-    "plain short → voice_only",
-  );
-  assert(
-    !replyNeedsTextChannel("All good — meeting at 3."),
-    "plain short needs no text channel",
-  );
-
-  const card = [
-    "Draft waiting for approval",
-    "",
-    "To: a@b.com",
-    "Subject: Hi",
-  ].join("\n");
-  assert(replyNeedsTextChannel(card), "card needs text");
-  assert(
-    planVoiceDelivery({
-      replyText: card,
-      transcript: "draft that",
-      inboundWasVoice: true,
-      forwarded: false,
-    }).spoken === VOICE_DETAILS_ABOVE,
-    "card speaks details-above line",
-  );
-
-  const long = `Hello. ${"word ".repeat(200)}`;
-  assert(long.length > VOICE_SPEAK_CHAR_CAP, "fixture is long");
-  assert(replyNeedsTextChannel(long), "long needs text");
-  assert(
-    planVoiceDelivery({
-      replyText: long,
-      transcript: "tell me more",
-      inboundWasVoice: true,
-      forwarded: false,
-    }).mode === "text_and_voice",
-    "long → text_and_voice",
-  );
-
-  assert(
-    replyNeedsTextChannel("See https://example.com for the deck"),
-    "links need text",
-  );
-  assert(
-    planVoiceDelivery({
-      replyText: "ok",
-      transcript: "hi",
-      inboundWasVoice: true,
-      forwarded: true,
-    }).mode === "text_only",
-    "forwarded → text_only plan",
-  );
-  assert(
-    planVoiceDelivery({
-      replyText: "ok",
-      transcript: "hi",
-      inboundWasVoice: false,
-      forwarded: false,
-    }).mode === "text_only",
-    "text-in → text_only plan",
-  );
-  console.log("delivery plan: ok");
+  // The caption is Aadi's words only, plus the short text any buttons need.
+  assert(voiceCaption("Sure, you're free after 4.", []) === "Sure, you're free after 4.", "words only");
+  assert(!voiceCaption("Done.", []).includes("You said"), "no transcript");
+  assert(voiceCaption("Tap one.", ["Which Sanchit? Nothing has gone out."]) === "Tap one.\n\nWhich Sanchit? Nothing has gone out.", "buttons' text after the words");
+  const longWords = "w".repeat(TELEGRAM_CAPTION_LIMIT);
+  const withCard = voiceCaption(longWords, ["Draft to x@y.example"]);
+  assert(withCard.length <= TELEGRAM_CAPTION_LIMIT && withCard.endsWith("Draft to x@y.example"), "the buttons' text always fits");
+  assert(voiceCaption(longWords + "w", []).length === TELEGRAM_CAPTION_LIMIT, "words alone are cut to the limit");
+  console.log("voice caption: ok");
 }
 
 {
+  // Only an ask for writing, or a yes to the offer, turns a voice note into text.
+  for (const phrase of ["note it down", "send it in text", "write that down", "give me the list", "send that in writing", "can you text me the details"]) {
+    assert(wantsItInWriting(phrase, ""), `"${phrase}" asks for writing`);
+  }
+  for (const phrase of ["what's on today", "send Selvaraj an email", "tell me the list of meetings"]) {
+    assert(!wantsItInWriting(phrase, ""), `"${phrase}" doesn't`);
+  }
+  assert(wantsItInWriting("yes please", `You have five meetings. ${WRITING_OFFER}`), "yes to the offer");
+  assert(!wantsItInWriting("yes please", "You have five meetings."), "yes to something else isn't");
+  console.log("writing requests: ok");
+}
+
+{
+  // Cards wait for a spoken turn, and only while it's open.
+  const card: VoiceCard = { text: "Card", caption: "Card" };
+  assert(!holdForVoiceNote(card), "outside a spoken turn, the caller posts it");
+  const collector = collectVoiceCards();
+  await collector.run(async () => {
+    assert(holdForVoiceNote(card), "inside one, it's held");
+  });
+  assert(collector.close().length === 1, "and handed over");
+  await collector.run(async () => {
+    assert(!holdForVoiceNote(card), "after the turn has answered, the caller posts it");
+  });
+  console.log("card collector: ok");
+}
+
+{
+  // Delivery.
   setVoiceRepliesEnabled(true);
-  stubOkTts();
-  const captions: string[] = [];
-  const spoken: string[] = [];
+  const sent: Array<{ caption: string; keyboard?: InlineKeyboard }> = [];
   const texts: string[] = [];
-  setVoiceReplyTestHooks({
-    fetch: async () =>
-      new Response(
-        JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }),
-        { status: 200 },
-      ),
-    sendVoice: async (_api, _chat, _path, caption) => {
-      captions.push(caption ?? "");
-      spoken.push("voice");
-    },
-  });
+  const posted: string[] = [];
+  const ok = (): void =>
+    setVoiceReplyTestHooks({
+      fetch: async () => new Response(JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }), { status: 200 }),
+      sendVoice: async (_api, _chat, _path, caption, keyboard) => {
+        sent.push({ caption: caption ?? "", keyboard });
+        return 500 + sent.length;
+      },
+    });
+  ok();
+  const deliver = (replyText: string, cards: VoiceCard[] = []) =>
+    deliverVoiceTurn({
+      api: fakeApi,
+      chatId: 1,
+      replyText,
+      sourceText: "hi",
+      cards,
+      sendText: async (text) => {
+        texts.push(text);
+      },
+      postCard: async (card) => {
+        posted.push(card.text);
+        card.posted = true;
+      },
+    });
 
-  const plain = await deliverVoiceTurn({
-    api: fakeApi,
-    chatId: 1,
-    replyText: "Sure, you're free after 4.",
-    transcript: "am I free after four",
-    inboundWasVoice: true,
-    forwarded: false,
-    sendText: async (text) => {
-      texts.push(text);
-    },
-  });
-  assert(plain.mode === "voice_only", "plain short mode voice_only");
-  assert(plain.sentVoice && !plain.sentText, "plain short: voice only, no text");
-  assert(texts.length === 0, "plain short sends no text message");
-  assert(
-    captions[0] === "You said: am I free after four\n\nSure, you're free after 4.",
-    `caption has the transcript and the reply, got ${captions[0]}`,
-  );
+  const plain = await deliver("**Sure**, you're free after 4.");
+  assert(plain.sentVoice && !plain.sentText && texts.length === 0, "a plain answer is a voice note only");
+  assert(sent[0]!.caption === "Sure, you're free after 4.", `caption is Aadi's words, got ${sent[0]!.caption}`);
 
-  // Markdown is stripped from the caption, as it is from the speech.
-  captions.length = 0;
-  await deliverVoiceTurn({
-    api: fakeApi,
-    chatId: 1,
-    replyText: "**Yes**, you're free.",
-    transcript: "am I free",
-    inboundWasVoice: true,
-    forwarded: false,
-    sendText: async (text) => {
-      texts.push(text);
-    },
-  });
-  assert(captions[0] === "You said: am I free\n\nYes, you're free.", `plain caption, got ${captions[0]}`);
+  const long = await deliver(`Here's everything. ${"Another long point to cover here. ".repeat(80)}`);
+  assert(long.sentVoice && !long.sentText && texts.length === 0, "a long answer is still voice only, no text dump");
+  assert(sent[1]!.caption.length <= TELEGRAM_CAPTION_LIMIT, "its caption fits");
 
-  // At the limit it still fits; one over and the reply follows as a message.
-  const heard = "h".repeat(600);
-  const prefix = "You said: ".length + heard.length + 2;
-  const fits = "y".repeat(TELEGRAM_CAPTION_LIMIT - prefix);
-  assert(fits.length < VOICE_SPEAK_CHAR_CAP, "the reply is short enough to speak");
-  captions.length = 0;
+  let draftMessage = 0;
+  const keyboard = new InlineKeyboard().text("Send", "approval:send:1");
+  const draft: VoiceCard = {
+    text: "Draft waiting for approval\n\nTo: priya@acme.example\nSubject: Demo\n\nFull body",
+    caption: "Draft to priya@acme.example\nSubject: Demo",
+    keyboard,
+    onPosted: (id) => {
+      draftMessage = id;
+    },
+  };
+  await deliver("I drafted it. Tap Send when you're happy.", [draft]);
+  const voiced = sent[2]!;
+  assert(voiced.keyboard === keyboard, "the buttons ride on the voice note");
+  assert(voiced.caption === "I drafted it. Tap Send when you're happy.\n\nDraft to priya@acme.example\nSubject: Demo", `with the text they need, got ${voiced.caption}`);
+  assert(draftMessage === 503, "the card knows which message it's on");
+  assert(texts.length === 0 && posted.length === 0, "no separate message");
+
+  const second: VoiceCard = { text: "Which Sanchit?", caption: "Which Sanchit?", keyboard: new InlineKeyboard().text("A", "x") };
+  const note: VoiceCard = { text: "Sent to Arjun.\nSubject: Hi\n\nBody", caption: "Sent to Arjun.\nSubject: Hi" };
+  await deliver("Done, and tap the right Sanchit.", [note, draft, second]);
+  assert(sent[3]!.caption.includes("Sent to Arjun.\nSubject: Hi") && sent[3]!.caption.includes("Draft to priya"), "a card with no buttons joins the caption");
+  assert(!sent[3]!.caption.includes("Body"), "but not its full text");
+  assert(posted.join("|") === "Which Sanchit?", "a second set of buttons gets a message of its own");
+
+  // The voice fails: the full text, then every card as it would have been.
   texts.length = 0;
-  const exact = await deliverVoiceTurn({
-    api: fakeApi, chatId: 1, replyText: fits, transcript: heard, inboundWasVoice: true, forwarded: false,
-    sendText: async (text) => {
-      texts.push(text);
-    },
-  });
-  assert(captions[0]!.length === TELEGRAM_CAPTION_LIMIT && captions[0]!.endsWith(fits), "exactly at the limit, both are in the caption");
-  assert(exact.sentVoice && !exact.sentText && texts.length === 0, "and no message follows");
-
-  const order: string[] = [];
-  const over = `${fits}y`;
-  captions.length = 0;
-  setVoiceReplyTestHooks({
-    sendVoice: async (_api, _chat, _path, caption) => {
-      captions.push(caption ?? "");
-      order.push("voice");
-    },
-  });
-  const overflow = await deliverVoiceTurn({
-    api: fakeApi, chatId: 1, replyText: over, transcript: heard, inboundWasVoice: true, forwarded: false,
-    sendText: async (text) => {
-      order.push(`text:${text}`);
-    },
-  });
-  assert(captions[0] === `You said: ${heard}`, "over the limit, the caption keeps the transcript");
-  assert(order.join("|") === `voice|text:${over}`, `the voice, then the full reply, got ${order.join("|")}`);
-  assert(overflow.sentVoice && overflow.sentText, "both are reported");
-
-  // If the voice fails, the reply still arrives once.
-  const failedTexts: string[] = [];
+  posted.length = 0;
   setVoiceReplyTestHooks({ fetch: async () => new Response("nope", { status: 500 }) });
-  const voiceFailed = await deliverVoiceTurn({
-    api: fakeApi, chatId: 1, replyText: over, transcript: heard, inboundWasVoice: true, forwarded: false,
-    sendText: async (text) => {
-      failedTexts.push(text);
-    },
-  });
-  assert(!voiceFailed.sentVoice && failedTexts.length === 1 && failedTexts[0] === over, "no voice: the text arrives once");
-  setVoiceReplyTestHooks({
-    fetch: async () => new Response(JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }), { status: 200 }),
-    sendVoice: async (_api, _chat, _path, caption) => {
-      captions.push(caption ?? "");
-      spoken.push("voice");
-    },
-  });
-  texts.length = 0;
+  const failed = await deliver("I drafted it.", [{ ...draft, posted: false }, { ...note, posted: false }]);
+  assert(!failed.sentVoice && failed.sentText && texts[0] === "I drafted it.", "the reply arrives as text");
+  assert(posted.length === 2 && posted[0]!.includes("Full body") && posted[1]!.includes("Body"), "and every card in full");
+  ok();
+  console.log("voice delivery: ok");
+}
 
-  captions.length = 0;
-  spoken.length = 0;
-  texts.length = 0;
-  const cardReply = await deliverVoiceTurn({
-    api: fakeApi,
-    chatId: 1,
-    replyText: "Draft waiting for approval\n\nTo: a@b.com\nSubject: Hi\n\nBody",
-    transcript: "draft a reply to Priya",
-    inboundWasVoice: true,
-    forwarded: false,
-    sendText: async (text) => {
-      texts.push(text);
+{
+  // A card made during a spoken turn waits; its message id is recorded once the voice note goes.
+  const log: string[] = [];
+  const fakeTelegram = {
+    sendMessage: async (_chat: unknown, text: string) => {
+      log.push(text);
+      return { message_id: 900, chat: { id: 1 }, date: 0, text };
     },
-  });
-  assert(cardReply.mode === "text_and_voice", "card → text_and_voice");
-  assert(cardReply.sentText && cardReply.sentVoice, "card: text + voice");
-  assert(texts.length === 1, "card sends text");
-  assert(texts[0]!.includes("Draft waiting for approval"), "text is full card");
+    editMessageText: async () => true,
+  } as unknown as Api;
+  setApprovalsTestHooks({ telegram: fakeTelegram });
+  const preview = { draftId: "d-voice", threadId: null, to: "priya@acme.example", subject: "Demo", body: "Hello Priya", googleAccount: "work" as const };
+  const collector = collectVoiceCards();
+  await collector.run(() => queueDraftApproval(preview));
+  assert(log.length === 0, "the draft card isn't posted on its own");
+  const [held] = collector.close();
+  assert(held?.keyboard !== undefined && held.caption.startsWith("Draft to priya@acme.example\nSubject: Demo"), "it's held with its buttons and short text");
+  held!.onPosted?.(4242);
+  assert(getPendingActionForDraft("d-voice")?.telegram_message_id === 4242, "the voice note becomes its card");
+  await queueDraftApproval({ ...preview, draftId: "d-typed" });
+  assert(log.length === 1 && getPendingActionForDraft("d-typed")?.telegram_message_id === 900, "a typed turn posts it as before");
+  console.log("held draft card: ok");
+}
 
-  captions.length = 0;
-  texts.length = 0;
-  const longReply = `Intro. ${"detail ".repeat(120)}`;
-  const long = await deliverVoiceTurn({
-    api: fakeApi,
-    chatId: 1,
-    replyText: longReply,
-    transcript: "give me the long version",
-    inboundWasVoice: true,
-    forwarded: false,
-    sendText: async (text) => {
-      texts.push(text);
-    },
+{
+  // A tap that edits a voice note as text becomes a caption edit, buttons kept.
+  const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+  const transformers: Array<(prev: unknown, method: string, payload: unknown, signal: unknown) => Promise<unknown>> = [];
+  const api = { config: { use: (fn: never) => transformers.push(fn) } } as unknown as Api;
+  installCaptionEditFallback(api);
+  const prev = async (method: string, payload: Record<string, unknown>) => {
+    calls.push({ method, payload });
+    if (method === "editMessageText" && payload.message_id === 1) {
+      throw new GrammyError("x", { ok: false, error_code: 400, description: "Bad Request: there is no text in the message to edit" }, "editMessageText", payload);
+    }
+    if (method === "editMessageText" && payload.message_id === 2) {
+      throw new GrammyError("x", { ok: false, error_code: 400, description: "Bad Request: message is not modified" }, "editMessageText", payload);
+    }
+    return true;
+  };
+  const markup = { inline_keyboard: [] };
+  await transformers[0]!(prev, "editMessageText", { chat_id: 1, message_id: 1, text: "Sent.", reply_markup: markup }, undefined);
+  assert(calls[1]!.method === "editMessageCaption" && calls[1]!.payload.caption === "Sent." && calls[1]!.payload.reply_markup === markup, "retried as a caption edit");
+  let other = "";
+  await transformers[0]!(prev, "editMessageText", { chat_id: 1, message_id: 2, text: "x" }, undefined).catch((error: Error) => {
+    other = error.message;
   });
-  assert(long.mode === "text_and_voice", "long → text_and_voice");
-  assert(long.sentText && long.sentVoice, "long: text + short voice");
-  assert(texts[0] === longReply, "long text is full reply");
-
-  setVoiceReplyTestHooks({
-    fetch: async () => new Response("nope", { status: 503 }),
-    sendVoice: async () => {
-      throw new Error("should not sendVoice on TTS fail");
-    },
-  });
-  texts.length = 0;
-  const failed = await deliverVoiceTurn({
-    api: fakeApi,
-    chatId: 1,
-    replyText: "Fallback text reply.",
-    transcript: "say hi",
-    inboundWasVoice: true,
-    forwarded: false,
-    sendText: async (text) => {
-      texts.push(text);
-    },
-  });
-  assert(failed.sentText && !failed.sentVoice, "TTS failure → text, no voice");
-  assert(texts[0] === "Fallback text reply.", "fallback sends full reply");
-
-  texts.length = 0;
-  stubOkTts();
-  setVoiceReplyTestHooks({
-    fetch: async () =>
-      new Response(
-        JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }),
-        { status: 200 },
-      ),
-    sendVoice: async () => {
-      throw new Error("typed should not send voice");
-    },
-  });
-  const typed = await deliverVoiceTurn({
-    api: fakeApi,
-    chatId: 1,
-    replyText: "Typed answer.",
-    transcript: "typed",
-    inboundWasVoice: false,
-    forwarded: false,
-    sendText: async (text) => {
-      texts.push(text);
-    },
-  });
-  assert(typed.mode === "text_only" && typed.sentText && !typed.sentVoice, "text-in → text only");
-  assert(texts[0] === "Typed answer.", "text-in sends text");
-
-  resetVoiceReplyTestHooks();
-  setVoiceRepliesEnabled(false);
-  console.log("deliverVoiceTurn behaviours: ok");
+  assert(other !== "" && calls.length === 3, "other edit errors are left alone");
+  await transformers[0]!(prev, "sendMessage", { chat_id: 1, text: "hi" }, undefined);
+  assert(calls[3]!.method === "sendMessage", "other calls pass straight through");
+  console.log("caption edit fallback: ok");
 }
 
 {
@@ -357,6 +263,7 @@ function stubOkTts(): void {
       ),
     sendVoice: async (_a, _c, _p, caption) => {
       captions.push(caption ?? "");
+      return 7;
     },
   });
   const full = "History must keep this exact assistant reply.";
@@ -365,12 +272,11 @@ function stubOkTts(): void {
     api: fakeApi,
     chatId: 1,
     replyText: full,
-    transcript: "remember this",
-    inboundWasVoice: true,
-    forwarded: false,
+    sourceText: "remember this",
     sendText: async () => {
       throw new Error("voice-only must not send text");
     },
+    postCard: async () => undefined,
   });
   const recent = getRecentMessages(5);
   assert(
@@ -381,25 +287,7 @@ function stubOkTts(): void {
     !recent.some((row) => /Heard:/i.test(row.content)),
     "no Heard: transcript message in history",
   );
-  assert(captions[0]?.startsWith("You said:"), "voice caption has You said:");
-
-  const cardText = "Draft waiting for approval\n\nTo: x@y.com";
-  saveMessage("assistant", cardText);
-  await deliverVoiceTurn({
-    api: fakeApi,
-    chatId: 1,
-    replyText: cardText,
-    transcript: "draft it",
-    inboundWasVoice: true,
-    forwarded: false,
-    sendText: async () => undefined,
-  });
-  assert(
-    getRecentMessages(10).some(
-      (row) => row.role === "assistant" && row.content === cardText,
-    ),
-    "history stores card reply text too",
-  );
+  assert(captions[0] === full, `the caption is Aadi's words only, got ${captions[0]}`);
 
   resetVoiceReplyTestHooks();
   setVoiceRepliesEnabled(false);
@@ -411,9 +299,13 @@ function stubOkTts(): void {
   assert(!/Heard: \$\{transcript\}/.test(botSrc), "Heard: transcript message removed");
   assert(/deliverVoiceTurn\(/.test(botSrc), "bot uses deliverVoiceTurn");
   assert(
-    /voiceReply:\s*options\.voiceReply === true && !forwarded/.test(botSrc),
-    "voice only for non-forwarded voice turns",
+    /const voiceIn = options\.voiceReply === true && !forwarded && voiceRepliesEnabled\(\);/.test(botSrc) &&
+      /voiceReply: spoken,/.test(botSrc),
+    "voice only for non-forwarded voice turns that didn't ask for writing",
   );
+  assert(/await replyInKind\(ctx, result\.message, spoken, userText\);/.test(botSrc), "\"send it\" is spoken on a spoken turn");
+  assert(/held \? \(\) => held\.run\(work\) : work/.test(botSrc), "a spoken turn collects its cards");
+  assert(/installCaptionEditFallback\(bot\.api\);/.test(botSrc), "bot edits fall back to captions");
   assert(
     /handleUserText\(ctx, ctx\.from\.id, transcript, \{ voiceReply: true \}\)/.test(
       botSrc,
@@ -435,17 +327,16 @@ function stubOkTts(): void {
         JSON.stringify({ audios: [Buffer.from("x").toString("base64")] }),
         { status: 200 },
       ),
-    sendVoice: async () => undefined,
+    sendVoice: async () => 1,
   });
   const before = Date.now();
   await deliverVoiceTurn({
     api: fakeApi,
     chatId: 1,
     replyText: "Usage check.",
-    transcript: "hi",
-    inboundWasVoice: true,
-    forwarded: false,
+    sourceText: "hi",
     sendText: async () => undefined,
+    postCard: async () => undefined,
   });
   const rows = listUsageLogs(
     new Date(before - 1000).toISOString(),

@@ -35,7 +35,9 @@ import {
   sendCommandEmail,
 } from "./security/command_send.js";
 import { SendNotApprovedError } from "./security/send_approval.js";
+import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
+import { holdForVoiceNote } from "./voice_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const CHOICE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -86,7 +88,10 @@ export function setCommandEmailTestHooks(hooks: { telegram?: Api }): void {
 }
 
 export function commandApi(): Api {
-  telegram ??= new Api(config.telegramBotToken);
+  if (!telegram) {
+    telegram = new Api(config.telegramBotToken);
+    installCaptionEditFallback(telegram);
+  }
   return telegram;
 }
 
@@ -291,7 +296,10 @@ export async function writeAndSend(
   ];
   const summary = lines.join("\n");
   try {
-    await api().sendMessage(config.ownerTelegramId, `${summary}\n\n${shown(written.body)}`);
+    const full = `${summary}\n\n${shown(written.body)}`;
+    if (!holdForVoiceNote({ text: full, caption: summary })) {
+      await api().sendMessage(config.ownerTelegramId, full);
+    }
     return {
       text: summary,
       hint: "Vishnu has already been shown the full email. Answer in one short line and don't repeat it.",
@@ -387,9 +395,16 @@ async function scheduleRequest(
     return { text: "Not scheduled again: this command was already handled." };
   }
   console.log(`Scheduled send ${row.id}: status -> scheduled`);
-  await api().sendMessage(config.ownerTelegramId, `Scheduled: ${itemText}`, {
-    reply_markup: new InlineKeyboard().text("Cancel", `cmdsend:cancelsched:${row.id}`),
-  });
+  const scheduledCard = {
+    text: `Scheduled: ${itemText}`,
+    caption: `Scheduled: ${itemText}`,
+    keyboard: new InlineKeyboard().text("Cancel", `cmdsend:cancelsched:${row.id}`),
+  };
+  if (!holdForVoiceNote(scheduledCard)) {
+    await api().sendMessage(config.ownerTelegramId, scheduledCard.text, {
+      reply_markup: scheduledCard.keyboard,
+    });
+  }
   return {
     text: `Scheduled: ${itemText}`,
     hint: "It's on his task list, and he's been shown it with a Cancel button. Answer in one short line.",
@@ -467,9 +482,16 @@ async function resolveAndContinue(
     }
     slot.options = match.options;
     const choiceId = createCommandChoice(JSON.stringify(request), now.toISOString());
-    await api().sendMessage(config.ownerTelegramId, `Which ${slot.query}? Nothing has gone out.`, {
-      reply_markup: choiceKeyboard(choiceId, match.options),
-    });
+    const choiceCard = {
+      text: `Which ${slot.query}? Nothing has gone out.`,
+      caption: `Which ${slot.query}? Nothing has gone out.`,
+      keyboard: choiceKeyboard(choiceId, match.options),
+    };
+    if (!holdForVoiceNote(choiceCard)) {
+      await api().sendMessage(config.ownerTelegramId, choiceCard.text, {
+        reply_markup: choiceCard.keyboard,
+      });
+    }
     return {
       text: `${notDone(request)} yet: "${slot.query}" matches ${match.options.length} addresses and I've asked with buttons.`,
       hint: "Tell him to tap one, and don't pick one yourself.",

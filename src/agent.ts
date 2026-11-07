@@ -81,6 +81,12 @@ const toolDefinitions: LlmTool[] = defaultToolNames(config.sendOnCommandEnabled)
   (name) => customTools[name]!.definition,
 );
 
+const SPOKEN_ANSWER_NOTE =
+  "Vishnu sent this as a voice note and will only hear your answer. Write it the way you'd say it out loud: no markdown, bullet points, numbered lists, headings, links, IDs or emoji, and say times and numbers the way people say them. Keep it short and easy to listen to, a few sentences and under about 80 words. If the full answer is long, such as a list, a document or many items, say a short summary and end with exactly: Want me to send that in writing? Buttons from any card a tool made appear on your voice note, so you can say \"tap Send\" or \"tap the one you mean\".";
+
+const WRITTEN_ANSWER_NOTE =
+  "Vishnu sent this as a voice note but wants the answer in writing. Give the full, detailed text answer. If he's saying yes to your offer to send something in writing, write out in full what you summarised before.";
+
 const SEND_ON_COMMAND_NOTE =
   "Sending email: when Vishnu tells you in this message, in any language, to send an email or to reply to someone, call send_email straight away with the names as he said them. It finds the address and writes the email, so never ask him for an address or for wording first, and don't look the address up yourself. For a reply, find the thread with search_emails and pass thread_id. Ask him only when send_email tells you to. Never set send_immediately: it only makes a Send card. draft_new_email and draft_reply are for when he says draft, write or prepare. \"Remind me to email X\" stays set_reminder and \"follow up on my email to X\" stays track_thread. Calendar: when he tells you to create an event, block his calendar or add something to it, call create_event right away, on the work calendar and 30 minutes unless he said otherwise, and don't ask which calendar or how long; to meet with someone, call book_meeting with the names as he said them; to delete, cancel or move an event, call delete_calendar_event or move_event. None of these needs a card or a tap, and create_meeting is unavailable. Use propose_calendar_event only when he says propose or park. For add_calendar_attendee, pass the name as he said it in attendee_email. Sending later: when he says send on Monday or a date or time, call send_email with send_on (and send_time if he gave one), and a short subject for a new email; these timers do exist. A date inside what the email should say isn't a send date. To cancel one, call cancel_scheduled_send.";
 
@@ -183,6 +189,8 @@ export interface RunAgentOptions {
   ctx?: { react: (emoji: string) => Promise<unknown> };
   /** Parallel 👀 / 👍 on Vishnu's message when this turn uses tools. */
   reactions?: ReactionSession;
+  /** A voice note from Vishnu: answer as speech, or in full writing when he asked. */
+  voiceAnswer?: "spoken" | "written";
   /** When set, only these tools are offered and executed. */
   toolNames?: readonly string[];
 }
@@ -308,6 +316,11 @@ export async function runAgent(
       `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
       sendIntentContext(options.sendConfirmation),
       config.sendOnCommandEnabled ? SEND_ON_COMMAND_NOTE : "",
+      options.voiceAnswer === "spoken"
+        ? SPOKEN_ANSWER_NOTE
+        : options.voiceAnswer === "written"
+          ? WRITTEN_ANSWER_NOTE
+          : "",
       recentUpload,
       "If Vishnu asked a specific question about a document or photo, answer only that question. Do not dump a full summary unless he asked for a summary.",
       memories,

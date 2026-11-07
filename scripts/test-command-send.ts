@@ -53,6 +53,7 @@ import {
   type CommandEventInsert,
 } from "../src/owner_meeting.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
+import { collectVoiceCards } from "../src/voice_cards.ts";
 import { modelReply } from "./fakes.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -494,6 +495,27 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   const dropping = tap(drop.callback_data);
   await dropping.run();
   assert(sends.length === count && dropping.edited[0] === "Not sent.", "Don't send sends nothing");
+}
+// On a spoken turn the buttons wait for Aadi's voice note instead of a message of their own.
+{
+  const before = told.length;
+  const collector = collectVoiceCards();
+  const result = await collector.run(() =>
+    sendEmailFromTool({ to: ["Sanchit"], instruction: "say hello" }, turn("send Sanchit a hello")),
+  );
+  const cards = collector.close();
+  assert(result.startsWith("Not sent yet") && told.length === before, "no separate message on a spoken turn");
+  assert(cards.length === 1 && cards[0]!.caption.startsWith("Which Sanchit?") && cards[0]!.keyboard !== undefined, "the choice is held with its buttons");
+  const count = sends.length;
+  const collector2 = collectVoiceCards();
+  await collector2.run(() =>
+    sendEmailFromTool({ to: ["selvaraj@yespanchi.com"], instruction: "say hi" }, turn("send selvaraj@yespanchi.com a hi")),
+  );
+  const sentCards = collector2.close();
+  assert(sends.length === count + 1, "it still sends");
+  const bodyLine = written.body.split("\n").pop()!;
+  assert(sentCards.length === 1 && sentCards[0]!.caption.startsWith("Sent to") && !sentCards[0]!.caption.includes(bodyLine), "the confirmation joins the voice note, without the body");
+  assert(sentCards[0]!.text.includes(bodyLine), "the full text is kept in case the voice fails");
 }
 // A second person is found however much mail the first has.
 {
