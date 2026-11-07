@@ -24,7 +24,8 @@ import {
   allowSendDraft,
 } from "./security/send_approval.js";
 import { parseAddressList } from "./followup_logic.js";
-import { installNetworkRetry } from "./telegram_io.js";
+import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
+import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import { plainTextBody, stripSignature } from "./google/mail.js";
 import { assertTestSeam } from "./test_seam.js";
 
@@ -33,6 +34,7 @@ const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
 
 const realTelegram = new Api(config.telegramBotToken);
 installNetworkRetry(realTelegram);
+installCaptionEditFallback(realTelegram);
 let telegram: Api = realTelegram;
 let fakeGmailFor: ((account: GoogleAccountId) => gmail_v1.Gmail) | undefined;
 
@@ -299,8 +301,21 @@ export async function queueEventApproval(
     description: input.description,
     googleAccount: input.googleAccount ?? "work",
   });
+  const markup = eventKeyboard(action.id);
+  const eventId = action.id;
+  if (
+    holdForVoiceNote({
+      text,
+      caption: shortCardText(text),
+      keyboard: markup,
+      onPosted: (messageId) => setPendingActionTelegramMessage(eventId, messageId),
+    })
+  ) {
+    console.log(`Approval action ${action.id}: event preview held for voice note`);
+    return action.id;
+  }
   const message = await telegram.sendMessage(config.ownerTelegramId, text, {
-    reply_markup: eventKeyboard(action.id),
+    reply_markup: markup,
   });
   setPendingActionTelegramMessage(action.id, message.message_id);
   console.log(`Approval action ${action.id}: event preview sent`);
@@ -356,6 +371,26 @@ export async function queueDraftApproval(
     }
   }
 
+  const draftActionId = action.id;
+  if (
+    holdForVoiceNote({
+      text,
+      caption: shortCardText(
+        [
+          `Draft to ${preview.to}`,
+          ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : []),
+          `Subject: ${preview.subject}`,
+          "",
+          preview.body,
+        ].join("\n"),
+      ),
+      keyboard: markup,
+      onPosted: (messageId) => setPendingActionTelegramMessage(draftActionId, messageId),
+    })
+  ) {
+    console.log(`Approval action ${action.id}: preview held for voice note`);
+    return action.id;
+  }
   const message = await telegram.sendMessage(config.ownerTelegramId, text, {
     reply_markup: markup,
   });

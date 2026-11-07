@@ -39,7 +39,8 @@ import { isSelfEmail } from "./mom_logic.js";
 import { allowOwnerChatStartSequence } from "./security/send_approval.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
-import { installNetworkRetry } from "./telegram_io.js";
+import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
+import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 import {
   companyFromDomain,
@@ -72,6 +73,7 @@ const EXPLICIT_THREAD_LIMIT = 10;
 
 const telegram = new Api(config.telegramBotToken);
 installNetworkRetry(telegram);
+installCaptionEditFallback(telegram);
 
 export interface ThreadAssessment {
   threadId: string;
@@ -411,17 +413,25 @@ function pitchCardKeyboard(id: number): InlineKeyboard {
 
 async function sendPitchCard(api: Api, row: SalesSequenceRecord): Promise<boolean> {
   try {
-    const card = await api.sendMessage(
-      config.ownerTelegramId,
-      pitchCardText({
-        name: row.prospect_name,
-        email: row.prospect_email,
-        company: row.prospect_company,
-        subject: row.subject,
-        manualFollowups: row.manual_followups,
-      }),
-      { reply_markup: pitchCardKeyboard(row.id) },
-    );
+    const text = pitchCardText({
+      name: row.prospect_name,
+      email: row.prospect_email,
+      company: row.prospect_company,
+      subject: row.subject,
+      manualFollowups: row.manual_followups,
+    });
+    const keyboard = pitchCardKeyboard(row.id);
+    if (
+      holdForVoiceNote({
+        text,
+        caption: shortCardText(text),
+        keyboard,
+        onPosted: (messageId) => setSalesSequenceCardMessage(row.id, messageId),
+      })
+    ) {
+      return true;
+    }
+    const card = await api.sendMessage(config.ownerTelegramId, text, { reply_markup: keyboard });
     setSalesSequenceCardMessage(row.id, card.message_id);
     return true;
   } catch (error) {

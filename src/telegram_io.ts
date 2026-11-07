@@ -1,4 +1,4 @@
-import { HttpError, type Api } from "grammy";
+import { GrammyError, HttpError, type Api } from "grammy";
 
 export const TELEGRAM_MESSAGE_LIMIT = 4000;
 
@@ -72,6 +72,43 @@ export function installNetworkRetry(
         );
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
+    }
+  });
+}
+
+/** A card can live on a voice note, which has a caption, not text. When a tap edits
+ *  such a message as text, Telegram refuses, so the edit is retried as a caption
+ *  edit with the same buttons. */
+export function installCaptionEditFallback(api: Api): void {
+  api.config.use(async (prev, method, payload, signal) => {
+    try {
+      return await prev(method, payload, signal);
+    } catch (error) {
+      if (
+        method !== "editMessageText" ||
+        !(error instanceof GrammyError) ||
+        !/no text in the message to edit/i.test(error.description)
+      ) {
+        throw error;
+      }
+      const edit = payload as {
+        chat_id?: number | string;
+        message_id?: number;
+        inline_message_id?: string;
+        text?: string;
+        reply_markup?: unknown;
+      };
+      return prev(
+        "editMessageCaption" as typeof method,
+        {
+          ...(edit.chat_id !== undefined ? { chat_id: edit.chat_id } : {}),
+          ...(edit.message_id !== undefined ? { message_id: edit.message_id } : {}),
+          ...(edit.inline_message_id !== undefined ? { inline_message_id: edit.inline_message_id } : {}),
+          caption: String(edit.text ?? "").slice(0, 1024),
+          ...(edit.reply_markup !== undefined ? { reply_markup: edit.reply_markup } : {}),
+        } as typeof payload,
+        signal,
+      );
     }
   });
 }

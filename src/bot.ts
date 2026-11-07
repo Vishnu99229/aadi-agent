@@ -36,6 +36,7 @@ import {
   wrapForwardedContent,
 } from "./security/owner_lock.js";
 import {
+  getRecentMessages,
   claimTelegramMessage,
   clearMessages,
   deleteMemory,
@@ -100,7 +101,9 @@ import {
   deliverVoiceTurn,
   setVoiceRepliesEnabled,
   voiceRepliesEnabled,
+  wantsItInWriting,
 } from "./voice_reply.js";
+import { collectVoiceCards, postCard, type VoiceCard } from "./voice_cards.js";
 import {
   consumePendingMeetingWrapUp,
   formatWrapUpPrefill,
@@ -141,6 +144,7 @@ import {
 import { quotedMessageText, withQuotedContext } from "./reply_context.js";
 import { isSendDraftCommand } from "./send_triggers.js";
 import {
+  installCaptionEditFallback,
   installNetworkRetry,
   redactBotToken,
   safeErrorText,
@@ -164,6 +168,7 @@ const TYPING_REFRESH_MS = 4_000;
 
 export const bot = new Bot(config.telegramBotToken);
 installNetworkRetry(bot.api);
+installCaptionEditFallback(bot.api);
 
 bot.use(ownerOnly(config.ownerTelegramId));
 
@@ -263,8 +268,10 @@ async function completeChatReply(
   }
   const startedAt = Date.now();
   const stopTyping = startTyping(ctx);
+  // A spoken turn keeps the cards its tools make, to put their buttons on the voice note.
+  const held = options.voiceReply ? collectVoiceCards() : undefined;
   try {
-    const settled = await settleChatWork(work, turnTimeoutMs());
+    const settled = await settleChatWork(held ? () => held.run(work) : work, turnTimeoutMs());
     if (settled.status === "timeout") {
       gate.open = false;
       closeTurn(gate, "timeout", startedAt);
@@ -287,28 +294,68 @@ async function completeChatReply(
     }
     closeTurn(gate, "ok", startedAt);
     if (options.voiceReply && ctx.chat) {
+      const chatId = ctx.chat.id;
+      const cards = held?.close() ?? [];
       try {
         await deliverVoiceTurn({
           api: ctx.api,
-          chatId: ctx.chat.id,
+          chatId,
           replyText: settled.reply,
-          transcript: options.voiceSourceText ?? userText,
-          inboundWasVoice: true,
-          forwarded,
+          sourceText: options.voiceSourceText ?? userText,
+          cards,
           sendText: (text) => sendPlainText(ctx, text),
+          postCard: (card) => postCard(ctx.api, chatId, card),
         });
       } catch (error) {
         const status =
           error instanceof Error ? error.name : "UnknownError";
         console.error(`Voice reply failed: provider=sarvam status=${status}`);
         await sendPlainText(ctx, settled.reply);
+        await postUnpostedCards(ctx, cards);
       }
     } else {
       await sendPlainText(ctx, settled.reply);
     }
   } finally {
+    // Failed, timed out or empty: any card the turn made still gets shown. One made
+    // after a timeout posts the usual way, because the collector is closed.
+    await postUnpostedCards(ctx, held?.close() ?? []);
     stopTyping();
   }
+}
+
+async function postUnpostedCards(ctx: Context, cards: readonly VoiceCard[]): Promise<void> {
+  if (!ctx.chat) {
+    return;
+  }
+  for (const card of cards) {
+    if (card.posted) {
+      continue;
+    }
+    try {
+      await postCard(ctx.api, ctx.chat.id, card);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Card post failed (${errorType}).`);
+    }
+  }
+}
+
+/** A short fixed reply, spoken on a spoken turn and typed otherwise. */
+async function replyInKind(ctx: Context, text: string, spoken: boolean, sourceText: string): Promise<void> {
+  if (!spoken || !ctx.chat) {
+    await ctx.reply(text);
+    return;
+  }
+  const chatId = ctx.chat.id;
+  await deliverVoiceTurn({
+    api: ctx.api,
+    chatId,
+    replyText: text,
+    sourceText,
+    sendText: (fallback) => sendPlainText(ctx, fallback),
+    postCard: (card) => postCard(ctx.api, chatId, card),
+  });
 }
 
 /** One path for every forwarded update: labelled text, no send confirmation, read and draft tools only. */
@@ -969,9 +1016,15 @@ Call update_draft exactly once with the draft ID above and the complete revised 
           react: (emoji: string) => ctx.react(emoji as never),
         }
       : undefined;
+  // A voice note gets a spoken answer, unless he asked for it in writing.
+  const voiceIn = options.voiceReply === true && !forwarded && voiceRepliesEnabled();
+  const lastReply =
+    getRecentMessages(6).filter((row) => row.role === "assistant").pop()?.content ?? "";
+  const inWriting = voiceIn && wantsItInWriting(userText, lastReply);
+  const spoken = voiceIn && !inWriting;
   if (confirmation && isSendDraftCommand(userText)) {
     const result = await sendPendingDraftByText(confirmation);
-    await ctx.reply(result.message);
+    await replyInKind(ctx, result.message, spoken, userText);
     return;
   }
   // If the last thing Aadi showed was a forget-memory list and Vishnu
@@ -1056,10 +1109,11 @@ Call update_draft exactly once with the draft ID above and the complete revised 
         sendConfirmation: confirmation,
         ctx: reactionCtx,
         reactions: session,
+        ...(spoken ? { voiceAnswer: "spoken" as const } : inWriting ? { voiceAnswer: "written" as const } : {}),
       }),
     {
       forwarded,
-      voiceReply: options.voiceReply === true && !forwarded,
+      voiceReply: spoken,
       voiceSourceText: userText,
     },
   );
