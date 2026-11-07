@@ -659,6 +659,33 @@ assert(
     !(FORWARDED_TOOLS as readonly string[]).includes("start_sequence"),
   "forwarded messages can't start or stop a sequence",
 );
+for (const tool of ["set_sequence_timezone", "add_sales_fact", "list_sales_facts", "remove_sales_fact"]) {
+  assert(
+    !(FORWARDED_TOOLS as readonly string[]).includes(tool),
+    `forwarded messages can't reach ${tool}`,
+  );
+}
+{
+  const salesFactsSrc = await readFile(join(root, "src/sales_facts.ts"), "utf8");
+  for (const fn of ["addSalesFactFromTool", "listSalesFactsFromTool", "removeSalesFactFromTool"]) {
+    const body = salesFactsSrc.slice(salesFactsSrc.indexOf(`export function ${fn}(`));
+    assert(
+      body.slice(0, body.indexOf("\n}\n")).trimStart().split("\n")[1]!.includes("allowOwnerChatSalesFacts(turn.confirmation)"),
+      `${fn} checks for his own message first`,
+    );
+  }
+  const runnerSrc = await readFile(join(root, "src/sequence_runner.ts"), "utf8");
+  const setZone = runnerSrc.slice(runnerSrc.indexOf("export function setSequenceTimezoneFromTool("));
+  assert(
+    setZone.indexOf("allowOwnerChatSequenceTimezone(turn.confirmation)") > 0 &&
+      setZone.indexOf("allowOwnerChatSequenceTimezone(turn.confirmation)") < setZone.indexOf("setSalesSequenceTimezone("),
+    "a time zone correction checks for his own message before it changes anything",
+  );
+  assert(
+    !/messages\.send|drafts\./.test(salesFactsSrc),
+    "the sales-fact tools can't reach Gmail",
+  );
+}
 assert(
   draftSendFiles.length === 1 && draftSendFiles[0]!.endsWith("/approvals.ts"),
   `drafts.send only allowed in approvals.ts, found ${draftSendFiles.join(", ") || "none"}`,

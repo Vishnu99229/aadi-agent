@@ -35,7 +35,7 @@ function seed(people: Array<[string, string, string]>): void {
       threadId: `live-${Math.random()}`,
       prospectEmail: email,
       prospectDomain: domain,
-      prospectKey: domain,
+      prospectKey: email.toLowerCase(),
       prospectName: name,
       prospectCompany: company,
       subject: `Epicode for ${company}`,

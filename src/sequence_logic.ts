@@ -40,7 +40,7 @@ export const EXCLUSION_LABELS: Record<PitchExclusion, string> = {
   other_recipient_in_thread: "others were on earlier emails in that thread",
   followups_used_up: "you've already sent all 4 follow-ups yourself",
   in_sequence: "that thread already had a sequence",
-  prospect_in_sequence: "that person or company already has an open sequence",
+  prospect_in_sequence: "that person already has an open sequence",
   meeting_auto_scheduling: "that thread is in meeting auto-scheduling",
   replied_elsewhere: "they have emailed you since on another thread",
 };
@@ -75,7 +75,7 @@ export interface PitchEnvironment {
   isDoNotContact(email: string): boolean;
   /** Any sequence row on this thread that still counts against enrolling it. */
   threadHasSequence: boolean;
-  /** Same company domain, or the exact address on a free-mail domain. */
+  /** This exact address already has an open sequence. */
   prospectHasOpenSequence(email: string): boolean;
   threadInMeetingFlow: boolean;
 }
@@ -119,15 +119,9 @@ export function matchesProspect(
   return fromDomain === domain || fromDomain.endsWith(`.${domain}`);
 }
 
-/** One open sequence per company. A free-mail domain is shared by strangers, so
- *  there each address counts on its own. */
-export function prospectKey(
-  email: string,
-  personalDomains: ReadonlySet<string>,
-): string {
-  const normalized = email.trim().toLowerCase();
-  const domain = domainOf(normalized);
-  return personalDomains.has(domain) ? normalized : domain;
+/** One open sequence per person; colleagues at one company each get their own. */
+export function prospectKey(email: string): string {
+  return email.trim().toLowerCase();
 }
 
 export interface ThreadMessageFact {

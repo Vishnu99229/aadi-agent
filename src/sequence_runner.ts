@@ -1,14 +1,11 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
 import { google, type gmail_v1 } from "googleapis";
-import { retireSequenceDraftCard } from "./approvals.js";
 import { accountMatchesEmail } from "./account_logic.js";
 import { decodedAccounts } from "./accounts.js";
 import { config } from "./config.js";
 import {
   addSalesDoNotContact,
   countSalesSendsSince,
-  getBlockedSalesStepForDraft,
-  getPendingActionForDraft,
   getSalesSequence,
   hasPendingMeetingWithEmail,
   isSalesDoNotContact,
@@ -16,32 +13,25 @@ import {
   lastSalesSendAt,
   listActiveSalesSequences,
   listSalesSequenceSteps,
-  listSalesStepsWaitingOnCard,
-  markSalesStepWaitingPing,
   postponeSalesSequence,
   recoverSalesStepSent,
   setSalesSequenceTimezone,
-  setSalesStepSlots,
   stopActiveSalesSequence,
   type SalesSequenceRecord,
 } from "./db.js";
 import { parseAddressList } from "./followup_logic.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./followups.js";
 import type { LoadedGoogleAccount } from "./google/auth.js";
-import {
-  buildMimeMessage,
-  messageHeader as headerOf,
-  plainTextBody,
-  signatureHtmlFor,
-  stripSignature,
-} from "./google/mail.js";
+import { plainTextBody, signatureHtmlFor } from "./google/mail.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { isSelfEmail } from "./mom_logic.js";
 import { blockedAutoSendDomains, PERSONAL_DOMAINS } from "./meeting_book.js";
-import { salesFactsStatus } from "./sales_facts.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
-import { allowOwnerChatStopSequence } from "./security/send_approval.js";
+import {
+  allowOwnerChatSequenceTimezone,
+  allowOwnerChatStopSequence,
+} from "./security/send_approval.js";
 import {
   sendSequenceStep,
   SequenceSendRefusedError,
@@ -69,15 +59,21 @@ import {
   type StopDecision,
   type StopFacts,
 } from "./sequence_rules.js";
-import { offerSlots, prepareSequenceStep } from "./sequence_writer.js";
-import { ownAddressOf, readProspectTimezone, workGmail } from "./sequences.js";
+import {
+  localClock,
+  resolveProspectTimezone,
+  zoneDisplay,
+  zoneFromWords,
+  zoneLabel,
+} from "./sequence_timezone.js";
+import { prepareSequenceStep } from "./sequence_writer.js";
+import { ownAddressOf, workGmail } from "./sequences.js";
 import { assertTestSeam } from "./test_seam.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const TICK_INTERVAL_MS = 5 * 60 * 1000;
 const TICK_TIMEOUT_MS = 10 * 60 * 1000;
 const RETRY_AFTER_MS = 60 * 60 * 1000;
-const WAITING_ON_CARD_MS = 5 * 24 * 60 * 60 * 1000;
 const MAX_PREPARES_PER_TICK = 3;
 const STOP_SCAN_RESULTS = 20;
 const TIME_ZONE = "Asia/Kolkata";
@@ -107,18 +103,16 @@ function listLine(row: SalesSequenceRecord): string {
   return `${displayName(row)}${company} <${row.prospect_email}>`;
 }
 
-/** Stops the sequence and takes any waiting approval card with it, so a stopped
- *  sequence can't send a draft from an old card. */
+/** "Munil Shah, Talkdesk - US Pacific" */
+function zoneLine(row: SalesSequenceRecord): string {
+  const company = row.prospect_company ? `, ${row.prospect_company}` : "";
+  return `${displayName(row)}${company} - ${zoneDisplay(row.prospect_timezone, row.prospect_timezone_source)}`;
+}
+
 async function stopSequence(row: SalesSequenceRecord, reason: string): Promise<boolean> {
-  const blocked = listSalesSequenceSteps(row.id).find(
-    (step) => step.status === "blocked" && step.draft_id,
-  );
   const stopped = stopActiveSalesSequence(row.id, reason);
   if (stopped) {
     console.log(`Sequence ${row.id}: status -> stopped reason=${reason}`);
-    if (blocked?.draft_id) {
-      await retireSequenceDraftCard(blocked.draft_id);
-    }
   }
   return stopped;
 }
@@ -343,7 +337,6 @@ export async function gatherStopFacts(
     claimed: claimed
       ? { stepNo: claimed.step_no, claimedAt: new Date(claimed.claimed_at ?? 0).getTime() }
       : undefined,
-    pausedOnCard: steps.some((step) => step.status === "blocked"),
   };
 }
 
@@ -424,35 +417,6 @@ async function applyStopRules(
   return "stopped";
 }
 
-async function pingWaitingCards(api: Api, now: Date): Promise<void> {
-  const cutoff = new Date(now.getTime() - WAITING_ON_CARD_MS).toISOString();
-  for (const step of listSalesStepsWaitingOnCard(cutoff)) {
-    const row = getSalesSequence(step.sequence_id);
-    if (!row) {
-      continue;
-    }
-    const card = step.draft_id ? getPendingActionForDraft(step.draft_id) : undefined;
-    try {
-      await api.sendMessage(
-        config.ownerTelegramId,
-        `Follow-up to ${displayName(row)} has been waiting for your tap for 5 days - Send, Edit or Discard?`,
-        card?.telegram_message_id
-          ? {
-              reply_parameters: {
-                message_id: card.telegram_message_id,
-                allow_sending_without_reply: true,
-              },
-            }
-          : {},
-      );
-      markSalesStepWaitingPing(step.sequence_id, step.step_no, now.toISOString());
-    } catch (error) {
-      const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.error(`Sequence ${row.id}: waiting ping failed (${errorType})`);
-    }
-  }
-}
-
 function replySubject(subject: string): string {
   return /^re\s*:/i.test(subject) ? subject : `Re: ${subject}`;
 }
@@ -502,8 +466,8 @@ export interface SequenceTickResult {
   sent: number;
 }
 
-/** One tick: every stop rule on every active sequence, the 5-day chase, then at
- *  most one send. Nothing here messages Vishnu about a normal send. */
+/** One tick: every stop rule on every active sequence, then at most one send.
+ *  Nothing here messages Vishnu about a normal send. */
 export async function runSequenceTick(
   api: Api,
   options: { now?: Date; factsPath?: string } = {},
@@ -532,12 +496,6 @@ export async function runSequenceTick(
       console.error(`Sequence ${row.id}: stop check failed (${errorType}); no send this tick`);
     }
   }
-  await pingWaitingCards(api, now);
-
-  if (!salesFactsStatus(options.factsPath).ready) {
-    console.log("Sequence send: held, sales_facts.md is not ready");
-    return result;
-  }
   if (capOrSpacingHolds(now)) {
     return result;
   }
@@ -558,14 +516,13 @@ export async function runSequenceTick(
     let row = listed;
     if (!row.prospect_timezone) {
       try {
-        const timezone = await readProspectTimezone(gmail, row.prospect_email);
-        if (timezone) {
-          setSalesSequenceTimezone(row.id, timezone);
-          row = { ...row, prospect_timezone: timezone };
-        }
+        const found = await resolveProspectTimezone(gmail, row);
+        setSalesSequenceTimezone(row.id, found.zone, found.source);
+        row = { ...row, prospect_timezone: found.zone, prospect_timezone_source: found.source };
       } catch (error) {
         const errorType = error instanceof Error ? error.name : "UnknownError";
-        console.error(`Sequence ${row.id}: timezone lookup failed (${errorType})`);
+        console.error(`Sequence ${row.id}: timezone lookup failed (${errorType}); no send this tick`);
+        continue;
       }
     }
     if (!inSendWindow(now, row.prospect_timezone)) {
@@ -617,7 +574,6 @@ export async function runSequenceTick(
         signatureHtml: await signatureHtmlFor(account),
         selfAddresses,
         now,
-        factsPath: options.factsPath,
       });
       result.sent += 1;
       break;
@@ -696,11 +652,27 @@ export async function stopSequenceFromTool(
     : "Nothing stopped: that sequence had already ended.";
 }
 
+function clockText(at: Date, timeZone: string, withDay: boolean): string {
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone,
+    ...(withDay ? { weekday: "short", day: "numeric", month: "short" } : {}),
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  } as Intl.DateTimeFormatOptions).format(at);
+}
+
+function theirClock(at: Date, zone: string): string {
+  if (/^[+-]\d{2}:\d{2}$/.test(zone)) {
+    const { minutes } = localClock(at, zone);
+    const hour = Math.floor(minutes / 60);
+    return `${hour % 12 || 12}:${String(minutes % 60).padStart(2, "0")} ${hour < 12 ? "am" : "pm"}`;
+  }
+  return clockText(at, zone, false);
+}
+
 function nextSendLabel(row: SalesSequenceRecord, now: Date): string {
   const step = listSalesSequenceSteps(row.id).find((item) => item.step_no === row.current_step);
-  if (step?.status === "blocked") {
-    return "paused, waiting on your card";
-  }
   if (step?.status === "sending") {
     return "sending";
   }
@@ -709,18 +681,12 @@ function nextSendLabel(row: SalesSequenceRecord, now: Date): string {
   }
   const due = new Date(row.next_step_at);
   const at = nextSendWindow(due > now ? due : now, row.prospect_timezone);
-  if (!at) {
-    return `won't send: 10:00-17:00 their time (${row.prospect_timezone}) never meets 09:00-19:00 IST`;
+  const ist = `${clockText(at, TIME_ZONE, true)} IST`;
+  if (!row.prospect_timezone) {
+    return `next ${ist}, once their time zone is checked`;
   }
-  return `next ${new Intl.DateTimeFormat("en-IN", {
-    timeZone: TIME_ZONE,
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  }).format(at)} IST`;
+  const label = zoneLabel(row.prospect_timezone);
+  return label === "India" ? `next ${ist}` : `next ${ist} (${theirClock(at, row.prospect_timezone)} ${label})`;
 }
 
 export function sequencesPanel(now = new Date()): {
@@ -736,7 +702,8 @@ export function sequencesPanel(now = new Date()): {
     keyboard.text(`Stop ${displayName(row)}`.slice(0, 60), `seq:stop:${row.id}`).row();
   }
   const lines = rows.map(
-    (row) => `- ${listLine(row)}: step ${row.current_step} of ${SEQUENCE_STEPS}, ${nextSendLabel(row, now)}`,
+    (row) =>
+      `- ${zoneLine(row)}\n  step ${row.current_step} of ${SEQUENCE_STEPS}, ${nextSendLabel(row, now)}`,
   );
   const off = config.sequencesEnabled
     ? ""
@@ -771,78 +738,34 @@ export async function handleSequenceStopCallback(ctx: Context): Promise<void> {
   });
 }
 
-/** Rebuilds the time lines Aadi wrote into a blocked step's draft, just before it
- *  is sent or edited. Once he has changed or removed any of them the times are his,
- *  and none come back. Throws when it can't get real times, so stale ones never go
- *  out. */
-export async function refreshSequenceDraftSlots(
-  draftId: string,
-  now = new Date(),
-): Promise<string | undefined> {
-  const step = getBlockedSalesStepForDraft(draftId);
-  const stored = JSON.parse(step?.slot_lines ?? "[]") as string[];
-  if (!step || stored.length === 0) {
-    return undefined;
+/** Vishnu's correction, typed or spoken: "Munil is in New York". Owner-set zones
+ *  are never looked up again. */
+export function setSequenceTimezoneFromTool(
+  input: { target: string; timezone: string },
+  turn: Pick<ToolTurn, "confirmation">,
+): string {
+  allowOwnerChatSequenceTimezone(turn.confirmation);
+  const zone = zoneFromWords(input.timezone);
+  if (!zone) {
+    return `Nothing changed: I don't know the time zone for "${input.timezone}". Ask Vishnu for a city or a zone such as Pacific, Eastern or IST.`;
   }
-  const row = getSalesSequence(step.sequence_id);
-  if (!row) {
-    return undefined;
+  const rows = listActiveSalesSequences();
+  if (rows.length === 0) {
+    return "Nothing changed: there are no active follow-up sequences.";
   }
-  const { account, gmail } = await workGmail();
-  const { data: draft } = await gmail.users.drafts.get({
-    userId: "me",
-    id: draftId,
-    format: "full",
-  });
-  const message = draft.message;
-  if (!message?.payload) {
-    throw new Error("Draft has no content to refresh.");
+  const match = matchSequencesForStop(rows, input.target);
+  const options = (items: SalesSequenceRecord[]): string =>
+    items.map((row) => `- ${zoneLine(row)}`).join("\n");
+  if (match.kind === "none") {
+    return `Nothing changed: no active sequence matches "${input.target}". Active sequences:\n${options(rows)}`;
   }
-  const current = stripSignature(plainTextBody(message.payload).trim());
-  const present = stored.filter((line) => current.body.includes(line));
-  if (present.length < stored.length) {
-    return undefined;
+  if (match.kind !== "one") {
+    return `Nothing changed yet: "${input.target}" matches more than one sequence. Ask Vishnu which:\n${options(match.rows)}`;
   }
-  const offer = await offerSlots(now, row.prospect_timezone);
-  if (!offer) {
-    throw new Error("No free slots to offer.");
-  }
-  const fresh = offer.lines;
-  if (present.length === fresh.length && present.every((line, index) => line === fresh[index])) {
-    return undefined;
-  }
-  let body = current.body.replace(present[0]!, fresh.join("\n"));
-  for (const line of present.slice(1)) {
-    body = body.replace(`${line}\n`, "").replace(line, "");
-  }
-  body = body.replace(/\n{3,}/g, "\n\n").trim();
-  const headers = message.payload.headers;
-  const raw = buildMimeMessage(
-    [
-      ["To", headerOf(headers, "To")],
-      ["Cc", headerOf(headers, "Cc")],
-      ["Bcc", headerOf(headers, "Bcc")],
-      ["Subject", headerOf(headers, "Subject")],
-      ["In-Reply-To", headerOf(headers, "In-Reply-To")],
-      ["References", headerOf(headers, "References")],
-    ],
-    body,
-    current.signed ? await signatureHtmlFor(account) : "",
-  );
-  await gmail.users.drafts.update({
-    userId: "me",
-    id: draftId,
-    requestBody: {
-      id: draftId,
-      message: {
-        threadId: message.threadId ?? undefined,
-        raw: Buffer.from(raw, "utf8").toString("base64url"),
-      },
-    },
-  });
-  setSalesStepSlots(step.sequence_id, step.step_no, body, fresh);
-  console.log(`Sequence ${row.id}: refreshed slots on blocked step ${step.step_no}`);
-  return `Times refreshed before sending:\n${fresh.join("\n")}`;
+  const row = match.rows[0]!;
+  setSalesSequenceTimezone(row.id, zone, "owner");
+  console.log(`Sequence ${row.id}: timezone set by owner`);
+  return `Set: ${zoneLine({ ...row, prospect_timezone: zone, prospect_timezone_source: "owner" })}. Follow-ups now go out Mon-Fri 9am-5pm their time.`;
 }
 
 export function registerSequenceSend(api: Api): IntervalJob | undefined {

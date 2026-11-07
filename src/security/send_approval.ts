@@ -137,6 +137,24 @@ export function allowOwnerChatStopSequence(confirmation: {
   requireOwnerChatConfirmation(confirmation);
 }
 
+/** set_sequence_timezone runs only on Vishnu's own chat/voice turn. A forwarded
+ *  message or an email can't move when follow-ups go out. */
+export function allowOwnerChatSequenceTimezone(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
+/** The sales-fact tools run only on Vishnu's own chat/voice turn: what follow-ups
+ *  may say is his to change, never an email's or a forwarded message's. */
+export function allowOwnerChatSalesFacts(confirmation: {
+  chatId: number;
+  messageId: number;
+} | undefined): void {
+  requireOwnerChatConfirmation(confirmation);
+}
+
 /** Vishnu's own chat/voice turn is the approval for add_calendar_attendee.
  *  Never call this from inbound email handling. */
 export function allowOwnerChatAddAttendee(confirmation: {

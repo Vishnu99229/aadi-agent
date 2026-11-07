@@ -621,13 +621,19 @@ async function computeSlots(card: CardPayload, now = new Date()): Promise<TimeSl
 }
 
 /** Free slots for an outbound offer. Reads the calendars and books nothing. */
+/** His free slots, optionally only those `accept` keeps, chosen from all of
+ *  them rather than filtered after the pick. */
 export async function freeSlotsForOffer(
   now: Date,
   durationMinutes: number,
+  accept?: (slot: TimeSlot) => boolean,
 ): Promise<TimeSlot[]> {
   const options = finderOptions(now, [], { durationMinutes, windowHint: null, offset: 0 });
   const busy = await loadBusy(now, new Date(now.getTime() + options.horizonDays * 24 * 60 * 60 * 1000));
-  return findSlots(finderOptions(now, busy, { durationMinutes, windowHint: null, offset: 0 }));
+  return findSlots({
+    ...finderOptions(now, busy, { durationMinutes, windowHint: null, offset: 0 }),
+    accept,
+  });
 }
 
 function cardText(card: CardPayload, slots: TimeSlot[]): string {

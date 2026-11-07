@@ -1,5 +1,5 @@
 /**
- * The real writer and checker models on invented fixture threads.
+ * The real writer model on invented fixture threads, with docs/sales_facts.md.
  * Gmail, Telegram and the calendar are stubs: nothing reads your mailbox or sends.
  */
 import { setApprovalsTestHooks } from "../src/approvals.js";
@@ -10,12 +10,10 @@ import {
   getSalesSequence,
   getSalesSequenceStep,
   recordSalesStepSent,
-  resolveBlockedSalesStep,
 } from "../src/db.js";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.js";
 import { setGmailClientForTests } from "../src/google/mail.js";
-import { PERSONAL_DOMAINS, setMeetingTestHooks } from "../src/meeting_book.js";
-import { CHECK_LABELS } from "../src/sequence_check.js";
+import { setMeetingTestHooks } from "../src/meeting_book.js";
 import { prospectKey } from "../src/sequence_logic.js";
 import { prepareSequenceStep } from "../src/sequence_writer.js";
 import { fakeTelegramApi } from "./fakes.js";
@@ -28,7 +26,6 @@ import {
   type FixtureMessage,
 } from "./fixtures/sequence-threads.js";
 
-const FACTS = "scripts/fixtures/sales_facts_ready.md";
 const threads = new Map<string, FixtureMessage[]>();
 const gmail = fixtureGmail(threads, { created: [], sent: [], deleted: [] });
 const account = { id: "work", tag: "work", label: "work (Epicode)", client: {} } as unknown as LoadedGoogleAccount;
@@ -48,7 +45,7 @@ for (const pitch of [DEMO_PITCH, PARTNERSHIP_PITCH, MEETING_PITCH]) {
     threadId: pitch.threadId,
     prospectEmail: pitch.prospectEmail,
     prospectDomain: pitch.prospectEmail.split("@")[1]!,
-    prospectKey: prospectKey(pitch.prospectEmail, PERSONAL_DOMAINS),
+    prospectKey: prospectKey(pitch.prospectEmail),
     prospectName: pitch.prospectName,
     prospectCompany: pitch.prospectCompany,
     subject: pitch.subject,
@@ -65,44 +62,24 @@ for (const pitch of [DEMO_PITCH, PARTNERSHIP_PITCH, MEETING_PITCH]) {
   });
   log(`\n=== ${pitch.subject}`);
   for (let stepNo = 1; stepNo <= 4; stepNo += 1) {
-    const outcome = await prepareSequenceStep(row.id, { factsPath: FACTS });
+    const outcome = await prepareSequenceStep(row.id);
     const ask = getSalesSequence(row.id)!.original_ask;
     const step = getSalesSequenceStep(row.id, stepNo)!;
     const text = step.draft_text ?? "";
-    const verdict =
-      outcome.kind === "blocked"
-        ? `BLOCKED: ${outcome.reasons.map((reason) => CHECK_LABELS[reason]).join("; ")}`
-        : outcome.kind === "ready"
-          ? "ready"
-          : `${outcome.kind}: ${outcome.reason}`;
+    const verdict = outcome.kind === "ready" ? "ready" : `${outcome.kind}: ${outcome.reason}`;
     log(`\n--- step ${stepNo} [ask=${ask}] ${verdict} (${text.split(/\s+/).filter(Boolean).length} words)`);
     log(text);
-    if (step.check_result) {
-      const model = JSON.parse(step.check_result).model as { pass: boolean; reason: string } | null;
-      if (model && !model.pass) {
-        log(`(second check: ${model.reason})`);
-      }
-    }
     if (!text) {
       break;
     }
     const sentAt = new Date().toISOString();
-    if (outcome.kind === "blocked") {
-      resolveBlockedSalesStep(step.draft_id!, {
-        kind: "sent",
-        sentMessageId: `live-${stepNo}`,
-        sentAt,
-        stepDays: 2,
-      });
-    } else {
-      recordSalesStepSent({
-        sequenceId: row.id,
-        stepNo,
-        sentMessageId: `live-${stepNo}`,
-        sentAt,
-        stepDays: 2,
-      });
-    }
+    recordSalesStepSent({
+      sequenceId: row.id,
+      stepNo,
+      sentMessageId: `live-${stepNo}`,
+      sentAt,
+      stepDays: 2,
+    });
     messages.push({
       id: `${pitch.threadId}-s${stepNo}`,
       from: `Vishnu Rajan <${FIXTURE_ME}>`,
@@ -117,7 +94,7 @@ for (const pitch of [DEMO_PITCH, PARTNERSHIP_PITCH, MEETING_PITCH]) {
 }
 const usage = new Map<string, { calls: number; cost: number; models: Set<string> }>();
 for (const row of listUsageLogs("2000-01-01T00:00:00.000Z", "2100-01-01T00:00:00.000Z")) {
-  if (row.task === "sequence" || row.task === "sequence_check") {
+  if (row.task === "sequence") {
     const entry = usage.get(row.task) ?? { calls: 0, cost: 0, models: new Set<string>() };
     entry.calls += 1;
     entry.cost += row.cost_usd;

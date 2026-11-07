@@ -10,8 +10,6 @@ import {
   listDraftsShownBefore,
   setPendingActionDraftMeta,
   setPendingActionTelegramMessage,
-  isBlockedSalesDraft,
-  resolveBlockedSalesStep,
   transitionPendingAction,
   type GoogleAccountId,
   type PendingAction,
@@ -56,35 +54,6 @@ async function gmailFor(account: GoogleAccountId): Promise<gmail_v1.Gmail> {
 const activeActions = new Set<number>();
 const editingActionByUser = new Map<number, number>();
 const sendOnlyActions = new Set<number>();
-
-/** Keeps a paused follow-up sequence in step with its approval card. It runs
- *  after the card's own outcome and can never change that outcome. */
-function noteSequenceDraft(
-  action: PendingAction,
-  outcome: Parameters<typeof resolveBlockedSalesStep>[1],
-): void {
-  if (!action.draft_id) {
-    return;
-  }
-  try {
-    if (resolveBlockedSalesStep(action.draft_id, outcome)) {
-      console.log(`Approval action ${action.id}: sequence step ${outcome.kind}`);
-    }
-  } catch (error) {
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Approval action ${action.id}: sequence hook failed (${errorType})`);
-  }
-}
-
-/** Runs just before a draft is sent or edited, and may rewrite it. It returns a
- *  note for the card when it did. If it throws, nothing is sent. It sits behind
- *  the approval gate and can't open it. */
-type DraftRefresher = (draftId: string) => Promise<string | undefined>;
-let draftRefresher: DraftRefresher | undefined;
-
-export function setDraftRefresher(handler: DraftRefresher | undefined): void {
-  draftRefresher = handler;
-}
 
 type AfterDraftSend = (
   draftId: string,
@@ -167,16 +136,6 @@ function isStale(action: PendingAction): boolean {
     return Date.now() - sqliteTimeMs(action.created_at) >= 24 * 60 * 60 * 1000;
   }
   return Date.now() - touchedAtMs(action) >= DRAFT_STALE_MS;
-}
-
-/** A blocked sequence step waits on its card until Vishnu taps it, so that card
- *  never expires. Once stale, chat confirmation still can't reach it. */
-function keptForSequence(action: PendingAction): boolean {
-  return action.draft_id !== null && isBlockedSalesDraft(action.draft_id);
-}
-
-function isExpired(action: PendingAction): boolean {
-  return isStale(action) && !keptForSequence(action);
 }
 
 function callbackMessageText(ctx: Context): string {
@@ -328,7 +287,7 @@ export async function queueDraftApproval(
 ): Promise<number> {
   let action = getPendingActionForDraft(preview.draftId);
 
-  if (action && isExpired(action)) {
+  if (action && isStale(action)) {
     await expireAction(action);
     action = undefined;
   }
@@ -413,7 +372,7 @@ async function currentPendingAction(
     return undefined;
   }
 
-  if (action.status === "pending" && isExpired(action)) {
+  if (action.status === "pending" && isStale(action)) {
     await expireAction(action);
     await showStatus(ctx, "Expired").catch(() => undefined);
     await ctx.answerCallbackQuery("Expired");
@@ -438,13 +397,10 @@ async function currentPendingAction(
 }
 
 type SendOutcome =
-  | { ok: true; note?: string }
-  | { ok: false; reason: "send_failed" | "status_update_failed" | "refresh_failed" };
+  | { ok: true }
+  | { ok: false; reason: "send_failed" | "status_update_failed" };
 
-function sendFailureText(reason: "send_failed" | "status_update_failed" | "refresh_failed"): string {
-  if (reason === "refresh_failed") {
-    return "Not sent: I couldn't get current times for this draft. Try again, Edit or Discard.";
-  }
+function sendFailureText(reason: "send_failed" | "status_update_failed"): string {
   return reason === "send_failed"
     ? "Sending failed. The draft is still pending; please try again."
     : "The draft was sent, but its approval status could not be updated.";
@@ -454,16 +410,6 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
   const draftId = action.draft_id;
   if (!draftId) {
     return { ok: false, reason: "send_failed" };
-  }
-  let note: string | undefined;
-  if (draftRefresher) {
-    try {
-      note = await draftRefresher(draftId);
-    } catch (error) {
-      const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.log(`Approval action ${action.id}: refresh failed (${errorType}); not sent`);
-      return { ok: false, reason: "refresh_failed" };
-    }
   }
   let sentMessageId: string | undefined;
   try {
@@ -484,20 +430,12 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
       console.log(`Approval action ${action.id}: after-send hook failed`);
     }
   }
-  if (sentMessageId) {
-    noteSequenceDraft(action, {
-      kind: "sent",
-      sentMessageId,
-      sentAt: new Date().toISOString(),
-      stepDays: config.sequenceStepDays,
-    });
-  }
   if (!transitionPendingAction(action.id, "pending", "sent")) {
     console.log(`Approval action ${action.id}: sent; status update failed`);
     return { ok: false, reason: "status_update_failed" };
   }
   console.log(`Approval action ${action.id}: status -> sent`);
-  return { ok: true, note };
+  return { ok: true };
 }
 
 /** Send a Gmail draft now. No Telegram card and no pending_actions row.
@@ -639,7 +577,7 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     await ctx.answerCallbackQuery({ text: sendFailureText(outcome.reason), show_alert: true });
     return;
   }
-  await showStatus(ctx, "Sent", outcome.note).catch(() => {
+  await showStatus(ctx, "Sent").catch(() => {
     console.log(`Approval action ${action.id}: sent preview update failed`);
   });
   await ctx.answerCallbackQuery("Sent").catch(() => undefined);
@@ -795,7 +733,7 @@ async function shownPendingDrafts(
 ): Promise<PendingAction[]> {
   const shown: PendingAction[] = [];
   for (const action of listDraftsShownBefore(confirmation.messageId)) {
-    if (isExpired(action)) {
+    if (isStale(action)) {
       await expireAction(action);
     } else if (!isStale(action)) {
       shown.push(action);
@@ -886,9 +824,7 @@ export async function sendPendingDraftByText(
     console.log(`Approval action ${action.id}: sent on chat confirmation`);
     return {
       ok: true,
-      message: outcome.note
-        ? `Sent the draft to ${recipient}. ${outcome.note}`
-        : `Sent the draft to ${recipient}.`,
+      message: `Sent the draft to ${recipient}.`,
     };
   } finally {
     activeActions.delete(action.id);
@@ -916,7 +852,6 @@ async function performDraftDiscard(action: PendingAction): Promise<DiscardOutcom
     );
     return { ok: false, reason: "delete_failed" };
   }
-  noteSequenceDraft(action, { kind: "discarded" });
   if (!transitionPendingAction(action.id, "pending", "discarded")) {
     console.log(`Approval action ${action.id}: discarded; status update failed`);
     return { ok: false, reason: "status_update_failed" };
@@ -1151,7 +1086,7 @@ export async function consumeDraftEdit(
     action.type !== "send_draft" ||
     !action.draft_id ||
     action.status !== "pending" ||
-    isExpired(action)
+    isStale(action)
   ) {
     if (action?.status === "pending") {
       await expireAction(action);
@@ -1159,16 +1094,6 @@ export async function consumeDraftEdit(
     return undefined;
   }
   const draftId = action.draft_id;
-
-  if (draftRefresher) {
-    try {
-      await draftRefresher(draftId);
-    } catch (error) {
-      // Send refreshes again and refuses if it still can't.
-      const errorType = error instanceof Error ? error.name : "UnknownError";
-      console.log(`Approval action ${action.id}: refresh before edit failed (${errorType})`);
-    }
-  }
 
   const gmail = await gmailFor(action.google_account);
   const draft = await gmail.users.drafts.get({
@@ -1185,20 +1110,9 @@ export async function consumeDraftEdit(
   };
 }
 
-/** A stopped sequence's card must not stay tappable. The Gmail draft is left alone,
- *  as it is for any expired card. */
-export async function retireSequenceDraftCard(draftId: string): Promise<void> {
-  const action = getPendingActionForDraft(draftId);
-  if (action) {
-    await expireAction(action);
-  }
-}
-
 export async function expirePendingApprovals(): Promise<void> {
   for (const action of getExpiredPendingActions()) {
-    if (!keptForSequence(action)) {
-      await expireAction(action);
-    }
+    await expireAction(action);
   }
 }
 
