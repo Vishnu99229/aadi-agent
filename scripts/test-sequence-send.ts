@@ -1603,7 +1603,7 @@ await expectStop(
 }
 
 // Protected partner domains: never enrolled, never sent, subdomains included.
-for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertroninfotech.com", "pinnacle.in"]) {
+for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertroninfotech.com", "pinnacle.in", "shriramlife.com", "mail.shriramlife.com"]) {
   assert(domainInSet(domain, blockedAutoSendDomains()), `${domain} is blocked by default`);
 
   // Tapping Start on a pitch to them is refused.
