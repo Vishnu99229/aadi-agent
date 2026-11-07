@@ -1,5 +1,5 @@
 import { config } from "./config.js";
-import type { LlmBackend, LlmMessage, LlmTool, ToolCall } from "./llm.js";
+import type { LlmBackend, LlmMessage, LlmTool, ToolCall, ToolChoice } from "./llm.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
 import { shouldForceCalendarTool } from "./calendar_guard.js";
@@ -19,7 +19,16 @@ import {
   setSetting,
   type StoredMessage,
 } from "./db.js";
-import { complete } from "./llm.js";
+import { backendForcesTools, complete } from "./llm.js";
+import {
+  COMMAND_TOOLS,
+  commandIntents,
+  commandNotRunMessage,
+  commandRetryPrompt,
+  echoesEarlierReply,
+  sequenceTargets,
+  type CommandKind,
+} from "./command_intent.js";
 import type { UsageTask } from "./usage.js";
 import { memoryContextLine } from "./memory.js";
 import {
@@ -365,6 +374,32 @@ export async function runAgent(
   const receipts: ToolReceipt[] = [];
   let searchSources: SearchHit[] = [];
 
+  // An explicit command in his own message has to be answered by a tool that runs
+  // this turn. Models, DeepSeek especially, can otherwise repeat an old answer
+  // from the chat history without checking anything. Forwarded messages have no
+  // confirmation and a fixed tool list, so this never applies to them.
+  const intents: CommandKind[] =
+    options.sendConfirmation && !options.toolNames ? commandIntents(guardText) : [];
+  const earlierReplies = history.messages
+    .filter((message) => message.role !== "user")
+    .map((message) => message.content);
+  const earlierToolResults = history.messages
+    .filter((message) => message.role === "tool")
+    .map((message) => message.content);
+  const freshResults: string[] = [];
+  const isCommandTool = (name: string): boolean =>
+    intents.some((kind) => COMMAND_TOOLS[kind].includes(name));
+  const forceSequence: ToolChoice | undefined =
+    intents.includes("sequence") && backendForcesTools(backend)
+      ? { name: "start_sequence" }
+      : undefined;
+  let toolChoice: ToolChoice | undefined = forceSequence;
+  let commandRetryUsed = false;
+  let sequenceRunInCode = false;
+  if (intents.length > 0) {
+    console.log(`Command turn: kinds=${intents.join(",")} forced=${forceSequence ? "start_sequence" : "none"}`);
+  }
+
   try {
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     const response = await complete({
@@ -374,7 +409,9 @@ export async function runAgent(
       backend,
       task: options.usageTask ?? usageTaskForAgent(options.task),
       effort,
+      ...(toolChoice ? { toolChoice } : {}),
     });
+    toolChoice = undefined;
 
     const responseText = response.textParts.join("\n").trim();
     if (responseText) {
@@ -442,6 +479,9 @@ export async function runAgent(
             searchSources = hits;
           }
         }
+        if (isCommandTool(call.name)) {
+          freshResults.push(result.content);
+        }
         if (saveAssistantMessage) {
           saveMessage("tool", result.content, call.name);
         }
@@ -453,6 +493,65 @@ export async function runAgent(
       });
       messages.push(...toolResults);
       continue;
+    }
+
+    const missingKinds = intents.filter(
+      (kind) => !COMMAND_TOOLS[kind].some((name) => toolsUsed.has(name)),
+    );
+    if (response.toolCalls.length === 0 && missingKinds.length > 0) {
+      // A sequence request names the person in his words, so code runs the check
+      // itself rather than trusting the model's answer.
+      const targets =
+        missingKinds.includes("sequence") && !sequenceRunInCode ? sequenceTargets(guardText) : undefined;
+      if (targets) {
+        sequenceRunInCode = true;
+        console.log(`Command check: start_sequence run in code, targets=${targets.length} iteration=${iteration}`);
+        const calls: ToolCall[] = targets.map((target, index) => ({
+          id: `code_start_sequence_${iteration}_${index}`,
+          name: "start_sequence",
+          input: { prospect: target },
+          execution: "client",
+        }));
+        const turn: ToolTurn = {
+          iteration,
+          calledTools: calls.map((call) => call.name),
+          confirmation: options.sendConfirmation,
+          userText: guardText,
+          ctx: options.ctx,
+        };
+        const results: Array<Extract<LlmMessage, { role: "tool" }>> = [];
+        for (const call of calls) {
+          const result = await runTool(call, turn, allowedTools);
+          results.push(result);
+          toolsUsed.add(call.name);
+          receipts.push({ name: call.name, success: isSuccessfulToolResult(result.content, result.isError) });
+          freshResults.push(result.content);
+          if (result.isError) {
+            toolFailed = true;
+          }
+          if (saveAssistantMessage) {
+            saveMessage("tool", result.content, call.name);
+          }
+        }
+        messages.push({ role: "assistant", textParts: [], toolCalls: calls });
+        messages.push(...results);
+        continue;
+      }
+      if (!commandRetryUsed) {
+        commandRetryUsed = true;
+        console.log(`Command check: retry kinds=${missingKinds.join(",")} iteration=${iteration}`);
+        toolChoice = missingKinds.includes("sequence") ? forceSequence : undefined;
+        messages.push({
+          role: "assistant",
+          textParts: response.textParts,
+          toolCalls: [],
+        });
+        messages.push({ role: "user", content: commandRetryPrompt(missingKinds) });
+        continue;
+      }
+      console.log(`Command check: not run kinds=${missingKinds.join(",")}`);
+      succeeded = false;
+      return saveAssistantReply(commandNotRunMessage(missingKinds), saveAssistantMessage);
     }
 
     if (
@@ -563,6 +662,15 @@ export async function runAgent(
     if (!finalReply) {
       succeeded = !toolFailed;
       return "";
+    }
+    if (
+      intents.length > 0 &&
+      echoesEarlierReply(finalReply, earlierReplies, freshResults, earlierToolResults)
+    ) {
+      // The tool ran, but the words are an earlier turn's. Show what it said now.
+      console.log("Command check: reply repeated an earlier answer; using this turn's tool result");
+      succeeded = !toolFailed;
+      return saveAssistantReply(freshResults.join("\n\n"), saveAssistantMessage);
     }
     const missing = unreceiptedClaims(finalReply, receipts);
     if (missing.length > 0) {

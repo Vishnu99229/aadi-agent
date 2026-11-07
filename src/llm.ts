@@ -138,6 +138,29 @@ export interface CompleteParams {
    * the schema is then placed in the prompt. See api-docs.deepseek.com/guides/json_mode.
    */
   jsonSchema?: Record<string, unknown>;
+  /** Make the model call this tool on this step instead of answering in text:
+   *  code decides the tool must run, the model only fills in its input. Sent to
+   *  OpenAI-compatible backends (DeepSeek, Gemini, local) only: Claude Sonnet 5.5
+   *  rejects forced tool use with a 400, so on Claude this is ignored and the
+   *  caller's own check has to cover it. */
+  toolChoice?: ToolChoice;
+}
+
+export type ToolChoice = "required" | { name: string };
+
+/** Backends that take a forced tool call. */
+export function backendForcesTools(backend: LlmBackend): boolean {
+  return backend !== "claude" && backend !== "haiku" && backend !== "deepseek-reasoner";
+}
+
+/** The OpenAI-compatible tool_choice (DeepSeek, Gemini, local) for a forced call. */
+export function openAiToolChoice(
+  choice: ToolChoice | undefined,
+): "required" | { type: "function"; function: { name: string } } | undefined {
+  if (!choice) {
+    return undefined;
+  }
+  return choice === "required" ? "required" : { type: "function", function: { name: choice.name } };
 }
 
 export interface CompleteResult {
@@ -775,11 +798,13 @@ async function completeWithOpenAiCompatible(
       dynamic: [system.dynamic, jsonMode.systemExtra].filter(Boolean).join("\n"),
     };
   }
+  const forced = tools.length > 0 && !options.thinking ? openAiToolChoice(params.toolChoice) : undefined;
   const response = await client.chat.completions.create(
     {
       model,
       messages: toOpenRouterMessages(system, params.messages),
       ...(tools.length > 0 ? { tools } : {}),
+      ...(forced ? { tool_choice: forced } : {}),
       max_tokens: params.maxTokens ?? MAX_TOKENS,
       ...(jsonMode.responseFormat
         ? { response_format: jsonMode.responseFormat }
