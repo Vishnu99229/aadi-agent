@@ -308,6 +308,7 @@ const DEFAULT_PARTNER_DOMAINS = [
   "supertroninfotech.com",
   "supertronindia.com",
   "pinnacle.in",
+  "shriramlife.com",
 ];
 const partnerDomains = (
   process.env.PARTNER_DOMAINS?.trim()

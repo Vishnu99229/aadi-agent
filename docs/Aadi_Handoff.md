@@ -238,7 +238,7 @@ Required at process start (`src/security/env_guard.ts`): `TELEGRAM_BOT_TOKEN`, `
 | `AUTO_BOOK_MIN_CONFIDENCE` | Classifier threshold |
 | `MEETING_TEST_SENDERS` | Extra From addresses treated as prospects |
 | `SELF_EMAIL_ADDRESSES` | Extra mailboxes treated as Vishnu by `loadFollowupSelfAddresses` (plus both accounts' profile and send-as aliases). A follow-up whose To is only those addresses is dropped by `isAlgorithmicallyExcluded` |
-| `PARTNER_DOMAINS` | Comma-separated. Default `supertroninfotech.com,supertronindia.com,pinnacle.in` when unset; setting it replaces the default, it doesn't add to it. `pinnacle.in` is the From domain on Pinnacle Teleservices mail and that account's `email_domains` |
+| `PARTNER_DOMAINS` | Comma-separated. Default `supertroninfotech.com,supertronindia.com,pinnacle.in,shriramlife.com` when unset; setting it replaces the default, it doesn't add to it. `pinnacle.in` is the From domain on Pinnacle Teleservices mail and that account's `email_domains` |
 | `SEND_ON_COMMAND_ENABLED` | Turns on `send_email` (no card, no content check), calendar on command and scheduled sends, routes those turns to Sonnet (`looksLikeCommandTurn`), and makes `send_immediately` a Send card. Default off, which leaves today's behaviour unchanged |
 | `SEQUENCES_ENABLED` | Kill switch for sequence detection and sending. Default off |
 | `SEQUENCE_STEP_DAYS`, `SEQUENCE_PITCH_MIN_CONFIDENCE`, `SEQUENCE_DAILY_SEND_CAP`, `SEQUENCE_MIN_SPACING_MINUTES` | Defaults 2 days, 0.75, 15 a day, 3 minutes |
