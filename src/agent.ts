@@ -1,3 +1,4 @@
+import { config } from "./config.js";
 import type { LlmBackend, LlmMessage, LlmTool, ToolCall } from "./llm.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
@@ -61,9 +62,27 @@ import {
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ITERATIONS = 8;
 
-const toolDefinitions: LlmTool[] = TOOL_ORDER.map(
+const COMMAND_ONLY_TOOLS: ReadonlySet<string> = new Set([
+  "send_email",
+  "create_event",
+  "book_meeting",
+  "move_event",
+  "cancel_scheduled_send",
+]);
+
+/** Off leaves the tool list exactly as it was, so nothing changes for the cached prefix. */
+export function defaultToolNames(sendOnCommand: boolean): string[] {
+  return TOOL_ORDER.filter((name) =>
+    sendOnCommand ? name !== "create_meeting" : !COMMAND_ONLY_TOOLS.has(name),
+  );
+}
+
+const toolDefinitions: LlmTool[] = defaultToolNames(config.sendOnCommandEnabled).map(
   (name) => customTools[name]!.definition,
 );
+
+const SEND_ON_COMMAND_NOTE =
+  "Sending email: when Vishnu tells you in this message, in any language, to send an email or to reply to someone, call send_email straight away with the names as he said them. It finds the address and writes the email, so never ask him for an address or for wording first, and don't look the address up yourself. For a reply, find the thread with search_emails and pass thread_id. Ask him only when send_email tells you to. Never set send_immediately: it only makes a Send card. draft_new_email and draft_reply are for when he says draft, write or prepare. \"Remind me to email X\" stays set_reminder and \"follow up on my email to X\" stays track_thread. Calendar: when he tells you to create an event, block his calendar or add something to it, call create_event right away, on the work calendar and 30 minutes unless he said otherwise, and don't ask which calendar or how long; to meet with someone, call book_meeting with the names as he said them; to delete, cancel or move an event, call delete_calendar_event or move_event. None of these needs a card or a tap, and create_meeting is unavailable. Use propose_calendar_event only when he says propose or park. For add_calendar_attendee, pass the name as he said it in attendee_email. Sending later: when he says send on Monday or a date or time, call send_email with send_on (and send_time if he gave one), and a short subject for a new email; these timers do exist. A date inside what the email should say isn't a send date. To cancel one, call cancel_scheduled_send.";
 
 function formatCurrentTime(): string {
   return new Intl.DateTimeFormat("en-IN", {
@@ -288,6 +307,7 @@ export async function runAgent(
     dynamic: [
       `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
       sendIntentContext(options.sendConfirmation),
+      config.sendOnCommandEnabled ? SEND_ON_COMMAND_NOTE : "",
       recentUpload,
       "If Vishnu asked a specific question about a document or photo, answer only that question. Do not dump a full summary unless he asked for a summary.",
       memories,

@@ -1,5 +1,8 @@
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { runAgent } from "./agent.js";
+import { handleCommandSendCallback } from "./command_email.js";
+import { looksLikeCommandTurn } from "./command_logic.js";
+import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
 import { FORWARDED_TOOLS } from "./tools/index.js";
 import { handleSequenceCallback, handleSequenceCommand } from "./sequences.js";
 import { handleSequencesCommand, handleSequenceStopCallback } from "./sequence_runner.js";
@@ -528,6 +531,10 @@ bot.command("sequence", async (ctx) => {
   await whileTyping(ctx, () => handleSequenceCommand(ctx));
 });
 
+bot.command("scheduledsends", async (ctx) => {
+  await handleScheduledSendsCommand(ctx);
+});
+
 bot.command("sequences", async (ctx) => {
   await handleSequencesCommand(ctx);
 });
@@ -723,6 +730,14 @@ bot.callbackQuery(/^meet:(wrap|remind|skip):(\d+)$/, async (ctx) => {
 
 bot.callbackQuery(/^md:/, async (ctx) => {
   await handleModelCallback(ctx);
+});
+
+bot.callbackQuery(/^cmdsend:(?:hold|cancelsched):/, async (ctx) => {
+  await handleScheduledSendCallback(ctx);
+});
+
+bot.callbackQuery(/^cmdsend:/, async (ctx) => {
+  await handleCommandSendCallback(ctx);
 });
 
 bot.callbackQuery(/^seq:stop:/, async (ctx) => {
@@ -1029,6 +1044,10 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       runAgent(modelText, {
         guardText: userText,
         task,
+        // These turns can act with no card. Sonnet acts where cheaper models ask.
+        ...(config.sendOnCommandEnabled && looksLikeCommandTurn(userText)
+          ? { backend: "claude" as const }
+          : {}),
         usageTask: drafting
           ? "drafting"
           : accountQuestion

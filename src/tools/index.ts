@@ -1,7 +1,10 @@
 import type { LlmTool } from "../llm.js";
 import type { SendConfirmation } from "../approvals.js";
 import * as accountStatus from "./account_status.js";
+import * as bookMeeting from "./book_meeting.js";
 import * as confirmSendPendingDraft from "./confirm_send_pending_draft.js";
+import * as createEvent from "./create_event.js";
+import * as moveEvent from "./move_event.js";
 import * as createMeeting from "./create_meeting.js";
 import * as discardPendingDraft from "./discard_pending_draft.js";
 import * as resendDraftCard from "./resend_draft_card.js";
@@ -11,6 +14,7 @@ import * as addTask from "./add_task.js";
 import * as markBillPaid from "./mark_bill_paid.js";
 import * as removeDate from "./remove_date.js";
 import * as cancelReminder from "./cancel_reminder.js";
+import * as cancelScheduledSend from "./cancel_scheduled_send.js";
 import * as completeTask from "./complete_task.js";
 import * as deleteCalendarEvent from "./delete_calendar_event.js";
 import * as deleteTask from "./delete_task.js";
@@ -51,6 +55,7 @@ import * as searchDrive from "./search_drive.js";
 import * as searchHistory from "./search_history.js";
 import * as searchEmails from "./search_emails.js";
 import * as searchNotes from "./search_notes.js";
+import * as sendEmail from "./send_email.js";
 import * as setReminder from "./set_reminder.js";
 import * as startSequence from "./start_sequence.js";
 import * as stopSequence from "./stop_sequence.js";
@@ -83,9 +88,12 @@ const modules = {
   add_calendar_attendee: addCalendarAttendee,
   add_date: addDate,
   add_task: addTask,
+  book_meeting: bookMeeting,
   cancel_reminder: cancelReminder,
+  cancel_scheduled_send: cancelScheduledSend,
   complete_task: completeTask,
   confirm_send_pending_draft: confirmSendPendingDraft,
+  create_event: createEvent,
   create_meeting: createMeeting,
   delete_calendar_event: deleteCalendarEvent,
   discard_pending_draft: discardPendingDraft,
@@ -109,6 +117,7 @@ const modules = {
   list_memories: listMemories,
   list_waiting: listWaiting,
   mark_bill_paid: markBillPaid,
+  move_event: moveEvent,
   propose_calendar_event: proposeCalendarEvent,
   react_to_message: reactToMessage,
   resend_draft_card: resendDraftCard,
@@ -128,6 +137,7 @@ const modules = {
   search_notes: searchNotes,
   search_qa_bank: searchQa,
   web_search: webSearch,
+  send_email: sendEmail,
   set_reminder: setReminder,
   start_sequence: startSequence,
   stop_sequence: stopSequence,
@@ -197,6 +207,11 @@ export const TOOL_ORDER = [
   "search_history",
   "start_sequence",
   "stop_sequence",
+  "send_email",
+  "create_event",
+  "book_meeting",
+  "move_event",
+  "cancel_scheduled_send",
   "list_documents",
 ] as const;
 

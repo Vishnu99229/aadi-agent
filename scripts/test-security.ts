@@ -619,10 +619,28 @@ for (const file of srcFiles) {
   }
 }
 assert(
-  messageSendFiles.length === 2 &&
+  messageSendFiles.length === 3 &&
     messageSendFiles.some((file) => file.endsWith("/security/auto_book.ts")) &&
-    messageSendFiles.some((file) => file.endsWith("/security/sequence_send.ts")),
-  `messages.send only allowed in auto_book.ts and security/sequence_send.ts, found ${messageSendFiles.join(", ") || "none"}`,
+    messageSendFiles.some((file) => file.endsWith("/security/sequence_send.ts")) &&
+    messageSendFiles.some((file) => file.endsWith("/security/command_send.ts")),
+  `messages.send only allowed in auto_book.ts, security/sequence_send.ts and security/command_send.ts, found ${messageSendFiles.join(", ") || "none"}`,
+);
+const commandSendSrc = await readFile(join(root, "src/security/command_send.ts"), "utf8");
+assert(
+  (commandSendSrc.match(/messages\.send/g) ?? []).length === 1,
+  "command_send.ts has exactly one send call",
+);
+assert(
+  commandSendSrc.indexOf("allowOwnerChatCommandSend(params") <
+    commandSendSrc.indexOf("evaluateCommandSendGate({") &&
+    commandSendSrc.indexOf("evaluateCommandSendGate({") <
+      commandSendSrc.indexOf("claimCommandSend({") &&
+    commandSendSrc.indexOf("claimCommandSend({") < commandSendSrc.indexOf("users.messages.send"),
+  "command send checks the owner, runs the gate, claims the command, then calls Gmail",
+);
+assert(
+  !(FORWARDED_TOOLS as readonly string[]).includes("send_email"),
+  "forwarded messages can't reach send_email",
 );
 const sequenceSendSrc = await readFile(join(root, "src/security/sequence_send.ts"), "utf8");
 assert(
@@ -692,7 +710,67 @@ assert(
 );
 
 const toolsIndex = await readFile(join(root, "src/tools/index.ts"), "utf8");
-assert(!/book_meeting|send_email|create_event/.test(toolsIndex), "no model send/book tools");
+// send_email, create_event, book_meeting and move_event are owner-command actions:
+// each tool is a thin wrapper, and the real call sits behind the owner-message,
+// recipient-resolution and toggle checks.
+for (const [tool, gated] of [
+  ["send_email", "sendEmailFromTool"],
+  ["create_event", "createOwnerCalendarEvent"],
+  ["book_meeting", "bookMeetingFromTool"],
+  ["move_event", "moveOwnerCalendarEvent"],
+  ["cancel_scheduled_send", "cancelScheduledSendFromTool"],
+] as const) {
+  const wrapper = await readFile(join(root, `src/tools/${tool}.ts`), "utf8");
+  assert(
+    wrapper.includes(gated) &&
+      !/google|gmail|calendar\.|messages\.|drafts\./i.test(
+        wrapper.replace(/"(?:[^"\\]|\\.)*"/g, "").replace(/`[^`]*`/g, ""),
+      ),
+    `the ${tool} tool can't reach Google itself`,
+  );
+  assert(
+    !(FORWARDED_TOOLS as readonly string[]).includes(tool),
+    `forwarded messages can't reach ${tool}`,
+  );
+}
+for (const tool of ["delete_calendar_event", "add_calendar_attendee", "create_meeting"]) {
+  assert(
+    !(FORWARDED_TOOLS as readonly string[]).includes(tool),
+    `forwarded messages can't reach ${tool}`,
+  );
+}
+const ownerEventSrc = await readFile(join(root, "src/owner_meeting.ts"), "utf8");
+const commandEventFn = ownerEventSrc.slice(ownerEventSrc.indexOf("export async function createCommandEvent"));
+assert(
+  commandEventFn.indexOf("allowOwnerChatCreateEvent(") < commandEventFn.indexOf("evaluateCommandEventGate({") &&
+    commandEventFn.indexOf("evaluateCommandEventGate({") < commandEventFn.indexOf("claimCommandSend({") &&
+    commandEventFn.indexOf("claimCommandSend({") < commandEventFn.indexOf("insertCommandEvent(input.event)"),
+  "a command event checks the owner, runs the gate, claims the command, then calls Calendar",
+);
+const scheduledSrc = await readFile(join(root, "src/scheduled_sends.ts"), "utf8");
+const fireFn = scheduledSrc.slice(scheduledSrc.indexOf("export async function fireScheduledSend"));
+assert(
+  fireFn.indexOf("recheckRecipients(request)") < fireFn.indexOf("writeAndSend(") &&
+    fireFn.includes("beforeSend: () => claimScheduledSend("),
+  "a scheduled send re-resolves its recipients, then claims right before sending",
+);
+assert(
+  !/messages\.send|drafts\.send/.test(scheduledSrc),
+  "scheduled sends go through sendCommandEmail, not Gmail directly",
+);
+const moveFn = (await readFile(join(root, "src/owner_calendar.ts"), "utf8"));
+assert(
+  moveFn.slice(moveFn.indexOf("export async function moveOwnerCalendarEvent")).includes("allowOwnerChatMoveEvent(input.confirmation)"),
+  "moving an event needs his own message",
+);
+const commandEmailSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
+assert(
+  commandEmailSrc.includes("sendCommandEmail({") &&
+    commandEmailSrc.includes("namedInOwnWords(query, ownWords)") &&
+    commandEmailSrc.includes("if (!confirmation)") &&
+    commandEmailSrc.includes("bookResolvedMeeting({"),
+  "send_email and book_meeting need his own message, and a recipient from his own words",
+);
 assert(!/sendSchedulingEmail|messages.send/.test(toolsIndex), "model tools have no send");
 assert(!/calendar\.events/.test(toolsIndex), "model tools have no calendar write");
 assert(

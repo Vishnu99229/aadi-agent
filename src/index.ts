@@ -29,6 +29,7 @@ import {
 } from "./meeting_book.js";
 import { registerShadowJobs } from "./shadow_inbox.js";
 import { registerSequenceDetection } from "./sequences.js";
+import { registerScheduledSends } from "./scheduled_sends.js";
 import { refreshSequenceDraftSlots, registerSequenceSend } from "./sequence_runner.js";
 import { registerMessageEmbed } from "./embeddings.js";
 import { registerJobWorker } from "./job_worker.js";
@@ -53,6 +54,7 @@ const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
 const shadowJobs = registerShadowJobs(bot.api);
 const sequenceDetectTask = registerSequenceDetection(bot.api);
 const sequenceSendTask = registerSequenceSend(bot.api);
+const scheduledSendTask = registerScheduledSends();
 setDraftRefresher(refreshSequenceDraftSlots);
 setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
@@ -116,6 +118,7 @@ process.once("SIGINT", () => {
   shadowJobs.evening.stop();
   sequenceDetectTask?.stop();
   sequenceSendTask?.stop();
+  scheduledSendTask?.stop();
   clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();
@@ -141,6 +144,7 @@ process.once("SIGTERM", () => {
   shadowJobs.evening.stop();
   sequenceDetectTask?.stop();
   sequenceSendTask?.stop();
+  scheduledSendTask?.stop();
   clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();

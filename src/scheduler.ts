@@ -45,6 +45,7 @@ export const HEALTH_JOBS = [
   "bill-scan",
   "followup-scan",
   "sequence-send",
+  "scheduled-send",
   "important-dates",
   "weekly-review",
   "weekly-backup",
@@ -583,6 +584,10 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
       continue;
     }
     if (name === "sequence-send" && !config.sequencesEnabled) {
+      lines.push(`${name}: off`);
+      continue;
+    }
+    if (name === "scheduled-send" && !config.sendOnCommandEnabled) {
       lines.push(`${name}: off`);
       continue;
     }

@@ -1,3 +1,4 @@
+import { config } from "../config.js";
 import type { LlmTool } from "../llm.js";
 import { createOwnerMeeting } from "../owner_meeting.js";
 import type { ToolTurn } from "./index.js";
@@ -40,6 +41,10 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
 };
 
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
+  // book_meeting is the path while this is on, so its recipient check can't be bypassed.
+  if (config.sendOnCommandEnabled) {
+    return "Not created: use book_meeting for this.";
+  }
   const values = (input ?? {}) as {
     person?: unknown;
     title?: unknown;

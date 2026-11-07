@@ -680,6 +680,45 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sales_sequence_steps_sent_message
     ON sales_sequence_steps (sent_message_id);
 
+  CREATE TABLE IF NOT EXISTS command_sends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idem_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('sending', 'sent', 'unconfirmed')),
+    account TEXT NOT NULL,
+    thread_id TEXT,
+    sent_message_id TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    sent_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS command_send_choices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'used', 'cancelled')),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS scheduled_sends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idem_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'scheduled'
+      CHECK (status IN ('scheduled', 'held', 'sending', 'sent', 'cancelled', 'failed')),
+    send_at TEXT NOT NULL,
+    retry_at TEXT,
+    task_id INTEGER NOT NULL REFERENCES tasks (id),
+    item_text TEXT NOT NULL,
+    request TEXT NOT NULL,
+    confirm_chat INTEGER NOT NULL,
+    confirm_message INTEGER NOT NULL,
+    write_failures INTEGER NOT NULL DEFAULT 0,
+    claimed_at TEXT,
+    sent_message_id TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_scheduled_sends_status_time
+    ON scheduled_sends (status, send_at);
+
   CREATE TABLE IF NOT EXISTS sales_do_not_contact (
     email TEXT PRIMARY KEY,
     reason TEXT NOT NULL,
@@ -5100,4 +5139,230 @@ export function hasPendingMeetingWithEmail(email: string): boolean {
       )
       .get(`"${address}"`) !== undefined
   );
+}
+
+// ---- Emails sent on Vishnu's command (send_email) ----
+
+export interface CommandChoiceRecord {
+  id: number;
+  request: string;
+  status: "open" | "used" | "cancelled";
+  created_at: string;
+}
+
+/** Claimed before the Gmail call. The unique key is what stops a second send. */
+export function claimCommandSend(input: {
+  key: string;
+  account: string;
+  threadId: string | null;
+}): boolean {
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO command_sends (idem_key, status, account, thread_id)
+       VALUES (?, 'sending', ?, ?)`,
+    )
+    .run(input.key, input.account, input.threadId);
+  return result.changes === 1;
+}
+
+export function getCommandSendByKey(
+  key: string,
+): { status: string; sent_message_id: string | null } | undefined {
+  return db
+    .prepare("SELECT status, sent_message_id FROM command_sends WHERE idem_key = ?")
+    .get(key) as { status: string; sent_message_id: string | null } | undefined;
+}
+
+export function recordCommandSendSent(key: string, sentMessageId: string): void {
+  db.prepare(
+    `UPDATE command_sends SET status = 'sent', sent_message_id = ?, sent_at = CURRENT_TIMESTAMP
+     WHERE idem_key = ? AND status = 'sending'`,
+  ).run(sentMessageId, key);
+}
+
+export function markCommandSendUnconfirmed(key: string): void {
+  db.prepare(
+    "UPDATE command_sends SET status = 'unconfirmed' WHERE idem_key = ? AND status = 'sending'",
+  ).run(key);
+}
+
+/** Gmail refused it, so the same command may try again. */
+export function releaseCommandSend(key: string): void {
+  db.prepare("DELETE FROM command_sends WHERE idem_key = ? AND status = 'sending'").run(key);
+}
+
+export function createCommandChoice(request: string, createdAt: string): number {
+  const result = db
+    .prepare("INSERT INTO command_send_choices (request, created_at) VALUES (?, ?)")
+    .run(request, createdAt);
+  return Number(result.lastInsertRowid);
+}
+
+export function getCommandChoice(id: number): CommandChoiceRecord | undefined {
+  return db.prepare("SELECT * FROM command_send_choices WHERE id = ?").get(id) as
+    | CommandChoiceRecord
+    | undefined;
+}
+
+export function listOpenCommandChoices(sinceIso: string): CommandChoiceRecord[] {
+  return db
+    .prepare("SELECT * FROM command_send_choices WHERE status = 'open' AND created_at >= ?")
+    .all(sinceIso) as CommandChoiceRecord[];
+}
+
+/** One tap wins: the choice closes here, so a double tap can't act twice. */
+export function closeCommandChoice(id: number, status: "used" | "cancelled"): boolean {
+  return (
+    db
+      .prepare("UPDATE command_send_choices SET status = ? WHERE id = ? AND status = 'open'")
+      .run(status, id).changes === 1
+  );
+}
+
+// ---- Emails to send later on Vishnu's command ----
+
+export type ScheduledSendStatus = "scheduled" | "held" | "sending" | "sent" | "cancelled" | "failed";
+
+export interface ScheduledSendRecord {
+  id: number;
+  idem_key: string;
+  status: ScheduledSendStatus;
+  send_at: string;
+  retry_at: string | null;
+  task_id: number;
+  item_text: string;
+  /** The CommandRequest, including who it goes to and what he asked it to say. */
+  request: string;
+  confirm_chat: number;
+  confirm_message: number;
+  write_failures: number;
+  claimed_at: string | null;
+  sent_message_id: string | null;
+  created_at: string;
+}
+
+/** The row and its visible task, together. Undefined when this command already made one. */
+export function createScheduledSend(input: {
+  key: string;
+  sendAt: string;
+  itemText: string;
+  tag: ItemTag;
+  request: string;
+  confirmChat: number;
+  confirmMessage: number;
+}): ScheduledSendRecord | undefined {
+  return db.transaction(() => {
+    if (db.prepare("SELECT 1 FROM scheduled_sends WHERE idem_key = ?").get(input.key)) {
+      return undefined;
+    }
+    const task = createTask(input.itemText, input.tag, input.sendAt);
+    const result = db
+      .prepare(
+        `INSERT INTO scheduled_sends
+           (idem_key, send_at, task_id, item_text, request, confirm_chat, confirm_message)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(input.key, input.sendAt, task.id, input.itemText, input.request, input.confirmChat, input.confirmMessage);
+    return getScheduledSend(Number(result.lastInsertRowid));
+  })();
+}
+
+export function getScheduledSend(id: number): ScheduledSendRecord | undefined {
+  return db.prepare("SELECT * FROM scheduled_sends WHERE id = ?").get(id) as
+    | ScheduledSendRecord
+    | undefined;
+}
+
+export function listOpenScheduledSends(): ScheduledSendRecord[] {
+  return db
+    .prepare(
+      "SELECT * FROM scheduled_sends WHERE status IN ('scheduled', 'held') ORDER BY send_at ASC, id ASC",
+    )
+    .all() as ScheduledSendRecord[];
+}
+
+export function listDueScheduledSends(nowIso: string, limit: number): ScheduledSendRecord[] {
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_sends
+       WHERE status = 'scheduled' AND send_at <= ? AND (retry_at IS NULL OR retry_at <= ?)
+       ORDER BY send_at ASC, id ASC
+       LIMIT ?`,
+    )
+    .all(nowIso, nowIso, limit) as ScheduledSendRecord[];
+}
+
+/** Closing the task is one of the ways to cancel. */
+export function listScheduledSendsWithClosedTask(): ScheduledSendRecord[] {
+  return db
+    .prepare(
+      `SELECT scheduled_sends.* FROM scheduled_sends
+       JOIN tasks ON tasks.id = scheduled_sends.task_id
+       WHERE scheduled_sends.status IN ('scheduled', 'held') AND tasks.status = 'done'`,
+    )
+    .all() as ScheduledSendRecord[];
+}
+
+export function listStaleScheduledSends(cutoffIso: string): ScheduledSendRecord[] {
+  return db
+    .prepare("SELECT * FROM scheduled_sends WHERE status = 'sending' AND claimed_at < ?")
+    .all(cutoffIso) as ScheduledSendRecord[];
+}
+
+/** The last check before Gmail. Fails if he cancelled, by any route, in the meantime. */
+export function claimScheduledSend(id: number, nowIso: string): boolean {
+  return (
+    db
+      .prepare(
+        `UPDATE scheduled_sends SET status = 'sending', claimed_at = ?
+         WHERE id = ? AND status = 'scheduled'
+           AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = scheduled_sends.task_id AND tasks.status = 'open')`,
+      )
+      .run(nowIso, id).changes === 1
+  );
+}
+
+export function transitionScheduledSend(
+  id: number,
+  from: readonly ScheduledSendStatus[],
+  to: ScheduledSendStatus,
+): boolean {
+  const places = from.map(() => "?").join(", ");
+  return (
+    db
+      .prepare(`UPDATE scheduled_sends SET status = ? WHERE id = ? AND status IN (${places})`)
+      .run(to, id, ...from).changes === 1
+  );
+}
+
+export function holdScheduledSend(id: number, request: string): boolean {
+  return (
+    db
+      .prepare("UPDATE scheduled_sends SET status = 'held', request = ? WHERE id = ? AND status = 'scheduled'")
+      .run(request, id).changes === 1
+  );
+}
+
+export function releaseHeldScheduledSend(id: number, request: string): boolean {
+  return (
+    db
+      .prepare(
+        "UPDATE scheduled_sends SET status = 'scheduled', request = ?, retry_at = NULL WHERE id = ? AND status = 'held'",
+      )
+      .run(request, id).changes === 1
+  );
+}
+
+export function recordScheduledSendSent(id: number, sentMessageId: string | null): void {
+  db.prepare("UPDATE scheduled_sends SET status = 'sent', sent_message_id = ? WHERE id = ?").run(
+    sentMessageId,
+    id,
+  );
+}
+
+export function retryScheduledSend(id: number, retryAt: string): number {
+  db.prepare(
+    "UPDATE scheduled_sends SET status = 'scheduled', retry_at = ?, write_failures = write_failures + 1 WHERE id = ?",
+  ).run(retryAt, id);
+  return getScheduledSend(id)?.write_failures ?? 0;
 }
