@@ -27,7 +27,6 @@ import {
   onMeetingDraftSent,
   registerMeetingBookingJobs,
 } from "./meeting_book.js";
-import { registerShadowJobs } from "./shadow_inbox.js";
 import { registerSequenceDetection } from "./sequences.js";
 import { registerScheduledSends } from "./scheduled_sends.js";
 import { refreshSequenceDraftSlots, registerSequenceSend } from "./sequence_runner.js";
@@ -51,7 +50,6 @@ const meetingScanTask = registerMeetingScan(bot.api);
 const weeklyBackupTask = registerWeeklyBackup(bot.api);
 const attachmentAlertTask = registerAttachmentAlertScan(bot.api);
 const meetingBookingJobs = registerMeetingBookingJobs(bot.api);
-const shadowJobs = registerShadowJobs(bot.api);
 const sequenceDetectTask = registerSequenceDetection(bot.api);
 const sequenceSendTask = registerSequenceSend(bot.api);
 const scheduledSendTask = registerScheduledSends();
@@ -115,11 +113,9 @@ process.once("SIGINT", () => {
   meetingBookingJobs.inbox.stop();
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
-  shadowJobs.evening.stop();
   sequenceDetectTask?.stop();
   sequenceSendTask?.stop();
   scheduledSendTask?.stop();
-  clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();
   messageEmbedTask.stop();
@@ -141,11 +137,9 @@ process.once("SIGTERM", () => {
   meetingBookingJobs.inbox.stop();
   meetingBookingJobs.poll.stop();
   meetingBookingJobs.pending.stop();
-  shadowJobs.evening.stop();
   sequenceDetectTask?.stop();
   sequenceSendTask?.stop();
   scheduledSendTask?.stop();
-  clearInterval(shadowJobs.expiry);
   buildPollTask.stop();
   jobQueueTask.stop();
   messageEmbedTask.stop();
