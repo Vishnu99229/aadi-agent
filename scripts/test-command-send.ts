@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bot } from "../src/bot.ts";
 import { buildMorningBrief } from "../src/brief.ts";
+import { getTaskBackend, setTaskBackend } from "../src/chat_backend.ts";
 import { formatHealthReport, HEALTH_JOBS } from "../src/scheduler.ts";
 import {
   handleScheduledSendCallback,
@@ -411,7 +412,7 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   assert(told[before]!.markup === undefined, "with no card");
   assert(draftsCreated.length === 0, "no draft");
   const call = writerCalls[writerCalls.length - 1]!;
-  assert(call.backend === "claude" && call.model === config.claudeModel && call.noFallback === true, "Sonnet only, no fallback");
+  assert(call.backend === getTaskBackend("command") && call.noFallback === true, "the Command backend only, no fallback");
   assert(call.tools.length === 0, "the writer has no tools");
 }
 
@@ -1042,14 +1043,14 @@ eventsOnCalendar.push(
   settings.sendOnCommandEnabled = true;
 }
 
-// ======== Sonnet for command turns ========
+// ======== Command backend for command turns ========
 for (const phrase of [
   "send Selvaraj an email", "email Sujoy", "reply to Selvaraj saying yes", "Selvaraj ko mail bhej do",
   "Selvaraj-nu oru mail ayakku", "block my calendar on Friday", "add dentist to my calendar",
   "book a meeting with Sujoy", "schedule a call with Ravi", "cancel the board prep event",
   "move the standup meeting to 4pm", "don't send the Selvaraj email",
 ]) {
-  assert(looksLikeCommandTurn(phrase), `"${phrase}" runs on Sonnet`);
+  assert(looksLikeCommandTurn(phrase), `"${phrase}" runs on the Command backend`);
 }
 for (const phrase of ["what's the weather", "summarise this document", "how much did I spend on bills", "remind me to buy milk", "hello"]) {
   assert(!looksLikeCommandTurn(phrase), `"${phrase}" stays on the normal model`);
@@ -1066,6 +1067,11 @@ for (const phrase of ["what's the weather", "summarise this document", "how much
     return { ok: true, result: true } as never;
   });
   await bot.init();
+  // Command and chat both default to Gemini; give command its own backend so routing is visible.
+  const commandDefault = getTaskBackend("command");
+  setTaskBackend("command", getTaskBackend("chat") === "claude" ? "gemini" : "claude");
+  const commandBackend = getTaskBackend("command");
+  const chatBackend = getTaskBackend("chat");
   const seen: unknown[] = [];
   chatScript = (params) => {
     seen.push(params.backend);
@@ -1087,16 +1093,17 @@ for (const phrase of ["what's the weather", "summarise this document", "how much
     await new Promise((resolve) => setTimeout(resolve, 30));
   };
   await say("send Arjun an email saying hello");
-  assert(seen.length > 0 && seen.every((item) => item === "claude"), `a send command runs on Sonnet, got ${seen.join()}`);
+  assert(seen.length > 0 && seen.every((item) => item === commandBackend), `a send command runs on the Command backend, got ${seen.join()}`);
   const normal = seen.length;
   await say("what's the weather like");
-  assert(seen.length > normal && seen.slice(normal).every((item) => item !== "claude"), `chat stays on its model, got ${seen.slice(normal).join()}`);
+  assert(seen.length > normal && seen.slice(normal).every((item) => item === chatBackend), `chat stays on its model, got ${seen.slice(normal).join()}`);
   settings.sendOnCommandEnabled = false;
   const off = seen.length;
   await say("send Arjun an email saying hello");
-  assert(seen.length > off && seen.slice(off).every((item) => item !== "claude"), "off: no routing");
+  assert(seen.length > off && seen.slice(off).every((item) => item === chatBackend), "off: no routing");
   settings.sendOnCommandEnabled = true;
   chatScript = undefined;
+  setTaskBackend("command", commandDefault);
 }
 
 // ======== scheduled sends ========
@@ -1189,7 +1196,7 @@ assert(!mentionsSendDate("Selvaraj ko mail bhej do ki Tuesday confirm hai"), "no
   await runScheduledSendTick(atIst(SOON, "09:59"));
   assert(sends.length === count && getScheduledSend(row.id)!.status === "scheduled", "nothing before its time");
 
-  // Due: written fresh, on Sonnet, with what's changed since.
+  // Due: written fresh, on the Command backend, with what's changed since.
   mail({ threadId: "later", from: `${name} Rao <${name.toLowerCase()}@co${personCounter}.example>`, to: ME, subject: "New since then", body: "Something changed" });
   const writerBefore = writerCalls.length;
   written = { subject: "ignored", body: "Hi,\n\nHello there." };
@@ -1198,7 +1205,7 @@ assert(!mentionsSendDate("Selvaraj ko mail bhej do ki Tuesday confirm hai"), "no
   assert(sends[count]!.subject === "Quick hello", "with the subject on his list");
   assert(sends[count]!.to.includes(`${name.toLowerCase()}@co${personCounter}.example`), "to the right person");
   const call = writerCalls[writerBefore]!;
-  assert(call.backend === "claude" && call.model === config.claudeModel && call.noFallback === true, "written on Sonnet at fire time");
+  assert(call.backend === getTaskBackend("command") && call.noFallback === true, "written on the Command backend at fire time");
   assert(JSON.stringify(call.messages).includes("New since then"), "and it sees what changed");
   assert(!told.some((entry) => entry.text.startsWith("Send email")), "no noise");
   const done = getScheduledSend(row.id)!;
