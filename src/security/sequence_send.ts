@@ -13,6 +13,7 @@ import {
 import type { LoadedGoogleAccount } from "../google/auth.js";
 import { buildThreadReplyMime, gmailClient, mimeHeaderBlock } from "../google/mail.js";
 import { blockedAutoSendDomains } from "../meeting_book.js";
+import { htmlFromSequenceBody } from "../sequence_writer.js";
 import { isSelfEmail } from "../mom_logic.js";
 import {
   domainInSet,
@@ -262,6 +263,9 @@ export async function sendSequenceStep(
     references: params.references,
     body: params.body,
     signatureHtml: params.signatureHtml,
+    htmlBody: params.signatureHtml
+      ? htmlFromSequenceBody(params.body, params.signatureHtml)
+      : undefined,
   });
   if (/^(?:cc|bcc):/im.test(mimeHeaderBlock(raw))) {
     throw new SequenceSendRefusedError("cc_not_allowed");

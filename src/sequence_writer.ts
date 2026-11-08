@@ -19,6 +19,7 @@ import { gmailClient, plainTextBody } from "./google/mail.js";
 import { config } from "./config.js";
 import { complete, completeBackground } from "./llm.js";
 import { freeSlotsForOffer } from "./meeting_book.js";
+import { htmlFromSchedulingBody } from "./security/auto_book.js";
 import { formatOfferSlot } from "./meeting_slots.js";
 import { salesFactsText } from "./sales_facts.js";
 import { slotInProspectHours } from "./sequence_rules.js";
@@ -74,7 +75,7 @@ export const WRITER_SYSTEM = `You write one short follow-up email for Vishnu Raj
 Rules:
 - At most 120 words, plain text. No subject line, no markdown, no bullet lists unless given a token for them.
 - Open the way his original email opens, and match its language and tone.
-- Do not write a sign-off or signature; one is added for you.
+- Do not write a sign-off, signature, physical address or opt-out line; those are added for you.
 - Draw on SALES FACTS to make the email specific and persuasive for this recipient: choose the one or two points most relevant to their business, and never list everything. Follow its writing style section.
 - Every claim, customer name or number comes from SALES FACTS or the ORIGINAL THREAD. Don't invent any.
 - Push for THE ASK and nothing else, and offer nothing extra such as materials or a write-up. Say "demo" only when THE ASK is a demo.
@@ -136,7 +137,33 @@ export function resolveOriginalAsk(
 }
 
 const SIGN_OFF_LINE =
-  /^(?:(?:best|best regards|regards|kind regards|warm regards|thanks|thank you|many thanks|cheers|sincerely)[,.!]?|vishnu(?: rajan)?[,.]?|gtm,? epicode.*)$/i;
+  /^(?:(?:best|best regards|regards|kind regards|warm regards|thanks|thank you|many thanks|cheers|sincerely)[,.!]?\s*vishnu(?: rajan)?[,.]?|(?:best|best regards|regards|kind regards|warm regards|thanks|thank you|many thanks|cheers|sincerely)[,.!]?|vishnu(?: rajan)?[,.]?|gtm,? epicode.*)$/i;
+
+/** CAN-SPAM opt-out and physical address. Appended after the model body, before
+ *  the Gmail signature. Sales sequence steps only. */
+export const SEQUENCE_FOOTER =
+  "If you'd prefer not to hear from me, just reply 'no thanks' and I'll close the loop.\n\nEpicode Pvt Ltd\n37(S), UNNATI, Vijayanagar, Bengaluru – 560040";
+
+export const SEQUENCE_FOOTER_HTML =
+  '<p>If you\'d prefer not to hear from me, just reply \'no thanks\' and I\'ll close the loop.</p><p><span style="font-size:12px;color:#666">Epicode Pvt Ltd<br>37(S), UNNATI, Vijayanagar, Bengaluru – 560040</span></p>';
+
+export function withSequenceFooter(body: string): string {
+  const trimmed = body.trimEnd();
+  if (!trimmed || trimmed.endsWith(SEQUENCE_FOOTER)) {
+    return trimmed;
+  }
+  return `${trimmed}\n\n${SEQUENCE_FOOTER}`;
+}
+
+/** HTML for a sequence step: the written body, then the opt-out footer, then
+ *  the Gmail signature. Scheduling emails do not use this. */
+export function htmlFromSequenceBody(body: string, signatureHtml: string): string {
+  const trimmed = body.trimEnd();
+  const main = trimmed.endsWith(SEQUENCE_FOOTER)
+    ? trimmed.slice(0, trimmed.length - SEQUENCE_FOOTER.length).trimEnd()
+    : trimmed;
+  return htmlFromSchedulingBody(main, `${SEQUENCE_FOOTER_HTML}${signatureHtml}`);
+}
 
 /** The body only: the real signature is added when the email is built. */
 export function cleanDraftBody(text: string): string {
@@ -425,6 +452,7 @@ export async function prepareSequenceStep(
   if (!body) {
     return finish({ kind: "deferred", reason: "writer_failed" });
   }
+  body = withSequenceFooter(body);
   setSalesStepPrepared(sequenceId, step.step_no, body);
   return finish({ kind: "ready", body });
 }

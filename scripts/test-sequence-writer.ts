@@ -28,10 +28,14 @@ import {
   ASK_SYSTEM,
   askPhrase,
   cleanDraftBody,
+  htmlFromSequenceBody,
   prepareSequenceStep,
   resolveOriginalAsk,
+  SEQUENCE_FOOTER,
+  SEQUENCE_FOOTER_HTML,
   SLOTS_TOKEN,
   stepBrief,
+  withSequenceFooter,
   WRITER_SYSTEM,
 } from "../src/sequence_writer.ts";
 import { fakeTelegramApi, type TelegramLog } from "./fakes.ts";
@@ -169,6 +173,32 @@ assert(
   cleanDraftBody("Hi Priya,\n\nWould that work?\n\nThanks,\nVishnu") === "Hi Priya,\n\nWould that work?",
   "a model sign-off is removed",
 );
+assert(
+  cleanDraftBody("Hi Priya,\n\nWould that work?\n\nBest, Vishnu") === "Hi Priya,\n\nWould that work?",
+  "a one-line Best, Vishnu sign-off is removed",
+);
+assert(
+  cleanDraftBody("Hi Priya,\n\nWould that work?\n\nThanks, Vishnu") === "Hi Priya,\n\nWould that work?",
+  "a one-line Thanks, Vishnu sign-off is removed",
+);
+assert(
+  withSequenceFooter("Hi Priya,\n\nWould a demo work?") ===
+    `Hi Priya,\n\nWould a demo work?\n\n${SEQUENCE_FOOTER}`,
+  "the CAN-SPAM footer follows the written body",
+);
+assert(withSequenceFooter(withSequenceFooter("Hi")).endsWith(SEQUENCE_FOOTER), "the footer is not doubled");
+assert(
+  SEQUENCE_FOOTER.includes("reply 'no thanks'") && SEQUENCE_FOOTER.includes("Bengaluru – 560040"),
+  "the footer has the opt-out line and the Bangalore address",
+);
+{
+  const html = htmlFromSequenceBody("Hi Priya,\n\nWould a demo work?\n\n" + SEQUENCE_FOOTER, "<div>SIG</div>");
+  assert(html.includes("Would a demo work?"), "HTML keeps the written body");
+  assert(html.includes(SEQUENCE_FOOTER_HTML), "HTML uses the styled footer");
+  assert(html.includes('font-size:12px'), "the address is in a smaller font");
+  assert(html.includes("<div>SIG</div>"), "the Gmail signature still follows");
+  assert(!html.includes("Would a demo work?\n\nIf you'd prefer"), "the footer is not left as escaped plain text");
+}
 
 // ---- the full flow on fixture threads ----
 const threads = new Map<string, FixtureMessage[]>();
@@ -262,7 +292,7 @@ function slotLines(body: string): string[] {
   assert(ready.kind === "ready", `clean draft is ready, got ${JSON.stringify(ready)}`);
   const step = getSalesSequenceStep(id, 1)!;
   assert(step.status === "planned", "ready does not mean sent");
-  assert(step.draft_text === cleanDraftBody(CLEAN), "the draft is stored");
+  assert(step.draft_text === withSequenceFooter(cleanDraftBody(CLEAN)), "the draft is stored with the footer");
   assert(step.check_result === null, "no check result is stored");
   assert(step.sent_message_id === null, "nothing was sent");
   assert(calls.length === 2, `one ask call and one writer call, no checker: ${calls.length}`);
@@ -303,7 +333,7 @@ function slotLines(body: string): string[] {
     const id = enrol({ ...DEMO_PITCH, threadId: `fixture-free-${index}`, prospectEmail: `p${index}@free${index}.example`, prospectName: "Priya", prospectCompany: `Free${index}` });
     script = { ask: '{"ask":"demo"}', write: JSON.stringify({ body }) };
     const ready = await prepareSequenceStep(id);
-    assert(ready.kind === "ready" && ready.body === body, `sent as written: ${body.slice(0, 40)}`);
+    assert(ready.kind === "ready" && ready.body === withSequenceFooter(body), `sent as written: ${body.slice(0, 40)}`);
     assert(getSalesSequenceStep(id, 1)!.status === "planned", "no blocked step");
     assert(getSalesSequence(id)!.next_step_at !== null, "the sequence isn't paused");
   }

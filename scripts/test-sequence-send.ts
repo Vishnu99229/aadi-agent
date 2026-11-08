@@ -70,7 +70,15 @@ import {
   zoneLabel,
   zoneOffsetMinutes,
 } from "../src/sequence_timezone.ts";
-import { ASK_SYSTEM, offerSlots, prepareSequenceStep, SLOTS_TOKEN, WRITER_SYSTEM } from "../src/sequence_writer.ts";
+import {
+  ASK_SYSTEM,
+  offerSlots,
+  prepareSequenceStep,
+  SEQUENCE_FOOTER,
+  SEQUENCE_FOOTER_HTML,
+  SLOTS_TOKEN,
+  WRITER_SYSTEM,
+} from "../src/sequence_writer.ts";
 import { handleSequenceCallback } from "../src/sequences.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
 import { fakeTelegramApi } from "./fakes.ts";
@@ -200,7 +208,7 @@ function search(q: string): Msg[] {
   return items.sort((left, right) => right.at - left.at);
 }
 
-function parseRaw(raw: string): { headers: Record<string, string>; plain: string; text: string } {
+function parseRaw(raw: string): { headers: Record<string, string>; plain: string; html: string; text: string } {
   const text = Buffer.from(raw, "base64url").toString("utf8");
   const block = text.split("\r\n\r\n")[0] ?? "";
   const headers: Record<string, string> = {};
@@ -210,9 +218,13 @@ function parseRaw(raw: string): { headers: Record<string, string>; plain: string
       headers[line.slice(0, at).toLowerCase()] = line.slice(at + 1).trim();
     }
   }
-  const part = /Content-Type: text\/plain[^\r]*\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(text);
-  const plain = Buffer.from((part?.[1] ?? "").replace(/\s/g, ""), "base64").toString("utf8");
-  return { headers, plain, text };
+  const decodePart = (type: string): string => {
+    const part = new RegExp(
+      `Content-Type: ${type}[^\\r]*\\r\\nContent-Transfer-Encoding: base64\\r\\n\\r\\n([A-Za-z0-9+/=\\r\\n]+)`,
+    ).exec(text);
+    return Buffer.from((part?.[1] ?? "").replace(/\s/g, ""), "base64").toString("utf8");
+  };
+  return { headers, plain: decodePart("text\\/plain"), html: decodePart("text\\/html"), text };
 }
 
 type SendMode = "ok" | "deliver_then_throw" | "throw_no_deliver" | "reject_403" | "reject_400";
@@ -650,6 +662,11 @@ assert(zoneForHeaderOffset("-04:00", utc("2026-11-10T15:00:00")) === "-04:00", "
   assert(chooseProspectZone(header("+00:00"), undefined).zone === "+00:00", "+0000 alone is taken literally");
   assert(chooseProspectZone(header("+00:00"), pacific).zone === "America/Los_Angeles", "a place they name beats +0000, often a server's clock");
 }
+assert(
+  LOCATION_SYSTEM.includes("America/Los_Angeles (Pacific)") &&
+    LOCATION_SYSTEM.includes("Never default a US prospect to Eastern"),
+  "unspecified US falls back to Pacific, not Eastern or IST",
+);
 assert(parseLocationGuess('{"timezone":"America/New_York","basis":"signature"}')?.zone === "America/New_York", "a location answer parses");
 assert(parseLocationGuess('{"timezone":"","basis":"none"}') === undefined, "no answer is no location");
 assert(parseLocationGuess('{"timezone":"Mars/Base","basis":"company"}') === undefined, "an invalid zone is ignored");
@@ -714,7 +731,7 @@ assert(classifyInbound(inbound({ body: "I'm away until Monday but keen, call me.
 assert(classifyInbound(inbound({ subject: "Automatic reply", body: "Priya no longer works here." })) === "reply", "an auto-reply about leaving stops it");
 assert(classifyInbound(inbound({ from: "mailer-daemon@googlemail.com" })) === "bounce", "a daemon is a bounce");
 assert(classifyInbound(inbound({ from: "postmaster@acme.com" })) === "bounce", "a postmaster is a bounce");
-for (const body of ["Not interested, thanks.", "Please remove me from this.", "unsubscribe", "Stop emailing me."]) {
+for (const body of ["Not interested, thanks.", "Please remove me from this.", "unsubscribe", "Stop emailing me.", "no thanks"]) {
   assert(classifyInbound(inbound({ body })) === "do_not_contact", `${body} marks do-not-contact`);
 }
 assert(
@@ -951,6 +968,11 @@ assert(
   assert(first.parsed.headers.references === item.pitch.messageId, "References starts the chain");
   assert(first.parsed.headers.subject!.startsWith("Re: "), "the subject is a reply");
   assert(first.parsed.plain.includes("Vishnu Rajan"), "the signature is on it");
+  assert(first.parsed.plain.includes(SEQUENCE_FOOTER), "plain text has the CAN-SPAM footer before the signature");
+  assert(first.parsed.plain.indexOf(SEQUENCE_FOOTER) < first.parsed.plain.indexOf("Vishnu Rajan"), "the footer comes before the Gmail signature");
+  assert(first.parsed.html.includes(SEQUENCE_FOOTER_HTML), "HTML has the styled footer");
+  assert(first.parsed.html.includes('font-size:12px'), "the address is in a smaller font");
+  assert(first.parsed.html.includes("<div>Vishnu Rajan<br>GTM, Epicode</div>"), "HTML still has the Gmail signature");
   const step1 = getSalesSequenceStep(item.id, 1)!;
   assert(step1.status === "sent" && step1.sent_message_id === first.id, "sent_message_id is recorded");
   const row = getSalesSequence(item.id)!;
@@ -1447,7 +1469,7 @@ await expectStop(
   },
   "bounced",
 );
-for (const phrase of ["Not interested", "remove me please", "unsubscribe", "Please stop emailing me"]) {
+for (const phrase of ["Not interested", "remove me please", "unsubscribe", "Please stop emailing me", "no thanks"]) {
   const item = await expectStop(`"${phrase}"`, (target) => void reply(target, phrase), "do_not_contact");
   assert(isSalesDoNotContact(item.email), `"${phrase}" marks them do-not-contact`);
 }

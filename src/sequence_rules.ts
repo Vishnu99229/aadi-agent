@@ -110,7 +110,7 @@ const OOO_SUBJECT =
 const LEFT_COMPANY =
   /\bno longer (?:with|at|work|employed)|\bhas left\b|\bleft the company\b/i;
 const DO_NOT_CONTACT =
-  /\bnot interested\b|\bremove me\b|\bunsubscribe\b|\bstop (?:emailing|mailing|contacting|sending)\b|\bdo(?:n't|n’t| not) (?:email|contact)\b/i;
+  /\bnot interested\b|\bremove me\b|\bunsubscribe\b|\bno thanks\b|\bstop (?:emailing|mailing|contacting|sending)\b|\bdo(?:n't|n’t| not) (?:email|contact)\b/i;
 
 /** Out-of-office is decided first, so an auto-reply never reads as a real reply.
  *  It takes an auto-reply header or subject: a person typing "I'm away until

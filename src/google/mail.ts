@@ -121,7 +121,7 @@ export function stripSignature(plain: string): { body: string; signed: boolean }
     : { body: plain.slice(0, index).trimEnd(), signed: true };
 }
 
-function mimeBodyLines(body: string, signatureHtml: string): string[] {
+function mimeBodyLines(body: string, signatureHtml: string, htmlBody?: string): string[] {
   if (!signatureHtml) {
     return [
       'Content-Type: text/plain; charset="UTF-8"',
@@ -144,7 +144,7 @@ function mimeBodyLines(body: string, signatureHtml: string): string[] {
     'Content-Type: text/html; charset="UTF-8"',
     "Content-Transfer-Encoding: base64",
     "",
-    encodeBody(htmlFromSchedulingBody(body, signatureHtml)),
+    encodeBody(htmlBody ?? htmlFromSchedulingBody(body, signatureHtml)),
     `--${boundary}--`,
   ];
 }
@@ -156,6 +156,7 @@ export function buildMimeMessage(
   headers: ReadonlyArray<readonly [string, string]>,
   body: string,
   signatureHtml = "",
+  htmlBody?: string,
 ): string {
   const headerLines = headers
     .filter(([, value]) => value.trim())
@@ -164,9 +165,11 @@ export function buildMimeMessage(
         ? `${name}: ${encodeMimeHeader(value)}`
         : `${name}: ${safeHeader(value)}`,
     );
-  return [...headerLines, "MIME-Version: 1.0", ...mimeBodyLines(body, signatureHtml)].join(
-    "\r\n",
-  );
+  return [
+    ...headerLines,
+    "MIME-Version: 1.0",
+    ...mimeBodyLines(body, signatureHtml, htmlBody),
+  ].join("\r\n");
 }
 
 /** Header names only, for logs: recipients and subjects stay out of them. */
@@ -320,6 +323,9 @@ export interface ThreadReplyMimeInput {
   body: string;
   /** HTML send-as signature; omitted means a plain-text-only draft. */
   signatureHtml?: string;
+  /** When set, used as the HTML part instead of wrapping the plain body.
+   *  Sequence sends pass the CAN-SPAM footer this way; scheduling emails omit it. */
+  htmlBody?: string;
 }
 
 export function buildThreadReplyMime(params: ThreadReplyMimeInput): string {
@@ -343,6 +349,7 @@ export function buildThreadReplyMime(params: ThreadReplyMimeInput): string {
     ],
     params.body,
     params.signatureHtml,
+    params.htmlBody,
   );
 }
 
