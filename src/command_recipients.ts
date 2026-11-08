@@ -7,7 +7,7 @@ import {
   nameTokens,
 } from "./command_logic.js";
 import { searchMemories } from "./db.js";
-import { parseAddressList, type ParsedMailbox } from "./followup_logic.js";
+import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { isSelfEmail } from "./mom_logic.js";
 

@@ -7,7 +7,7 @@ import {
   recordCommandSendSent,
   releaseCommandSend,
 } from "./db.js";
-import { parseAddressList, type ParsedMailbox } from "./followup_logic.js";
+import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import { getGoogleAccount, loadGoogleAccounts } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import {

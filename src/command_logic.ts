@@ -1,4 +1,4 @@
-import type { ParsedMailbox } from "./followup_logic.js";
+import type { ParsedMailbox } from "./mail_helpers.js";
 
 const ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
 const NOT_NAME_WORDS = new Set([
@@ -14,7 +14,7 @@ const SEND_WORD = "(?:send|email|e-mail|mail|reply|respond|write|follow[ -]?up)"
 const NOT_A_COMMAND: ReadonlyArray<readonly [RegExp, string]> = [
   [new RegExp(`\\b(?:don'?t|don’t|do not|never|not to|shouldn'?t|wouldn'?t)\\b(?!\\s+forget)[^.?!\\n]{0,20}\\b${SEND_WORD}\\b`, "i"), "he said not to"],
   [new RegExp(`\\bremind\\s+me\\s+to\\s+${SEND_WORD}\\b`, "i"), "he asked for a reminder"],
-  [/\bfollow(?:ing)?[ -]?up\s+on\s+my\s+email\b/i, "that asks to track the thread"],
+  [/\bfollow(?:ing)?[ -]?up\s+on\s+my\s+email\b/i, "that asks for a follow-up sequence card"],
   [new RegExp(`\\b(?:should|shall|must)\\s+(?:i|we)\\b[^.?!\\n]{0,20}\\b${SEND_WORD}\\b`, "i"), "he asked a question"],
   [new RegExp(`\\b(?:did|have|has)\\s+(?:i|you|we)\\b[^.?!\\n]{0,20}\\b(?:sent|send|emailed|email|mailed|replied)\\b`, "i"), "he asked a question"],
   [new RegExp(`\\bi\\s+(?:need|have|want|plan|ought)\\s+to\\s+${SEND_WORD}\\b`, "i"), "he described a plan"],

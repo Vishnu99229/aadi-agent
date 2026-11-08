@@ -13,7 +13,7 @@ import {
   resolveGmailMessage,
   signatureHtmlFor,
 } from "../google/mail.js";
-import { parseAddressList } from "../followup_logic.js";
+import { parseAddressList } from "../mail_helpers.js";
 import { isSelfEmail } from "../mom_logic.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {

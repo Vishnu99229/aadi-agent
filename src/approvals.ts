@@ -21,7 +21,7 @@ import {
   allowOwnerChatSendDraft,
   allowSendDraft,
 } from "./security/send_approval.js";
-import { parseAddressList } from "./followup_logic.js";
+import { parseAddressList } from "./mail_helpers.js";
 import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import { plainTextBody, stripSignature } from "./google/mail.js";

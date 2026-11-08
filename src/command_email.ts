@@ -21,8 +21,8 @@ import {
   listOpenCommandChoices,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
-import { parseAddressList, type ParsedMailbox } from "./followup_logic.js";
-import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./followups.js";
+import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
+import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
 import { gmailClient, signatureHtmlFor } from "./google/mail.js";

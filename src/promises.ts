@@ -21,7 +21,7 @@ import {
 import {
   isAlgorithmicallyExcluded,
   recipientDomain,
-} from "./followups.js";
+} from "./mail_helpers.js";
 import { extractDeadline } from "./promise_dates.js";
 import { findNearDuplicate } from "./dedupe.js";
 import {

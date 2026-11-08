@@ -4,7 +4,7 @@ import {
   findAccountByName,
   type AccountRecord,
 } from "./account_logic.js";
-import type { ParsedMailbox } from "./followup_logic.js";
+import type { ParsedMailbox } from "./mail_helpers.js";
 import { isSelfEmail } from "./mom_logic.js";
 
 const EPICODE_SUFFIX = "@epicode.in";

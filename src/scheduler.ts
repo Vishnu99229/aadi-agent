@@ -43,7 +43,6 @@ export const HEALTH_JOBS = [
   "build-poll",
   "morning-brief",
   "bill-scan",
-  "followup-scan",
   "sequence-send",
   "scheduled-send",
   "important-dates",

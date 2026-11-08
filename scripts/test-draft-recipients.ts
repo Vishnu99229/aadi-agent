@@ -1,6 +1,6 @@
 import type { AccountRecord } from "../src/account_logic.ts";
 import { splitDraftRecipients } from "../src/draft_recipients.ts";
-import type { ParsedMailbox } from "../src/followup_logic.ts";
+import type { ParsedMailbox } from "../src/mail_helpers.ts";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {

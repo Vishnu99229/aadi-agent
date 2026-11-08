@@ -62,7 +62,7 @@ export interface InteractionLine {
 }
 
 export interface OpenItemLine {
-  kind: "follow-up" | "task" | "promised";
+  kind: "sequence" | "task" | "promised";
   text: string;
 }
 
@@ -283,9 +283,9 @@ export function suggestedNextStep(params: {
   if (params.account.next_step.trim()) {
     return params.account.next_step.trim();
   }
-  const followup = params.openItems.find((item) => item.kind === "follow-up");
-  if (followup) {
-    return `Follow up on ${followup.text}`;
+  const sequence = params.openItems.find((item) => item.kind === "sequence");
+  if (sequence) {
+    return `Automatic follow-ups running: ${sequence.text}`;
   }
   const promised = params.openItems.find((item) => item.kind === "promised");
   if (promised) {

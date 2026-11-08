@@ -50,7 +50,6 @@ const {
   extractSpreadsheetText,
 } = await import("../src/xlsx_text.ts");
 const { createNote, getNote } = await import("../src/db.ts");
-const { selectReplyRecipients } = await import("../src/followups.ts");
 const { buildThreadReplyMime, mimeHeaderBlock } = await import(
   "../src/google/mail.ts"
 );
@@ -341,21 +340,12 @@ function testXlsx(): void {
   console.log(`xlsx: chars=${text.length} sheets=2`);
 }
 
-function testFollowupReplyHeaders(): void {
-  // Original send: Vishnu -> Karthik, CC Sendhil. Vishnu also sits on To
-  // (self-copy, which some mail apps add) and on Cc as a reply-all echo.
-  const toHeader = `"Karthik" <karthik@elevenlabs.io>, vishnu.rajan@epicode.in`;
-  const ccHeader = `Sendhil <sendhil@epicode.in>, Vishnu <vishnu.rajan@epicode.in>`;
-  const { to, cc } = selectReplyRecipients(toHeader, ccHeader);
-
-  assert(/karthik@elevenlabs\.io/i.test(to), "To contains Karthik");
-  assert(!/vishnu\.rajan/i.test(to), "Vishnu dropped from To");
-  assert(/sendhil@epicode\.in/i.test(cc), "Cc keeps Sendhil (internal colleague)");
-  assert(!/vishnu\.rajan/i.test(cc), "Vishnu dropped from Cc");
-
+/** The shared reply builder used by sequences and meetings. The recipient
+ *  selection that once fed it belonged to the removed follow-up tracker. */
+function testThreadReplyMime(): void {
   const mime = buildThreadReplyMime({
-    to,
-    cc,
+    to: '"Karthik" <karthik@elevenlabs.io>',
+    cc: "Sendhil <sendhil@epicode.in>",
     subject: "Re: Partnership follow-up",
     inReplyTo: "<original-123@mail.epicode.in>",
     references: "<original-123@mail.epicode.in>",
@@ -373,34 +363,6 @@ function testFollowupReplyHeaders(): void {
     /^References: <original-123@mail\.epicode\.in>/m.test(mime),
     "References wires the original Message-ID",
   );
-
-  // Edge case: original send went only to self → promote first external Cc.
-  const promoted = selectReplyRecipients(
-    "vishnu.rajan@epicode.in",
-    "Karthik <karthik@elevenlabs.io>, Sendhil <sendhil@epicode.in>",
-  );
-  assert(/karthik@elevenlabs\.io/i.test(promoted.to), "External Cc promoted to To");
-  assert(/sendhil@epicode\.in/i.test(promoted.cc), "Remaining Cc preserved after promotion");
-
-  // Walk-back case: the latest sent message in the thread was a reminder Vishnu
-  // sent to himself. Simulate the loop in createFollowupDraftForApproval
-  // choosing the first sent message with an external recipient.
-  const sentMessages = [
-    { to: "vishnu.rajan@epicode.in", cc: "" }, // latest
-    { to: "vishnu.rajan@epicode.in", cc: "" },
-    { to: "karthik@elevenlabs.io", cc: "Sendhil <sendhil@epicode.in>" }, // oldest
-  ];
-  let picked: { to: string; cc: string } | undefined;
-  for (const message of sentMessages) {
-    const candidate = selectReplyRecipients(message.to, message.cc);
-    if (candidate.to) {
-      picked = candidate;
-      break;
-    }
-  }
-  assert(picked !== undefined, "walk-back finds an external recipient");
-  assert(/karthik/i.test(picked!.to), "walk-back picks Karthik, not self");
-  assert(/sendhil/i.test(picked!.cc), "walk-back preserves Cc from older message");
 
   // Hard throw: buildThreadReplyMime must refuse an empty To rather than let
   // Gmail silently fall back to the authenticated user.
@@ -420,8 +382,7 @@ function testFollowupReplyHeaders(): void {
   }
   assert(threw, "buildThreadReplyMime throws on empty To");
 
-  // LLM-dropped Cc: when the follow-up planner picks To=Karthik and Cc=[],
-  // the final MIME must contain no Cc: header line.
+  // No Cc given: the MIME must contain no Cc: header line.
   const mimeNoCc = buildThreadReplyMime({
     to: "Karthik <karthik@elevenlabs.io>",
     cc: undefined,
@@ -431,7 +392,7 @@ function testFollowupReplyHeaders(): void {
     body: "Hi Karthik,\n\nSmall nudge.\n\nThanks,\nVishnu",
   });
   const headersNoCc = mimeHeaderBlock(mimeNoCc);
-  assert(!/^Cc:/m.test(headersNoCc), "no Cc header when LLM drops all Cc");
+  assert(!/^Cc:/m.test(headersNoCc), "no Cc header when there is no Cc");
   assert(/^To: .*karthik@elevenlabs\.io/m.test(headersNoCc), "To is Karthik");
 }
 
@@ -442,5 +403,5 @@ testReviewMergeAndFormat();
 testGmailPartsAndSize();
 await testLongTextPdf();
 testXlsx();
-testFollowupReplyHeaders();
+testThreadReplyMime();
 console.log("Stage 10 checks passed.");
