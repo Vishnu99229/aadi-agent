@@ -2,7 +2,9 @@ import "dotenv/config";
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import {
   COMMAND_TOOLS,
+  commandFamilyTools,
   commandIntents,
+  forcedCommandTool,
   commandNotRunMessage,
   echoesEarlierReply,
   sequenceTargets,
@@ -32,16 +34,31 @@ const log = console.log;
 console.log = () => undefined;
 console.error = () => undefined;
 
-// ---- which messages are commands ----
+// ---- which messages are commands, family by family ----
 const commands: Array<[string, string]> = [
   ["Start a sequence for Dorothy Copeland.", "sequence"],
   ["start a sequence for dorothy.copeland@nice.com", "sequence"],
   ["Can you auto follow up with Jeff Comstock", "sequence"],
+  ["Stop following up with Rajan", "sequence_stop"],
+  ["pause all follow-ups", "sequence_stop"],
+  ["Don't email Talkdesk again", "sequence_stop"],
+  ["stop the sequence for Munil", "sequence_stop"],
+  ["Set Jeff's timezone to Pacific", "sequence_timezone"],
+  ["change Munil's time zone to Eastern", "sequence_timezone"],
+  ["Add to sales facts: we run on Kubernetes", "sales_fact_add"],
+  ["add this to my sales facts under BotCompose: live in 12 languages", "sales_fact_add"],
+  ["Remove sales fact 3", "sales_fact_remove"],
   ["Send Jeff an email saying we're on for Monday", "send"],
   ["send a reply to Munil saying thanks", "send"],
   ["Reply to Munil saying thanks", "send"],
   ["Email Selvaraj about the invoice", "send"],
   ["please email Priya the deck link", "send"],
+  ["Draft a reply to Jeff saying Monday works", "draft"],
+  ["draft an email to Priya about the renewal", "draft"],
+  ["Write a follow-up email to Dorothy", "draft"],
+  ["Prepare the MoM for today's call", "draft"],
+  ["change the draft to say Tuesday instead", "draft"],
+  ["Discard the draft", "draft_discard"],
   ["Book a meeting with Jeff tomorrow at 3", "calendar"],
   ["Schedule a call with Dorothy on Monday", "calendar"],
   ["Cancel my call with Dorothy", "calendar"],
@@ -49,6 +66,25 @@ const commands: Array<[string, string]> = [
   ["Block my calendar Friday 2-4", "calendar"],
   ["Add Dorothy to the meeting", "calendar"],
   ["create an event tomorrow 4pm", "calendar"],
+  ["Remind me to email Jeff tomorrow at 10", "reminder"],
+  ["remind me at 6pm to call Amma", "reminder"],
+  ["Set a reminder for the Airtel payment on Friday", "reminder"],
+  ["Cancel the reminder for the dentist", "reminder"],
+  ["Add a task to send the proposal to Tata", "task_add"],
+  ["add renew the domain to my to-do list", "task_add"],
+  ["Mark the proposal task as done", "task"],
+  ["Delete the sales report task", "task"],
+  ["Mark the Airtel bill paid", "bill"],
+  ["Ignore the LinkedIn bill", "bill"],
+  ["Add Priya's birthday on 14 March", "date_add"],
+  ["save our anniversary as 12 June", "date_add"],
+  ["Remove Ravi's birthday", "date"],
+  ["Add Supertron as a partner", "account"],
+  ["Create a new account for Tata Tele", "account"],
+  ["Update the Talkdesk account: next step is a pilot", "account"],
+  ["Remember that Jeff prefers mornings", "memory"],
+  ["Forget the note about my old address", "memory"],
+  ["Learn the Q&A from the Tata RFP", "qa_bank"],
 ];
 for (const [text, kind] of commands) {
   const kinds = commandIntents(text);
@@ -62,9 +98,7 @@ const notCommands = [
   "did I start a sequence for Jeff?",
   "don't start a sequence for Jeff",
   "should I start a sequence for Jeff?",
-  "remind me to email Jeff",
-  "remind me to book a meeting with Jeff",
-  "draft an email to Jeff",
+  "draft",
   "Should I email Jeff?",
   "did you send the email to Munil?",
   "I'll email Jeff later",
@@ -73,14 +107,33 @@ const notCommands = [
   "What meetings do I have today?",
   "when is my call with Dorothy?",
   "propose a meeting with Jeff next week",
-  "follow up on my email to Jeff",
   "how's the weather",
+  "is the draft ready?",
+  "did you set the reminder?",
+  "remind me what Jeff said about pricing",
+  "what are my tasks?",
+  "I need to add a task for this later",
+  "which bills are due?",
+  "when is Priya's birthday?",
+  "show my sales facts",
+  "what's Munil's timezone?",
+  "remember when we met Jeff in Bangalore?",
+  "is Talkdesk an account?",
+  "remove my Google account",
+  "the follow-ups are working well",
 ];
 for (const text of notCommands) {
   const kinds = commandIntents(text);
   assert(kinds.length === 0, `"${text}" is not a command, got ${kinds.join(",")}`);
 }
+// One message, two commands; and the specific object wins over a generic word.
 assert(commandIntents("Book a call with Jeff on Monday. Email him the agenda.").join(",") === "send,calendar", "one message can hold two commands");
+assert(commandIntents("Cancel the reminder for the call").join(",") === "reminder", "a reminder about a call is a reminder");
+assert(commandIntents("Draft an email to Jeff to schedule a call").join(",") === "draft", "a draft that mentions a call is a draft");
+assert(commandIntents("Delete the task about the Talkdesk call").join(",") === "task", "a task about a call is a task");
+assert(commandIntents("remind me to book a meeting with Jeff").join(",") === "reminder", "remind me to book is a reminder, not a booking");
+assert(!commandIntents("Remind me to follow up with Jeff").includes("reminder"), "a follow-up reminder is left for the sequence card");
+assert(commandIntents("draft and send an email to Jeff saying Monday works").join(",") === "send", "draft and send is a send");
 
 // ---- who a sequence request names ----
 assert(JSON.stringify(sequenceTargets("Start a sequence for Dorothy Copeland.")) === '["Dorothy Copeland"]', "a name");
@@ -108,7 +161,18 @@ assert(!echoesEarlierReply("Done.", ["Done."], []), "a very short reply can't be
   assert(echoesEarlierReply(OLD, [OLD], [card], [OLD]), "an old refusal over a new result is an echo");
 }
 
-// ---- forced tool calls by backend ----
+// ---- forced tool calls by backend and family ----
+assert(forcedCommandTool(["task_add"]) === "add_task" && forcedCommandTool(["date_add"]) === "add_date", "safe single tools are forced");
+assert(forcedCommandTool(["sequence_stop"]) === undefined, "stop is never forced: \"pause all\" would stop every sequence");
+assert(forcedCommandTool(["task"]) === undefined && forcedCommandTool(["bill"]) === undefined, "tools that need a lookup first aren't forced");
+assert(forcedCommandTool(["reminder"]) === undefined, "set_reminder wants get_current_time first, so it isn't forced");
+assert(forcedCommandTool(["task_add", "reminder"]) === undefined, "two commands force nothing");
+assert(commandFamilyTools("task").includes("list_tasks") && commandFamilyTools("bill").includes("list_bills"), "a lookup counts for its family");
+for (const [kind, names] of Object.entries(COMMAND_TOOLS)) {
+  for (const name of [...names, ...commandFamilyTools(kind as never)]) {
+    assert(Boolean(tools[name]), `${kind} names a real tool: ${name}`);
+  }
+}
 assert(backendForcesTools("deepseek") && backendForcesTools("gemini"), "DeepSeek and Gemini take a forced call");
 assert(!backendForcesTools("claude") && !backendForcesTools("haiku"), "Claude rejects tool_choice, so it is never sent");
 assert(JSON.stringify(openAiToolChoice({ name: "start_sequence" })) === '{"type":"function","function":{"name":"start_sequence"}}', "named choice");
@@ -136,6 +200,15 @@ setToolInterceptorForTests((call: ToolCall, turn: ToolTurn) => {
   if (call.name === "send_email") {
     return "Sent to Jeff Comstock <jeff.comstock@nice.com>: Monday is on.";
   }
+  if (call.name === "add_task") {
+    return `Added task #${40 + ran.length}: ${(call.input as { text: string }).text}`;
+  }
+  if (call.name === "list_tasks") {
+    return '[{"id":3,"text":"Send the proposal to Tata"},{"id":7,"text":"Send the proposal to Airtel"}]';
+  }
+  if (call.name === "list_bills") {
+    return '[{"id":2,"name":"Airtel","status":"upcoming"}]';
+  }
   return "ok";
 });
 
@@ -143,6 +216,14 @@ setToolInterceptorForTests((call: ToolCall, turn: ToolTurn) => {
  *  the newest earlier answer, and calls a tool only when the API forces it. */
 let honoursForcing = true;
 let callsWhenAsked: string | undefined;
+/** Calls this read tool first, then answers with `clarify` or by pasting. */
+let lookupFirst: string | undefined;
+let clarify: string | undefined;
+const SAMPLE_INPUT: Record<string, unknown> = {
+  start_sequence: { prospect: "Dorothy Copeland" },
+  add_task: { text: "Send the proposal to Tata", tag: "work" },
+  add_date: { person: "Priya", month_day: "03-14", type: "birthday" },
+};
 const seen: CompleteParams[] = [];
 setCompleteForTests(async (params) => {
   seen.push(params);
@@ -151,7 +232,13 @@ setCompleteForTests(async (params) => {
   }
   const forced = params.toolChoice;
   if (forced && honoursForcing && typeof forced === "object") {
-    return modelReply({ tools: [{ name: forced.name, input: { prospect: "Dorothy Copeland" } }] });
+    return modelReply({ tools: [{ name: forced.name, input: SAMPLE_INPUT[forced.name] ?? {} }] });
+  }
+  if (lookupFirst && !params.messages.some((message) => message.role === "tool")) {
+    return modelReply({ tools: [{ name: lookupFirst, input: {} }] });
+  }
+  if (lookupFirst && clarify) {
+    return modelReply({ text: clarify });
   }
   const last = params.messages.at(-1);
   if (callsWhenAsked && last?.role === "user" && String(last.content).includes("looks like a command")) {
@@ -179,6 +266,8 @@ function reset(): void {
   seen.length = 0;
   honoursForcing = true;
   callsWhenAsked = undefined;
+  lookupFirst = undefined;
+  clarify = undefined;
 }
 
 // The old refusal is in the history, as it was on the phone.
@@ -255,6 +344,54 @@ saveMessage("assistant", "Sent to Jeff Comstock <jeff.comstock@nice.com>: Monday
   const reply = await say("Book a meeting with Jeff tomorrow at 3", { backend: "claude" });
   assert(!ran.some((item) => COMMAND_TOOLS.calendar.includes(item.name)), "nothing was booked");
   assert(reply === commandNotRunMessage(["calendar"]), `he's told the calendar wasn't changed, got: ${reply}`);
+}
+
+// A task on DeepSeek: add_task is forced, and an old "Added" can't stand in for the new one.
+saveMessage("user", "Add a task to send the proposal to Tata");
+saveMessage("assistant", "Added task #12: Send the proposal to Tata. It's on your list for today.");
+for (let attempt = 1; attempt <= 2; attempt += 1) {
+  reset();
+  const reply = await say("Add a task to send the proposal to Tata");
+  const first = seen.find((params) => params.tools.length > 0)!;
+  assert(JSON.stringify(first.toolChoice) === '{"name":"add_task"}', "the first step forces add_task");
+  assert(ran.filter((item) => item.name === "add_task").length === 1, `attempt ${attempt}: the task is added once`);
+  assert(reply.startsWith("Added task #4") && !reply.includes("#12"), `attempt ${attempt}: this turn's task, not the old one: ${reply}`);
+}
+
+// Stop is never forced, even on DeepSeek.
+{
+  reset();
+  await say("pause all follow-ups");
+  assert(seen.every((params) => params.toolChoice === undefined), "pause all follow-ups forces nothing");
+}
+
+// A fresh lookup and a "which one?" is a real answer.
+{
+  reset();
+  lookupFirst = "list_tasks";
+  clarify = "Which one: #3 Send the proposal to Tata, or #7 Send the proposal to Airtel?";
+  const reply = await say("Mark the proposal task as done", { backend: "claude" });
+  assert(ran.map((item) => item.name).join(",") === "list_tasks", "it looked the tasks up");
+  assert(reply === clarify, `and its question goes through: ${reply}`);
+  assert(!seen.some((params) => String((params.messages.at(-1) as { content?: unknown } | undefined)?.content ?? "").includes("looks like a command")), "with no retry");
+}
+
+// A lookup and then an old answer: he's told nothing was done, not shown the lookup.
+saveMessage("user", "Mark the Airtel bill paid");
+saveMessage("assistant", "Marked the Airtel bill paid. Next one due is LinkedIn on the 30th.");
+{
+  reset();
+  lookupFirst = "list_bills";
+  const reply = await say("Mark the Airtel bill paid", { backend: "claude" });
+  assert(reply === commandNotRunMessage(["bill"]), `nothing was marked, and he's told: ${reply}`);
+}
+// No tool at all, twice: the same.
+{
+  reset();
+  const reply = await say("Mark the Airtel bill paid", { backend: "claude" });
+  assert(ran.length === 0, "nothing ran");
+  assert(reply === commandNotRunMessage(["bill"]), `an honest "not run": ${reply}`);
+  assert(reply.includes("no bill was marked paid or skipped"), "in the bill family's words");
 }
 
 // Not a command: nothing is forced, retried or replaced.

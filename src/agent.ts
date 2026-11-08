@@ -22,7 +22,9 @@ import {
 import { backendForcesTools, complete } from "./llm.js";
 import {
   COMMAND_TOOLS,
+  commandFamilyTools,
   commandIntents,
+  forcedCommandTool,
   commandNotRunMessage,
   commandRetryPrompt,
   echoesEarlierReply,
@@ -386,18 +388,24 @@ export async function runAgent(
   const earlierToolResults = history.messages
     .filter((message) => message.role === "tool")
     .map((message) => message.content);
+  // Results from this turn's command tools: lookups included (anything said this
+  // turn is fresh), and the actions alone (what an echo is replaced with).
   const freshResults: string[] = [];
-  const isCommandTool = (name: string): boolean =>
+  const actionResults: string[] = [];
+  const isFamilyTool = (name: string): boolean =>
+    intents.some((kind) => commandFamilyTools(kind).includes(name));
+  const isActionTool = (name: string): boolean =>
     intents.some((kind) => COMMAND_TOOLS[kind].includes(name));
-  const forceSequence: ToolChoice | undefined =
-    intents.includes("sequence") && backendForcesTools(backend)
-      ? { name: "start_sequence" }
-      : undefined;
-  let toolChoice: ToolChoice | undefined = forceSequence;
+  const forcing = (kinds: readonly CommandKind[]): { name: string } | undefined => {
+    const name = backendForcesTools(backend) ? forcedCommandTool(kinds) : undefined;
+    return name ? { name } : undefined;
+  };
+  const firstForced = forcing(intents);
+  let toolChoice: ToolChoice | undefined = firstForced;
   let commandRetryUsed = false;
   let sequenceRunInCode = false;
   if (intents.length > 0) {
-    console.log(`Command turn: kinds=${intents.join(",")} forced=${forceSequence ? "start_sequence" : "none"}`);
+    console.log(`Command turn: kinds=${intents.join(",")} forced=${firstForced?.name ?? "none"}`);
   }
 
   try {
@@ -479,8 +487,11 @@ export async function runAgent(
             searchSources = hits;
           }
         }
-        if (isCommandTool(call.name)) {
+        if (isFamilyTool(call.name)) {
           freshResults.push(result.content);
+        }
+        if (isActionTool(call.name)) {
+          actionResults.push(result.content);
         }
         if (saveAssistantMessage) {
           saveMessage("tool", result.content, call.name);
@@ -496,7 +507,7 @@ export async function runAgent(
     }
 
     const missingKinds = intents.filter(
-      (kind) => !COMMAND_TOOLS[kind].some((name) => toolsUsed.has(name)),
+      (kind) => !commandFamilyTools(kind).some((name) => toolsUsed.has(name)),
     );
     if (response.toolCalls.length === 0 && missingKinds.length > 0) {
       // A sequence request names the person in his words, so code runs the check
@@ -526,6 +537,7 @@ export async function runAgent(
           toolsUsed.add(call.name);
           receipts.push({ name: call.name, success: isSuccessfulToolResult(result.content, result.isError) });
           freshResults.push(result.content);
+          actionResults.push(result.content);
           if (result.isError) {
             toolFailed = true;
           }
@@ -540,7 +552,7 @@ export async function runAgent(
       if (!commandRetryUsed) {
         commandRetryUsed = true;
         console.log(`Command check: retry kinds=${missingKinds.join(",")} iteration=${iteration}`);
-        toolChoice = missingKinds.includes("sequence") ? forceSequence : undefined;
+        toolChoice = forcing(missingKinds);
         messages.push({
           role: "assistant",
           textParts: response.textParts,
@@ -667,10 +679,14 @@ export async function runAgent(
       intents.length > 0 &&
       echoesEarlierReply(finalReply, earlierReplies, freshResults, earlierToolResults)
     ) {
-      // The tool ran, but the words are an earlier turn's. Show what it said now.
-      console.log("Command check: reply repeated an earlier answer; using this turn's tool result");
-      succeeded = !toolFailed;
-      return saveAssistantReply(freshResults.join("\n\n"), saveAssistantMessage);
+      // A tool ran, but the words are an earlier turn's. Show what the action said
+      // now, or, when only a lookup ran, that nothing was done.
+      console.log("Command check: reply repeated an earlier answer; using this turn's result");
+      succeeded = !toolFailed && actionResults.length > 0;
+      return saveAssistantReply(
+        actionResults.length > 0 ? actionResults.join("\n\n") : commandNotRunMessage(intents),
+        saveAssistantMessage,
+      );
     }
     const missing = unreceiptedClaims(finalReply, receipts);
     if (missing.length > 0) {
