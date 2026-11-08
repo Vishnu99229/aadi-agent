@@ -4,9 +4,9 @@ import {
   deletePendingAccountUpdate,
   getAccount,
   getAccounts,
-  getFollowups,
   getPendingAccountUpdate,
   getTasks,
+  listActiveSalesSequences,
   searchNotes,
   updateAccount,
   updateAccountActivity,
@@ -16,6 +16,7 @@ import {
 import { loadGoogleAccounts } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import {
+  accountMatchesEmail,
   accountMatchesText,
   accountMatchesThread,
   decodeAccount,
@@ -116,14 +117,15 @@ function matchingNotes(account: AccountRecord): NoteRecord[] {
 
 function openItemsFor(account: AccountRecord): OpenItemLine[] {
   const items: OpenItemLine[] = [];
-  for (const followup of getFollowups()) {
-    if (followup.status !== "waiting" && followup.status !== "snoozed") {
-      continue;
-    }
-    if (accountMatchesText(account, `${followup.recipient} ${followup.subject}`)) {
+  for (const sequence of listActiveSalesSequences()) {
+    if (
+      accountMatchesEmail(account, sequence.prospect_email) ||
+      accountMatchesText(account, `${sequence.prospect_company} ${sequence.prospect_email}`)
+    ) {
+      const who = sequence.prospect_name.trim() || sequence.prospect_email;
       items.push({
-        kind: "follow-up",
-        text: `${followup.subject} (${followup.recipient})`,
+        kind: "sequence",
+        text: `${who} <${sequence.prospect_email}>, step ${sequence.current_step} of 4 ('${sequence.subject}')`,
       });
     }
   }

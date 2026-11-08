@@ -7,7 +7,6 @@ import {
   activateSalesSequence,
   addSalesDoNotContact,
   createAccount,
-  createFollowup,
   createMeetingProposal,
   createPendingEventAction,
   createProposedSalesSequence,
@@ -20,12 +19,6 @@ import {
   setSalesSequenceTimezone,
   stopActiveSalesSequence,
 } from "../src/db.ts";
-import {
-  activeFollowups,
-  collectCandidates,
-  createFollowupDraftForApproval,
-  dueFollowupsNow,
-} from "../src/followups.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
@@ -1807,51 +1800,7 @@ for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertro
   setMeetingTestHooks({ loadBusy: async () => busy });
 }
 
-// ======== the six collisions ========
-// 1. No duplicate follow-up nudge.
-{
-  nextScenario();
-  const item = enrol();
-  const control = push({
-    threadId: `control-${item.id}`,
-    from: `Vishnu Rajan <${ME}>`,
-    to: "Lena <lena@control.example>",
-    subject: "Pricing",
-    at: clock.getTime() - DAY,
-    sent: true,
-    body: "Waiting on you",
-  });
-  const candidates = await collectCandidates(gmail, ME, "work", new Set([ME]));
-  assert(candidates.some((candidate) => candidate.threadId === control.threadId), "another thread is still tracked");
-  assert(!candidates.some((candidate) => candidate.threadId === item.threadId), "the sequence thread is not");
-  const tracked = createFollowup({
-    threadId: item.threadId,
-    recipient: item.email,
-    subject: "x",
-    tag: "work",
-    lastSentAt: clock.toISOString(),
-    nextCheckAt: new Date(clock.getTime() - HOUR).toISOString(),
-    googleAccount: "work",
-    importance: "high",
-  });
-  assert(!dueFollowupsNow(clock).some((row) => row.id === tracked.id), "a thread tracked earlier gets no nudge");
-  assert(!activeFollowups().some((row) => row.id === tracked.id), "and isn't on the panel");
-  let refused = false;
-  await createFollowupDraftForApproval(tracked.id, false).catch(() => {
-    refused = true;
-  });
-  assert(refused, "and an old Draft button can't make a second email");
-  stopActiveSalesSequence(item.id, "owner_stop");
-  assert(activeFollowups().some((row) => row.id === tracked.id), "the tracker comes back once the sequence stops");
-
-  nextScenario();
-  const finished = enrol({ manual: 3 });
-  await tick();
-  assert(getSalesSequence(finished.id)!.status === "completed", "a sequence finishes");
-  const later = await collectCandidates(gmail, ME, "work", new Set([ME]));
-  assert(!later.some((candidate) => candidate.threadId === finished.threadId), "the scan doesn't start nudging after its last note");
-}
-
+// ======== collisions with other features ========
 // 2. The promise scan skips what the sequence sent.
 {
   nextScenario();

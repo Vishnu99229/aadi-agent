@@ -1,16 +1,12 @@
 import {
-  createFollowup,
   createMemory,
-  getDueFollowups,
-  getFollowup,
   listMemories,
   listPendingMemoryConfirms,
-  snoozeFollowup,
 } from "../src/db.ts";
 import {
   isAlgorithmicallyExcluded,
   mergeSelfAddresses,
-} from "../src/followups.ts";
+} from "../src/mail_helpers.ts";
 import {
   meetingCardAlreadySent,
   notReplyingText,
@@ -25,49 +21,6 @@ function assert(condition: boolean, message: string): void {
   if (!condition) {
     throw new Error(message);
   }
-}
-
-const past = new Date(Date.now() - 60_000).toISOString();
-const future = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
-
-{
-  const due = createFollowup({
-    threadId: "thread-waiting",
-    recipient: "priya@acme.com",
-    subject: "Demo",
-    tag: "work",
-    googleAccount: "work",
-    lastSentAt: past,
-    nextCheckAt: past,
-  });
-  const snoozed = createFollowup({
-    threadId: "thread-snoozed",
-    recipient: "ada@acme.com",
-    subject: "Pricing",
-    tag: "work",
-    googleAccount: "work",
-    lastSentAt: past,
-    nextCheckAt: future,
-  });
-  snoozeFollowup(snoozed.id, past);
-  const stillSnoozed = createFollowup({
-    threadId: "thread-later",
-    recipient: "lee@acme.com",
-    subject: "Later",
-    tag: "work",
-    googleAccount: "work",
-    lastSentAt: past,
-    nextCheckAt: future,
-  });
-  snoozeFollowup(stillSnoozed.id, future);
-
-  const rows = getDueFollowups(new Date().toISOString());
-  const ids = new Set(rows.map((row) => row.id));
-  assert(ids.has(due.id), "a waiting row that is due is returned");
-  assert(ids.has(snoozed.id), "a snoozed row whose time has passed is returned");
-  assert(!ids.has(stillSnoozed.id), "a future snooze stays out of the due list");
-  assert(getFollowup(snoozed.id)?.status === "waiting", "an elapsed snooze is set back to waiting");
-  assert(getFollowup(stillSnoozed.id)?.status === "snoozed", "a future snooze stays snoozed");
 }
 
 {

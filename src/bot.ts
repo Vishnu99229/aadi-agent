@@ -1,11 +1,15 @@
-import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, Keyboard, type Api, type Context } from "grammy";
 import { runAgent } from "./agent.js";
 import { handleCommandSendCallback } from "./command_email.js";
 import { looksLikeCommandTurn } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
 import { FORWARDED_TOOLS } from "./tools/index.js";
 import { handleSequenceCallback, handleSequenceCommand } from "./sequences.js";
-import { handleSequencesCommand, handleSequenceStopCallback } from "./sequence_runner.js";
+import {
+  handleSequencesCommand,
+  handleSequenceStopCallback,
+  sequencesPanel,
+} from "./sequence_runner.js";
 import { reactToSimpleGratitude } from "./gratitude.js";
 import {
   createReactionSession,
@@ -53,12 +57,6 @@ import {
   handleBillDuplicateCallback,
 } from "./bills.js";
 import { handlePromiseDuplicateCallback } from "./promises.js";
-import { runFollowupScan } from "./followups.js";
-import {
-  handleFollowupCallback,
-  sendActiveFollowupPanel,
-  sendWaitingOnPanel,
-} from "./followup_panel.js";
 import { handleModelCallback, sendModelPanel } from "./model_panel.js";
 import {
   consumeBuildFollowup,
@@ -383,7 +381,10 @@ function shortError(error: unknown): string {
 }
 
 const KEYBOARD_SETTING = "reply_keyboard";
-const QUICK_ACTIONS = ["Menu", "Brief", "Waiting on", "Tasks"] as const;
+const QUICK_ACTIONS = ["Menu", "Brief", "Sequences", "Tasks"] as const;
+/** Bumped when the reply keyboard's buttons change, so the new one is sent once. */
+const KEYBOARD_LAYOUT_SETTING = "reply_keyboard_layout";
+const KEYBOARD_LAYOUT = "sequences-v1";
 
 function replyKeyboardOn(): boolean {
   return getSetting(KEYBOARD_SETTING) === "on";
@@ -393,7 +394,7 @@ function replyKeyboard(): Keyboard {
   const keyboard = new Keyboard()
     .text("Menu")
     .text("Brief")
-    .text("Waiting on")
+    .text("Sequences")
     .text("Tasks");
   keyboard.resize_keyboard = true;
   keyboard.is_persistent = true;
@@ -406,7 +407,7 @@ function menuKeyboard(): InlineKeyboard {
     .row()
     .text("Morning brief", "menu:brief")
     .row()
-    .text("Waiting on", "menu:waiting")
+    .text("Sequences", "menu:sequences")
     .row()
     .text("Upcoming bills", "menu:bills")
     .row()
@@ -435,6 +436,25 @@ function isAccountOrMeetingQuestion(text: string): boolean {
 
 async function sendMenu(ctx: Context): Promise<void> {
   await ctx.reply(menuCaption(), { reply_markup: menuKeyboard() });
+}
+
+/** The /sequences panel from his own menu button. */
+async function sendSequencesPanel(ctx: Context): Promise<void> {
+  const panel = sequencesPanel();
+  await ctx.reply(panel.text, panel.keyboard ? { reply_markup: panel.keyboard } : {});
+}
+
+/** Sends the reply keyboard again once after its buttons change, since Telegram
+ *  keeps showing the old one until a new one arrives. Only when it's switched on. */
+export async function refreshReplyKeyboardOnce(api: Api): Promise<boolean> {
+  if (!replyKeyboardOn() || getSetting(KEYBOARD_LAYOUT_SETTING) === KEYBOARD_LAYOUT) {
+    return false;
+  }
+  await api.sendMessage(config.ownerTelegramId, "Your keyboard now has Sequences in place of Waiting on.", {
+    reply_markup: replyKeyboard(),
+  });
+  setSetting(KEYBOARD_LAYOUT_SETTING, KEYBOARD_LAYOUT);
+  return true;
 }
 
 function formatBills(raw: string, heading: string): string {
@@ -477,6 +497,7 @@ async function sendOpenTasks(ctx: Context): Promise<void> {
 async function setReplyKeyboard(ctx: Context, on: boolean): Promise<void> {
   setSetting(KEYBOARD_SETTING, on ? "on" : "off");
   if (on) {
+    setSetting(KEYBOARD_LAYOUT_SETTING, KEYBOARD_LAYOUT);
     await ctx.reply("Keyboard on.", { reply_markup: replyKeyboard() });
     return;
   }
@@ -565,13 +586,6 @@ bot.command("voice", async (ctx) => {
 
 bot.command("hidekeyboard", async (ctx) => {
   await setReplyKeyboard(ctx, false);
-});
-
-bot.command("followups", async (ctx) => {
-  await whileTyping(ctx, async () => {
-    await runFollowupScan();
-    await sendActiveFollowupPanel(ctx.api);
-  });
 });
 
 bot.command("sequence", async (ctx) => {
@@ -795,10 +809,6 @@ bot.callbackQuery(/^seq:/, async (ctx) => {
   await handleSequenceCallback(ctx);
 });
 
-bot.callbackQuery(/^fu:/, async (ctx) => {
-  await handleFollowupCallback(ctx);
-});
-
 bot.callbackQuery(/^build:/, async (ctx) => {
   try {
     await handleBuildCallback(ctx);
@@ -810,7 +820,7 @@ bot.callbackQuery(/^build:/, async (ctx) => {
   }
 });
 
-bot.callbackQuery(/^menu:(model|brief|waiting|bills|tasks|keyboard)$/, async (ctx) => {
+bot.callbackQuery(/^menu:(model|brief|sequences|bills|tasks|keyboard)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCallbackQuery();
   if (action === "keyboard") {
@@ -832,8 +842,8 @@ bot.callbackQuery(/^menu:(model|brief|waiting|bills|tasks|keyboard)$/, async (ct
       await whileTyping(ctx, () => sendMorningBrief(ctx.api));
       return;
     }
-    if (action === "waiting") {
-      await whileTyping(ctx, () => sendWaitingOnPanel(ctx.api));
+    if (action === "sequences") {
+      await sendSequencesPanel(ctx);
       return;
     }
     if (action === "bills") {
@@ -1308,8 +1318,8 @@ bot.on("message:text", async (ctx) => {
         await whileTyping(ctx, () => sendMorningBrief(ctx.api));
         return;
       }
-      if (text === "Waiting on") {
-        await whileTyping(ctx, () => sendWaitingOnPanel(ctx.api));
+      if (text === "Sequences") {
+        await handleSequencesCommand(ctx);
         return;
       }
       await sendOpenTasks(ctx);

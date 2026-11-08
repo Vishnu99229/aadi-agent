@@ -535,13 +535,15 @@ for (const phrase of [
 ]) {
   assert(isExplicitSequenceRequest(phrase), `explicit: ${phrase}`);
 }
+// Since the old tracker was removed, its phrasings ask for the Start card too.
 for (const phrase of [
   "follow up on my email to Rajan",
-  "follow up with Rajan",
   "remind me to follow up with Rajan",
   "track my email to Rajan",
-  "start following up with Rajan",
 ]) {
+  assert(isExplicitSequenceRequest(phrase), `explicit now: ${phrase}`);
+}
+for (const phrase of ["follow up with Rajan", "start following up with Rajan", "follow up with me"]) {
   assert(!isExplicitSequenceRequest(phrase), `not explicit: ${phrase}`);
 }
 {
@@ -753,7 +755,7 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   const sentBefore = telegram.sent.length;
   const vague = await startSequenceFromTool(
     "tia@phi.com",
-    { confirmation, userText: "follow up on my email to Tia" },
+    { confirmation, userText: "follow up with Tia" },
     api,
   );
   assert(vague.startsWith("No card sent"), "a vague phrase gets no card even if the model calls the tool");
@@ -767,8 +769,34 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   assert(clear.startsWith("Start card sent"), "a clear phrase shows the card");
   assert(getSalesSequenceByThread("t-tool")!.status === "proposed", "the tool never enrols");
 
-  const trackSrc = await readFile("src/tools/track_thread.ts", "utf8");
-  assert(trackSrc.includes("Use when he asks to follow up."), "track_thread keeps its meaning");
+  // The old tracker's phrasings now reach the same Start card.
+  for (const phrase of [
+    "follow up on my email to Tia",
+    "Follow up on my last email to tia@phi.com",
+    "follow up on the email I sent Tia",
+    "Follow up with Tia on my email",
+    "Remind me to follow up with Tia",
+    "remind me to follow up with Tia on Monday",
+    "track my email to Tia",
+  ]) {
+    assert(isExplicitSequenceRequest(phrase), `"${phrase}" offers the Start card`);
+  }
+  for (const phrase of ["follow up with me tomorrow", "remind me to follow up with me on Friday", "Follow up with Tia", "remind me to email Tia"]) {
+    assert(!isExplicitSequenceRequest(phrase), `"${phrase}" is not a sequence request`);
+  }
+  const remapped = await startSequenceFromTool(
+    "tia@phi.com",
+    { confirmation, userText: "follow up on my email to Tia" },
+    api,
+  );
+  assert(remapped.startsWith("Start card sent"), `"follow up on my email to X" shows the card, got: ${remapped}`);
+  assert(getSalesSequenceByThread("t-tool")!.status === "proposed", "and still enrols nothing");
+  const reminded = await startSequenceFromTool(
+    "tia@phi.com",
+    { confirmation, userText: "remind me to follow up with Tia" },
+    api,
+  );
+  assert(reminded.startsWith("Start card sent"), "\"remind me to follow up with X\" shows the card");
 
   const replies: string[] = [];
   pitch("t-fwd", "Fay <fay@rho.com>", "Pitch");

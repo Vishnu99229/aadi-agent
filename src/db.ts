@@ -78,43 +78,6 @@ export interface ReminderRecord {
   related_bill_id: number | null;
 }
 
-export type FollowupStatus =
-  | "waiting"
-  | "replied"
-  | "snoozed"
-  | "dismissed";
-
-export type FollowupImportance = "high" | "medium" | "low";
-
-export interface FollowupRecord {
-  id: number;
-  thread_id: string;
-  recipient: string;
-  subject: string;
-  tag: ItemTag;
-  google_account: GoogleAccountId;
-  last_sent_at: string;
-  status: FollowupStatus;
-  nudge_count: number;
-  next_check_at: string;
-  reason_for_followup: string | null;
-  importance: FollowupImportance;
-  last_notified_at: string | null;
-  created_at: string;
-}
-
-export interface FollowupInput {
-  threadId: string;
-  recipient: string;
-  subject: string;
-  tag: ItemTag;
-  googleAccount: GoogleAccountId;
-  lastSentAt: string;
-  nextCheckAt: string;
-  reasonForFollowup?: string | null;
-  importance?: FollowupImportance;
-}
-
 export const DB_PATH = process.env.AADI_DB_PATH?.trim() || "./aadi.db";
 
 const db = new Database(DB_PATH);
@@ -190,30 +153,6 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_reminders_status_time
     ON reminders (status, remind_at);
-
-  CREATE TABLE IF NOT EXISTS followups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL,
-    recipient TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
-    google_account TEXT NOT NULL DEFAULT 'personal'
-      CHECK (google_account IN ('personal', 'work')),
-    last_sent_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'waiting'
-      CHECK (status IN ('waiting', 'replied', 'snoozed', 'dismissed')),
-    nudge_count INTEGER NOT NULL DEFAULT 0,
-    next_check_at TEXT NOT NULL,
-    reason_for_followup TEXT,
-    importance TEXT NOT NULL DEFAULT 'medium'
-      CHECK (importance IN ('high', 'medium', 'low')),
-    last_notified_at TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (google_account, thread_id)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_followups_status_next_check
-    ON followups (status, next_check_at);
 
   CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -822,6 +761,12 @@ db.exec(`
   DROP TABLE IF EXISTS shadow_skip_counts;
   DELETE FROM job_runs WHERE name = 'shadow-evening';
 `);
+// The old follow-up tracker was removed. Its table (and with it its index) and its
+// job record go too. Sales sequences never read it.
+db.exec(`
+  DROP TABLE IF EXISTS followups;
+  DELETE FROM job_runs WHERE name = 'followup-scan';
+`);
 if (!tableHasColumn("sales_sequences", "prospect_timezone_source")) {
   db.exec(`ALTER TABLE sales_sequences ADD COLUMN prospect_timezone_source TEXT`);
 }
@@ -1052,78 +997,6 @@ if (!tableHasColumn("pending_actions", "event_title")) {
       ON pending_actions (draft_id, status);
   `);
   console.log("pending_actions migrated to support create_event rows.");
-}
-
-const followupsSchema =
-  (
-    db
-      .prepare(
-        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'followups'`,
-      )
-      .get() as { sql: string } | undefined
-  )?.sql ?? "";
-
-if (!tableHasColumn("followups", "google_account")) {
-  db.exec(
-    `ALTER TABLE followups ADD COLUMN google_account TEXT NOT NULL DEFAULT 'personal'`,
-  );
-}
-
-if (!tableHasColumn("followups", "reason_for_followup")) {
-  db.exec(`ALTER TABLE followups ADD COLUMN reason_for_followup TEXT`);
-}
-if (!tableHasColumn("followups", "importance")) {
-  db.exec(
-    `ALTER TABLE followups ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'
-       CHECK (importance IN ('high', 'medium', 'low'))`,
-  );
-  // Existing rows get 'medium' by default; the DEFAULT clause above already
-  // backfills them, but set it explicitly for clarity and to repair any
-  // legacy row that somehow holds NULL.
-  db.exec(
-    `UPDATE followups SET importance = 'medium' WHERE importance IS NULL OR importance = ''`,
-  );
-}
-if (!tableHasColumn("followups", "last_notified_at")) {
-  db.exec(`ALTER TABLE followups ADD COLUMN last_notified_at TEXT`);
-}
-
-if (followupsSchema.includes("thread_id TEXT NOT NULL UNIQUE")) {
-  db.exec(`
-    CREATE TABLE followups_migrate (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      thread_id TEXT NOT NULL,
-      recipient TEXT NOT NULL,
-      subject TEXT NOT NULL,
-      tag TEXT NOT NULL CHECK (tag IN ('work', 'personal')),
-      google_account TEXT NOT NULL DEFAULT 'personal'
-        CHECK (google_account IN ('personal', 'work')),
-      last_sent_at TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'waiting'
-        CHECK (status IN ('waiting', 'replied', 'snoozed', 'dismissed')),
-      nudge_count INTEGER NOT NULL DEFAULT 0,
-      next_check_at TEXT NOT NULL,
-      reason_for_followup TEXT,
-      importance TEXT NOT NULL DEFAULT 'medium'
-        CHECK (importance IN ('high', 'medium', 'low')),
-      last_notified_at TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE (google_account, thread_id)
-    );
-    INSERT INTO followups_migrate (
-      id, thread_id, recipient, subject, tag, google_account, last_sent_at,
-      status, nudge_count, next_check_at, reason_for_followup, importance,
-      last_notified_at, created_at
-    )
-    SELECT id, thread_id, recipient, subject, tag, google_account, last_sent_at,
-           status, nudge_count, next_check_at, reason_for_followup, importance,
-           last_notified_at, created_at
-    FROM followups;
-    DROP TABLE followups;
-    ALTER TABLE followups_migrate RENAME TO followups;
-    CREATE INDEX IF NOT EXISTS idx_followups_status_next_check
-      ON followups (status, next_check_at);
-  `);
 }
 
 const insertMessage = db.prepare(
@@ -1668,196 +1541,6 @@ export function transitionReminderStatus(
        WHERE id = ? AND status = ?`,
     )
     .run(to, id, from);
-
-  return result.changes === 1;
-}
-
-const FOLLOWUP_COLUMNS = `id, thread_id, recipient, subject, tag, google_account,
-              last_sent_at, status, nudge_count, next_check_at,
-              reason_for_followup, importance, last_notified_at, created_at`;
-
-export function getFollowup(id: number): FollowupRecord | undefined {
-  return db
-    .prepare(
-      `SELECT ${FOLLOWUP_COLUMNS}
-       FROM followups
-       WHERE id = ?`,
-    )
-    .get(id) as FollowupRecord | undefined;
-}
-
-export function getFollowupByThread(
-  threadId: string,
-  googleAccount: GoogleAccountId = "personal",
-): FollowupRecord | undefined {
-  return db
-    .prepare(
-      `SELECT ${FOLLOWUP_COLUMNS}
-       FROM followups
-       WHERE thread_id = ? AND google_account = ?`,
-    )
-    .get(threadId, googleAccount) as FollowupRecord | undefined;
-}
-
-export function getFollowups(): FollowupRecord[] {
-  return db
-    .prepare(
-      `SELECT ${FOLLOWUP_COLUMNS}
-       FROM followups
-       ORDER BY last_sent_at ASC, id ASC`,
-    )
-    .all() as FollowupRecord[];
-}
-
-export function createFollowup(input: FollowupInput): FollowupRecord {
-  const result = db
-    .prepare(
-      `INSERT INTO followups (
-         thread_id, recipient, subject, tag, google_account,
-         last_sent_at, next_check_at,
-         reason_for_followup, importance
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      input.threadId,
-      input.recipient,
-      input.subject,
-      input.tag,
-      input.googleAccount,
-      input.lastSentAt,
-      input.nextCheckAt,
-      input.reasonForFollowup ?? null,
-      input.importance ?? "medium",
-    );
-
-  return getFollowup(Number(result.lastInsertRowid))!;
-}
-
-export function restartFollowup(
-  id: number,
-  input: FollowupInput,
-): FollowupRecord {
-  db.prepare(
-    `UPDATE followups
-     SET recipient = ?,
-         subject = ?,
-         tag = ?,
-         google_account = ?,
-         last_sent_at = ?,
-         status = 'waiting',
-         nudge_count = 0,
-         next_check_at = ?,
-         reason_for_followup = ?,
-         importance = ?,
-         last_notified_at = NULL
-     WHERE id = ?`,
-  ).run(
-    input.recipient,
-    input.subject,
-    input.tag,
-    input.googleAccount,
-    input.lastSentAt,
-    input.nextCheckAt,
-    input.reasonForFollowup ?? null,
-    input.importance ?? "medium",
-    id,
-  );
-
-  return getFollowup(id)!;
-}
-
-export function getDueFollowups(nowIso: string): FollowupRecord[] {
-  const woken = db
-    .prepare(
-      `UPDATE followups
-       SET status = 'waiting'
-       WHERE status = 'snoozed' AND next_check_at <= ?`,
-    )
-    .run(nowIso);
-  if (woken.changes > 0) {
-    console.log(`Follow-up snooze elapsed: woken=${woken.changes}`);
-  }
-  return db
-    .prepare(
-      `SELECT ${FOLLOWUP_COLUMNS}
-       FROM followups
-       WHERE status = 'waiting' AND next_check_at <= ?
-       ORDER BY importance = 'high' DESC, next_check_at ASC, id ASC`,
-    )
-    .all(nowIso) as FollowupRecord[];
-}
-
-export function recordFollowupNudge(
-  id: number,
-  lastNotifiedAt: string,
-  nudgeCount: number,
-  nextCheckAt: string,
-): void {
-  db.prepare(
-    `UPDATE followups
-     SET last_notified_at = ?,
-         nudge_count = ?,
-         next_check_at = ?
-     WHERE id = ?`,
-  ).run(lastNotifiedAt, nudgeCount, nextCheckAt, id);
-}
-
-export function refreshFollowupSentMessage(
-  id: number,
-  recipient: string,
-  subject: string,
-  lastSentAt: string,
-  nextCheckAt: string,
-): FollowupRecord {
-  db.prepare(
-    `UPDATE followups
-     SET recipient = ?,
-         subject = ?,
-         last_sent_at = ?,
-         status = 'waiting',
-         nudge_count = 0,
-         next_check_at = ?
-     WHERE id = ? AND status IN ('waiting', 'snoozed')`,
-  ).run(recipient, subject, lastSentAt, nextCheckAt, id);
-
-  return getFollowup(id)!;
-}
-
-export function snoozeFollowup(
-  id: number,
-  nextCheckAt: string,
-): FollowupRecord | undefined {
-  const result = db
-    .prepare(
-      `UPDATE followups
-       SET status = 'snoozed',
-           next_check_at = ?
-       WHERE id = ? AND status IN ('waiting', 'snoozed')`,
-    )
-    .run(nextCheckAt, id);
-  if (result.changes !== 1) {
-    return undefined;
-  }
-  return getFollowup(id);
-}
-
-export function transitionFollowupStatus(
-  id: number,
-  from: FollowupStatus | FollowupStatus[],
-  to: FollowupStatus,
-): boolean {
-  const statuses = Array.isArray(from) ? from : [from];
-  if (statuses.length === 0) {
-    return false;
-  }
-  const placeholders = statuses.map(() => "?").join(", ");
-  const result = db
-    .prepare(
-      `UPDATE followups
-       SET status = ?
-       WHERE id = ? AND status IN (${placeholders})`,
-    )
-    .run(to, id, ...statuses);
 
   return result.changes === 1;
 }
@@ -4811,30 +4494,6 @@ export function lastSalesSendAt(): string | undefined {
     )
     .get() as { last: string | null };
   return row.last ?? undefined;
-}
-
-export function hasActiveSalesSequenceOnThread(threadId: string): boolean {
-  return (
-    db
-      .prepare(
-        `SELECT 1 FROM sales_sequences
-         WHERE account = 'work' AND thread_id = ? AND status = 'active'`,
-      )
-      .get(threadId) !== undefined
-  );
-}
-
-/** Running or finished: the follow-up scan doesn't start tracking this thread, and
- *  a sequence that said "last note" isn't followed by a nudge to write another. */
-export function salesSequenceOwnsThread(threadId: string): boolean {
-  return (
-    db
-      .prepare(
-        `SELECT 1 FROM sales_sequences
-         WHERE account = 'work' AND thread_id = ? AND status IN ('active', 'completed')`,
-      )
-      .get(threadId) !== undefined
-  );
 }
 
 /** A meeting already in motion with this address: an open offer, a booking about

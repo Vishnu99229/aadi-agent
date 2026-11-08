@@ -39,6 +39,12 @@ const commands: Array<[string, string]> = [
   ["Start a sequence for Dorothy Copeland.", "sequence"],
   ["start a sequence for dorothy.copeland@nice.com", "sequence"],
   ["Can you auto follow up with Jeff Comstock", "sequence"],
+  ["Follow up on my email to Jeff Comstock", "sequence"],
+  ["follow up on the email I sent Munil", "sequence"],
+  ["Follow up with Dorothy on my email", "sequence"],
+  ["Remind me to follow up with Jeff on Monday", "sequence"],
+  ["track my email to Priya", "sequence"],
+  ["remind me to follow up with me on Friday", "reminder"],
   ["Stop following up with Rajan", "sequence_stop"],
   ["pause all follow-ups", "sequence_stop"],
   ["Don't email Talkdesk again", "sequence_stop"],
@@ -121,6 +127,9 @@ const notCommands = [
   "is Talkdesk an account?",
   "remove my Google account",
   "the follow-ups are working well",
+  "don't follow up on my email to Jeff",
+  "did I follow up on my email to Jeff?",
+  "follow up with me tomorrow about the deck",
 ];
 for (const text of notCommands) {
   const kinds = commandIntents(text);
@@ -132,7 +141,7 @@ assert(commandIntents("Cancel the reminder for the call").join(",") === "reminde
 assert(commandIntents("Draft an email to Jeff to schedule a call").join(",") === "draft", "a draft that mentions a call is a draft");
 assert(commandIntents("Delete the task about the Talkdesk call").join(",") === "task", "a task about a call is a task");
 assert(commandIntents("remind me to book a meeting with Jeff").join(",") === "reminder", "remind me to book is a reminder, not a booking");
-assert(!commandIntents("Remind me to follow up with Jeff").includes("reminder"), "a follow-up reminder is left for the sequence card");
+assert(commandIntents("Remind me to follow up with Jeff").join(",") === "sequence", "remind me to follow up with X is the sequence card, not a reminder");
 assert(commandIntents("draft and send an email to Jeff saying Monday works").join(",") === "send", "draft and send is a send");
 
 // ---- who a sequence request names ----
@@ -143,6 +152,9 @@ assert(
   JSON.stringify(sequenceTargets("Start a sequence for Munil Shah. Start a sequence for Jeff Comstock too.")) === '["Munil Shah","Jeff Comstock"]',
   "one target per request",
 );
+assert(JSON.stringify(sequenceTargets("Follow up on my email to Jeff Comstock")) === '["Jeff Comstock"]', "the old tracker's phrasing names the person");
+assert(JSON.stringify(sequenceTargets("Remind me to follow up with Jeff on Monday")) === '["Jeff"]', "the person, not the day");
+assert(JSON.stringify(sequenceTargets("Follow up with Dorothy on my email")) === '["Dorothy"]', "follow up with X on my email");
 for (const vague of ["start a sequence for her", "Start a sequence for the other person also", "start a sequence for them", "Start a sequence from Dorothy for Coplan"]) {
   assert(sequenceTargets(vague) === undefined, `"${vague}" is left to the model`);
 }

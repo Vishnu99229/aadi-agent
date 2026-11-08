@@ -142,7 +142,7 @@ function testMatchingAndStatus(): void {
     },
   ];
   const openItems = [
-    { kind: "follow-up" as const, text: "KYC timeline (kyc@slic-stage8.example)" },
+    { kind: "sequence" as const, text: "KYC timeline <kyc@slic-stage8.example>, step 2 of 4" },
     { kind: "task" as const, text: "Send SLIC KYC deck to Vinfer Test" },
     { kind: "promised" as const, text: "Share API spec" },
   ];
@@ -153,15 +153,15 @@ function testMatchingAndStatus(): void {
   });
   assert(status.includes("Last interactions:"), "has interactions");
   assert(status.includes("KYC timeline"), "email thread line");
-  assert(status.includes("follow-up:"), "open follow-up");
+  assert(status.includes("sequence:"), "an active sales sequence is an open item");
   assert(status.includes("promised:"), "promised item");
   assert(
     suggestedNextStep({
       account: { ...account, next_step: "" },
       openItems,
       interactions,
-    }).includes("KYC timeline"),
-    "suggested next step from a real follow-up",
+    }).startsWith("Automatic follow-ups running: KYC timeline"),
+    "suggested next step from an active sequence",
   );
   assert(
     suggestedNextStep({

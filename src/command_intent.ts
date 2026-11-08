@@ -45,8 +45,8 @@ const FAMILIES: Record<CommandKind, CommandFamily> = {
     notRun: "no sequence was started or checked",
   },
   sequence_stop: {
-    action: ["stop_sequence", "stop_tracking"],
-    lookup: ["list_waiting"],
+    action: ["stop_sequence"],
+    lookup: [],
     // Never forced: "pause all follow-ups" stops every sequence.
     retry: "To stop follow-ups, call stop_sequence now with who he named, or \"all\" only if he said all.",
     notRun: "no follow-ups were stopped",
@@ -331,7 +331,11 @@ export function commandIntents(ownWords: string): CommandKind[] {
   }
   const found = new Set<CommandKind>();
   const any = (patterns: readonly RegExp[]): boolean => patterns.some((pattern) => pattern.test(text));
-  if (isExplicitSequenceRequest(text) && !NOT_A_SEQUENCE_COMMAND.some((pattern) => pattern.test(text))) {
+  if (
+    isExplicitSequenceRequest(text) &&
+    !NOT_A_SEQUENCE_COMMAND.some((pattern) => pattern.test(text)) &&
+    !notAnInstruction(text, { remindAllowed: true })
+  ) {
     found.add("sequence");
   }
   if (any(STOP_SEQUENCE) && !notAnInstruction(text, { negationAllowed: true })) {
@@ -363,10 +367,11 @@ export function commandIntents(ownWords: string): CommandKind[] {
   ) {
     found.add("calendar");
   }
-  // "Remind me to follow up with X" is a sequence, not a reminder.
+  // "Remind me to follow up with X" is a sequence card; "remind me to follow up
+  // with me" is still a reminder.
   if (
     (any(SET_REMINDER) || CANCEL_REMINDER.test(text)) &&
-    !/\bfollow[\s-]*up\b/i.test(text) &&
+    !found.has("sequence") &&
     !notAnInstruction(text, { remindAllowed: true })
   ) {
     found.add("reminder");
@@ -418,10 +423,20 @@ export function sequenceTargets(ownWords: string): string[] | undefined {
     if (!isExplicitSequenceRequest(sentence)) {
       continue;
     }
+    const reminded = /\bremind\s+me\s+to\s+follow[\s-]*up\s+(?:with|on)\s+(.+)$/i.exec(sentence);
     const match =
       /\b(?:start|begin)\b(?:\s+(?:a|an|the|new|another|follow[\s-]*up|auto(?:matic)?|email|mail))*\s+sequences?\s+(?:for|with|to|on)\s+(.+)$/i.exec(sentence) ??
-      /\bauto[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence);
-    const target = match?.[1]
+      /\bauto[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence) ??
+      /\bfollow[\s-]*up\s+on\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|message|note|thread)\s+(?:to|with|for)\s+(.+)$/i.exec(sentence) ??
+      /\bfollow[\s-]*up\s+on\s+(?:my|the)\s+(?:e-?mail|mail)\s+(?:that\s+)?i\s+sent\s+(?:to\s+)?(.+)$/i.exec(sentence) ??
+      /\bfollow[\s-]*up\s+with\s+(.+?)\s+on\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread)\b/i.exec(sentence) ??
+      /\btrack\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread)\s+(?:to|with)\s+(.+)$/i.exec(sentence);
+    // "Remind me to follow up with Jeff on Monday": the person, not the day.
+    const fromReminder = reminded?.[1]?.replace(
+      /\s+(?:on|by|next|this|tomorrow|today|tonight|in|after|about|regarding|re)\b.*$/i,
+      "",
+    );
+    const target = (fromReminder ?? match?.[1])
       ?.replace(/[.!?,;:]+\s*$/, "")
       .replace(TRAILING_FILLER, "")
       .replace(/^["'“”]+|["'“”]+$/g, "")

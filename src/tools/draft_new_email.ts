@@ -8,7 +8,7 @@ import {
   formatMailboxList,
   splitDraftRecipients,
 } from "../draft_recipients.js";
-import { parseAddressList } from "../followup_logic.js";
+import { parseAddressList } from "../mail_helpers.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor } from "../google/mail.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";

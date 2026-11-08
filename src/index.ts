@@ -1,4 +1,4 @@
-import { bot } from "./bot.js";
+import { bot, refreshReplyKeyboardOnce } from "./bot.js";
 import { installOutboundHistory } from "./outbound.js";
 import {
   setAfterDraftSend,
@@ -6,8 +6,6 @@ import {
 } from "./approvals.js";
 import { registerBillScan } from "./bills.js";
 import { registerMorningBrief } from "./brief.js";
-import { sendOverdueFollowupNudge } from "./followup_panel.js";
-import { registerFollowupScan } from "./followups.js";
 import { registerImportantDateReminders } from "./important_dates.js";
 import { registerPromiseScan } from "./promises.js";
 import { registerWeeklyReview } from "./weekly.js";
@@ -37,10 +35,6 @@ const morningBriefTask = registerMorningBrief(bot.api);
 const billScanTask = registerBillScan(bot.api);
 const importantDateTask = registerImportantDateReminders(bot.api);
 const weeklyReviewTask = registerWeeklyReview(bot.api);
-const followupScanTask = registerFollowupScan(
-  sendOverdueFollowupNudge,
-  bot.api,
-);
 const promiseScanTask = registerPromiseScan(bot.api);
 const approvalExpirySweep = startApprovalExpirySweep();
 const reminderScheduler = await registerReminderScheduler(bot.api);
@@ -58,7 +52,6 @@ const jobQueueTask = registerJobWorker(bot.api);
 const messageEmbedTask = registerMessageEmbed();
 await applyPendingDeployResult();
 const MENU_COMMANDS = [
-  { command: "followups", description: "Scan and list emails waiting on a reply" },
   { command: "model", description: "Choose which model handles each task" },
   { command: "build", description: "Ask a Cursor agent to change Aadi's code" },
   { command: "builds", description: "List recent code builds" },
@@ -90,6 +83,14 @@ await logGoogleAccounts();
 bot.start({
   onStart: async () => {
     await replaceBotCommandMenu();
+    try {
+      if (await refreshReplyKeyboardOnce(bot.api)) {
+        console.log("Reply keyboard refreshed: Sequences replaces Waiting on.");
+      }
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Reply keyboard refresh failed (${errorType}); it will retry next start.`);
+    }
     console.log(
       `Telegram / menu: ${MENU_COMMANDS.map((item) => `/${item.command}`).join(", ")}`,
     );
@@ -103,7 +104,6 @@ process.once("SIGINT", () => {
   billScanTask.stop();
   importantDateTask.stop();
   weeklyReviewTask.stop();
-  followupScanTask.stop();
   promiseScanTask.stop();
   meetingScanTask.stop();
   weeklyBackupTask.stop();
@@ -127,7 +127,6 @@ process.once("SIGTERM", () => {
   billScanTask.stop();
   importantDateTask.stop();
   weeklyReviewTask.stop();
-  followupScanTask.stop();
   promiseScanTask.stop();
   meetingScanTask.stop();
   weeklyBackupTask.stop();

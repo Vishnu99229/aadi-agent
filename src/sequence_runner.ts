@@ -19,8 +19,8 @@ import {
   stopActiveSalesSequence,
   type SalesSequenceRecord,
 } from "./db.js";
-import { parseAddressList } from "./followup_logic.js";
-import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./followups.js";
+import { parseAddressList } from "./mail_helpers.js";
+import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import type { LoadedGoogleAccount } from "./google/auth.js";
 import { plainTextBody, signatureHtmlFor } from "./google/mail.js";
 import { messageHeader } from "./gmail_attachments.js";
@@ -630,7 +630,7 @@ export async function stopSequenceFromTool(
   allowOwnerChatStopSequence(turn.confirmation);
   const rows = listActiveSalesSequences();
   if (rows.length === 0) {
-    return "Nothing stopped: there are no active follow-up sequences. If Vishnu meant a follow-up nudge, that is stop_tracking.";
+    return "Nothing stopped: there are no active follow-up sequences.";
   }
   const match = matchSequencesForStop(rows, target);
   const options = (items: SalesSequenceRecord[]): string =>

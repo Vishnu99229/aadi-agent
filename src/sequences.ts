@@ -23,13 +23,13 @@ import {
   stopProposedSalesSequence,
   type SalesSequenceRecord,
 } from "./db.js";
-import { parseAddressList, type ParsedMailbox } from "./followup_logic.js";
+import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import {
   getSentThreadMetadata,
   isAlgorithmicallyExcluded,
   isCalendarMessage,
   loadFollowupSelfAddresses,
-} from "./followups.js";
+} from "./mail_helpers.js";
 import { getGoogleAccount, type LoadedGoogleAccount } from "./google/auth.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { gmailClient, plainTextBody } from "./google/mail.js";
@@ -690,7 +690,7 @@ export async function startSequenceFromTool(
 ): Promise<string> {
   allowOwnerChatStartSequence(turn.confirmation);
   if (!isExplicitSequenceRequest(turn.userText ?? "")) {
-    return "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\" or \"auto follow up with X\". Use track_thread for a follow-up nudge.";
+    return "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\", \"auto follow up with X\", \"follow up on my email to X\" or \"remind me to follow up with X\". For a reminder about something else, use set_reminder.";
   }
   return requestSequenceCard(target, api);
 }

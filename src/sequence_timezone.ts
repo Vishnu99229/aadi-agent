@@ -1,5 +1,5 @@
 import type { gmail_v1 } from "googleapis";
-import { parseAddressList } from "./followup_logic.js";
+import { parseAddressList } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { plainTextBody } from "./google/mail.js";
 import { completeBackground } from "./llm.js";

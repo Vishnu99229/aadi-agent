@@ -39,7 +39,6 @@ import * as listSalesFacts from "./list_sales_facts.js";
 import * as listTasks from "./list_tasks.js";
 import * as learnQa from "./learn_qa.js";
 import * as listMemories from "./list_memories.js";
-import * as listWaiting from "./list_waiting.js";
 import * as proposeCalendarEvent from "./propose_calendar_event.js";
 import * as remember from "./remember.js";
 import * as searchMemories from "./search_memories.js";
@@ -63,8 +62,6 @@ import * as setReminder from "./set_reminder.js";
 import * as setSequenceTimezone from "./set_sequence_timezone.js";
 import * as startSequence from "./start_sequence.js";
 import * as stopSequence from "./stop_sequence.js";
-import * as stopTracking from "./stop_tracking.js";
-import * as trackThread from "./track_thread.js";
 import * as updateAccount from "./update_account.js";
 import * as updateDraft from "./update_draft.js";
 
@@ -121,7 +118,6 @@ const modules = {
   list_sales_facts: listSalesFacts,
   list_tasks: listTasks,
   list_memories: listMemories,
-  list_waiting: listWaiting,
   mark_bill_paid: markBillPaid,
   move_event: moveEvent,
   propose_calendar_event: proposeCalendarEvent,
@@ -149,8 +145,6 @@ const modules = {
   set_sequence_timezone: setSequenceTimezone,
   start_sequence: startSequence,
   stop_sequence: stopSequence,
-  stop_tracking: stopTracking,
-  track_thread: trackThread,
   update_account: updateAccount,
   update_memory: updateMemory,
   update_draft: updateDraft,
@@ -180,7 +174,6 @@ export const TOOL_ORDER = [
   "list_reminders",
   "list_tasks",
   "list_memories",
-  "list_waiting",
   "mark_bill_paid",
   "propose_calendar_event",
   "create_meeting",
@@ -201,8 +194,6 @@ export const TOOL_ORDER = [
   "search_qa_bank",
   "web_search",
   "set_reminder",
-  "stop_tracking",
-  "track_thread",
   "update_account",
   "update_memory",
   "update_draft",
@@ -246,7 +237,6 @@ export const FORWARDED_TOOLS = [
   "list_reminders",
   "list_tasks",
   "list_memories",
-  "list_waiting",
   "propose_calendar_event",
   "read_attachment",
   "read_document",

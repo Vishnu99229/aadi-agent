@@ -12,15 +12,7 @@ function ensureTestEnv(): void {
 ensureTestEnv();
 
 const { looksLikeDeferredAction } = await import("../src/deferred_action.ts");
-const {
-  cleanSubjectTitle,
-  formatFollowupPanelText,
-  formatToLine,
-  formatWaitingPhrase,
-  isSelfSentRecipient,
-  neededLine,
-  parseAddressList,
-} = await import("../src/followup_logic.ts");
+const { isSelfSentRecipient, parseAddressList } = await import("../src/mail_helpers.ts");
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -39,50 +31,18 @@ assert(named[0]?.name === "Priya Sharma", "quoted display name");
 assert(named[0]?.email === "priya@pinnacle.in", "quoted email");
 
 assert(
-  formatToLine("priya@pinnacle.in", []) === "To: Priya, Pinnacle",
-  "name and company from domain",
-);
-assert(
-  formatToLine("Vishnu <vishnu.rajan294@gmail.com>", []) ===
-    "To: (sent to yourself)",
-  "self-address label",
-);
-assert(
   isSelfSentRecipient("vishnu.rajan294@gmail.com"),
-  "personal Gmail is a self-sent follow-up",
+  "personal Gmail is self-sent",
 );
 assert(
   isSelfSentRecipient(
     "Vishnu <vishnu.rajan@epicode.in>, Vishnu <vishnu.rajan294@gmail.com>",
   ),
-  "work-to-personal test mail is a self-sent follow-up",
+  "work-to-personal test mail is self-sent",
 );
 assert(
   !isSelfSentRecipient("Ada <ada@acme.com>"),
   "external recipient is not self-sent",
 );
 
-assert(cleanSubjectTitle("Re: Dialler integration proposal") === "Dialler integration proposal", "strip Re");
-assert(formatWaitingPhrase(1) === "waiting 1 day", "singular waiting");
-assert(formatWaitingPhrase(3) === "waiting 3 days", "plural waiting");
-assert(neededLine("  Please share the proposal  ") === "Please share the proposal", "needed snippet");
-
-const text = formatFollowupPanelText(
-  [
-    {
-      id: 12,
-      title: "Dialler integration proposal",
-      toLine: "To: Priya Sharma, Pinnacle",
-      sentLine: "Sent: Mon 12 Oct, 4:10 pm · waiting 3 days",
-      needed: "the signed proposal",
-      note: "Snoozed until Sun 18 Oct",
-    },
-  ],
-  "Waiting on",
-);
-assert(text.includes("1. Dialler integration proposal"), "numbered title");
-assert(text.includes("To: Priya Sharma, Pinnacle"), "to line");
-assert(text.includes("Needed: the signed proposal"), "needed line");
-assert(text.includes("Snoozed until Sun 18 Oct"), "action note");
-
-console.log("Panel and deferred-action checks passed.");
+console.log("Deferred-action and address checks passed.");

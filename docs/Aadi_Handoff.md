@@ -114,7 +114,6 @@ Gates in one line: **owner lock** = ignore anyone except `OWNER_TELEGRAM_ID`. **
 | `/build <task>` | Cursor cloud agent against this repo | Owner lock; confirm card; CI; protected-path block; optional auto-merge |
 | `/builds` | Recent `/build` runs | Owner lock |
 | `/showkeyboard` `/hidekeyboard` | Reply keyboard | Owner lock |
-| `/followups` | Scan + list waiting-on-reply threads | Owner lock; read Gmail |
 | `/jobs` | Running/recent multi-step jobs; cancel from chat | Owner lock; jobs cannot send/book |
 | `/health` | Version, turns, LLM credit flags, heartbeat, last-success per job | Owner lock |
 | `/meetings` | Auto-handled meeting threads | Owner lock |
@@ -127,7 +126,7 @@ Gates in one line: **owner lock** = ignore anyone except `OWNER_TELEGRAM_ID`. **
 | `/next` | Pre-meeting brief for the next work meeting | Owner lock |
 | `/wrapup` | Save call/meeting notes | Owner lock |
 
-Also on the bot menu (set at startup): `/followups`, `/model`, `/build`, `/builds`, `/health`, `/memory`, `/meetings`, `/reset`, `/jobs`.
+Also on the bot menu (set at startup): `/model`, `/build`, `/builds`, `/health`, `/memory`, `/meetings`, `/reset`, `/jobs`.
 
 Retry callback `retry:<turnId>` re-runs the last failed user text for that turn.
 
@@ -168,7 +167,6 @@ Self-scheduling `setTimeout`, Asia/Kolkata. Last success in `job_runs`. Catch-up
 | --- | --- | --- |
 | `morning-brief` | `BRIEF_TIME` (default 08:00) | Off until setting `morning_brief=on` |
 | `bill-scan` | `BILL_SCAN_TIME` (default 09:00); prefers DeepSeek off-peak | Classify only; no send |
-| `followup-scan` | `FOLLOWUP_SCAN_TIME` (default 10:00) | Nudge Telegram; no auto-send mail. `sendOverdueFollowupNudge` buttons: Draft follow-up, Ignore (`stopTrackingFollowup`), Snooze 3 days (`snoozeFollowupThreeDays`). `getDueFollowups` sets an elapsed snooze back to `waiting` so it pings again |
 | `important-dates` | 09:00 daily | Telegram ping |
 | `promise-scan` | Weekdays 09:00; DeepSeek off-peak preferred | Creates open tasks from work Sent; not a mail send |
 | `weekly-review` | `WEEKLY_REVIEW_TIME` default 19:00 Sundays | Telegram only |
@@ -205,8 +203,6 @@ Required at process start (`src/security/env_guard.ts`): `TELEGRAM_BOT_TOKEN`, `
 | `CLAUDE_MODEL` | Sonnet model id |
 | `BACKGROUND_MODEL` | Haiku id for `/model` haiku and some background paths (default `claude-haiku-5-5`) |
 | `LLM_PROVIDER` | Must be `claude` |
-| `FOLLOWUP_AFTER_HOURS` | Hours before a sent mail is “waiting” (default 72) |
-| `FOLLOWUP_SCAN_TIME` | Follow-up scan clock |
 | `BILL_SCAN_TIME` | Bill scan clock |
 | `WEEKLY_REVIEW_TIME` | Sunday review clock |
 | `PRE_MEETING_MINUTES` | Comma list e.g. `15,10,5` |
@@ -238,7 +234,7 @@ Required at process start (`src/security/env_guard.ts`): `TELEGRAM_BOT_TOKEN`, `
 | `AUTO_SEND_DAILY_CAP` | Max auto scheduling emails / day |
 | `AUTO_BOOK_MIN_CONFIDENCE` | Classifier threshold |
 | `MEETING_TEST_SENDERS` | Extra From addresses treated as prospects |
-| `SELF_EMAIL_ADDRESSES` | Extra mailboxes treated as Vishnu by `loadFollowupSelfAddresses` (plus both accounts' profile and send-as aliases). A follow-up whose To is only those addresses is dropped by `isAlgorithmicallyExcluded` |
+| `SELF_EMAIL_ADDRESSES` | Extra mailboxes treated as Vishnu by `loadFollowupSelfAddresses` in `src/mail_helpers.ts` (plus both accounts' profile and send-as aliases). A sent email whose To is only those addresses is dropped by `isAlgorithmicallyExcluded` |
 | `PARTNER_DOMAINS` | Comma-separated. Default `supertroninfotech.com,supertronindia.com,pinnacle.in,shriramlife.com` when unset; setting it replaces the default, it doesn't add to it. `pinnacle.in` is the From domain on Pinnacle Teleservices mail and that account's `email_domains` |
 | `SEND_ON_COMMAND_ENABLED` | Turns on `send_email` (no card, no content check), calendar on command and scheduled sends, routes those turns to Sonnet (`looksLikeCommandTurn`), and makes `send_immediately` a Send card. Default off, which leaves today's behaviour unchanged |
 | `SEQUENCES_ENABLED` | Kill switch for sequence detection and sending. Default off |
@@ -275,7 +271,7 @@ Not env: `google-credentials.json`, `google-token.json` (personal Gmail), `googl
 - `allowCreateEvent` — Create button `approval:create:<id>`.
 - Owner-chat exceptions: `allowOwnerChatSendDraft`, `allowOwnerChatCommandSend`, `allowOwnerChatCreateEvent`, `allowOwnerChatDeleteEvent`, `allowOwnerChatMoveEvent`, `allowOwnerChatAddAttendee`, `allowOwnerChatCancelScheduledSend` — require a real `chatId` + `messageId` from Vishnu’s turn.
 
-Sequence stop rules live in `evaluateStopRules` (`src/sequence_rules.ts`) and run in `applyStopRules` (`src/sequence_runner.ts`). `colleagueWroteOnThread` stops a sequence when anyone else at `epicode.in` writes on its thread after enrolment, to the prospect or to Vishnu; the `SENT` label keeps his own aliases out of it. Other scans stay out of sequences: `collectCandidates` skips threads where `salesSequenceOwnsThread`, `dueFollowupsNow` / `activeFollowups` / `overdueFollowups` hide threads with an active sequence, and `runPromiseScan` skips `isSalesSequenceSentMessage`. `prepareSequenceStep` writes each follow-up from `salesFactsText()`: `docs/sales_facts.md` merged with the facts Vishnu adds by chat (`add_sales_fact`, `list_sales_facts`, `remove_sales_fact`, table `sales_facts_added`), read fresh for every follow-up. There is no checker: a writer failure waits and retries hourly. The four chat tools are owner-only and out of `FORWARDED_TOOLS`. A reply from anyone at the prospect's company still stops every sequence to that company (unchanged stop rule), and so does his own email to anyone there.
+Sequence stop rules live in `evaluateStopRules` (`src/sequence_rules.ts`) and run in `applyStopRules` (`src/sequence_runner.ts`). `colleagueWroteOnThread` stops a sequence when anyone else at `epicode.in` writes on its thread after enrolment, to the prospect or to Vishnu; the `SENT` label keeps his own aliases out of it. `runPromiseScan` skips `isSalesSequenceSentMessage`, so a sequence email never becomes a promise task. The old follow-up tracker (`/followups`, the Waiting on panel, the daily "N days with no reply" pings, `track_thread` / `stop_tracking` / `list_waiting`, the `followups` table) was removed on 2026-11-08; "follow up on my email to X" and "remind me to follow up with X" now offer the sequence Start card (`isExplicitSequenceRequest`). Its shared mail helpers moved unchanged to `src/mail_helpers.ts`. `prepareSequenceStep` writes each follow-up from `salesFactsText()`: `docs/sales_facts.md` merged with the facts Vishnu adds by chat (`add_sales_fact`, `list_sales_facts`, `remove_sales_fact`, table `sales_facts_added`), read fresh for every follow-up. There is no checker: a writer failure waits and retries hourly. The four chat tools are owner-only and out of `FORWARDED_TOOLS`. A reply from anyone at the prospect's company still stops every sequence to that company (unchanged stop rule), and so does his own email to anyone there.
 
 `approvals.ts` `sendDraft` must call `allowSendDraft` **before** `performDraftSend`. Text “send it” goes through `sendPendingDraftByText` → same `performDraftSend`. Auto-scheduling mail is **not** this gate; it is `sendSchedulingEmail` with a frozen template. Sequence follow-ups aren't either: they go through `sendSequenceStep` and `evaluateSequenceSendGate`.
 
@@ -375,7 +371,6 @@ Live file: phone `aadi.db`. Created/migrated in `src/db.ts`.
 | `pending_actions` | Draft Send cards and Create Event cards (account, headers, expiry) |
 | `tasks` | Open/done tasks; extra columns for promises (`kind`, `source_thread_id`, `deadline`, `recipient`, …) |
 | `reminders` | One-off / daily / weekly / weekdays; may link task or bill |
-| `followups` | Threads waiting on a reply (work + personal) |
 | `documents` | Ingested PDFs/photos/Drive; 7-day delete |
 | `jobs` | Multi-step job header (budget, Telegram progress message) |
 | `job_steps` | Plan steps + `done_condition` + `done_check_passed` |

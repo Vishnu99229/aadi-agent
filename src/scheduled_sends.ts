@@ -26,8 +26,8 @@ import {
   type ScheduledSendRecord,
 } from "./db.js";
 import { formatMailbox } from "./draft_recipients.js";
-import type { ParsedMailbox } from "./followup_logic.js";
-import { loadFollowupSelfAddresses } from "./followups.js";
+import type { ParsedMailbox } from "./mail_helpers.js";
+import { loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { getGoogleAccount } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";

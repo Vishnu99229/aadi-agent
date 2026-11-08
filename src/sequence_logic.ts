@@ -1,4 +1,4 @@
-import type { ParsedMailbox } from "./followup_logic.js";
+import type { ParsedMailbox } from "./mail_helpers.js";
 import { isSelfEmail } from "./mom_logic.js";
 
 export const OWN_DOMAIN = "epicode.in";
@@ -363,12 +363,23 @@ export function pitchClassifierInput(lines: ThreadLine[]): string {
   ].join("\n");
 }
 
-/** Only these clear phrases may reach a Start card from chat. "Follow up on my
- *  email", "remind me" and "track" stay track_thread nudges. */
+/** "Follow up on my email to X", "remind me to follow up with X" and close
+ *  variants. They used to mean the old follow-up tracker, which is gone; now
+ *  they offer the same Start card. "Follow up with me" is a reminder, not this. */
+export const FOLLOW_UP_ON_EMAIL: readonly RegExp[] = [
+  /\bfollow[\s-]*up\s+on\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|message|note|thread)\s+(?:to|with|for)\s+\S/i,
+  /\bfollow[\s-]*up\s+on\s+(?:my|the)\s+(?:e-?mail|mail)\s+(?:that\s+)?i\s+sent\s+(?:to\s+)?\S/i,
+  /\bfollow[\s-]*up\s+with\s+(?!(?:me|us|myself)\b)\S+(?:\s+\S+){0,4}?\s+on\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread)\b/i,
+  /\bremind\s+me\s+to\s+follow[\s-]*up\s+(?:with|on)\s+(?!(?:me|us|myself)\b)\S/i,
+  /\btrack\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread)\s+(?:to|with)\s+\S/i,
+];
+
+/** Only these clear phrases may reach a Start card from chat. */
 export function isExplicitSequenceRequest(text: string): boolean {
   return (
     /\bstart\b(?:\s+\S+){0,3}?\s+sequence\b/i.test(text) ||
-    /\bauto[\s-]*follow[\s-]*up\b/i.test(text)
+    /\bauto[\s-]*follow[\s-]*up\b/i.test(text) ||
+    FOLLOW_UP_ON_EMAIL.some((pattern) => pattern.test(text))
   );
 }
 
