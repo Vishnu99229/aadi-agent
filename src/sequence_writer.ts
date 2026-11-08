@@ -182,6 +182,25 @@ export function cleanDraftBody(text: string): string {
   return lines.join("\n").trim();
 }
 
+/** Pulls {"body"} out of the writer reply, including when Gemini wraps it in
+ *  ```json fences. Truncated JSON still throws, so the step is deferred. */
+export function parseWriterPayload(text: string): string {
+  const stripped = text
+    .replace(/^\s*```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/, "")
+    .trim();
+  const start = stripped.indexOf("{");
+  const end = stripped.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    throw new Error("Sequence writer returned no body.");
+  }
+  const parsed = JSON.parse(stripped.slice(start, end + 1)) as { body?: unknown };
+  if (typeof parsed.body !== "string") {
+    throw new Error("Sequence writer returned no body.");
+  }
+  return cleanDraftBody(parsed.body);
+}
+
 function clip(text: string, max: number): string {
   const clean = text.replace(/[ \t]+/g, " ").trim();
   return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
@@ -368,17 +387,10 @@ async function writeDraft(input: Parameters<typeof writerInput>[0]): Promise<str
     messages: [{ role: "user", content: writerInput(input) }],
     tools: [],
     jsonSchema: WRITER_SCHEMA,
-    maxTokens: 500,
+    maxTokens: 1500,
     cacheTtl: "5m",
   });
-  const text = result.textParts.join("");
-  const parsed = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)) as {
-    body?: unknown;
-  };
-  if (typeof parsed.body !== "string") {
-    throw new Error("Sequence writer returned no body.");
-  }
-  return cleanDraftBody(parsed.body);
+  return parseWriterPayload(result.textParts.join(""));
 }
 
 /** Up to three of his free times that also fall inside the prospect's 09:00-18:00

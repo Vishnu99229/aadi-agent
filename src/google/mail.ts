@@ -103,6 +103,7 @@ export function signaturePlainText(html: string): string {
   return decodeHtmlEntities(
     html
       .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<(div|p|tr|li|h[1-6])\b[^>]*>/gi, "\n")
       .replace(/<\/(div|p|tr|li|h[1-6])>/gi, "\n")
       .replace(/<[^>]+>/g, ""),
   )
