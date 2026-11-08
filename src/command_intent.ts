@@ -423,14 +423,22 @@ export function sequenceTargets(ownWords: string): string[] | undefined {
     if (!isExplicitSequenceRequest(sentence)) {
       continue;
     }
-    const reminded = /\bremind\s+me\s+to\s+follow[\s-]*up\s+(?:with|on)\s+(.+)$/i.exec(sentence);
-    const match =
-      /\b(?:start|begin)\b(?:\s+(?:a|an|the|new|another|follow[\s-]*up|auto(?:matic)?|email|mail))*\s+sequences?\s+(?:for|with|to|on)\s+(.+)$/i.exec(sentence) ??
-      /\bauto[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence) ??
-      /\bfollow[\s-]*up\s+on\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|message|note|thread)\s+(?:to|with|for)\s+(.+)$/i.exec(sentence) ??
-      /\bfollow[\s-]*up\s+on\s+(?:my|the)\s+(?:e-?mail|mail)\s+(?:that\s+)?i\s+sent\s+(?:to\s+)?(.+)$/i.exec(sentence) ??
+    // The email-anchored phrasings name the person after the email, whatever
+    // comes before: "auto follow up on my email to Jeff", "start a sequence on the
+    // email I sent Munil", "remind me to follow up on my email to Dorothy". They go
+    // first, or a generic prefix below would take "my email to Jeff" as the name.
+    const onEmail =
+      /\bon\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|message|note|thread)\s+(?:that\s+)?i\s+sent\s+(?:to\s+)?(.+)$/i.exec(sentence) ??
+      /\bon\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|message|note|thread)\s+(?:to|with|for)\s+(.+)$/i.exec(sentence) ??
       /\bfollow[\s-]*up\s+with\s+(.+?)\s+on\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread)\b/i.exec(sentence) ??
       /\btrack\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread)\s+(?:to|with)\s+(.+)$/i.exec(sentence);
+    const reminded = onEmail
+      ? null
+      : /\bremind\s+me\s+to\s+follow[\s-]*up\s+(?:with|on)\s+(.+)$/i.exec(sentence);
+    const match =
+      onEmail ??
+      /\b(?:start|begin)\b(?:\s+(?:a|an|the|new|another|follow[\s-]*up|auto(?:matic)?|email|mail))*\s+sequences?\s+(?:for|with|to|on)\s+(.+)$/i.exec(sentence) ??
+      /\bauto[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence);
     // "Remind me to follow up with Jeff on Monday": the person, not the day.
     const fromReminder = reminded?.[1]?.replace(
       /\s+(?:on|by|next|this|tomorrow|today|tonight|in|after|about|regarding|re)\b.*$/i,

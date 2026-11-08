@@ -155,6 +155,19 @@ assert(
 assert(JSON.stringify(sequenceTargets("Follow up on my email to Jeff Comstock")) === '["Jeff Comstock"]', "the old tracker's phrasing names the person");
 assert(JSON.stringify(sequenceTargets("Remind me to follow up with Jeff on Monday")) === '["Jeff"]', "the person, not the day");
 assert(JSON.stringify(sequenceTargets("Follow up with Dorothy on my email")) === '["Dorothy"]', "follow up with X on my email");
+// An email-anchored phrase names the person after the email, whatever prefix comes first.
+for (const [text, person] of [
+  ["auto follow up on my email to Jeff", "Jeff"],
+  ["follow up on my email to Dorothy", "Dorothy"],
+  ["start a sequence on my email to Jeff", "Jeff"],
+  ["auto follow up on the email I sent Munil", "Munil"],
+  ["remind me to follow up on my email to Dorothy", "Dorothy"],
+  ["Auto follow up on my last email to dorothy.copeland@nice.com", "dorothy.copeland@nice.com"],
+] as const) {
+  assert(JSON.stringify(sequenceTargets(text)) === JSON.stringify([person]), `"${text}" names ${person}, got ${JSON.stringify(sequenceTargets(text))}`);
+  assert(commandIntents(text).includes("sequence"), `"${text}" is a sequence command`);
+}
+assert(sequenceTargets("auto follow up on my email to her") === undefined, "a pronoun after the email is still left to the model");
 for (const vague of ["start a sequence for her", "Start a sequence for the other person also", "start a sequence for them", "Start a sequence from Dorothy for Coplan"]) {
   assert(sequenceTargets(vague) === undefined, `"${vague}" is left to the model`);
 }
