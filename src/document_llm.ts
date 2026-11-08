@@ -596,7 +596,7 @@ export async function analyzeImage(
     },
   ];
   const result = await complete({
-    backend: "gemini",
+    backend: getTaskBackend("vision"),
     tools: [],
     task: "document",
     system: {

@@ -21,6 +21,9 @@ const TASK_CODE: Record<ModelTask, string> = {
   documents: "docs",
   meetings: "meet",
   drafting: "draft",
+  command: "cmd",
+  background: "bg",
+  vision: "vis",
 };
 
 const TASK_FROM_CODE: Record<string, ModelTask> = {
@@ -29,6 +32,9 @@ const TASK_FROM_CODE: Record<string, ModelTask> = {
   docs: "documents",
   meet: "meetings",
   draft: "drafting",
+  cmd: "command",
+  bg: "background",
+  vis: "vision",
 };
 
 const BACKEND_CODE: Record<ChatBackend, string> = {
@@ -66,20 +72,18 @@ function emptyKeyboard(): InlineKeyboard {
 
 function homeKeyboard(): InlineKeyboard {
   const keyboard = new InlineKeyboard();
-  const row = MODEL_TASKS.slice(0, 3);
-  const rest = MODEL_TASKS.slice(3);
-  for (const task of row) {
-    keyboard.text(TASK_BUTTON_LABELS[task], `md:t:${TASK_CODE[task]}`);
+  const rows = [
+    MODEL_TASKS.slice(0, 3),
+    MODEL_TASKS.slice(3, 6),
+    MODEL_TASKS.slice(6),
+  ];
+  for (const row of rows) {
+    for (const task of row) {
+      keyboard.text(TASK_BUTTON_LABELS[task], `md:t:${TASK_CODE[task]}`);
+    }
+    keyboard.row();
   }
-  keyboard.row();
-  for (const task of rest) {
-    keyboard.text(TASK_BUTTON_LABELS[task], `md:t:${TASK_CODE[task]}`);
-  }
-  keyboard
-    .row()
-    .text("Set all to…", "md:a")
-    .row()
-    .text("Close", "md:x");
+  keyboard.text("Set all to…", "md:a").row().text("Close", "md:x");
   return keyboard;
 }
 

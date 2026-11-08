@@ -1026,18 +1026,9 @@ export async function completeWithCreditFallback(
 export async function completeBackground(
   params: Omit<CompleteParams, "model" | "backend">,
 ): Promise<CompleteResult> {
-  if (config.deepseekApiKey) {
-    return complete({
-      ...params,
-      backend: "deepseek",
-      model: config.deepseekModel,
-      task: params.task ?? "classification",
-      effort: params.effort ?? "low",
-    });
-  }
   return complete({
     ...params,
-    backend: getTaskBackend("brief"),
+    backend: getTaskBackend("background"),
     model: undefined,
     task: params.task ?? "classification",
     effort: params.effort ?? "low",

@@ -12,7 +12,10 @@ export type ModelTask =
   | "brief"
   | "documents"
   | "meetings"
-  | "drafting";
+  | "drafting"
+  | "command"
+  | "background"
+  | "vision";
 
 export const MODEL_TASKS: ModelTask[] = [
   "chat",
@@ -20,6 +23,9 @@ export const MODEL_TASKS: ModelTask[] = [
   "documents",
   "meetings",
   "drafting",
+  "command",
+  "background",
+  "vision",
 ];
 
 export const TASK_LABELS: Record<ModelTask, string> = {
@@ -28,6 +34,9 @@ export const TASK_LABELS: Record<ModelTask, string> = {
   documents: "Documents (PDFs, contracts, RFPs)",
   meetings: "Meeting briefs and account status",
   drafting: "Email drafting",
+  command: "Command turns (send, calendar)",
+  background: "Background scans",
+  vision: "Vision (image analysis)",
 };
 
 export const TASK_BUTTON_LABELS: Record<ModelTask, string> = {
@@ -36,6 +45,9 @@ export const TASK_BUTTON_LABELS: Record<ModelTask, string> = {
   documents: "Documents",
   meetings: "Meetings",
   drafting: "Drafting",
+  command: "Command",
+  background: "Background",
+  vision: "Vision",
 };
 
 export const EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high"];
@@ -77,16 +89,19 @@ export function modelDisplayName(backend: ChatBackend): string {
   return "Gemini 3.6 Flash";
 }
 
-const DEFAULTS_GENERATION = "v3-gemini-migration";
+const DEFAULTS_GENERATION = "v4-gemini-defaults-all-tasks";
 const GENERATION_SETTING = "llm_task_defaults_generation";
 
 function defaultChoices(): TaskBackendMap {
   return {
-    chat: "haiku",
-    brief: "haiku",
-    documents: "haiku",
-    meetings: "haiku",
-    drafting: "haiku",
+    chat: "gemini",
+    brief: "gemini",
+    documents: "gemini",
+    meetings: "gemini",
+    drafting: "gemini",
+    command: "gemini",
+    background: "gemini",
+    vision: "gemini",
   };
 }
 
@@ -119,8 +134,7 @@ function migrateIfNeeded(): TaskBackendMap {
   }
   const generation = getSetting(GENERATION_SETTING);
   if (generation !== DEFAULTS_GENERATION) {
-    // One-time: wipe stuck cloud-gemma (and any other saved backends) and
-    // restore Haiku defaults so Gemini can be chosen fresh.
+    // One-time: wipe saved backends and restore current defaults (Gemini).
     choices = defaultChoices();
     persist(choices);
     setSetting(GENERATION_SETTING, DEFAULTS_GENERATION);
@@ -156,6 +170,9 @@ function defaultEfforts(): TaskEffortMap {
     documents: "low",
     meetings: "low",
     drafting: "low",
+    command: "low",
+    background: "low",
+    vision: "low",
   };
 }
 
@@ -232,11 +249,6 @@ export function formatModelSetupText(options?: {
     const suffix = updated.has(task) ? " ✅ updated" : "";
     lines.push(`${formatTaskSetupLine(task)}${suffix}`);
   }
-  lines.push(
-    config.deepseekApiKey
-      ? "Background scans — DeepSeek Flash (automatic)"
-      : "Background scans — Haiku 5.5 (automatic)",
-  );
   return lines.join("\n");
 }
 

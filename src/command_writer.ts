@@ -1,5 +1,5 @@
 import type { gmail_v1 } from "googleapis";
-import { config } from "./config.js";
+import { getTaskBackend } from "./chat_backend.js";
 import { searchMemories } from "./db.js";
 import { searchHistory } from "./embeddings.js";
 import { messageHeader } from "./gmail_attachments.js";
@@ -145,13 +145,12 @@ export async function commandWriterInput(input: CommandEmailInput): Promise<stri
   );
 }
 
-/** Writes on Sonnet only. When that can't run, this throws and nothing is sent. */
+/** Writes with the Command task backend. When that can't run, this throws and nothing is sent. */
 export async function writeCommandEmail(
   input: CommandEmailInput,
 ): Promise<{ subject: string; body: string }> {
   const result = await complete({
-    backend: "claude",
-    model: config.claudeModel,
+    backend: getTaskBackend("command"),
     noFallback: true,
     task: "command_send",
     effort: "high",
@@ -159,7 +158,6 @@ export async function writeCommandEmail(
     messages: [{ role: "user", content: await commandWriterInput(input) }],
     tools: [],
     jsonSchema: WRITER_SCHEMA,
-    // Sonnet reasons before it answers and that counts here.
     maxTokens: 16000,
     cacheTtl: "5m",
   });

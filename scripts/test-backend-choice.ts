@@ -288,8 +288,8 @@ assert(!claudeOnly.includes("Fallback ("), claudeOnly);
 clearLlmBackendFlagsForTests();
 state.mode = "ok";
 resetCalls();
-setTaskBackend("brief", "gemini");
-assert(getTaskBackend("brief") === "gemini", "brief task is gemini");
+setTaskBackend("background", "haiku");
+assert(getTaskBackend("background") === "haiku", "background task is haiku");
 const logged: string[] = [];
 const originalError = console.error;
 console.error = (...args: unknown[]) => {

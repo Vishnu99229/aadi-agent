@@ -1093,11 +1093,15 @@ Call update_draft exactly once with the draft ID above and the complete revised 
   const accountQuestion =
     findAccountByName(decodedAccounts(), userText).length > 0 ||
     /\b(account status|where are we with)\b/i.test(userText);
-  const task: ModelTask = drafting
-    ? "drafting"
-    : isAccountOrMeetingQuestion(userText)
-      ? "meetings"
-      : "chat";
+  const commandTurn =
+    config.sendOnCommandEnabled && looksLikeCommandTurn(userText);
+  const task: ModelTask = commandTurn
+    ? "command"
+    : drafting
+      ? "drafting"
+      : isAccountOrMeetingQuestion(userText)
+        ? "meetings"
+        : "chat";
   const quoted = quotedMessageText(ctx.message?.reply_to_message);
   const modelText = withQuotedContext(userText, quoted);
   await completeChatReply(
@@ -1107,10 +1111,6 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       runAgent(modelText, {
         guardText: userText,
         task,
-        // These turns can act with no card. Sonnet acts where cheaper models ask.
-        ...(config.sendOnCommandEnabled && looksLikeCommandTurn(userText)
-          ? { backend: "claude" as const }
-          : {}),
         usageTask: drafting
           ? "drafting"
           : accountQuestion

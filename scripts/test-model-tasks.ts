@@ -25,6 +25,8 @@ const {
   getTaskBackends,
   getTaskEffort,
   isChatBackend,
+  isModelTask,
+  MODEL_TASKS,
   modelDisplayName,
   supportsEffort,
 } = await import("../src/chat_backend.ts");
@@ -43,37 +45,43 @@ function resetModelSettings(): void {
 }
 
 resetModelSettings();
-assert(getTaskBackend("chat") === "haiku", "default chat is Fast/Haiku");
-assert(getTaskBackend("brief") === "haiku", "default brief is Haiku");
-assert(getTaskBackend("documents") === "haiku", "default documents is Haiku");
-assert(getTaskBackend("meetings") === "haiku", "default meetings is Haiku");
-assert(getTaskBackend("drafting") === "haiku", "default drafting is Haiku");
+assert(MODEL_TASKS.length === 8, "eight model tasks");
+assert(isModelTask("command"), "command is a valid task key");
+assert(isModelTask("background"), "background is a valid task key");
+assert(isModelTask("vision"), "vision is a valid task key");
+for (const task of MODEL_TASKS) {
+  assert(getTaskBackend(task) === "gemini", `default ${task} is Gemini`);
+}
 
 resetModelSettings();
 setSetting("llm_backend", "haiku");
 const migrated = getTaskBackends();
-assert(migrated.chat === "haiku", "generation bump restores Haiku chat");
-assert(migrated.brief === "haiku", "generation bump restores Haiku brief");
-assert(migrated.meetings === "haiku", "generation bump restores Haiku meetings");
-assert(migrated.documents === "haiku", "documents use new Haiku default");
-assert(migrated.drafting === "haiku", "drafting uses new Haiku default");
+for (const task of MODEL_TASKS) {
+  assert(migrated[task] === "gemini", `generation bump restores Gemini ${task}`);
+}
 
 const one = applyTaskBackend("chat", "claude");
 assert(one.switched && getTaskBackend("chat") === "claude", "manual Sonnet override");
-assert(getTaskBackend("brief") === "haiku", "other tasks unchanged");
+assert(getTaskBackend("brief") === "gemini", "other tasks unchanged");
+assert(
+  applyTaskBackend("command", "claude").switched &&
+    getTaskBackend("command") === "claude",
+  "command can override default to Claude",
+);
 
 const shortcut = applyAllTasks("claude");
 assert(shortcut.switched, "claude shortcut switches all");
-assert(getTaskBackend("chat") === "claude", "shortcut chat");
-assert(getTaskBackend("brief") === "claude", "shortcut brief");
-assert(getTaskBackend("documents") === "claude", "shortcut documents");
-assert(getTaskBackend("meetings") === "claude", "shortcut meetings");
-assert(getTaskBackend("drafting") === "claude", "shortcut drafting");
+for (const task of MODEL_TASKS) {
+  assert(getTaskBackend(task) === "claude", `shortcut ${task}`);
+}
 
 applyTaskBackend("drafting", "haiku");
 applyAllTasks("gemini");
 assert(getTaskBackend("chat") === "gemini", "gemini shortcut chat");
 assert(getTaskBackend("drafting") === "gemini", "gemini shortcut drafting");
+assert(getTaskBackend("command") === "gemini", "gemini shortcut command");
+assert(getTaskBackend("background") === "gemini", "gemini shortcut background");
+assert(getTaskBackend("vision") === "gemini", "gemini shortcut vision");
 
 const allFast = applyAllTasks("haiku");
 assert(allFast.switched, "fast shortcut");
@@ -89,18 +97,20 @@ setSetting(
     documents: "cloud-gemma",
     meetings: "cloud-gemma",
     drafting: "haiku",
+    command: "cloud-gemma",
+    background: "cloud-gemma",
+    vision: "cloud-gemma",
   }),
 );
 const flipped = getTaskBackends();
-assert(flipped.chat === "haiku", "stuck Gemma chat resets to Haiku");
-assert(flipped.brief === "haiku", "stuck Gemma brief resets to Haiku");
-assert(flipped.documents === "haiku", "stuck Gemma documents reset to Haiku");
-assert(flipped.meetings === "haiku", "stuck Gemma meetings reset to Haiku");
-assert(flipped.drafting === "haiku", "drafting resets to Haiku");
+for (const task of MODEL_TASKS) {
+  assert(flipped[task] === "gemini", `stuck Gemma ${task} resets to Gemini`);
+}
 
 resetModelSettings();
 assert(getTaskEffort("chat") === "low", "default effort is low");
 assert(getTaskEffort("drafting") === "low", "drafting effort defaults low");
+assert(getTaskEffort("command") === "low", "command effort defaults low");
 assert(modelDisplayName("haiku") === "Haiku 5.5", "haiku display name");
 assert(modelDisplayName("claude") === "Claude Sonnet 5.5", "sonnet display name");
 assert(modelDisplayName("gemini") === "Gemini 3.6 Flash", "gemini display name");
@@ -119,27 +129,29 @@ assert(
 const allGemini = applyAllChoice("gemini");
 assert(allGemini.switched, "set all gemini applies to every task");
 assert(getTaskBackend("drafting") === "gemini", "drafting uses gemini too");
+assert(getTaskBackend("background") === "gemini", "background uses gemini too");
 assert(
   formatModelSetupText({
     updatedTasks: ["chat"],
   }).includes("Chat and questions — Gemini 3.6 Flash ✅ updated"),
   "updated gemini line",
 );
+assert(
+  !formatModelSetupText().includes("(automatic)"),
+  "no automatic background line",
+);
+assert(
+  formatModelSetupText().includes("Background scans — Gemini 3.6 Flash"),
+  "background is a selectable setup line",
+);
 
 const allHaiku = applyAllChoice("haiku", "medium");
 assert(allHaiku.switched, "set all haiku medium");
 assert(getTaskBackend("drafting") === "haiku", "drafting is haiku after set all");
 assert(getTaskEffort("documents") === "medium", "set all effort applies");
-assert(
-  formatModelSetupText().includes("Background scans — Haiku 5.5 (automatic)") ||
-    formatModelSetupText().includes(
-      "Background scans — DeepSeek Flash (automatic)",
-    ),
-  "background scans line",
-);
 
 resetModelSettings();
-assert(getTaskBackend("chat") === "haiku", "cleanup restores Haiku default");
+assert(getTaskBackend("chat") === "gemini", "cleanup restores Gemini default");
 assert(getTaskEffort("chat") === "low", "cleanup restores low effort");
 
 assert(TOOL_ORDER.includes("read_sheet"), "read_sheet stays in the cached tool list");
