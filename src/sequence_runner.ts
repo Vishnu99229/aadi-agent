@@ -61,6 +61,7 @@ import {
 } from "./sequence_rules.js";
 import {
   localClock,
+  needsTimezoneRefresh,
   resolveProspectTimezone,
   zoneDisplay,
   zoneFromWords,
@@ -514,7 +515,7 @@ export async function runSequenceTick(
       continue;
     }
     let row = listed;
-    if (!row.prospect_timezone) {
+    if (needsTimezoneRefresh(row.prospect_timezone, row.prospect_timezone_source)) {
       try {
         const found = await resolveProspectTimezone(gmail, row);
         setSalesSequenceTimezone(row.id, found.zone, found.source);

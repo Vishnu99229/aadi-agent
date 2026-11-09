@@ -229,8 +229,14 @@ export function isUsZone(zone: string | null | undefined): boolean {
   );
 }
 
+function isIndiaDefault(zone: string | null | undefined): boolean {
+  const value = validZone(zone);
+  return value === IST_ZONE || value === "Asia/Calcutta" || value === "+05:30";
+}
+
 /** Company HQ outside the US is not a person-level zone: look up again so a
- *  US contact at a global company (NiCE in Israel) is not stuck on HQ time. */
+ *  US contact at a global company (NiCE in Israel) is not stuck on HQ time.
+ *  An old IST default is the same: that was "nothing to go on", not India. */
 export function needsTimezoneRefresh(
   zone: string | null | undefined,
   source: string | null | undefined,
@@ -238,14 +244,18 @@ export function needsTimezoneRefresh(
   if (!zone) {
     return true;
   }
+  if (source === "default" && isIndiaDefault(zone)) {
+    return true;
+  }
   return source === "company" && !isUsZone(zone);
 }
 
 /** The lookup order: their Date header, then a place in their signature or the
- *  thread, then a US company's location as Pacific, then IST. A US Date header
- *  or US signature always beats a non-US HQ (NiCE in Israel does not place a
- *  US contact in Asia/Jerusalem). Unspecified US is Pacific. A +0000 header is
- *  often a mail server's clock, so a place they name wins over it. */
+ *  thread, then a US or global company's location as Pacific, then Pacific
+ *  when nothing is known. IST only when they are explicitly in India. A US
+ *  Date header or US signature always beats a non-US HQ (NiCE in Israel does
+ *  not place a US contact in Asia/Jerusalem). Unspecified US is Pacific. A
+ *  +0000 header is often a mail server's clock, so a place they name wins. */
 export function chooseProspectZone(
   header: HeaderOffset | undefined,
   location: LocationGuess | undefined,
@@ -277,7 +287,7 @@ export function chooseProspectZone(
     }
     return { zone: location.zone, source: "company_non_us" };
   }
-  return { zone: IST_ZONE, source: "default" };
+  return { zone: US_PACIFIC_ZONE, source: "default" };
 }
 
 interface ProspectMessage {
@@ -330,17 +340,26 @@ export function newestHeaderOffset(messages: ProspectMessage[]): HeaderOffset | 
 
 export const LOCATION_SYSTEM = `Work out the market and time zone where one sales prospect works, as an IANA name such as America/Los_Angeles, America/New_York, Asia/Kolkata or Europe/London.
 
-Use the first of these that is clear:
-1. "signature": a city, state or country in THEIR OWN emails, usually the signature or the address under their name.
+Look at every signal before you classify:
+1. Phone numbers: US (+1), UK (+44), India (+91), and other country codes in THEIR emails or signature. A phone country code is explicit location evidence.
+2. Physical addresses: any city, state or country in THEIR signature.
+3. Company headquarters: if the company is a known global SaaS or telephony provider (like NiCE, Talkdesk, Five9, Zoom), default to America/Los_Angeles unless explicit non-US evidence is found.
+4. The Golden Rule: If the prospect is in a global B2B SaaS company and there is no explicit non-US signal, default to America/Los_Angeles.
+5. Their most recent Date header: the offset they sent from (for example -0800) is a strong signal of where they physically were.
+
+Then pick the first basis that is clear:
+1. "signature": a city, state, country, address or phone in THEIR OWN emails, usually the signature.
 2. "thread": a place stated for them or their office in the email thread.
-3. "company": the company's market only when it is clearly US-only or non-US-only. Do not use a headquarters city for a global company.
+3. "company": the company's market only when it is clearly US-only, non-US-only, or a global SaaS/telephony company with no personal location.
 
 - market "us": the prospect is in the US, or the company is clearly US-based. Use their named US city when clear; otherwise use America/Los_Angeles (Pacific).
-- market "non_us": the prospect's own signature/thread clearly places them outside the US, or the company is clearly non-US-only. Return that actual non-US zone.
-- market "global": the company operates globally and the prospect's own location is unclear (for example NiCE). Use America/Los_Angeles (Pacific).
-- market "none": there is no location evidence. Return "" for timezone and "none" for basis.
+- market "non_us": the prospect's own signature, address, phone or thread clearly places them outside the US, or the company is clearly non-US-only. Return that actual non-US zone. Use Asia/Kolkata only when they are explicitly in India (for example +91 or Bengaluru in the signature).
+- market "global": the company operates globally and the prospect's own location is unclear (for example NiCE, Talkdesk, Five9, Zoom). Use America/Los_Angeles (Pacific).
+- market "none": there is no location evidence. Return timezone "unknown" and basis "none" — never Asia/Kolkata.
 
 An exact place in the prospect's signature or thread beats company classification. Never assign Asia/Jerusalem or another HQ zone to a global-company contact just because the company is based there. Never default a US or global prospect to Eastern, IST, or a foreign headquarters.
+
+If you cannot tell, return timezone "unknown" or "global", not Asia/Kolkata.
 
 Never guess from the person's name.
 
@@ -370,13 +389,25 @@ export function parseLocationGuess(text: string): LocationGuess | undefined {
       basis?: unknown;
       market?: unknown;
     };
-    const zone = typeof parsed.timezone === "string" ? validZone(parsed.timezone) : undefined;
+    const rawZone = typeof parsed.timezone === "string" ? parsed.timezone.trim() : "";
     const basis = parsed.basis;
     const market =
       parsed.market === "us" || parsed.market === "non_us" || parsed.market === "global"
         ? parsed.market
         : undefined;
-    if (!zone || FIXED_OFFSET.test(zone) || (basis !== "signature" && basis !== "thread" && basis !== "company")) {
+    const basisOk = basis === "signature" || basis === "thread" || basis === "company";
+    if (/^global$/i.test(rawZone) || (!rawZone && (market === "global" || market === "us"))) {
+      return {
+        zone: US_PACIFIC_ZONE,
+        basis: basisOk ? basis : "company",
+        market: market === "us" ? "us" : "global",
+      };
+    }
+    if (/^unknown$/i.test(rawZone)) {
+      return undefined;
+    }
+    const zone = validZone(rawZone);
+    if (!zone || FIXED_OFFSET.test(zone) || !basisOk) {
       return undefined;
     }
     return { zone, basis, ...(market ? { market } : {}) };
@@ -396,9 +427,11 @@ export async function guessProspectLocation(input: {
   prospectCompany: string;
   theirEmails: string[];
   threadText: string;
+  dateHeader?: string;
 }): Promise<LocationGuess | undefined> {
   const content = [
     `PROSPECT: ${input.prospectName || "(no name)"} <${input.prospectEmail}>${input.prospectCompany ? `, ${input.prospectCompany}` : ""}`,
+    `<<<UNTRUSTED_DATE_HEADER>>>\n${input.dateHeader?.trim() || "(none)"}\n<<<END_UNTRUSTED_DATE_HEADER>>>`,
     `<<<UNTRUSTED_THEIR_EMAILS>>>\n${input.theirEmails.map((body) => tail(body, 2500)).join("\n---\n") || "(none)"}\n<<<END_UNTRUSTED_THEIR_EMAILS>>>`,
     `<<<UNTRUSTED_THREAD>>>\n${input.threadText.slice(0, 6000) || "(none)"}\n<<<END_UNTRUSTED_THREAD>>>`,
   ].join("\n\n");
@@ -441,6 +474,7 @@ export async function resolveProspectTimezone(
     prospectCompany: row.prospect_company,
     theirEmails: messages.slice(0, 3).map((message) => message.body),
     threadText: await threadText(gmail, row.thread_id),
+    dateHeader: messages[0]?.dateHeader ?? "",
   });
   return chooseProspectZone(header, location);
 }
@@ -455,7 +489,7 @@ const SOURCE_NOTES: Record<TimezoneSource, string> = {
   default: " (default)",
 };
 
-/** "US Pacific", "US Pacific (from company HQ)" or "India (default)". */
+/** "US Pacific", "US Pacific (from company HQ)" or "US Pacific (default)". */
 export function zoneDisplay(zone: string | null | undefined, source: string | null | undefined): string {
   if (!zone) {
     return "time zone not checked yet";
