@@ -999,6 +999,59 @@ if (!tableHasColumn("pending_actions", "event_title")) {
   console.log("pending_actions migrated to support create_event rows.");
 }
 
+/**
+ * Pre-fix NiCE HQ caches stored Asia/Jerusalem on sales_sequences.prospect_timezone,
+ * which stops the sequence runner from calling chooseProspectZone. There is no
+ * company_name column; the company is prospect_company. NULL on both cache
+ * columns is the signal to resolve again on the next tick. A global company
+ * with no person-level place resolves to US Pacific.
+ *
+ * Idempotent: rows that are not that zone, or not a NiCE company, are left
+ * alone, and a second run changes nothing. An owner correction stays: the
+ * runner never looks that source up again. The settings row makes it one-shot
+ * so a later correct Asia/Jerusalem is not wiped on every process start.
+ */
+export const STALE_NICE_JERUSALEM_TZ_KEY = "sales_sequences_cleared_stale_jerusalem";
+
+export function clearStaleNiceJerusalemTimezones(): number {
+  return db
+    .prepare(
+      `UPDATE sales_sequences
+       SET prospect_timezone = NULL,
+           prospect_timezone_source = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE prospect_timezone = 'Asia/Jerusalem'
+         AND prospect_company LIKE '%NiCE%'
+         AND COALESCE(prospect_timezone_source, '') <> 'owner'`,
+    )
+    .run().changes;
+}
+
+export function migrateStaleNiceJerusalemTimezones(): number {
+  const done = db
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get(STALE_NICE_JERUSALEM_TZ_KEY) as { value: string } | undefined;
+  if (done?.value === "1") {
+    return 0;
+  }
+  const changes = db.transaction(() => {
+    const cleared = clearStaleNiceJerusalemTimezones();
+    db.prepare(
+      `INSERT INTO settings (key, value) VALUES (?, '1')
+       ON CONFLICT(key) DO UPDATE SET value = '1'`,
+    ).run(STALE_NICE_JERUSALEM_TZ_KEY);
+    return cleared;
+  })();
+  if (changes > 0) {
+    console.log(
+      `Cleared ${changes} stale NiCE Asia/Jerusalem sequence timezone${changes === 1 ? "" : "s"}.`,
+    );
+  }
+  return changes;
+}
+
+migrateStaleNiceJerusalemTimezones();
+
 const insertMessage = db.prepare(
   "INSERT INTO messages (role, content, tool_name) VALUES (?, ?, ?)",
 );
@@ -4344,17 +4397,6 @@ export function setSalesSequenceTimezone(id: number, timezone: string, source: s
      SET prospect_timezone = ?, prospect_timezone_source = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
   ).run(timezone, source, id);
-}
-
-/** Drop a cached prospect zone so the next resolution is not stuck on it.
- *  There is no refresh-flag column; NULL is the signal. */
-export function clearSalesSequenceTimezone(id: number): void {
-  db.prepare(
-    `UPDATE sales_sequences
-     SET prospect_timezone = NULL, prospect_timezone_source = NULL,
-         updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
-  ).run(id);
 }
 
 export interface AddedSalesFact {
