@@ -80,7 +80,7 @@ export interface ReminderRecord {
 
 export const DB_PATH = process.env.AADI_DB_PATH?.trim() || "./aadi.db";
 
-const db = new Database(DB_PATH);
+export const db = new Database(DB_PATH);
 
 export async function backupDatabaseTo(destPath: string): Promise<void> {
   await db.backup(destPath);
@@ -4397,6 +4397,15 @@ export function setSalesSequenceTimezone(id: number, timezone: string, source: s
      SET prospect_timezone = ?, prospect_timezone_source = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
   ).run(timezone, source, id);
+}
+
+export function clearSalesSequenceTimezone(id: number): void {
+  db.prepare(
+    `UPDATE sales_sequences
+     SET prospect_timezone = NULL, prospect_timezone_source = NULL,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(id);
 }
 
 export interface AddedSalesFact {
