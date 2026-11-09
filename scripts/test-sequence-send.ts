@@ -664,7 +664,7 @@ assert(zoneForHeaderOffset("-04:00", utc("2026-11-10T15:00:00")) === "-04:00", "
 }
 assert(
   LOCATION_SYSTEM.includes("America/Los_Angeles (Pacific)") &&
-    LOCATION_SYSTEM.includes("Never default a US prospect to Eastern"),
+    LOCATION_SYSTEM.includes("Never default a US or global prospect to Eastern"),
   "unspecified US falls back to Pacific, not Eastern or IST",
 );
 assert(parseLocationGuess('{"timezone":"America/New_York","basis":"signature"}')?.zone === "America/New_York", "a location answer parses");

@@ -4346,6 +4346,17 @@ export function setSalesSequenceTimezone(id: number, timezone: string, source: s
   ).run(timezone, source, id);
 }
 
+/** Drop a cached prospect zone so the next resolution is not stuck on it.
+ *  There is no refresh-flag column; NULL is the signal. */
+export function clearSalesSequenceTimezone(id: number): void {
+  db.prepare(
+    `UPDATE sales_sequences
+     SET prospect_timezone = NULL, prospect_timezone_source = NULL,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  ).run(id);
+}
+
 export interface AddedSalesFact {
   id: number;
   section: string | null;
