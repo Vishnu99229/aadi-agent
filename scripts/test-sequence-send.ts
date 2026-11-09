@@ -60,10 +60,13 @@ import {
 } from "../src/sequence_runner.ts";
 import {
   chooseProspectZone,
+  IST_ZONE,
   LOCATION_SYSTEM,
+  needsTimezoneRefresh,
   parseDateHeaderOffset,
   parseLocationGuess,
   slotDisplayZone,
+  US_PACIFIC_ZONE,
   zoneDisplay,
   zoneForHeaderOffset,
   zoneFromWords,
@@ -465,7 +468,7 @@ function enrol(options: {
   email?: string;
   manual?: number;
   company?: string;
-  timezone?: string;
+  timezone?: string | null;
 } = {}): Enrolled {
   enrolCounter += 1;
   const first = options.first ?? "Priya";
@@ -514,7 +517,9 @@ function enrol(options: {
     enrolledAt: new Date(clock.getTime() - DAY).toISOString(),
     manualFollowups: manual,
   });
-  if (options.timezone) {
+  if (options.timezone === undefined) {
+    setSalesSequenceTimezone(row.id, IST_ZONE, "email");
+  } else if (options.timezone) {
     setSalesSequenceTimezone(row.id, options.timezone, "email");
   }
   return { id: row.id, threadId, email, domain, pitch, first };
@@ -658,20 +663,82 @@ assert(zoneForHeaderOffset("-04:00", utc("2026-11-10T15:00:00")) === "-04:00", "
   assert(chooseProspectZone(undefined, pacific).zone === "America/Los_Angeles" && chooseProspectZone(undefined, pacific).source === "signature", "(b) a signature next");
   assert(chooseProspectZone(undefined, hq).source === "company", "(c) the company's location next");
   const none = chooseProspectZone(undefined, undefined);
-  assert(none.zone === "Asia/Kolkata" && none.source === "default", "(d) IST by default");
+  assert(none.zone === US_PACIFIC_ZONE && none.source === "default", "(d) US Pacific by default");
+  assert(
+    chooseProspectZone(undefined, { zone: IST_ZONE, basis: "signature" }).zone === IST_ZONE &&
+      chooseProspectZone(undefined, { zone: IST_ZONE, basis: "signature" }).source === "signature",
+    "explicit India in the signature stays IST",
+  );
   assert(chooseProspectZone(header("+00:00"), undefined).zone === "+00:00", "+0000 alone is taken literally");
   assert(chooseProspectZone(header("+00:00"), pacific).zone === "America/Los_Angeles", "a place they name beats +0000, often a server's clock");
+  assert(
+    chooseProspectZone(undefined, {
+      zone: "Asia/Jerusalem",
+      basis: "company",
+      market: "global",
+    }).zone === US_PACIFIC_ZONE,
+    "an ambiguous global company uses Pacific, not its foreign HQ",
+  );
+  const confirmedNonUs = chooseProspectZone(undefined, {
+    zone: "Europe/London",
+    basis: "company",
+    market: "non_us",
+  });
+  assert(
+    confirmedNonUs.zone === "Europe/London" && confirmedNonUs.source === "company_non_us",
+    "a confirmed non-US company keeps its actual zone",
+  );
+  assert(
+    chooseProspectZone(header("-08:00"), {
+      zone: "Asia/Jerusalem",
+      basis: "company",
+      market: "global",
+    }).zone === US_PACIFIC_ZONE,
+    "a US Date header beats a foreign HQ",
+  );
+  assert(
+    chooseProspectZone(undefined, { zone: "America/New_York", basis: "signature" }).zone === "America/New_York",
+    "a US signature keeps its own zone",
+  );
 }
 assert(
-  LOCATION_SYSTEM.includes("America/Los_Angeles (Pacific)") &&
-    LOCATION_SYSTEM.includes("Never default a US or global prospect to Eastern"),
-  "unspecified US falls back to Pacific, not Eastern or IST",
+  LOCATION_SYSTEM.includes("Phone numbers") &&
+    LOCATION_SYSTEM.includes("US (+1)") &&
+    LOCATION_SYSTEM.includes("UK (+44)") &&
+    LOCATION_SYSTEM.includes("Physical addresses") &&
+    LOCATION_SYSTEM.includes("NiCE, Talkdesk, Five9, Zoom") &&
+    LOCATION_SYSTEM.includes(
+      "If the prospect is in a global B2B SaaS company and there is no explicit non-US signal, default to America/Los_Angeles.",
+    ) &&
+    LOCATION_SYSTEM.includes("America/Los_Angeles (Pacific)") &&
+    LOCATION_SYSTEM.includes("Never default a US or global prospect to Eastern") &&
+    LOCATION_SYSTEM.includes('market "non_us"') &&
+    LOCATION_SYSTEM.includes('market "global"'),
+  "the location prompt uses phones, addresses, global SaaS HQ and the Golden Rule",
 );
 assert(parseLocationGuess('{"timezone":"America/New_York","basis":"signature"}')?.zone === "America/New_York", "a location answer parses");
+assert(
+  parseLocationGuess('{"timezone":"America/Los_Angeles","basis":"company","market":"global"}')?.market === "global",
+  "an ambiguous global market parses",
+);
+assert(
+  parseLocationGuess('{"timezone":"Europe/London","basis":"company","market":"non_us"}')?.market === "non_us",
+  "a confirmed non-US market parses",
+);
+assert(parseLocationGuess('{"timezone":"global","basis":"company"}')?.zone === US_PACIFIC_ZONE, "timezone global is Pacific");
+assert(parseLocationGuess('{"timezone":"unknown","basis":"none"}') === undefined, "timezone unknown has no location guess");
+assert(
+  parseLocationGuess('{"timezone":"","basis":"company","market":"global"}')?.zone === US_PACIFIC_ZONE,
+  "an empty zone with market global is Pacific",
+);
 assert(parseLocationGuess('{"timezone":"","basis":"none"}') === undefined, "no answer is no location");
 assert(parseLocationGuess('{"timezone":"Mars/Base","basis":"company"}') === undefined, "an invalid zone is ignored");
 assert(parseLocationGuess('{"timezone":"-05:00","basis":"company"}') === undefined, "the model must name a zone, not an offset");
 assert(parseLocationGuess("New York") === undefined, "prose is ignored");
+assert(chooseProspectZone(undefined, parseLocationGuess('{"timezone":"unknown","basis":"none"}')).zone === US_PACIFIC_ZONE, "unknown falls back to Pacific");
+assert(needsTimezoneRefresh(null, null) && needsTimezoneRefresh(IST_ZONE, "default"), "a missing zone and an old IST default are looked up again");
+assert(!needsTimezoneRefresh(US_PACIFIC_ZONE, "default") && !needsTimezoneRefresh(IST_ZONE, "signature"), "Pacific default and explicit India are kept");
+assert(needsTimezoneRefresh("Asia/Jerusalem", "company") && !needsTimezoneRefresh(US_PACIFIC_ZONE, "company"), "a non-US company HQ is looked up again");
 
 // What he says, as a zone.
 for (const [words, zone] of [
@@ -703,7 +770,8 @@ assert(zoneFromWords("Atlantis") === undefined && zoneFromWords("") === undefine
 assert(zoneLabel("+00:00") === "UTC" && zoneLabel("-05:00") === "UTC-05:00", "offsets are labelled as UTC offsets");
 assert(zoneLabel("Europe/London") === "London" && zoneLabel("America/Sao_Paulo") === "Sao Paulo", "other zones show their city");
 assert(zoneDisplay("America/Los_Angeles", "company") === "US Pacific (from company HQ)", "a company guess says so");
-assert(zoneDisplay("Asia/Kolkata", "default") === "India (default)", "the default says so");
+assert(zoneDisplay(US_PACIFIC_ZONE, "default") === "US Pacific (default)", "unknown now shows as Pacific default");
+assert(zoneDisplay("Asia/Kolkata", "default") === "India (default)", "an IST default still labels as India");
 assert(zoneDisplay("America/Los_Angeles", "owner") === "US Pacific", "his own setting is plain");
 assert(zoneDisplay(null, null) === "time zone not checked yet", "an unchecked zone says so");
 
@@ -981,7 +1049,7 @@ assert(
   const dueAt = new Date(row.next_step_at!);
 
   assert(!modelCalls.some((call) => call.task === "sequence_check"), "no second check runs");
-  assert(row.prospect_timezone === "Asia/Kolkata" && row.prospect_timezone_source === "default", "with nothing to go on the zone is IST");
+  assert(row.prospect_timezone === IST_ZONE && row.prospect_timezone_source === "email", "fixture sequences keep IST so the send window is India's morning");
 
   assert((await tick(after(MIN))).sent === 0, "nothing is due yet");
   assert((await tick(new Date(dueAt.getTime() - MIN))).sent === 0, "still nothing a minute before it's due");
@@ -1110,6 +1178,12 @@ async function tapStart(id: number): Promise<string> {
   assert(started.status === "active", "Start activates it");
   const expected = zoneForHeaderOffset("-05:00", new Date(Date.now() - 4 * DAY));
   assert(started.prospect_timezone === expected && started.prospect_timezone_source === "email", `the header's zone is stored, got ${started.prospect_timezone}`);
+  const headerCall = modelCalls.find((call) => (call.system as { cacheable?: string }).cacheable === LOCATION_SYSTEM)!;
+  const headerContent = String((headerCall.messages[0] as { content: unknown }).content);
+  assert(
+    headerContent.includes("<<<UNTRUSTED_DATE_HEADER>>>") && headerContent.includes("-0500"),
+    "the classifier sees their most recent Date header",
+  );
   assert(reply.includes(`Their time zone: ${zoneLabel(expected)}`), `Start says where they are: ${reply}`);
   assert(reply.includes("Mon-Fri 9am-5pm their time"), "and when mail goes out");
   assert(!reply.includes("Nothing will go out"), "a US prospect is never held for the IST floor");
@@ -1136,7 +1210,7 @@ function localHour(at: Date, zone: string): number {
   return Number(new Intl.DateTimeFormat("en-US", { timeZone: zone, hour: "numeric", hourCycle: "h23" }).format(at));
 }
 
-// (b)-(d): a signature, the company, or IST when nothing says.
+// (b)-(d): a signature, the company, or US Pacific when nothing says.
 {
   nextScenario();
   locationAnswer = '{"timezone":"America/Los_Angeles","basis":"signature"}';
@@ -1157,8 +1231,17 @@ function localHour(at: Date, zone: string): number {
   locationAnswer = NO_LOCATION;
   const plain = proposeWithHistory({ email: `ravi@in${enrolCounter + 1}.example`, first: "Ravi" });
   await tapStart(plain);
-  assert(getSalesSequence(plain)!.prospect_timezone === "Asia/Kolkata", "nothing to go on means IST");
-  assert(sequencesPanel(clock).text.includes("Ravi Lee, Us - India (default)"), "shown as the default");
+  assert(getSalesSequence(plain)!.prospect_timezone === US_PACIFIC_ZONE, "nothing to go on means Pacific");
+  assert(sequencesPanel(clock).text.includes("Ravi Lee, Us - US Pacific (default)"), "shown as the Pacific default");
+
+  locationAnswer = NO_LOCATION;
+  const nice = proposeWithHistory({ email: "jeff@nice.com", first: "Jeff" });
+  await tapStart(nice);
+  assert(getSalesSequence(nice)!.prospect_timezone === US_PACIFIC_ZONE, "NiCE with no signature is Pacific");
+  assert(getSalesSequence(nice)!.prospect_timezone_source === "default", "and recorded as the unknown fallback");
+  const talkdesk = proposeWithHistory({ email: "munil@talkdesk.com", first: "Munil" });
+  await tapStart(talkdesk);
+  assert(getSalesSequence(talkdesk)!.prospect_timezone === US_PACIFIC_ZONE, "Talkdesk with no signature is Pacific");
 
   // +0000 from a mail server loses to a place they name.
   locationAnswer = '{"timezone":"America/New_York","basis":"signature"}';
@@ -1183,7 +1266,7 @@ function localHour(at: Date, zone: string): number {
 {
   nextScenario();
   const before = sends.length;
-  const item = enrol();
+  const item = enrol({ timezone: null });
   setCompleteForTests(async (params: CompleteParams) => {
     if ((params.system as { cacheable?: string }).cacheable === LOCATION_SYSTEM) {
       throw new Error("model down");
@@ -1194,9 +1277,23 @@ function localHour(at: Date, zone: string): number {
   assert(getSalesSequence(item.id)!.prospect_timezone === null, "nothing is stored on a failed lookup");
   assert(sends.length === before, "and nothing is sent until it's known");
   restoreModels();
-  await tick(after(5 * MIN));
-  assert(getSalesSequence(item.id)!.prospect_timezone === "Asia/Kolkata", "the next tick looks it up");
+  locationAnswer = NO_LOCATION;
+  await tick(nextSendWindow(after(5 * MIN), US_PACIFIC_ZONE));
+  assert(getSalesSequence(item.id)!.prospect_timezone === US_PACIFIC_ZONE, "the next tick looks it up");
+  assert(getSalesSequence(item.id)!.prospect_timezone_source === "default", "unknown falls back to Pacific, not IST");
   assert(sends.length === before + 1, "and sends");
+}
+
+{
+  nextScenario();
+  const item = enrol({ timezone: null });
+  setSalesSequenceTimezone(item.id, IST_ZONE, "default");
+  locationAnswer = NO_LOCATION;
+  const before = sends.length;
+  await tick(nextSendWindow(clock, US_PACIFIC_ZONE));
+  const row = getSalesSequence(item.id)!;
+  assert(row.prospect_timezone === US_PACIFIC_ZONE && row.prospect_timezone_source === "default", "an old IST default is looked up again as Pacific");
+  assert(sends.length === before + 1, "and mail goes in their Pacific window");
 }
 
 // The send gate holds their window on its own, whatever the runner did.
@@ -2027,7 +2124,7 @@ for (const domain of ["supertronindia.com", "mail.supertronindia.com", "supertro
   assert(ambiguous.startsWith("Nothing changed yet") && ambiguous.includes("Jeff Shah, Alpha") && ambiguous.includes("Jeff Shah, Beta"), "two Jeffs: it asks which");
   assert(handler({ target: "Jeff Beta", timezone: "Pacific" }, { confirmation }).startsWith("Nothing changed"), "a name it can't match changes nothing");
   assert(handler({ target: "Beta", timezone: "Pacific" }, { confirmation }).includes("Jeff Shah, Beta - US Pacific"), "by company it's one");
-  assert(getSalesSequence(jeffA.id)!.prospect_timezone === null, "the other Jeff is untouched");
+  assert(getSalesSequence(jeffA.id)!.prospect_timezone === IST_ZONE, "the other Jeff is untouched");
   assert(handler({ target: "Munil", timezone: "Atlantis" }, { confirmation }).startsWith("Nothing changed"), "an unknown place changes nothing");
   assert(handler({ target: "all", timezone: "Pacific" }, { confirmation }).startsWith("Nothing changed yet"), "\"all\" isn't a way to set every zone");
 
