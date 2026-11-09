@@ -29,6 +29,7 @@ import {
   askPhrase,
   cleanDraftBody,
   htmlFromSequenceBody,
+  parseWriterPayload,
   prepareSequenceStep,
   resolveOriginalAsk,
   SEQUENCE_FOOTER,
@@ -161,13 +162,21 @@ assert(stepBrief(3, "meeting").includes("a 15-20 minute meeting"), "meeting step
 assert(stepBrief(3, "demo").includes(SLOTS_TOKEN), "step 3 with times carries the slot token");
 assert(!stepBrief(3, "demo", false).includes(SLOTS_TOKEN), "step 3 without times has no token");
 assert(/a day and time that suits them/.test(stepBrief(3, "demo", false)), "step 3 without times asks for one");
-assert(/gentle bump/i.test(stepBrief(1, "demo")), "step 1 is a bump");
+assert(/curiosity/i.test(stepBrief(1, "demo")), "step 1 is curiosity");
 assert(/SALES FACTS/.test(stepBrief(1, "demo")) && /SALES FACTS/.test(stepBrief(2, "demo")), "steps 1 and 2 draw on the sales facts");
-assert(/proof point/i.test(stepBrief(2, "demo")), "step 2 is a proof point");
-assert(/close-the-loop/i.test(stepBrief(4, "demo")), "step 4 closes the loop");
+assert(/business value/i.test(stepBrief(2, "demo")), "step 2 is business value");
+assert(/meeting conversion/i.test(stepBrief(4, "demo")), "step 4 converts to a meeting");
+assert(WRITER_SYSTEM.includes("Infrastructure Partners"), "the writer classifies infrastructure partners");
+assert(WRITER_SYSTEM.includes("Voice AI Companies and Builders"), "and Voice AI builders");
 assert(WRITER_SYSTEM.includes("one or two points most relevant"), "the writer picks one or two points");
 assert(WRITER_SYSTEM.includes("never list everything"), "the writer never lists everything");
 assert(WRITER_SYSTEM.includes("Never suggest the recipient would get the same result"), "the writer won't promise a customer's result");
+assert(WRITER_SYSTEM.includes('"subject"') && WRITER_SYSTEM.includes('"body"'), "the writer returns subject and body JSON");
+assert(
+  parseWriterPayload('{"subject":"Re: IraVoice","body":"Hi Priya,\\n\\nWould a demo work?"}') ===
+    "Hi Priya,\n\nWould a demo work?",
+  "subject-and-body JSON still yields the body",
+);
 
 assert(
   cleanDraftBody("Hi Priya,\n\nWould that work?\n\nThanks,\nVishnu") === "Hi Priya,\n\nWould that work?",
@@ -305,7 +314,8 @@ function slotLines(body: string): string[] {
   assert(prompt.includes("SALES FACTS:\n# Epicode sales facts"), "the writer gets the whole fact sheet");
   assert(prompt.includes("Zoom, Five9, Bajaj Finserv, Pinnacle."), "the writer sees the customer list");
   assert(prompt.includes("Live in 12 Indian languages."), "the writer sees a fact added by chat");
-  assert(prompt.includes("Gentle bump"), "the writer gets the step's angle");
+  assert(prompt.includes("Curiosity"), "the writer gets the step's angle");
+  assert(prompt.includes("SEQUENCE STEP: 1"), "the writer sees the step number");
 
   addSalesFactFromTool({ fact: "Brand-new point for the next email.", section: "Trusted by" }, OWNER);
   reset();
@@ -425,11 +435,11 @@ function slotLines(body: string): string[] {
 // The last step gets the closing angle.
 {
   const id = enrol({ ...DEMO_PITCH, threadId: "fixture-last", prospectEmail: "d@last.example", prospectName: "Dev", prospectCompany: "Last" }, 3);
-  assert(getSalesSequence(id)!.current_step === 4, "it's the close-the-loop step");
+  assert(getSalesSequence(id)!.current_step === 4, "it's the last step");
   script.write = JSON.stringify({ body: "Hi Dev,\n\nLast note from me." });
   reset();
   await prepareSequenceStep(id);
-  assert(writerPrompt().includes("close-the-loop"), "the writer gets the closing angle");
+  assert(writerPrompt().includes("Meeting conversion"), "the writer gets the closing angle");
 }
 
 // No bodies, names or addresses reach the logs.
