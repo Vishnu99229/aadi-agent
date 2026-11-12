@@ -154,8 +154,8 @@ function testSkipRules(): void {
       }),
       SELF,
       true,
-    ) === "internal-recurring",
-    "skip internal recurring when enabled",
+    ) === "internal",
+    "skip internal recurring",
   );
   assert(
     skipReason(
@@ -168,8 +168,8 @@ function testSkipRules(): void {
       }),
       SELF,
       false,
-    ) === null,
-    "do not skip internal recurring when disabled",
+    ) === "internal",
+    "skip internal meetings even when the recurring flag is off",
   );
   assert(
     skipReason(
@@ -181,8 +181,8 @@ function testSkipRules(): void {
       }),
       SELF,
       true,
-    ) === null,
-    "do not skip one-off internal meetings",
+    ) === "internal",
+    "skip one-off internal meetings",
   );
   assert(
     skipReason(

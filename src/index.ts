@@ -29,6 +29,8 @@ import { registerScheduledSends } from "./scheduled_sends.js";
 import { registerSequenceSend } from "./sequence_runner.js";
 import { registerMessageEmbed } from "./embeddings.js";
 import { registerJobWorker } from "./job_worker.js";
+import { runMwfAudit } from "./mwf_audit.js";
+import { registerMwfAuditJob } from "./scheduler.js";
 
 installOutboundHistory(bot.api);
 const morningBriefTask = registerMorningBrief(bot.api);
@@ -50,6 +52,7 @@ setAfterDraftSend(onMeetingDraftSent);
 const buildPollTask = registerBuildPoll();
 const jobQueueTask = registerJobWorker(bot.api);
 const messageEmbedTask = registerMessageEmbed();
+const mwfAuditTask = registerMwfAuditJob(() => runMwfAudit(bot.api));
 await applyPendingDeployResult();
 const MENU_COMMANDS = [
   { command: "model", description: "Choose which model handles each task" },
@@ -117,6 +120,7 @@ process.once("SIGINT", () => {
   buildPollTask.stop();
   jobQueueTask.stop();
   messageEmbedTask.stop();
+  mwfAuditTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);
@@ -140,6 +144,7 @@ process.once("SIGTERM", () => {
   buildPollTask.stop();
   jobQueueTask.stop();
   messageEmbedTask.stop();
+  mwfAuditTask.stop();
   clearInterval(approvalExpirySweep);
   clearInterval(reminderScheduler);
   clearInterval(documentExpirySweep);

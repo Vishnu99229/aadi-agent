@@ -175,11 +175,12 @@ export function skipReason(
   if (isDeclined(event, selfEmail)) {
     return "declined";
   }
+  void skipInternalRecurring;
   if (otherAttendees(event, selfEmail).length === 0) {
     return "no-other-attendees";
   }
-  if (skipInternalRecurring && isRecurring(event) && isInternalOnly(event, selfEmail)) {
-    return "internal-recurring";
+  if (isInternalOnly(event, selfEmail)) {
+    return "internal";
   }
   return null;
 }

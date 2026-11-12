@@ -435,24 +435,30 @@ export function sequenceTargets(ownWords: string): string[] | undefined {
     const reminded = onEmail
       ? null
       : /\bremind\s+me\s+to\s+follow[\s-]*up\s+(?:with|on)\s+(.+)$/i.exec(sentence);
+    const counted = /\bfollow[\s-]*ups?\s+(?:with\s+)?(.+?)\s+\d+\s+times?\b/i.exec(sentence);
+    const added = /\badd\s+(.+?)\s+to\s+(?:the\s+|a\s+|my\s+)?sequences?\b/i.exec(sentence);
+    const withPerson = /\bfollow[\s-]*ups?\s+with\s+(?!(?:me|us|myself)\b)(.+)$/i.exec(sentence);
     const match =
       onEmail ??
       /\b(?:start|begin)\b(?:\s+(?:a|an|the|new|another|follow[\s-]*up|auto(?:matic)?|email|mail))*\s+sequences?\s+(?:for|with|to|on)\s+(.+)$/i.exec(sentence) ??
-      /\bauto[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence);
+      /\bauto[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence) ??
+      counted ??
+      added ??
+      withPerson;
     // "Remind me to follow up with Jeff on Monday": the person, not the day.
-    const fromReminder = reminded?.[1]?.replace(
-      /\s+(?:on|by|next|this|tomorrow|today|tonight|in|after|about|regarding|re)\b.*$/i,
-      "",
-    );
-    const target = (fromReminder ?? match?.[1])
-      ?.replace(/[.!?,;:]+\s*$/, "")
+    const named = (reminded?.[1] ?? match?.[1])
+      ?.replace(
+        /\s+(?:on|by|next|this|tomorrow|today|tonight|in|after|about|regarding|re)\b.*$/i,
+        "",
+      )
+      .replace(/[.!?,;:]+\s*$/, "")
       .replace(TRAILING_FILLER, "")
       .replace(/^["'“”]+|["'“”]+$/g, "")
       .trim();
-    if (!target || target.length > 120 || VAGUE_TARGET.test(target)) {
+    if (!named || named.length > 120 || VAGUE_TARGET.test(named)) {
       return undefined;
     }
-    targets.push(target);
+    targets.push(named);
   }
   return targets.length > 0 ? targets : undefined;
 }

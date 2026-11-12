@@ -543,9 +543,12 @@ for (const phrase of [
 ]) {
   assert(isExplicitSequenceRequest(phrase), `explicit now: ${phrase}`);
 }
-for (const phrase of ["follow up with Rajan", "start following up with Rajan", "follow up with me"]) {
+for (const phrase of ["start following up with Rajan", "follow up with me"]) {
   assert(!isExplicitSequenceRequest(phrase), `not explicit: ${phrase}`);
 }
+assert(isExplicitSequenceRequest("follow up with Rajan"), "follow up with a person is a sequence");
+assert(isExplicitSequenceRequest("follow up Abhishek 4 times"), "follow up N times is a sequence");
+assert(isExplicitSequenceRequest("add Abhishek to sequence"), "add to sequence is a sequence");
 {
   pitch("t-explicit", "Asha Rao <asha@nu.com>", "BotCompose intro", 5);
   modelCalls = 0;
@@ -755,7 +758,7 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   const sentBefore = telegram.sent.length;
   const vague = await startSequenceFromTool(
     "tia@phi.com",
-    { confirmation, userText: "follow up with Tia" },
+    { confirmation, userText: "check in with Tia" },
     api,
   );
   assert(vague.startsWith("No card sent"), "a vague phrase gets no card even if the model calls the tool");
@@ -781,9 +784,10 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   ]) {
     assert(isExplicitSequenceRequest(phrase), `"${phrase}" offers the Start card`);
   }
-  for (const phrase of ["follow up with me tomorrow", "remind me to follow up with me on Friday", "Follow up with Tia", "remind me to email Tia"]) {
+  for (const phrase of ["follow up with me tomorrow", "remind me to follow up with me on Friday", "remind me to email Tia"]) {
     assert(!isExplicitSequenceRequest(phrase), `"${phrase}" is not a sequence request`);
   }
+  assert(isExplicitSequenceRequest("Follow up with Tia"), "\"Follow up with Tia\" offers the Start card");
   const remapped = await startSequenceFromTool(
     "tia@phi.com",
     { confirmation, userText: "follow up on my email to Tia" },

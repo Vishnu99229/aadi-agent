@@ -155,6 +155,10 @@ assert(
 assert(JSON.stringify(sequenceTargets("Follow up on my email to Jeff Comstock")) === '["Jeff Comstock"]', "the old tracker's phrasing names the person");
 assert(JSON.stringify(sequenceTargets("Remind me to follow up with Jeff on Monday")) === '["Jeff"]', "the person, not the day");
 assert(JSON.stringify(sequenceTargets("Follow up with Dorothy on my email")) === '["Dorothy"]', "follow up with X on my email");
+assert(JSON.stringify(sequenceTargets("follow up with Abhishek")) === '["Abhishek"]', "follow up with a person");
+assert(JSON.stringify(sequenceTargets("follow up Abhishek 4 times")) === '["Abhishek"]', "follow up N times names the person");
+assert(JSON.stringify(sequenceTargets("add Abhishek to sequence")) === '["Abhishek"]', "add to sequence names the person");
+assert(JSON.stringify(sequenceTargets("start a follow up sequence for Abhishek")) === '["Abhishek"]', "start a follow up sequence names the person");
 // An email-anchored phrase names the person after the email, whatever prefix comes first.
 for (const [text, person] of [
   ["auto follow up on my email to Jeff", "Jeff"],

@@ -50,6 +50,7 @@ export const HEALTH_JOBS = [
   "weekly-backup",
   "job-queue",
   "message-embed",
+  "mwf-audit",
 ] as const;
 
 /**
@@ -594,4 +595,14 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
     lines.push(`${name}: ${lastRanLabel(row?.last_success_at ?? null, now)}`);
   }
   return lines.join("\n");
+}
+
+/** Monday, Wednesday, Friday at 08:00 Asia/Kolkata. */
+export function registerMwfAuditJob(run: () => Promise<void>): IntervalJob {
+  const task = everyClock("mwf-audit", 8, 0, run, {
+    weekdays: [1, 3, 5],
+    kind: "weekly",
+  });
+  console.log("MWF audit scheduled Monday, Wednesday and Friday at 08:00 Asia/Kolkata.");
+  return task;
 }

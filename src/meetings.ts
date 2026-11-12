@@ -335,6 +335,15 @@ async function refreshNudges(
     if (plan.action !== "send") {
       continue;
     }
+    const attendees = parseAttendeesJson(brief.attendees_json);
+    if (
+      attendees.length > 0 &&
+      attendees.every((person) => person.email.toLowerCase().endsWith("@epicode.in"))
+    ) {
+      updateMeetingNudge(brief.id, "skipped");
+      console.log(`Post-call nudge skipped: brief=${brief.id} reason=internal`);
+      continue;
+    }
     try {
       const current = getMeetingBrief(brief.id);
       if (!current) {

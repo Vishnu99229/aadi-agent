@@ -374,12 +374,25 @@ export const FOLLOW_UP_ON_EMAIL: readonly RegExp[] = [
   /\btrack\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread)\s+(?:to|with)\s+\S/i,
 ];
 
+/** "follow up with Abhishek", "follow up Abhishek 4 times". Not "follow up with me". */
+const NOT_A_FOLLOW_PERSON = "me|us|myself|with|on|the|my|a|an|to|for|about|tomorrow|today|this|that";
+const FOLLOW_UP_WITH_PERSON = new RegExp(
+  `\\bfollow[\\s-]*up(?!s)\\s+(?:with\\s+(?!(?:${NOT_A_FOLLOW_PERSON})\\b)|(?!(?:${NOT_A_FOLLOW_PERSON})\\b))\\p{L}`,
+  "iu",
+);
+
+/** "add Abhishek to sequence" / "add Abhishek to the sequence". */
+const ADD_TO_SEQUENCE =
+  /\badd\s+(?!(?:me|us|myself)\b).{1,80}?\bto\s+(?:the\s+|a\s+|my\s+)?sequences?\b/i;
+
 /** Only these clear phrases may reach a Start card from chat. */
 export function isExplicitSequenceRequest(text: string): boolean {
   return (
-    /\bstart\b(?:\s+\S+){0,3}?\s+sequence\b/i.test(text) ||
+    /\bstart\b(?:\s+\S+){0,4}?\s+sequences?\b/i.test(text) ||
     /\bauto[\s-]*follow[\s-]*up\b/i.test(text) ||
-    FOLLOW_UP_ON_EMAIL.some((pattern) => pattern.test(text))
+    FOLLOW_UP_ON_EMAIL.some((pattern) => pattern.test(text)) ||
+    FOLLOW_UP_WITH_PERSON.test(text) ||
+    ADD_TO_SEQUENCE.test(text)
   );
 }
 

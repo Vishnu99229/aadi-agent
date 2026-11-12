@@ -28,6 +28,9 @@ import { plainTextBody, stripSignature } from "./google/mail.js";
 import { assertTestSeam } from "./test_seam.js";
 
 const PREVIEW_LIMIT = 3800;
+/** Long drafts stay off the card. The full text is a separate tap. */
+const DRAFT_SUMMARY_CHARS = 1000;
+const TELEGRAM_TEXT_LIMIT = 4000;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
 
 const realTelegram = new Api(config.telegramBotToken);
@@ -83,17 +86,37 @@ export interface DraftEditContext {
   body: string;
 }
 
-function keyboard(actionId: number, sendOnly = false): InlineKeyboard {
+function keyboard(actionId: number, sendOnly = false, showFull = false): InlineKeyboard {
+  const keys = new InlineKeyboard();
+  if (showFull) {
+    keys.text("📄 Show Full Draft", `approval:draft:${actionId}`).row();
+  }
   if (sendOnly) {
-    return new InlineKeyboard()
+    return keys
       .text("Send", `approval:send:${actionId}`)
       .row()
       .text("Cancel", `approval:discard:${actionId}`);
   }
-  return new InlineKeyboard()
+  return keys
     .text("Send", `approval:send:${actionId}`)
     .text("Edit", `approval:edit:${actionId}`)
     .text("Discard", `approval:discard:${actionId}`);
+}
+
+function recipientLabel(to: string): string {
+  return parseAddressList(to)[0]?.name?.trim() || to.trim() || "them";
+}
+
+export function splitTelegramText(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
+  const characters = Array.from(text);
+  if (characters.length <= limit) {
+    return [text];
+  }
+  const parts: string[] = [];
+  for (let offset = 0; offset < characters.length; offset += limit) {
+    parts.push(characters.slice(offset, offset + limit).join(""));
+  }
+  return parts;
 }
 
 function truncate(text: string, limit: number): string {
@@ -117,6 +140,20 @@ function previewText(preview: DraftApprovalPreview): string {
     ...(extra.length ? ["", ...extra] : []),
     "",
   ].join("\n");
+
+  const bodyChars = Array.from(preview.body).length;
+  if (bodyChars > DRAFT_SUMMARY_CHARS) {
+    const count = bodyChars.toLocaleString("en-US");
+    return [
+      `Draft ready for ${recipientLabel(preview.to)}. The email is ${count} characters long.`,
+      "",
+      `Account: ${mailbox}`,
+      `To: ${preview.to}`,
+      ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : []),
+      `Subject: ${preview.subject}`,
+      ...(extra.length ? ["", ...extra] : []),
+    ].join("\n");
+  }
 
   return `${prefix}${truncate(preview.body, PREVIEW_LIMIT - prefix.length)}`;
 }
@@ -313,7 +350,11 @@ export async function queueDraftApproval(
   else sendOnlyActions.delete(action.id);
 
   const text = previewText(preview);
-  const markup = keyboard(action.id, sendOnlyActions.has(action.id));
+  const markup = keyboard(
+    action.id,
+    sendOnlyActions.has(action.id),
+    Array.from(preview.body).length > DRAFT_SUMMARY_CHARS,
+  );
 
   if (action.telegram_message_id && options.newCard !== true) {
     try {
@@ -998,8 +1039,39 @@ export type ApprovalOperation =
   | "send"
   | "edit"
   | "discard"
+  | "draft"
   | "create"
   | "cancel";
+
+async function showFullDraft(ctx: Context, action: PendingAction): Promise<void> {
+  if (action.type !== "send_draft" || !action.draft_id) {
+    await ctx.answerCallbackQuery({
+      text: "That approval is not a draft.",
+      show_alert: true,
+    });
+    return;
+  }
+  const gmail = await gmailFor(action.google_account);
+  const draft = await gmail.users.drafts.get({
+    userId: "me",
+    id: action.draft_id,
+    format: "full",
+  });
+  const payload = draft.data.message?.payload;
+  const body = payload ? stripSignature(plainTextBody(payload).trim()).body.trim() : "";
+  if (!body) {
+    await ctx.answerCallbackQuery({
+      text: "That draft has no text.",
+      show_alert: true,
+    });
+    return;
+  }
+  await ctx.answerCallbackQuery("Sending the full draft.");
+  const parts = splitTelegramText(body);
+  for (const part of parts) {
+    await ctx.reply(part);
+  }
+}
 
 export async function handleApprovalCallback(
   ctx: Context,
@@ -1012,6 +1084,20 @@ export async function handleApprovalCallback(
   }
 
   // Draft-only operations.
+  if (operation === "draft") {
+    try {
+      await showFullDraft(ctx, action);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Approval action ${action.id}: full draft failed (${errorType})`);
+      await ctx.answerCallbackQuery({
+        text: "I couldn't load that draft.",
+        show_alert: true,
+      });
+    }
+    return;
+  }
+
   if (operation === "edit") {
     if (action.type !== "send_draft") {
       await ctx.answerCallbackQuery({

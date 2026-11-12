@@ -690,7 +690,7 @@ export async function startSequenceFromTool(
 ): Promise<string> {
   allowOwnerChatStartSequence(turn.confirmation);
   if (!isExplicitSequenceRequest(turn.userText ?? "")) {
-    return "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\", \"auto follow up with X\", \"follow up on my email to X\" or \"remind me to follow up with X\". For a reminder about something else, use set_reminder.";
+    return "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\", \"follow up with X\", \"follow up X N times\", \"add X to sequence\", \"auto follow up with X\", \"follow up on my email to X\" or \"remind me to follow up with X\". For a reminder about something else, use set_reminder.";
   }
   return requestSequenceCard(target, api);
 }

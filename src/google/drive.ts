@@ -190,3 +190,28 @@ export async function searchDriveFiles(
     modifiedTime: file.modifiedTime ?? undefined,
   }));
 }
+
+/** Names of work-Drive files touched in the last `days` days. No file bodies. */
+export async function listRecentDriveFiles(
+  days = 3,
+  limit = 8,
+  account: GoogleAccountId = "work",
+): Promise<DriveSearchHit[]> {
+  const drive = await getAuthedDrive(account);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const response = await drive.files.list({
+    q: `modifiedTime > '${since}' and trashed = false`,
+    pageSize: Math.max(1, Math.min(limit, 10)),
+    fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
+    orderBy: "modifiedTime desc",
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+  });
+  return (response.data.files ?? []).map((file) => ({
+    id: file.id ?? "",
+    name: file.name ?? "(untitled)",
+    mimeType: file.mimeType ?? "application/octet-stream",
+    webViewLink: file.webViewLink ?? "",
+    modifiedTime: file.modifiedTime ?? undefined,
+  }));
+}
