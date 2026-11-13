@@ -23,7 +23,7 @@ export const salesAgent: SpecialistDefinition = {
     { name: "add_sales_fact", effect: "write", retry: "never" },
     { name: "remove_sales_fact", effect: "write", retry: "never" },
   ],
-  sharedTools: ["get_current_time", "react_to_message"],
+  sharedTools: ["get_current_time", "react_to_message", "resolve_contact"],
   routing: {
     patterns: [/\b(?:accounts?|deals?|pipeline|prospects?|sales\s+facts?|crm|where\s+are\s+we\s+with)\b/i],
     commandKinds: ["sales_fact_add", "sales_fact_remove", "account"],

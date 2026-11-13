@@ -1,5 +1,8 @@
+import { matchAnswer, whichQuestion, type Contact } from "../../contact_logic.js";
+import { resolveContact } from "../../contacts.js";
 import { buttonRows, extractFields } from "../helpers.js";
-import type { SpecialistDefinition, Stoppable } from "../specialist.js";
+import type { CapabilityContext, SpecialistDefinition, Stoppable } from "../specialist.js";
+import { InputRequiredSignal } from "../types.js";
 
 interface FoundEmail {
   id?: string;
@@ -17,6 +20,38 @@ function parseEmails(raw: string): FoundEmail[] {
   } catch {
     return [];
   }
+}
+
+const WHO_CHECKPOINT = "who_options";
+
+/**
+ * Whose mail a name means, as a Gmail from: value. One person becomes their
+ * address. Several people by that name is Vishnu's call: the task pauses with
+ * the choices and resumes with his answer, and it never takes the first found.
+ */
+async function senderFor(person: string, ctx: CapabilityContext): Promise<string> {
+  const offered = ctx.checkpoint.get<Contact[]>(WHO_CHECKPOINT);
+  const answer = ctx.resume?.input.answer;
+  if (offered && offered.length > 0 && typeof answer === "string") {
+    const match = matchAnswer(offered, answer);
+    if (match.kind === "one") {
+      return offered[match.index]!.emails.join(" OR ");
+    }
+    if (match.kind === "address") {
+      return match.email;
+    }
+    throw new InputRequiredSignal({ question: whichQuestion(person, offered), from: "user" });
+  }
+  const resolution = await resolveContact(person);
+  if (resolution.kind === "one") {
+    return resolution.contact.emails.join(" OR ");
+  }
+  if (resolution.kind === "many") {
+    ctx.checkpoint.set(WHO_CHECKPOINT, resolution.options);
+    throw new InputRequiredSignal({ question: whichQuestion(person, resolution.options), from: "user" });
+  }
+  // Nobody known by that name: search for it as written.
+  return person;
 }
 
 /**
@@ -47,7 +82,7 @@ export const emailAgent: SpecialistDefinition = {
     { name: "send_email", effect: "external", retry: "never" },
     { name: "cancel_scheduled_send", effect: "external", retry: "never" },
   ],
-  sharedTools: ["get_current_time", "react_to_message", "search_notes"],
+  sharedTools: ["get_current_time", "react_to_message", "search_notes", "resolve_contact"],
   routing: {
     patterns: [
       /\b(?:e-?mails?|inbox|gmail|mails?|mailbox|drafts?|repl(?:y|ied|ies)|follow[\s-]?ups?|sequences?|outbox|unread)\b/i,
@@ -108,14 +143,15 @@ export const emailAgent: SpecialistDefinition = {
         const person = String(input.person).trim();
         const days = typeof input.days === "number" && input.days > 0 ? Math.min(60, input.days) : 7;
         const about = typeof input.about === "string" ? input.about.trim() : "";
+        const sender = await senderFor(person, ctx);
         const raw = await ctx.runTool("search_emails", {
-          query: `from:(${person}) newer_than:${days}d${about ? ` ${about}` : ""}`,
+          query: `from:(${sender}) newer_than:${days}d${about ? ` ${about}` : ""}`,
           max_results: 5,
         });
         let found = parseEmails(raw);
         if (found.length === 0 && about) {
           found = parseEmails(
-            await ctx.runTool("search_emails", { query: `from:(${person}) newer_than:${days}d`, max_results: 5 }),
+            await ctx.runTool("search_emails", { query: `from:(${sender}) newer_than:${days}d`, max_results: 5 }),
           );
         }
         const latest = found

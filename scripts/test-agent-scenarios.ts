@@ -16,6 +16,7 @@ import { pickRoute, runOwnerTurn } from "../src/agents/orchestrator.ts";
 import { getAgent } from "../src/agents/registry.ts";
 import { listPausedTasks } from "../src/agents/store.ts";
 import { createAccount, db, getBuild, getReminders, listBuilds, updateBuild } from "../src/db.ts";
+import { setGoogleAccountForTests } from "../src/google/auth.ts";
 import { setCompleteForTests, type CompleteParams, type ToolCall } from "../src/llm.ts";
 import { modelReply, nextMessageId } from "./fakes.ts";
 
@@ -28,6 +29,12 @@ function assert(condition: boolean, message: string): void {
 if (process.env.AADI_DB_PATH !== ":memory:") {
   throw new Error("test-agent-scenarios.ts must run with AADI_DB_PATH=:memory:");
 }
+
+// check_reply looks up who a name means in Gmail and Calendar. This test has no
+// Google account wherever it runs, so that lookup finds nobody and reads nothing real.
+setGoogleAccountForTests(() => {
+  throw new Error("no Google account in this test");
+});
 
 const log = console.log;
 console.log = () => undefined;

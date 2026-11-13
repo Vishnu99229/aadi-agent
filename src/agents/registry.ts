@@ -40,6 +40,8 @@ const toolOwners = new Map<string, ToolOwnership>();
 const CORE_TOOLS: Record<string, { effect: CapabilityEffect; retry: RetryPolicy }> = {
   get_current_time: { effect: "read", retry: "safe" },
   react_to_message: { effect: "write", retry: "never" },
+  // Who Vishnu means by a name: the same lookup for every agent that works with people.
+  resolve_contact: { effect: "read", retry: "safe" },
 };
 
 for (const [name, detail] of Object.entries(CORE_TOOLS)) {

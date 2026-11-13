@@ -3,6 +3,7 @@ import type { LlmBackend, LlmMessage, LlmTool, ToolCall, ToolChoice } from "./ll
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
 import { shouldForceCalendarTool } from "./calendar_guard.js";
+import { contactQuestionAsked, contactQuestionMark } from "./contact_questions.js";
 import { looksLikeDeferredAction } from "./deferred_action.js";
 import {
   documentMultiReadRetryPrompt,
@@ -55,6 +56,7 @@ import {
   type TurnContext,
 } from "./agents/dispatch.js";
 import { specialistFor } from "./agents/index.js";
+import { toolOwnership } from "./agents/registry.js";
 import { AgentTaskError } from "./agents/types.js";
 import type { ReactionSession } from "./contextual_react.js";
 import {
@@ -158,6 +160,8 @@ export interface RunReport {
   inputTokens: number;
   widened: boolean;
   stopped?: string;
+  /** The stop was "which person do you mean?": Vishnu's answer re-runs his request. */
+  contactQuestion?: boolean;
   tools: Array<{ tool: string; owner: string; ok: boolean; reused?: boolean; ms: number }>;
 }
 
@@ -497,6 +501,10 @@ export async function runAgent(
     depth: options.delegation ? options.delegation.depth + 1 : 0,
   });
   let stoppedReply: string | undefined;
+  // A tool that can't tell who he means opens a question for this chat. The loop
+  // ends on it, so the model can't go on and pick someone itself.
+  const askChatId = (options.delegation?.grant?.confirmation ?? options.sendConfirmation)?.chatId;
+  const contactMark = contactQuestionMark(askChatId);
   let commandDeferred = false;
   let widened = false;
   let aadiPrompt: string | undefined;
@@ -709,6 +717,14 @@ export async function runAgent(
         toolCalls: response.toolCalls,
       });
       messages.push(...toolResults);
+      const whichPerson = stoppedReply === undefined ? contactQuestionAsked(askChatId, contactMark) : undefined;
+      if (whichPerson) {
+        console.log(`contact question: asked iteration=${iteration}`);
+        stoppedReply = whichPerson.text;
+        if (report) {
+          report.contactQuestion = true;
+        }
+      }
       if (stoppedReply !== undefined) {
         if (report) {
           report.stopped = stoppedReply;
@@ -910,7 +926,10 @@ export async function runAgent(
         saveAssistantMessage,
       );
     }
-    const missing = unreceiptedClaims(finalReply, receipts);
+    const missing = unreceiptedClaims(finalReply, receipts, {
+      ownerText: guardText,
+      isReadTool: (name) => toolOwnership(name)?.effect === "read",
+    });
     if (missing.length > 0) {
       if (!receiptRetryUsed) {
         receiptRetryUsed = true;

@@ -185,6 +185,11 @@ async function runGoal(
     ],
   });
   ctx.onUsage({ llmCalls: report.llmCalls, costUsd: report.costUsd });
+  if (report.stopped !== undefined && report.contactQuestion) {
+    // "Which Hardik?" is asked in the chat itself, and his answer re-runs his
+    // request from the start. Nothing is left paused here.
+    return { text: report.stopped, output: { asked: "contact" } };
+  }
   if (report.stopped !== undefined) {
     dialogue.push({ question: report.stopped });
     ctx.checkpoint.set(DIALOGUE_CHECKPOINT, dialogue);

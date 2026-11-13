@@ -138,9 +138,112 @@ export function detectClaimedActions(reply: string): ClaimAction[] {
   return [...found];
 }
 
+/** What the turn was, for telling a claim from a description of something read. */
+export interface ClaimContext {
+  /** Vishnu's own words this turn. */
+  ownerText?: string;
+  /** True for a tool that only reads. */
+  isReadTool?: (name: string) => boolean;
+}
+
+const OWN_VERBS: Record<ClaimAction, string> = {
+  sent: "(?:sent|emailed)",
+  booked: "booked",
+  created: "created",
+  scheduled: "scheduled",
+  saved: "saved",
+  discarded: "discarded",
+  reminded: "(?:set a reminder|reminded)",
+  invited: "invited",
+  deleted: "deleted",
+  updated: "updated",
+  answered: "answered",
+  completed: "completed",
+  searched: "(?:searched|looked (?:it|that|this) up)",
+};
+
+/** Aadi saying it did the thing itself: "I sent", "I've booked", "we deleted". */
+function ownClaim(action: ClaimAction): RegExp {
+  return new RegExp(
+    `\\b(?:i|we)(?:'ve|’ve| have)?\\s+(?:just\\s+|already\\s+)?${OWN_VERBS[action]}\\b`,
+    "i",
+  );
+}
+
+/** What each action sounds like when Vishnu asks for it. */
+const ASKED_FOR: Record<ClaimAction, RegExp> = {
+  sent: /\b(?:send|resend|reply|respond|forward|follow[ -]?up|draft|write|compose|e-?mail\s+(?:him|her|them|back)|bhej\w*|ayakk\w*|ayach\w*)\b/i,
+  booked: /\b(?:book|schedule|set\s*up|arrange|invite)\b/i,
+  created: /\b(?:create|make|add|draft|write|set\s*up|book|schedule|propose)\b/i,
+  scheduled: /\b(?:schedule|reschedule|book|set\s*up|move|remind|send)\b/i,
+  saved: /\b(?:save|remember|note|draft|write|learn|update|store)\b/i,
+  discarded: /\b(?:discard|delete|drop|cancel|remove|scrap)\b/i,
+  reminded: /\b(?:remind|reminder|nudge)\b/i,
+  invited: /\b(?:invite|add|book|schedule|include)\b/i,
+  deleted: /\b(?:delete|remove|cancel|forget|drop|clear)\b/i,
+  updated: /\b(?:update|change|edit|revise|move|reschedule|fix|rewrite)\b/i,
+  answered: /\b(?:answer|fill|respond|reply)\b/i,
+  completed: /\b(?:complete|finish|mark|tick|close)\b/i,
+  searched: /$^/,
+};
+
+const ASKS_TO_LOOK =
+  /\b(?:find|search|look|show|summari[sz]e|summary|recap|check|read|list|tell|what|when|who|whom|which|where|did|does|has|have|is|are|was|were|any|latest|last|recent|how)\b/i;
+
+/** "Did Hardik reply?" and "has it been sent?" ask what happened, not for it to happen. */
+const ASKS_WHAT_HAPPENED = /^\s*(?:did|has|have|had|was|were|is|are|when|who|what|which)\b/i;
+
+/**
+ * True when Vishnu asked for something to be looked up and did not ask for
+ * this action. A go-ahead such as "yes, do it" is not a lookup, so the check
+ * stays strict for it.
+ */
+export function askedOnlyToLook(ownerText: string, action: ClaimAction): boolean {
+  const text = ownerText.trim();
+  if (!text || !ASKS_TO_LOOK.test(text)) {
+    return false;
+  }
+  if (!ASKED_FOR[action].test(text)) {
+    return true;
+  }
+  if (!ASKS_WHAT_HAPPENED.test(text)) {
+    return false;
+  }
+  // A question about the past, unless something after it asks for the action.
+  const rest = text.split(/[?.!,;\n]/).slice(1).join(" ");
+  return !ASKED_FOR[action].test(rest);
+}
+
+/** Words Aadi is quoting from what it read are not Aadi's own. */
+function withoutQuoted(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => !/^\s*>/.test(line))
+    .join("\n")
+    .replace(/"[^"\n]*"|“[^”\n]*”/g, " ");
+}
+
+function claimsItself(reply: string, action: ClaimAction): boolean {
+  const own = ownClaim(action);
+  return sentences(withoutQuoted(reply)).some(
+    (sentence) => !NEGATION.test(sentence) && own.test(sentence),
+  );
+}
+
+/**
+ * Actions the reply claims that no tool did.
+ *
+ * With `context`, a reply that only describes what was read is let through:
+ * "Hardik's email was sent on Monday" after a mail search is a summary, not a
+ * claim that Aadi sent anything. That holds only when Vishnu asked to look
+ * something up and not for this action, a read tool succeeded this turn, no
+ * tool that could have done the action was even tried, and the reply doesn't
+ * say Aadi did it ("I sent"). Live-lookup claims ("searched") are never relaxed.
+ */
 export function unreceiptedClaims(
   reply: string,
   receipts: readonly ToolReceipt[],
+  context: ClaimContext = {},
 ): ClaimAction[] {
   const claimed = detectClaimedActions(reply);
   if (claimed.length === 0) {
@@ -149,7 +252,7 @@ export function unreceiptedClaims(
   const ok = new Set(
     receipts.filter((row) => row.success).map((row) => row.name),
   );
-  return claimed.filter((action) => {
+  const missing = claimed.filter((action) => {
     for (const name of TOOLS_FOR[action]) {
       if (ok.has(name)) {
         return false;
@@ -157,6 +260,20 @@ export function unreceiptedClaims(
     }
     return true;
   });
+  const { ownerText, isReadTool } = context;
+  if (missing.length === 0 || !ownerText || !isReadTool) {
+    return missing;
+  }
+  if (!receipts.some((row) => row.success && isReadTool(row.name))) {
+    return missing;
+  }
+  return missing.filter(
+    (action) =>
+      action === "searched" ||
+      receipts.some((row) => TOOLS_FOR[action].has(row.name)) ||
+      !askedOnlyToLook(ownerText, action) ||
+      claimsItself(reply, action),
+  );
 }
 
 export function receiptRetryPrompt(actions: readonly ClaimAction[]): string {

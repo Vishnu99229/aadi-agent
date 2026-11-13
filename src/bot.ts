@@ -3,6 +3,15 @@ import { runAgent } from "./agent.js";
 import { issueGrant, revokeGrant } from "./agents/auth.js";
 import { listWorkflows } from "./agents/store.js";
 import type { CardButton } from "./agents/helpers.js";
+import {
+  answerContactQuestion,
+  contactQuestionAsked,
+  contactQuestionMark,
+  dropContactQuestion,
+  hasOpenContactQuestion,
+  pickContactOption,
+  type ContactAnswer,
+} from "./contact_questions.js";
 import { runCapability, runOwnerTurn, tryDirectAnswer } from "./agents/orchestrator.js";
 import { parseSettingPhrase } from "./settings_logic.js";
 import { handleCommandSendCallback } from "./command_email.js";
@@ -259,6 +268,8 @@ async function completeChatReply(
     voiceReply?: boolean;
     /** Language detection source (usually the voice transcript). */
     voiceSourceText?: string;
+    /** Buttons for a typed reply, read once the work is done. */
+    replyButtons?: () => CardButton[][];
   } = {},
 ): Promise<void> {
   const forwarded = options.forwarded === true;
@@ -315,7 +326,12 @@ async function completeChatReply(
         await postUnpostedCards(ctx, cards);
       }
     } else {
-      await sendPlainText(ctx, settled.reply);
+      const rows = options.replyButtons?.() ?? [];
+      if (rows.length > 0) {
+        await replyWithButtons(ctx, settled.reply, rows);
+      } else {
+        await sendPlainText(ctx, settled.reply);
+      }
     }
   } finally {
     // Failed, timed out or empty: any card the turn made still gets shown. One made
@@ -855,6 +871,33 @@ bot.callbackQuery(/^retry:(\d+)$/, async (ctx) => {
   await handleUserText(ctx, ctx.from.id, retryText);
 });
 
+/** Carries out the request Vishnu made before he was asked "which one?". */
+async function continueAfterContactAnswer(
+  ctx: Context,
+  userId: number,
+  answer: Exclude<ContactAnswer, { kind: "none" }>,
+  options: { voiceReply?: boolean } = {},
+): Promise<void> {
+  if (answer.kind === "reply") {
+    await replyWithButtons(ctx, answer.text, answer.buttons);
+    return;
+  }
+  await handleUserText(ctx, userId, answer.request, { ...options, contactNote: answer.note });
+}
+
+// A tap chooses who is looked up. It is not Vishnu's typed turn, so the re-run
+// reads and drafts freely but anything that sends still needs its own approval.
+bot.callbackQuery(/^contact:(pick|drop):(\d+)(?::(\d+))?$/, async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  await ctx.editMessageReplyMarkup().catch(() => undefined);
+  const id = Number(ctx.match[2]);
+  const answer =
+    ctx.match[1] === "pick" ? pickContactOption(id, Number(ctx.match[3] ?? -1)) : dropContactQuestion(id);
+  if (answer.kind !== "none") {
+    await continueAfterContactAnswer(ctx, ctx.from.id, answer);
+  }
+});
+
 bot.callbackQuery(/^meet:/, async (ctx) => {
   const data = ctx.callbackQuery.data;
   if (data && (await handleMeetingBookCallback(ctx, data))) {
@@ -1133,10 +1176,27 @@ async function handleUserText(
   ctx: Context,
   userId: number,
   userText: string,
-  options: { forwarded?: boolean; voiceReply?: boolean } = {},
+  options: { forwarded?: boolean; voiceReply?: boolean; contactNote?: string } = {},
 ): Promise<void> {
   if (await tryGratitudeReaction(ctx, userText)) {
     return;
+  }
+
+  // His own reply to "which Hardik?" picks the person and re-runs what he asked
+  // for, so he doesn't have to say it again. A forward can't answer it.
+  if (
+    ctx.chat &&
+    options.contactNote === undefined &&
+    options.forwarded !== true &&
+    !isForwardedMessage(ctx.message) &&
+    hasOpenContactQuestion(ctx.chat.id)
+  ) {
+    const chatId = ctx.chat.id;
+    const answer = await whileTyping(ctx, () => answerContactQuestion(chatId, userText));
+    if (answer.kind !== "none") {
+      await continueAfterContactAnswer(ctx, userId, answer, { voiceReply: options.voiceReply });
+      return;
+    }
   }
 
   const jobCommand = handleJobChatCommand(userText);
@@ -1300,7 +1360,8 @@ Call update_draft exactly once with the draft ID above and the complete revised 
         ? "meetings"
         : "chat";
   const quoted = quotedMessageText(ctx.message?.reply_to_message);
-  const modelText = withQuotedContext(userText, quoted);
+  const modelText = `${withQuotedContext(userText, quoted)}${options.contactNote ? `\n\n${options.contactNote}` : ""}`;
+  const contactMark = contactQuestionMark(ctx.chat?.id);
   // Some questions one agent can answer by itself, with no model call.
   if (confirmation) {
     const grant = issueGrant({ source: "owner_chat", confirmation, ownerText: userText });
@@ -1348,6 +1409,7 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       forwarded,
       voiceReply: spoken,
       voiceSourceText: userText,
+      replyButtons: () => contactQuestionAsked(ctx.chat?.id, contactMark)?.buttons ?? [],
     },
   );
   void captureFromUserMessage(userText).catch((error: unknown) => {

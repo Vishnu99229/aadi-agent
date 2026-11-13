@@ -66,7 +66,7 @@ export const calendarAgent: SpecialistDefinition = {
     { name: "delete_calendar_event", effect: "external", retry: "never" },
     { name: "add_calendar_attendee", effect: "external", retry: "never" },
   ],
-  sharedTools: ["get_current_time", "react_to_message"],
+  sharedTools: ["get_current_time", "react_to_message", "resolve_contact"],
   routing: {
     patterns: [
       /\b(?:calendar|schedule|meetings?|events?|invites?|availability|available|free\s+(?:at|on|today|tomorrow|this|next)|reschedul\w*|standup)\b/i,

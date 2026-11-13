@@ -6,12 +6,16 @@ import {
   type LoadedGoogleAccount,
 } from "../google/auth.js";
 import { gmailClient } from "../google/mail.js";
+import { peopleNamedInQuery, rewriteQuery, type Contact, type NamedInQuery } from "../contact_logic.js";
+import { askWhichContact, type UnresolvedContact } from "../contact_questions.js";
+import { resolveContact } from "../contacts.js";
+import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "search_emails",
   description:
-    'Search personal and work Gmail. Returns metadata and snippets, not full bodies. Gmail query syntax, e.g. "is:unread newer_than:1d". Omit account to search both mailboxes.',
+    'Search personal and work Gmail. Returns metadata and snippets, not full bodies. Gmail query syntax, e.g. "is:unread newer_than:1d". Omit account to search both mailboxes. For mail from or to a person, put their name as Vishnu said it in from: or to: (from:hardik, from:"hardik singh"): the name is resolved to that one person\'s address, and if several people share it Vishnu is asked which one.',
   inputSchema: {
     type: "object",
     properties: {
@@ -83,7 +87,22 @@ async function searchAccount(
   );
 }
 
-export async function handler(input: unknown): Promise<string> {
+/** True when any mail at all carries this name, whatever the rest of the query asked for. */
+async function nameAppearsInMail(accounts: LoadedGoogleAccount[], name: string): Promise<boolean> {
+  const found = await Promise.all(
+    accounts.map(async (account) => {
+      const result = await gmailClient(account).users.messages.list({
+        userId: "me",
+        q: `from:(${name}) OR to:(${name}) OR cc:(${name})`,
+        maxResults: 1,
+      });
+      return (result.data.messages ?? []).length > 0;
+    }),
+  );
+  return found.some(Boolean);
+}
+
+export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
   const values = input as {
     query?: unknown;
     max_results?: unknown;
@@ -99,10 +118,27 @@ export async function handler(input: unknown): Promise<string> {
       ? values.max_results
       : 10;
   const maxResults = Math.min(50, Math.max(1, Math.floor(requestedMax)));
-  const query = values.query.trim();
   const accounts = await accountsForFilter(
     parseGoogleAccountFilter(values.account),
   );
+
+  // A name in from:/to:/cc: means one person. Gmail would match everyone who
+  // shares it, so the name is resolved first: one person becomes their address,
+  // and several are Vishnu's to choose between on his own turn.
+  const ownTurn = turn?.confirmation !== undefined && Boolean(turn.userText?.trim());
+  const resolved: Array<{ named: NamedInQuery; contact: Contact }> = [];
+  let unknown: { name: string; resolution: UnresolvedContact } | undefined;
+  for (const named of peopleNamedInQuery(values.query)) {
+    const resolution = await resolveContact(named.name);
+    if (resolution.kind === "one") {
+      resolved.push({ named, contact: resolution.contact });
+    } else if (resolution.kind === "many" && ownTurn) {
+      return askWhichContact(turn ?? {}, named.name, resolution);
+    } else if (resolution.kind === "none" && !resolution.company) {
+      unknown ??= { name: named.name, resolution };
+    }
+  }
+  const query = rewriteQuery(values.query, resolved).trim();
 
   const emails = (
     await Promise.all(
@@ -111,6 +147,11 @@ export async function handler(input: unknown): Promise<string> {
   ).flat();
 
   if (emails.length === 0) {
+    // Nothing matched and the name is nowhere in his mail or contacts: that's
+    // an unknown person, not an empty inbox.
+    if (unknown && ownTurn && !(await nameAppearsInMail(accounts, unknown.name))) {
+      return askWhichContact(turn ?? {}, unknown.name, unknown.resolution);
+    }
     return "No emails found.";
   }
 

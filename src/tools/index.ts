@@ -51,6 +51,7 @@ import * as readDraft from "./read_draft.js";
 import * as readDriveFile from "./read_drive_file.js";
 import * as removeAccount from "./remove_account.js";
 import * as removeSalesFact from "./remove_sales_fact.js";
+import * as resolveContact from "./resolve_contact.js";
 import * as readEmail from "./read_email.js";
 import * as readSheet from "./read_sheet.js";
 import * as searchDrive from "./search_drive.js";
@@ -111,6 +112,7 @@ const modules = {
   list_attachments: listAttachments,
   list_bills: listBills,
   list_dates: listDates,
+  resolve_contact: resolveContact,
   list_documents: listDocuments,
   list_events: listEvents,
   list_upcoming_dates: listUpcomingDates,
@@ -215,6 +217,7 @@ export const TOOL_ORDER = [
   "add_sales_fact",
   "list_sales_facts",
   "remove_sales_fact",
+  "resolve_contact",
   "list_documents",
 ] as const;
 

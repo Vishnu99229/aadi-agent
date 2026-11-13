@@ -34,7 +34,7 @@ The tool code in `src/tools/` did not move; ownership is declared in
 
 | Agent | Tools it owns | Coded workflows |
 | --- | --- | --- |
-| Aadi | get_current_time, react_to_message | routing, delegation, authorization, the reply |
+| Aadi | get_current_time, react_to_message, resolve_contact (shared with Email, Calendar and Sales) | routing, delegation, authorization, the reply |
 | Email | search_emails, read_email, read_draft, draft_reply, draft_new_email, update_draft, draft_mom, resend_draft_card, confirm_send_pending_draft, discard_pending_draft, send_email, cancel_scheduled_send, start_sequence, stop_sequence, set_sequence_timezone | outbox, check_reply, prepare_followups |
 | Calendar | list_events, propose_calendar_event, create_event, create_meeting, book_meeting, move_event, delete_calendar_event, add_calendar_attendee | next_meeting, check_conflicts, book_confirmed_meeting |
 | Sales | account_status, list_accounts, add_account, update_account, remove_account, list_sales_facts, add_sales_fact, remove_sales_fact | pipeline, accounts_needing_followup |
@@ -105,6 +105,57 @@ only in a goal, an email or a remote reply does not resolve.
 
 Results from agents, emails, web pages, documents and remote agents go back to
 a model marked as data, not instructions.
+
+## Who a name means
+
+"The latest email from Hardik" names a person, not an address. One service,
+`src/contacts.ts`, works out who that is for the Email, Calendar and Sales
+agents (`src/contact_logic.ts` holds the matching and wording, with no I/O).
+
+- **Where it looks:** known contacts (follow-up prospects and addresses Vishnu
+  told Aadi himself, never automatic memories), Gmail correspondence on both
+  accounts, calendar attendees, and account records (which give the company and
+  a full name). Newsletters, automated senders and Vishnu's own addresses are
+  not people.
+- **How it matches:** a first name or a full name, whatever the capitals and
+  spacing, optionally with the company ("Hardik from Pinnacle"). A company name
+  on its own is not a person and is searched as written.
+- **One match** is used. The same full name on a company address and a personal
+  address is one person with both addresses. **Several** are never narrowed:
+  the result is `many`. **None** is `none`.
+
+It is used in three places:
+
+| Where | One | Several | Nobody |
+| --- | --- | --- | --- |
+| `search_emails` (a name in `from:`, `to:` or `cc:`) | the name is swapped for the address | on Vishnu's own turn: asks, searches nothing | searched as written; if that finds nothing and the name is nowhere in his mail, asks |
+| `resolve_contact` (shared tool) | returns name, address, company | asks | asks, or says it is a company |
+| `email.check_reply` (workflow) | checks that address | the task pauses as `input-required` and resumes with the answer | searched as written |
+
+**Asking** (`src/contact_questions.ts`): the tool opens a question for the chat
+and the loop that called it stops, so the reply is the question itself ("Which
+Hardik are you referring to?" with the choices, as text and as buttons) and the
+model cannot go on to pick someone. Vishnu's next message is read against it:
+a number, a company, a full name or an address that fits exactly one choice
+resumes **the request he already made**. A reply that fits two asks again, and
+a reply that is not an answer drops the question and is handled as a new
+message. For `none`, an address or a fuller name does the same. His choice
+stands for an hour for that name, then the name is looked up afresh.
+
+What this does not change: it authorizes nothing. Only Vishnu's own chat or
+voice turn can open a question, and only his own reply or tap can answer it (a
+forward cannot). Every send and booking still resolves its recipient from his
+own words in `src/security/` and `src/command_recipients.ts`, which were not
+touched and do not read his choice. A typed answer re-runs his request as his
+own turn; a tap is not a typed turn, so a re-run from a tap can read and draft
+but anything that sends still needs its own approval. Background jobs and
+forwarded messages search as they always did.
+
+The reply check that blocks "I sent it" when no tool sent anything
+(`src/receipt.ts`) now tells a claim from a description: after a successful
+read, on a request that asked only to look something up, "her email was sent on
+Tuesday" is a summary. "I sent…", a go-ahead, a requested or attempted send,
+and live-lookup claims are checked exactly as before.
 
 ## Task lifecycle
 
@@ -217,9 +268,10 @@ Its skills then appear to Aadi as `<id>` capabilities marked (remote).
 | `npm run test:agent-routing` | one owner per tool, routing table, zero-model direct answers, specialist loop and hand-back, dispatcher authorization, the command menu |
 | `npm run test:agent-scenarios` | scenarios A to E with a scripted model and fixture tools |
 | `npm run test:a2a` | real HTTP on loopback against a separately running example agent, and Aadi's own endpoint |
+| `npm run test:contacts` | who a name means: unique, duplicate, full and unknown names, the follow-up answer by text and by tap, the three agents, who may ask and answer, and the reply check on read-only turns. Real bot handlers and tools; scripted model, fake Telegram, Gmail and Calendar |
 | `npm run live:agent-routing` | the real chat model on invented data; nothing is read, sent or booked |
 
-The first four are part of `npm test`.
+The first five are part of `npm test`.
 
 ## Known limits
 
@@ -231,3 +283,5 @@ The first four are part of `npm test`.
 - Remote agents' progress updates show state only. Remote skills are all treated as acting outside Aadi.
 - The A2A server keeps its view of tasks in memory (the SDK's in-memory task store), so after a restart a remote caller's old task ids are not found. The work itself is still in SQLite.
 - Only `knowledge.web_search` is open to other agents.
+- Who a name means has only been run against fake Gmail and Calendar so far (see "Who a name means"). A first name shared with someone from one old thread asks once an hour.
+- `list_events` has no person filter: the Calendar Agent resolves the name with `resolve_contact` and matches attendees itself.
