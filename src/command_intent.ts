@@ -514,7 +514,7 @@ export function commandRetryPrompt(kinds: readonly CommandKind[]): string {
 export function commandNotRunMessage(kinds: readonly CommandKind[]): string {
   const what = kinds.map((kind) => FAMILIES[kind].notRun).join(", and ");
   const hint = kinds.includes("sequence")
-    ? " Say it again, or use /sequence with their name or email."
+    ? " Say it again, or use /outbox with their name or email."
     : " Please say it again.";
   return `I didn't carry that out this time, so ${what}.${hint}`;
 }

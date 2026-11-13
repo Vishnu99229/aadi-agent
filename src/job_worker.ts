@@ -714,6 +714,36 @@ export function jobsListText(): string {
   return formatJobsList(listJobs(20));
 }
 
+const DRAIN_MAX_MS = 8 * 60 * 1000;
+let draining = false;
+
+/**
+ * Runs job steps back to back for as long as each one finishes cleanly, so a
+ * job doesn't wait a minute between steps. A step that fails or has to be
+ * retried ends the run; the minute tick picks it up, which is also what
+ * recovers a job after a restart.
+ */
+export async function drainJobSteps(maxMs = DRAIN_MAX_MS): Promise<number> {
+  if (draining) {
+    return 0;
+  }
+  draining = true;
+  const startedAt = Date.now();
+  let steps = 0;
+  try {
+    while (Date.now() - startedAt < maxMs) {
+      const outcome = await processNextJobStep();
+      if (outcome !== "done" && outcome !== "yield") {
+        break;
+      }
+      steps += 1;
+    }
+  } finally {
+    draining = false;
+  }
+  return steps;
+}
+
 export function registerJobWorker(api: Api): IntervalJob {
   notifyApi = api;
   recoverStuckJobSteps(JOB_STUCK_MS);
@@ -721,7 +751,7 @@ export function registerJobWorker(api: Api): IntervalJob {
     "job-queue",
     60_000,
     async () => {
-      await processNextJobStep();
+      await drainJobSteps();
     },
     { runImmediately: true, jobTimeoutMs: 10 * 60 * 1000 },
   );

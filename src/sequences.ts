@@ -702,7 +702,7 @@ export async function handleSequenceCommand(ctx: Context): Promise<void> {
   }
   const target = typeof ctx.match === "string" ? ctx.match.trim() : "";
   if (!target) {
-    await ctx.reply("Usage: /sequence <name, company or email>");
+    await ctx.reply("Usage: /outbox <name, company or email>");
     return;
   }
   await ctx.reply(await requestSequenceCard(target, ctx.api));

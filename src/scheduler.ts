@@ -51,6 +51,7 @@ export const HEALTH_JOBS = [
   "job-queue",
   "message-embed",
   "mwf-audit",
+  "agent-recovery",
 ] as const;
 
 /**

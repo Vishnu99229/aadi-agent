@@ -455,7 +455,79 @@ function readCostRates(
   };
 }
 
+export type AgentRouting = "off" | "fast" | "full";
+
+/**
+ * How much of a chat turn goes to the specialist agents:
+ * off  = Aadi's own loop handles every turn (tools still run through their owners);
+ * fast = plus direct answers that need no model call;
+ * full = plus single-domain turns to that specialist, and delegated workflows.
+ */
+function readAgentRouting(): AgentRouting {
+  const raw = process.env.AGENT_ROUTING?.trim().toLowerCase();
+  return raw === "off" || raw === "fast" ? raw : "full";
+}
+
+export interface RemoteAgentConfig {
+  id: string;
+  url: string;
+  /** Read from A2A_REMOTE_<ID>_TOKEN. Never logged. */
+  token: string;
+}
+
+/**
+ * A2A_REMOTE_AGENTS is a comma-separated allowlist of "id=url". Only these
+ * endpoints are ever contacted, and only over loopback or https.
+ */
+function readRemoteAgents(): RemoteAgentConfig[] {
+  const out: RemoteAgentConfig[] = [];
+  for (const entry of (process.env.A2A_REMOTE_AGENTS ?? "").split(",")) {
+    const [rawId, ...rest] = entry.trim().split("=");
+    const id = rawId?.trim().toLowerCase() ?? "";
+    const url = rest.join("=").trim();
+    if (!id || !url) {
+      continue;
+    }
+    if (!/^[a-z][a-z0-9_-]{0,30}$/.test(id)) {
+      throw new Error(`A2A_REMOTE_AGENTS: "${id}" is not a valid agent id.`);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`A2A_REMOTE_AGENTS: the URL for "${id}" is not valid.`);
+    }
+    const loopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]";
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+      throw new Error(`A2A_REMOTE_AGENTS: "${id}" must use https, or http on loopback.`);
+    }
+    const token = process.env[`A2A_REMOTE_${id.toUpperCase().replace(/-/g, "_")}_TOKEN`]?.trim() ?? "";
+    out.push({ id, url: url.replace(/\/+$/, ""), token });
+  }
+  return out;
+}
+
+function readA2aPort(): number {
+  const port = Number(process.env.A2A_SERVER_PORT ?? "41241");
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error("A2A_SERVER_PORT must be a port number between 1024 and 65535.");
+  }
+  return port;
+}
+
+const a2aServerToken = process.env.A2A_SERVER_TOKEN?.trim() ?? "";
+const a2aServerEnabled = parseBool(process.env.A2A_SERVER_ENABLED, false);
+if (a2aServerEnabled && a2aServerToken.length < 24) {
+  throw new Error("A2A_SERVER_ENABLED needs A2A_SERVER_TOKEN set to at least 24 characters.");
+}
+
 export const config = {
+  agentRouting: readAgentRouting(),
+  /** The A2A endpoint is off unless switched on, and only ever listens on loopback. */
+  a2aServerEnabled,
+  a2aServerPort: readA2aPort(),
+  a2aServerToken,
+  a2aRemoteAgents: readRemoteAgents(),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN!,
   ownerTelegramId,
   googleSheetId,
