@@ -36,7 +36,10 @@ import {
   parseDoneCondition,
   parseJobCommand,
   parseResultRef,
+  isStandaloneEmailDraft,
   looksLikeBigJob,
+  referencesDocument,
+  withoutDocumentExtraction,
   type PlannedJob,
 } from "./job_logic.js";
 import { planJobFromOwnerMessage } from "./job_plan.js";
@@ -649,15 +652,23 @@ export async function tryStartBigJob(input: {
   const chunks =
     input.chunkCount ??
     (document ? documentChunkCount(document.extracted_text) : 0);
-  if (!looksLikeBigJob(input.ownerText, chunks)) {
+  // A dictated email, including "show me the draft for review", is the Email
+  // Agent's draft. A recent upload he did not mention is not a document to extract.
+  if (isStandaloneEmailDraft(input.ownerText) || !looksLikeBigJob(input.ownerText, referencesDocument(input.ownerText) ? chunks : 0)) {
     return undefined;
   }
-  const plan = await planJobFromOwnerMessage(input.ownerText, {
-    documentId: document?.id,
-    fileName: document?.file_name ?? upload?.fileName,
-    chars: document?.extracted_text.length,
-    chunks,
-  });
+  const plan = withoutDocumentExtraction(
+    await planJobFromOwnerMessage(input.ownerText, {
+      documentId: document?.id,
+      fileName: document?.file_name ?? upload?.fileName,
+      chars: document?.extracted_text.length,
+      chunks,
+    }),
+    Boolean(document),
+  );
+  if (plan.steps.length === 0 || plan.steps.every((step) => step.type === "draft")) {
+    return undefined;
+  }
   const job = persistPlannedJob(input.ownerText, plan, { chatId: input.chatId });
   const text = formatPlanMessage(plan);
   try {

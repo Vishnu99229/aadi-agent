@@ -42,8 +42,19 @@ export interface MomDraft {
   tbdWarnings: string[];
 }
 
+/** Extra owner addresses from SELF_EMAIL_ADDRESSES. Not hardcoded. */
+function configuredSelfEmails(): Set<string> {
+  return new Set(
+    (process.env.SELF_EMAIL_ADDRESSES ?? "")
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter((item) => item.includes("@")),
+  );
+}
+
 export function isSelfEmail(email: string): boolean {
-  return SELF_EMAILS.has(email.trim().toLowerCase());
+  const normalized = email.trim().toLowerCase();
+  return SELF_EMAILS.has(normalized) || configuredSelfEmails().has(normalized);
 }
 
 export function recipientsExcludingSelf(

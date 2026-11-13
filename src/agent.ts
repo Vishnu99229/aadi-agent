@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
 import { shouldForceCalendarTool } from "./calendar_guard.js";
 import { contactQuestionAsked, contactQuestionMark } from "./contact_questions.js";
+import { draftBodyFromCall, shortenDraftReply } from "./draft_confirm.js";
 import { looksLikeDeferredAction } from "./deferred_action.js";
 import {
   documentMultiReadRetryPrompt,
@@ -557,6 +558,7 @@ export async function runAgent(
   let toolFailed = false;
   let receiptRetryUsed = false;
   const receipts: ToolReceipt[] = [];
+  const draftBodies: string[] = [];
   let searchSources: SearchHit[] = [];
   /** The official release pages a release check read. They are cited ahead of search hits. */
   let releaseSources: SearchHit[] = [];
@@ -691,6 +693,10 @@ export async function runAgent(
           name: call.name,
           success,
         });
+        const draftBody = draftBodyFromCall(call.name, call.input, success);
+        if (draftBody) {
+          draftBodies.push(draftBody);
+        }
         if (call.name === "read_document") {
           const id = (call.input as { id?: unknown }).id;
           if (typeof id === "number" && Number.isSafeInteger(id) && id > 0) {
@@ -964,7 +970,10 @@ export async function runAgent(
     return saveAssistantReply(
       // When the release list itself was read, it is the source. Articles a
       // search also turned up are cited only if the reply used them.
-      withSearchCitations(finalReply, releaseSources.length > 0 ? releaseSources : searchSources),
+      withSearchCitations(
+        shortenDraftReply(finalReply, draftBodies),
+        releaseSources.length > 0 ? releaseSources : searchSources,
+      ),
       saveAssistantMessage,
     );
   }

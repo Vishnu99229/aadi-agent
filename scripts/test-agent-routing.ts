@@ -107,6 +107,13 @@ for (const [text, kind, target] of routes) {
 assert(pickRoute("Start a follow-up sequence for Rahul.", { mode: "off" }).kind === "aadi", "routing off: everything goes to Aadi");
 assert(pickRoute("Start a follow-up sequence for Rahul.", { mode: "fast" }).kind === "aadi", "fast mode: no specialist loops");
 assert(pickRoute("Show my scheduled emails.", { mode: "fast" }).kind === "direct", "fast mode keeps direct answers");
+const dictatedEmail =
+  'Draft an email to priya@acme.com with the subject "Hello" and the message "See you Monday." Show me the draft for review. Do not send it.';
+const dictatedRoute = pickRoute(dictatedEmail, { mode: "full" });
+assert(
+  dictatedRoute.kind === "specialist" && dictatedRoute.agentId === "email",
+  `a dictated email goes to the Email Agent (${dictatedRoute.kind === "specialist" ? dictatedRoute.agentId : dictatedRoute.kind})`,
+);
 assert(pickRoute("What's my next meeting?", { mode: "full", quoted: true }).kind === "aadi", "a reply to an earlier message stays with Aadi");
 assert(pickRoute(`remind me ${"very ".repeat(200)}soon`, { mode: "full" }).kind === "aadi", "a long message stays with Aadi");
 passed.push(`routing: ${routes.length} phrases routed by registry data alone (direct / specialist / Aadi), plus off, fast, quoted and long`);

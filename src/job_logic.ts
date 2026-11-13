@@ -64,15 +64,54 @@ const ACTION_RES: RegExp[] = [
   /\bcreate\b.{0,20}\btasks?\b/i,
 ];
 
+/** The message points at a file, not at an email he already dictated. */
+const DOCUMENT_REFERENCE =
+  /\b(?:attach(?:ed|ment)?|uploaded|this\s+(?:document|doc|pdf|file|rfp|deck|attachment)|the\s+(?:document|pdf|rfp|attachment|uploaded\s+file)|questionnaire)\b/i;
+
+const EMAIL_DRAFT =
+  /\b(?:draft|write|compose|prepare)\b[\s\S]{0,80}\b(?:e-?mails?|reply|gmail)\b|\b(?:e-?mails?|reply|gmail)\b[\s\S]{0,40}\b(?:draft|write|compose)\b/i;
+
+export function referencesDocument(ownerText: string): boolean {
+  return DOCUMENT_REFERENCE.test(ownerText);
+}
+
+/**
+ * He named the recipient and the email himself. "Show me the draft for review"
+ * is that request, not a request to read a document first.
+ */
+export function isStandaloneEmailDraft(ownerText: string): boolean {
+  const text = ownerText.trim();
+  if (!EMAIL_DRAFT.test(text)) {
+    return false;
+  }
+  if (referencesDocument(text)) {
+    return false;
+  }
+  if (/\b(?:every question|all (?:the )?questions|checklist)\b/i.test(text)) {
+    return false;
+  }
+  return true;
+}
+
+/** "for review" is about the draft he wants to see, not a document to analyse. */
+function textForActionHits(ownerText: string): string {
+  return ownerText
+    .replace(/\bfor review\b/gi, " ")
+    .replace(/\breview(?:ing)?\s+(?:the|that|this|my)\s+draft\b/gi, " ");
+}
+
 export function looksLikeBigJob(
   ownerText: string,
   chunkCount?: number,
 ): boolean {
   const text = ownerText.trim();
+  if (isStandaloneEmailDraft(text)) {
+    return false;
+  }
   if (text.length < 24) {
     return false;
   }
-  const hits = ACTION_RES.filter((re) => re.test(text)).length;
+  const hits = ACTION_RES.filter((re) => re.test(textForActionHits(text))).length;
   if (hits >= 2) {
     return true;
   }
@@ -121,6 +160,28 @@ export function normalizeStepType(value: string): JobStepType | undefined {
     return undefined;
   }
   return TYPE_ALIASES[key];
+}
+
+const NEEDS_A_DOCUMENT = new Set<JobStepType>(["extract", "read_chunk"]);
+
+/**
+ * extract and read_chunk fail without a stored document. Drop them, and drop
+ * dependencies on the steps that went, so a dictated email is not blocked on
+ * an extraction that cannot run.
+ */
+export function withoutDocumentExtraction(plan: PlannedJob, hasDocument: boolean): PlannedJob {
+  if (hasDocument) {
+    return plan;
+  }
+  const steps = plan.steps.filter((step) => !NEEDS_A_DOCUMENT.has(step.type));
+  const kept = new Set(steps.map((step) => step.id));
+  return {
+    ...plan,
+    steps: steps.map((step) => ({
+      ...step,
+      depends_on: step.depends_on.filter((id) => kept.has(id)),
+    })),
+  };
 }
 
 export function fallbackPlanFromOwnerMessage(

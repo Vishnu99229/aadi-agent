@@ -12,6 +12,7 @@ export const CLAIM_ACTIONS = [
   "answered",
   "completed",
   "searched",
+  "offered",
 ] as const;
 
 export type ClaimAction = (typeof CLAIM_ACTIONS)[number];
@@ -73,6 +74,7 @@ const TOOLS_FOR: Record<ClaimAction, ReadonlySet<string>> = {
   answered: new Set(["search_qa_bank", "learn_qa_bank"]),
   completed: new Set(["complete_task"]),
   searched: new Set(["web_search", "latest_release"]),
+  offered: new Set(["start_sequence"]),
 };
 
 const CLAIM_RE: Record<ClaimAction, RegExp> = {
@@ -90,6 +92,8 @@ const CLAIM_RE: Record<ClaimAction, RegExp> = {
   completed: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?completed\b|\b(?:task|it)\s+(?:is\s+|was\s+)?(?:completed|done)\b|^completed\b/i,
   searched:
     /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?(?:searched|looked (?:it|that|this) up)\b|\b(?:from|via) (?:the )?(?:web|internet|search results?)\b|\bas of (?:today|now|this (?:morning|afternoon|evening))\b|\b(?:latest|breaking) (?:news|headlines?)\b|\bcurrent (?:price|rate|score|standings?|headline)\b|\blive (?:score|price|rate|updates?)\b|\baccording to (?:search|the web|sources?|reports?)\b|\b(?:search )?results? (?:show|say|from)\b/i,
+  offered:
+    /\boffer posted\b|\bsequence card is shown\b|\bstart card sent\b|\bcard is shown above\b|\bwaiting for (?:your|vishnu's) start tap\b/i,
 };
 
 const NEGATION =
@@ -160,6 +164,7 @@ const OWN_VERBS: Record<ClaimAction, string> = {
   answered: "answered",
   completed: "completed",
   searched: "(?:searched|looked (?:it|that|this) up)",
+  offered: "(?:offered|posted)",
 };
 
 /** Aadi saying it did the thing itself: "I sent", "I've booked", "we deleted". */
@@ -185,6 +190,7 @@ const ASKED_FOR: Record<ClaimAction, RegExp> = {
   answered: /\b(?:answer|fill|respond|reply)\b/i,
   completed: /\b(?:complete|finish|mark|tick|close)\b/i,
   searched: /$^/,
+  offered: /\b(?:sequence|follow[\s-]*up)\b/i,
 };
 
 const ASKS_TO_LOOK =

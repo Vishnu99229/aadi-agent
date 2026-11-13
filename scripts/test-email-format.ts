@@ -11,6 +11,7 @@ import {
   stripSignature,
 } from "../src/google/mail.ts";
 import { encodeMimeHeader } from "../src/google/mime.ts";
+import { shortenDraftReply } from "../src/draft_confirm.ts";
 import { fakeGmail, TEST_SIGNATURE_HTML, type GmailLog } from "./fakes.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -125,4 +126,15 @@ const workAccount = {
 }
 
 setGmailClientForTests(undefined);
+
+{
+  const body = "Testing the Email Agent's drafting functionality. This sentence is long enough to count as the draft body itself.";
+  const repeated = `Draft ready for review.\n\nTo: Qa Draft <qa-draft@example.com>\nSubject: Aadi Draft Test\n\n${body}`;
+  const short = shortenDraftReply(repeated, [body]);
+  assert(!short.includes(body), "the chat reply does not repeat the draft body");
+  assert(/Send tap/.test(short) && /Nothing was sent/.test(short), "it points at the card instead");
+  assert(shortenDraftReply("Draft ready.", [body]) === "Draft ready.", "a short reply that does not quote the body is left alone");
+  assert(shortenDraftReply(repeated, [body, "A different draft body that is also longer than forty characters."]).includes(body), "two different drafts are not rewritten");
+}
+
 console.log("Email format checks passed.");

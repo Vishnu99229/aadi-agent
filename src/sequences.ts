@@ -49,7 +49,9 @@ import {
   EXCLUSION_LABELS,
   evaluatePitchExclusion,
   firstStepAt,
+  hasOriginalOutreach,
   isExplicitSequenceRequest,
+  prospectDisplay,
   parsePitchClassification,
   PITCH_SCHEMA,
   PITCH_SYSTEM,
@@ -373,6 +375,10 @@ function pitchCardKeyboard(id: number): InlineKeyboard {
 }
 
 async function sendPitchCard(api: Api, row: SalesSequenceRecord): Promise<boolean> {
+  if (!hasOriginalOutreach(row.original_message_id)) {
+    console.log(`Sequence ${row.id}: no original sent message; card not sent`);
+    return false;
+  }
   try {
     const text = pitchCardText({
       name: row.prospect_name,
@@ -473,9 +479,7 @@ function prospectLabel(row: {
   prospect_name: string;
   prospect_email: string;
 }): string {
-  return row.prospect_name
-    ? `${row.prospect_name} <${row.prospect_email}>`
-    : row.prospect_email;
+  return prospectDisplay(row.prospect_name, row.prospect_email);
 }
 
 function switchedOffNote(): string {
@@ -642,7 +646,7 @@ export async function requestSequenceCard(
   }
   if (newestByProspect.size > 1) {
     const options = [...newestByProspect.values()].map(
-      (item) => `- ${item.prospect!.name} <${item.prospect!.email}> ('${item.subject}')`,
+      (item) => `- ${prospectDisplay(item.prospect!.name, item.prospect!.email)} ('${item.subject}')`,
     );
     return `Not started: more than one person matches "${target}". Which one?\n${options.join("\n")}`;
   }

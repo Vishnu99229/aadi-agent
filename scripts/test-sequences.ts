@@ -20,6 +20,7 @@ import {
   countManualFollowups,
   evaluatePitchExclusion,
   firstStepAt,
+  hasOriginalOutreach,
   isExplicitSequenceRequest,
   matchesProspect,
   parsePitchClassification,
@@ -37,6 +38,7 @@ import {
   runSequenceDetection,
   startSequenceFromTool,
 } from "../src/sequences.ts";
+import { unreceiptedClaims } from "../src/receipt.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -169,7 +171,7 @@ assert(
     company: "Acme",
     subject: "IraVoice demo",
   }) ===
-    "Looks like a sales pitch to Priya, Acme ('IraVoice demo'). Start a 4-step follow-up sequence?",
+    "Looks like a sales pitch to Priya (priya@acme.com), Acme ('IraVoice demo'). Start a 4-step follow-up sequence?",
   "card wording matches the spec",
 );
 {
@@ -409,7 +411,7 @@ modelCalls = 0;
   assert(offered === 1, `one card for one candidate, got ${offered}`);
   assert(
     card(telegram) ===
-      "Looks like a sales pitch to Priya Shah, Acme ('IraVoice for Acme support'). Start a 4-step follow-up sequence?",
+      "Looks like a sales pitch to Priya Shah (priya@acme.com), Acme ('IraVoice for Acme support'). Start a 4-step follow-up sequence?",
     "the card names the prospect",
   );
   const row = getSalesSequenceByThread("t-lone")!;
@@ -546,6 +548,55 @@ for (const phrase of [
 for (const phrase of ["start following up with Rajan", "follow up with me"]) {
   assert(!isExplicitSequenceRequest(phrase), `not explicit: ${phrase}`);
 }
+assert(
+  isExplicitSequenceRequest(
+    'For my test account "Aadi QA Demo", propose a follow-up sequence to qa-prospect@example.com requesting a 15-minute demo. Show me the sequence for approval. Do not start the sequence or send any emails.',
+  ),
+  "proposing a follow-up sequence is an explicit request",
+);
+assert(!isExplicitSequenceRequest("follow up sequence tomorrow"), "the word sequence is not a person's name");
+assert(!hasOriginalOutreach("") && !hasOriginalOutreach(null) && hasOriginalOutreach("1a1cba5a"), "a card needs a sent message id");
+{
+  const shown = pitchCardText({
+    name: "Aadi QA Demo",
+    email: "qa-prospect@example.com",
+    company: "",
+    subject: "Demo",
+    manualFollowups: 0,
+  });
+  assert(shown.includes("(qa-prospect@example.com)"), "the card shows the stored address");
+  assert(!shown.includes("<qa-prospect@example.com>"), "the address is not wrapped in angle brackets");
+}
+{
+  const claim =
+    "Offer posted for Aadi QA Demo (qa-prospect@example.com). The follow-up sequence card is shown above. Nothing is enrolled until you tap Start.";
+  assert(
+    unreceiptedClaims(claim, []).includes("offered"),
+    "a Start card claimed with no tool is not accepted",
+  );
+  assert(
+    unreceiptedClaims(claim, [{ name: "start_sequence", success: true }]).length === 0,
+    "a real Start card satisfies the claim",
+  );
+  assert(
+    unreceiptedClaims(claim, [{ name: "start_sequence", success: false }]).includes("offered"),
+    "a refused sequence tool does not count as a card",
+  );
+}
+{
+  const before = telegram.sent.length;
+  const refused = await startSequenceFromTool(
+    "qa-prospect@example.com",
+    {
+      confirmation: { chatId: 1, messageId: 9 },
+      userText:
+        'For my test account "Aadi QA Demo", propose a follow-up sequence to qa-prospect@example.com. Do not start the sequence or send any emails.',
+    },
+    api,
+  );
+  assert(refused.startsWith("Not started"), `no originating sent email means no card (${refused})`);
+  assert(telegram.sent.length === before, "no Start card was posted");
+}
 assert(isExplicitSequenceRequest("follow up with Rajan"), "follow up with a person is a sequence");
 assert(isExplicitSequenceRequest("follow up Abhishek 4 times"), "follow up N times is a sequence");
 assert(isExplicitSequenceRequest("add Abhishek to sequence"), "add to sequence is a sequence");
@@ -554,9 +605,10 @@ assert(isExplicitSequenceRequest("add Abhishek to sequence"), "add to sequence i
   modelCalls = 0;
   const before = telegram.sent.length;
   const reply = await requestSequenceCard("Asha", api);
-  assert(reply.startsWith("Start card sent for Asha Rao <asha@nu.com>"), `explicit card: ${reply}`);
+  assert(reply.startsWith("Start card sent for Asha Rao (asha@nu.com)"), `explicit card: ${reply}`);
   assert(telegram.sent.length === before + 1, "an explicit request sends one card");
-  assert(card(telegram).startsWith("Looks like a sales pitch to Asha Rao, Nu"), "same card as detection");
+  assert(card(telegram).startsWith("Looks like a sales pitch to Asha Rao (asha@nu.com), Nu"), "same card as detection");
+  assert(getSalesSequenceByThread("t-explicit")!.prospect_email === "asha@nu.com", "the card's address is the stored recipient");
   assert(modelCalls === 0, "an explicit request needs no classifier");
   const row = getSalesSequenceByThread("t-explicit")!;
   assert(row.status === "proposed", "an explicit request never enrols");
@@ -659,7 +711,7 @@ assert(prospectKey("Ravi@Gmail.com") === "ravi@gmail.com", "free-mail key is the
 
   assert(
     pitchCardText({ name: "Priya", email: "p@a.com", company: "A", subject: "S", manualFollowups: 1 }) ===
-      "Looks like a sales pitch to Priya, A ('S'). You've already followed up once - Aadi will send up to 3 more. Start the follow-up sequence?",
+      "Looks like a sales pitch to Priya (p@a.com), A ('S'). You've already followed up once - Aadi will send up to 3 more. Start the follow-up sequence?",
     "one manual follow-up on the card",
   );
   assert(

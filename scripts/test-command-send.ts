@@ -831,10 +831,18 @@ const run = (name: string, input: object, userText: string, confirmation: object
     assert(!(FORWARDED_TOOLS as readonly string[]).includes(name), `forwarded can't reach ${name}`);
   }
 }
-for (const phrase of ["block my calendar on Friday", "book a meeting with Selvaraj", "don't forget to book Selvaraj", "cancel that event", "move that event to 4pm"]) {
+for (const phrase of [
+  "block my calendar on Friday",
+  "book a meeting with Selvaraj",
+  "don't forget to book Selvaraj",
+  "cancel that event",
+  "move that event to 4pm",
+  'Create a 15-minute event on my work calendar tomorrow at 6:00 PM IST. Title it "Aadi Calendar Test". Do not add any attendees or send invitations',
+  'Move my "Aadi Calendar Test" event on Saturday from 6:00 PM to 6:30 PM IST. Keep the duration at 15 minutes. Do not add attendees.',
+]) {
   assert(notAnEventCommand(phrase) === undefined, `"${phrase}" is a command`);
 }
-for (const phrase of ["don't book anything with Selvaraj", "should I block my calendar?", "did you create the event?", "remind me to book Selvaraj", "I need to cancel that", "propose a meeting with Selvaraj", "I'll block Friday"]) {
+for (const phrase of ["don't book anything with Selvaraj", "should I block my calendar?", "did you create the event?", "remind me to book Selvaraj", "I need to cancel that", "propose a meeting with Selvaraj", "I'll block Friday", "do not delete the event", "don't invite Priya to the meeting"]) {
   assert(notAnEventCommand(phrase) !== undefined, `"${phrase}" isn't a command`);
 }
 {

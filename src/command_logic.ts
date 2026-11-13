@@ -49,10 +49,18 @@ const NOT_AN_EVENT_COMMAND: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(?:propose|suggest|park)\b/i, "he asked to propose it, which is propose_calendar_event"],
 ];
 
+/**
+ * "Do not add attendees" limits who is invited. It is not a refusal to create
+ * or move the event. Deleting, cancelling, and "don't book" stay refusals.
+ */
+const ATTENDEE_LIMIT =
+  /\b(?:don'?t|don’t|do not|never|not to|shouldn'?t|wouldn'?t)\b(?!\s+forget)[^.?!\n]{0,40}\b(?:add|invite|include)\b[^.?!\n]{0,40}\b(?:any\s+|the\s+|no\s+)?(?:attendees?|guests?|invitations?|invites?)\b/gi;
+
 /** The calendar version of notASendCommand. */
 export function notAnEventCommand(ownWords: string): string | undefined {
+  const text = ownWords.replace(ATTENDEE_LIMIT, " ");
   for (const [pattern, reason] of NOT_AN_EVENT_COMMAND) {
-    if (pattern.test(ownWords)) {
+    if (pattern.test(text)) {
       return reason;
     }
   }
