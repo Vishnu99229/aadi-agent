@@ -1,3 +1,4 @@
+import { RELEASE_QUESTION } from "../../release_logic.js";
 import { extractFields } from "../helpers.js";
 import type { SpecialistDefinition, Stoppable } from "../specialist.js";
 import { InputRequiredSignal } from "../types.js";
@@ -10,7 +11,7 @@ export const knowledgeAgent: SpecialistDefinition = {
   id: "knowledge",
   name: "Knowledge Agent",
   description:
-    "Reads uploaded documents, Drive files, sheets and email attachments, searches the web, and keeps the Q&A bank, long-term memory and call notes.",
+    "Reads uploaded documents, Drive files, sheets and email attachments, searches the web, looks up the latest release of software or a protocol from its official release list, and keeps the Q&A bank, long-term memory and call notes.",
   version: "1.0.0",
   promptFile: "knowledge.md",
   tools: [
@@ -23,6 +24,7 @@ export const knowledgeAgent: SpecialistDefinition = {
     { name: "read_sheet", effect: "read", retry: "safe" },
     { name: "search_qa_bank", effect: "read", retry: "safe" },
     { name: "web_search", effect: "read", retry: "safe", remoteExposed: true },
+    { name: "latest_release", effect: "read", retry: "safe" },
     { name: "search_memories", effect: "read", retry: "safe" },
     { name: "list_memories", effect: "read", retry: "safe" },
     { name: "search_history", effect: "read", retry: "safe" },
@@ -36,6 +38,8 @@ export const knowledgeAgent: SpecialistDefinition = {
   routing: {
     patterns: [
       /\b(?:documents?|docs?|pdfs?|drive|sheets?|spreadsheets?|rfps?|questionnaires?|q\s*&\s*a|memor(?:y|ies)|attachments?|uploads?|uploaded|files?|scans?|scanned|photos?|screenshots?|call\s+notes|meeting\s+notes|search\s+the\s+web|google\s+it)\b/i,
+      // "What's the latest version of X?" is a lookup, whether or not he says "search".
+      RELEASE_QUESTION,
     ],
     commandKinds: ["memory", "qa_bank"],
   },

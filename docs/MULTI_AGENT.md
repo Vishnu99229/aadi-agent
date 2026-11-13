@@ -38,7 +38,7 @@ The tool code in `src/tools/` did not move; ownership is declared in
 | Email | search_emails, read_email, read_draft, draft_reply, draft_new_email, update_draft, draft_mom, resend_draft_card, confirm_send_pending_draft, discard_pending_draft, send_email, cancel_scheduled_send, start_sequence, stop_sequence, set_sequence_timezone | outbox, check_reply, prepare_followups |
 | Calendar | list_events, propose_calendar_event, create_event, create_meeting, book_meeting, move_event, delete_calendar_event, add_calendar_attendee | next_meeting, check_conflicts, book_confirmed_meeting |
 | Sales | account_status, list_accounts, add_account, update_account, remove_account, list_sales_facts, add_sales_fact, remove_sales_fact | pipeline, accounts_needing_followup |
-| Knowledge | read_document, list_documents, read_attachment, list_attachments, read_drive_file, search_drive, read_sheet, search_qa_bank, learn_qa_bank, web_search, search_memories, list_memories, remember, update_memory, forget_memory, search_history, search_notes | extract_bill |
+| Knowledge | read_document, list_documents, read_attachment, list_attachments, read_drive_file, search_drive, read_sheet, search_qa_bank, learn_qa_bank, web_search, latest_release, search_memories, list_memories, remember, update_memory, forget_memory, search_history, search_notes | extract_bill |
 | Operations | list_tasks, add_task, complete_task, delete_task, list_reminders, set_reminder, cancel_reminder, list_dates, list_upcoming_dates, add_date, remove_date, list_bills, mark_bill_paid, ignore_bill | track_bill_with_reminder |
 | Build | none (it wraps `src/builds.ts`) | request_build, list_builds, build_status |
 
@@ -105,6 +105,27 @@ only in a goal, an email or a remote reply does not resolve.
 
 Results from agents, emails, web pages, documents and remote agents go back to
 a model marked as data, not instructions.
+
+## Latest release of software
+
+"What's the latest release of X?" is a Knowledge Agent lookup. One tool,
+`latest_release` (`src/releases.ts` over `src/release_logic.ts`), reads the
+project's official GitHub Releases (or git tags), compares version numbers and
+dates in code, and reports:
+
+- the **latest stable** release (highest non-prerelease version, not whatever
+  was published last);
+- the **latest major** release (the x.0.0 that began that line), separately
+  from a later patch;
+- any **newer prerelease**;
+- what the project's **changelog** says at the top;
+- sibling **SDK** repositories, each with their own version numbers.
+
+A web search on the same question puts the project's own release pages first
+and tells the model to call `latest_release`. Nothing about any one project or
+version is hardcoded: the same path answers A2A, Kubernetes, Node.js or a
+project that does not exist yet. If the project is not on GitHub, the model
+answers only from the vendor's own release notes or documentation.
 
 ## Who a name means
 
@@ -269,9 +290,11 @@ Its skills then appear to Aadi as `<id>` capabilities marked (remote).
 | `npm run test:agent-scenarios` | scenarios A to E with a scripted model and fixture tools |
 | `npm run test:a2a` | real HTTP on loopback against a separately running example agent, and Aadi's own endpoint |
 | `npm run test:contacts` | who a name means: unique, duplicate, full and unknown names, the follow-up answer by text and by tap, the three agents, who may ask and answer, and the reply check on read-only turns. Real bot handlers and tools; scripted model, fake Telegram, Gmail and Calendar |
+| `npm run test:latest-release` | latest version/release: version ordering, major vs patch vs prerelease vs SDK, dates vs versions, changelog cross-check, routing, web_search nudge, Knowledge Agent turn with official citations. Invented projects only; fake GitHub and search |
+| `npm run live:latest-release` | the real chat model, real web search and real GitHub on a release question (default: latest A2A protocol release); nothing reaches Telegram, Gmail or Calendar |
 | `npm run live:agent-routing` | the real chat model on invented data; nothing is read, sent or booked |
 
-The first five are part of `npm test`.
+The first six are part of `npm test`.
 
 ## Known limits
 

@@ -72,7 +72,7 @@ const TOOLS_FOR: Record<ClaimAction, ReadonlySet<string>> = {
   updated: new Set(["update_draft", "update_memory", "update_account", "move_event"]),
   answered: new Set(["search_qa_bank", "learn_qa_bank"]),
   completed: new Set(["complete_task"]),
-  searched: new Set(["web_search"]),
+  searched: new Set(["web_search", "latest_release"]),
 };
 
 const CLAIM_RE: Record<ClaimAction, RegExp> = {

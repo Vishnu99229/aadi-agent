@@ -37,6 +37,7 @@ import * as listUpcomingDates from "./list_upcoming_dates.js";
 import * as listReminders from "./list_reminders.js";
 import * as listSalesFacts from "./list_sales_facts.js";
 import * as listTasks from "./list_tasks.js";
+import * as latestRelease from "./latest_release.js";
 import * as learnQa from "./learn_qa.js";
 import * as listMemories from "./list_memories.js";
 import * as proposeCalendarEvent from "./propose_calendar_event.js";
@@ -107,6 +108,7 @@ const modules = {
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
   ignore_bill: ignoreBill,
+  latest_release: latestRelease,
   learn_qa_bank: learnQa,
   list_accounts: listAccounts,
   list_attachments: listAttachments,
@@ -218,6 +220,7 @@ export const TOOL_ORDER = [
   "list_sales_facts",
   "remove_sales_fact",
   "resolve_contact",
+  "latest_release",
   "list_documents",
 ] as const;
 
@@ -252,6 +255,7 @@ export const FORWARDED_TOOLS = [
   "search_notes",
   "search_qa_bank",
   "web_search",
+  "latest_release",
   "read_draft",
   "draft_new_email",
   "search_history",

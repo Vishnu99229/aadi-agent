@@ -558,6 +558,8 @@ export async function runAgent(
   let receiptRetryUsed = false;
   const receipts: ToolReceipt[] = [];
   let searchSources: SearchHit[] = [];
+  /** The official release pages a release check read. They are cited ahead of search hits. */
+  let releaseSources: SearchHit[] = [];
 
   // An explicit command in his own message has to be answered by a tool that runs
   // this turn. Models, DeepSeek especially, can otherwise repeat an old answer
@@ -699,6 +701,12 @@ export async function runAgent(
           const hits = parseSearchSources(result.content);
           if (hits.length > 0) {
             searchSources = hits;
+          }
+        }
+        if (call.name === "latest_release" && success) {
+          const pages = parseSearchSources(result.content);
+          if (pages.length > 0) {
+            releaseSources = pages;
           }
         }
         if (isFamilyTool(call.name)) {
@@ -954,7 +962,9 @@ export async function runAgent(
     }
     succeeded = !toolFailed;
     return saveAssistantReply(
-      withSearchCitations(finalReply, searchSources),
+      // When the release list itself was read, it is the source. Articles a
+      // search also turned up are cited only if the reply used them.
+      withSearchCitations(finalReply, releaseSources.length > 0 ? releaseSources : searchSources),
       saveAssistantMessage,
     );
   }
