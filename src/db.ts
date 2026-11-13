@@ -637,6 +637,22 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS contact_questions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    request TEXT NOT NULL,
+    query TEXT NOT NULL,
+    options TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'answered', 'dropped')),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS contact_choices (
+    name_key TEXT PRIMARY KEY,
+    contact TEXT NOT NULL,
+    chosen_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS scheduled_sends (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     idem_key TEXT NOT NULL UNIQUE,
@@ -4668,6 +4684,101 @@ export function closeCommandChoice(id: number, status: "used" | "cancelled"): bo
       .prepare("UPDATE command_send_choices SET status = ? WHERE id = ? AND status = 'open'")
       .run(status, id).changes === 1
   );
+}
+
+// ---- "Which Hardik?": a name that fits several people, or nobody ----
+
+export interface ContactQuestionRecord {
+  id: number;
+  chat_id: number;
+  /** Vishnu's own message that needed the person, re-run once he answers. */
+  request: string;
+  /** The name as it was asked for. */
+  query: string;
+  /** JSON list of the people to choose from. Empty when nobody matched. */
+  options: string;
+  status: "open" | "answered" | "dropped";
+  created_at: string;
+}
+
+/** One question per chat: asking a new one drops the one before it. */
+export function openContactQuestion(input: {
+  chatId: number;
+  request: string;
+  query: string;
+  options: string;
+  createdAt: string;
+}): number {
+  db.prepare("UPDATE contact_questions SET status = 'dropped' WHERE chat_id = ? AND status = 'open'").run(
+    input.chatId,
+  );
+  const result = db
+    .prepare(
+      "INSERT INTO contact_questions (chat_id, request, query, options, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .run(input.chatId, input.request, input.query, input.options, input.createdAt);
+  return Number(result.lastInsertRowid);
+}
+
+export function getContactQuestion(id: number): ContactQuestionRecord | undefined {
+  return db.prepare("SELECT * FROM contact_questions WHERE id = ?").get(id) as
+    | ContactQuestionRecord
+    | undefined;
+}
+
+export function getOpenContactQuestion(
+  chatId: number,
+  sinceIso: string,
+): ContactQuestionRecord | undefined {
+  return db
+    .prepare(
+      "SELECT * FROM contact_questions WHERE chat_id = ? AND status = 'open' AND created_at >= ? ORDER BY id DESC LIMIT 1",
+    )
+    .get(chatId, sinceIso) as ContactQuestionRecord | undefined;
+}
+
+/** The newest question id for this chat, so a turn can tell whether it asked one. */
+export function latestContactQuestionId(chatId: number): number {
+  const row = db
+    .prepare("SELECT MAX(id) AS id FROM contact_questions WHERE chat_id = ?")
+    .get(chatId) as { id: number | null };
+  return row.id ?? 0;
+}
+
+/** One answer wins: the question closes here, so a double tap can't act twice. */
+export function closeContactQuestion(id: number, status: "answered" | "dropped"): boolean {
+  return (
+    db
+      .prepare("UPDATE contact_questions SET status = ? WHERE id = ? AND status = 'open'")
+      .run(status, id).changes === 1
+  );
+}
+
+/** Who Vishnu said he meant by a name. Only his own answer or tap writes this. */
+export function saveContactChoice(nameKey: string, contact: string, chosenAt: string): void {
+  db.prepare(
+    `INSERT INTO contact_choices (name_key, contact, chosen_at) VALUES (?, ?, ?)
+     ON CONFLICT(name_key) DO UPDATE SET contact = excluded.contact, chosen_at = excluded.chosen_at`,
+  ).run(nameKey, contact, chosenAt);
+}
+
+export function getContactChoice(nameKey: string, sinceIso: string): string | undefined {
+  const row = db
+    .prepare("SELECT contact FROM contact_choices WHERE name_key = ? AND chosen_at >= ?")
+    .get(nameKey, sinceIso) as { contact: string } | undefined;
+  return row?.contact;
+}
+
+/** Everyone a follow-up sequence was proposed or run for: name, address and company. */
+export function listSequenceProspects(): Array<{ name: string; email: string; company: string; seen_at: string }> {
+  return db
+    .prepare(
+      `SELECT prospect_name AS name, prospect_email AS email, prospect_company AS company,
+              MAX(updated_at) AS seen_at
+       FROM sales_sequences
+       GROUP BY prospect_email`,
+    )
+    .all() as Array<{ name: string; email: string; company: string; seen_at: string }>;
 }
 
 // ---- Emails to send later on Vishnu's command ----

@@ -16,6 +16,7 @@ import {
   notASendCommand,
   referencesAttachment,
 } from "../src/command_logic.ts";
+import { commandIntents } from "../src/command_intent.ts";
 import { commandWriterInput, COMMAND_WRITER_SYSTEM } from "../src/command_writer.ts";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -338,6 +339,18 @@ for (const phrase of [
   "should I reply to Selvaraj?",
 ]) {
   assert(notASendCommand(phrase) !== undefined, `"${phrase}" isn't a command`);
+}
+assert(
+  notASendCommand("Draft an email to Selvaraj but don't send it") === "he asked for a draft",
+  "draft but don't send authorizes a draft and blocks sending",
+);
+assert(notASendCommand("don't send Selvaraj anything") === "he said not to", "a bare don't-send is still a refusal");
+{
+  const draft = commandIntents("Draft an email to qa@example.com with subject Hi but don't send it");
+  assert(draft.includes("draft") && !draft.includes("send"), `draft-not-send intents: ${draft.join(",")}`);
+  const event = commandIntents("Create an event tomorrow at 6pm without attendees");
+  assert(event.includes("calendar"), `create without attendees is a calendar command: ${event.join(",")}`);
+  assert(!commandIntents("do not delete the event").includes("calendar"), "don't delete is not a calendar command");
 }
 assert(namedInOwnWords("Selvaraj", "send Selvaraj's team a note"), "a possessive still names him");
 assert(!namedInOwnWords("Raj", "send Rajan a note"), "a part of a name isn't the name");
@@ -831,10 +844,19 @@ const run = (name: string, input: object, userText: string, confirmation: object
     assert(!(FORWARDED_TOOLS as readonly string[]).includes(name), `forwarded can't reach ${name}`);
   }
 }
-for (const phrase of ["block my calendar on Friday", "book a meeting with Selvaraj", "don't forget to book Selvaraj", "cancel that event", "move that event to 4pm"]) {
+for (const phrase of [
+  "block my calendar on Friday",
+  "book a meeting with Selvaraj",
+  "don't forget to book Selvaraj",
+  "cancel that event",
+  "move that event to 4pm",
+  'Create a 15-minute event on my work calendar tomorrow at 6:00 PM IST. Title it "Aadi Calendar Test". Do not add any attendees or send invitations',
+  "Create an event tomorrow at 6pm without attendees",
+  'Move my "Aadi Calendar Test" event on Saturday from 6:00 PM to 6:30 PM IST. Keep the duration at 15 minutes. Do not add attendees.',
+]) {
   assert(notAnEventCommand(phrase) === undefined, `"${phrase}" is a command`);
 }
-for (const phrase of ["don't book anything with Selvaraj", "should I block my calendar?", "did you create the event?", "remind me to book Selvaraj", "I need to cancel that", "propose a meeting with Selvaraj", "I'll block Friday"]) {
+for (const phrase of ["don't book anything with Selvaraj", "should I block my calendar?", "did you create the event?", "remind me to book Selvaraj", "I need to cancel that", "propose a meeting with Selvaraj", "I'll block Friday", "do not delete the event", "don't invite Priya to the meeting"]) {
   assert(notAnEventCommand(phrase) !== undefined, `"${phrase}" isn't a command`);
 }
 {

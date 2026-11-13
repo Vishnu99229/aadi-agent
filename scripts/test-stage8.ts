@@ -251,6 +251,20 @@ function testPartnerEndClientModel(): void {
       ).id,
     )!,
   );
+  const prospect = JSON.parse(
+    addAccount(
+      { name: `${NAME} QA Demo`, relationship: "partner", stage: "Prospect" },
+      {
+        iteration: 1,
+        calledTools: [],
+        userText:
+          'Add a test sales account called "Aadi QA Demo" with contact qa-prospect@example.com. Set its status to Prospect.',
+      } as never,
+    ),
+  ) as { relationship: string; stage: string; via_partner_id: number | null };
+  assert(prospect.relationship === "end_client", "a sales prospect is an end client, not a partner");
+  assert(prospect.stage === "Prospect", "a sales prospect is stage Prospect");
+  assert(prospect.via_partner_id === null, "a prospect does not require a partner");
   assert(eternal.relationship === "end_client", "eternal is end_client");
   assert(eternal.via_partner_id === partner.id, "eternal linked to pinnacle");
   assert(eternal.people.includes("Ananya Saxena"), "people stored for display");

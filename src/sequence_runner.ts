@@ -45,6 +45,7 @@ import {
   isBounceSender,
   matchesProspect,
   OWN_DOMAIN,
+  prospectDisplay,
   SEQUENCE_STEPS,
 } from "./sequence_logic.js";
 import {
@@ -101,7 +102,7 @@ function displayName(row: { prospect_name: string; prospect_email: string }): st
 
 function listLine(row: SalesSequenceRecord): string {
   const company = row.prospect_company ? `, ${row.prospect_company}` : "";
-  return `${displayName(row)}${company} <${row.prospect_email}>`;
+  return `${prospectDisplay(row.prospect_name, row.prospect_email)}${company}`;
 }
 
 /** "Munil Shah, Talkdesk - US Pacific" */

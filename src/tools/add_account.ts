@@ -1,14 +1,14 @@
 import type { LlmTool } from "../llm.js";
 import { createAccount } from "../db.js";
 import {
+  accountFromOwnerWords,
   findAccountByName,
-  parseRelationship,
   parseStringList,
   parseWaitingOn,
-  type AccountRelationship,
   type WaitingOn,
 } from "../account_logic.js";
 import { decodedAccounts } from "../accounts.js";
+import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -38,7 +38,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         type: "string",
         enum: ["partner", "end_client"],
         description:
-          "partner = Epicode sells to them. end_client = their deal runs through a partner.",
+          "partner = a channel partner. end_client = a customer, including a sales prospect (stage Prospect). A prospect is never a partner. via_partner is only needed when he names the partner.",
       },
       via_partner: {
         type: "string",
@@ -76,7 +76,7 @@ function parseDue(value: unknown): string | null {
   return date.toISOString();
 }
 
-export function handler(input: unknown): string {
+export function handler(input: unknown, turn?: ToolTurn): string {
   const values = input as {
     name?: unknown;
     aliases?: unknown;
@@ -96,17 +96,14 @@ export function handler(input: unknown): string {
     values.waiting_on === undefined || values.waiting_on === ""
       ? "nobody"
       : parseWaitingOn(values.waiting_on);
-  const relationship: AccountRelationship =
-    values.relationship === undefined || values.relationship === ""
-      ? values.via_partner
-        ? "end_client"
-        : "partner"
-      : parseRelationship(values.relationship);
+  const fromWords = accountFromOwnerWords(turn?.userText ?? "", {
+    relationship: values.relationship,
+    stage: values.stage,
+  });
+  const relationship = fromWords.relationship;
+  const stage = fromWords.stage;
   let viaPartnerId: number | null = null;
-  if (relationship === "end_client") {
-    if (typeof values.via_partner !== "string" || !values.via_partner.trim()) {
-      throw new Error("end_client accounts need via_partner (the partner account name).");
-    }
+  if (relationship === "end_client" && typeof values.via_partner === "string" && values.via_partner.trim()) {
     const matches = findAccountByName(
       decodedAccounts(),
       values.via_partner.trim(),
@@ -132,7 +129,7 @@ export function handler(input: unknown): string {
     people: JSON.stringify(parseStringList(values.people)),
     relationship,
     viaPartnerId,
-    stage: typeof values.stage === "string" ? values.stage.trim() : "",
+    stage,
     nextStep: typeof values.next_step === "string" ? values.next_step.trim() : "",
     nextStepDue: parseDue(values.next_step_due),
     waitingOn,

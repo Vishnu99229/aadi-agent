@@ -171,6 +171,53 @@ assert(
   "image vision routes through getFallbackChain(gemini)",
 );
 
+const { runAgent, setToolInterceptorForTests } = await import("../src/agent.ts");
+const { modelReply } = await import("./fakes.ts");
+const executions: string[] = [];
+setToolInterceptorForTests((call) => {
+  const query = (call.input as { query?: unknown }).query;
+  executions.push(typeof query === "string" ? `${call.name}:${query}` : call.name);
+  return `${call.name} done`;
+});
+setNamedBackendCompleteForTests(async (backend, params) => {
+  const toolCount = params.messages.filter((message) => message.role === "tool").length;
+  if (backend === "gemini") {
+    if (toolCount === 0) {
+      return modelReply({ tools: [{ name: "web_search", input: { query: "a2a" } }] });
+    }
+    throw new Error("400 Function call is missing a thought_signature in functionCall parts");
+  }
+  if (backend === "deepseek") {
+    if (toolCount < 2) {
+      return modelReply({
+        tools: [
+          { name: "web_search", input: { query: "a2a" } },
+          { name: "web_search", input: { query: "a2a protocol" } },
+          { name: "add_task", input: { text: "read the notes", tag: "work" } },
+        ],
+      });
+    }
+    return modelReply({ text: "Noted." });
+  }
+  throw new Error(`unexpected backend ${backend}`);
+});
+const fallbackReply = await runAgent("Check A2A.", {
+  saveUserMessage: false,
+  saveAssistantMessage: false,
+  skipHistory: true,
+  backend: "gemini",
+  toolNames: ["web_search", "add_task"],
+  sendConfirmation: { chatId: 1, messageId: 1 },
+  guardText: "Check A2A.",
+});
+assert(
+  executions.join(",") === "web_search:a2a,web_search:a2a protocol,add_task",
+  `identical fallback call skipped, different arguments still ran (${executions.join(",")})`,
+);
+assert(fallbackReply.includes("Noted."), `fallback still answers (${fallbackReply})`);
+setNamedBackendCompleteForTests(undefined);
+setToolInterceptorForTests(undefined);
+
 console.log(
-  `test-llm-fallback: ok chain=${withKeys.join(",")} hopped=${attempted.join(",")}`,
+  `test-llm-fallback: ok chain=${withKeys.join(",")} hopped=${attempted.join(",")} replayed=web_search:a2a kept=web_search:a2a protocol`,
 );

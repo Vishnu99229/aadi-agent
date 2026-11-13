@@ -7,7 +7,7 @@ import {
   heartbeatPath,
   writeHeartbeat,
 } from "./heartbeat.js";
-import { formatVersionLine, readDeployVersion } from "./version.js";
+import { formatVersionLine, readDeployVersion, readLocalGitHash } from "./version.js";
 import { formatTurnsHealthLine } from "./turns.js";
 import { formatCreditHealthLine } from "./llm_fallback.js";
 
@@ -51,6 +51,7 @@ export const HEALTH_JOBS = [
   "job-queue",
   "message-embed",
   "mwf-audit",
+  "agent-recovery",
 ] as const;
 
 /**
@@ -559,7 +560,7 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
   const runs = new Map(listJobRuns().map((row) => [row.name, row]));
   const lines = [
     "Aadi health",
-    formatVersionLine(readDeployVersion(cwd)),
+    formatVersionLine(readDeployVersion(cwd), readLocalGitHash(cwd)),
     formatTurnsHealthLine(now),
     formatCreditHealthLine(now.getTime()),
   ];

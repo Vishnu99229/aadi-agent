@@ -377,7 +377,7 @@ export const FOLLOW_UP_ON_EMAIL: readonly RegExp[] = [
 /** "follow up with Abhishek", "follow up Abhishek 4 times". Not "follow up with me". */
 const NOT_A_FOLLOW_PERSON = "me|us|myself|with|on|the|my|a|an|to|for|about|tomorrow|today|this|that";
 const FOLLOW_UP_WITH_PERSON = new RegExp(
-  `\\bfollow[\\s-]*up(?!s)\\s+(?:with\\s+(?!(?:${NOT_A_FOLLOW_PERSON})\\b)|(?!(?:${NOT_A_FOLLOW_PERSON})\\b))\\p{L}`,
+  `\\bfollow[\\s-]*up(?!s)\\s+(?:with\\s+(?!(?:${NOT_A_FOLLOW_PERSON}|sequences?)\\b)|(?!(?:${NOT_A_FOLLOW_PERSON}|sequences?)\\b))\\p{L}`,
   "iu",
 );
 
@@ -386,14 +386,33 @@ const ADD_TO_SEQUENCE =
   /\badd\s+(?!(?:me|us|myself)\b).{1,80}?\bto\s+(?:the\s+|a\s+|my\s+)?sequences?\b/i;
 
 /** Only these clear phrases may reach a Start card from chat. */
+const PROPOSE_SEQUENCE =
+  /\b(?:propose|offer|show|prepare)\b[^.?!\n]{0,50}\bfollow[\s-]*up\s+sequences?\b/i;
+
 export function isExplicitSequenceRequest(text: string): boolean {
   return (
     /\bstart\b(?:\s+\S+){0,4}?\s+sequences?\b/i.test(text) ||
     /\bauto[\s-]*follow[\s-]*up\b/i.test(text) ||
+    PROPOSE_SEQUENCE.test(text) ||
     FOLLOW_UP_ON_EMAIL.some((pattern) => pattern.test(text)) ||
     FOLLOW_UP_WITH_PERSON.test(text) ||
     ADD_TO_SEQUENCE.test(text)
   );
+}
+
+/** A Start card needs the sent message it would follow up. An account alone is not enough. */
+export function hasOriginalOutreach(originalMessageId: string | null | undefined): boolean {
+  return Boolean(originalMessageId && originalMessageId.trim());
+}
+
+/** How a prospect is shown in Telegram. Parentheses, so the address is not eaten as markup. */
+export function prospectDisplay(name: string, email: string): string {
+  const who = name.trim();
+  const address = email.trim();
+  if (!address) {
+    return who;
+  }
+  return who ? `${who} (${address})` : address;
 }
 
 export function companyFromDomain(
@@ -414,7 +433,7 @@ export function pitchCardText(input: {
   subject: string;
   manualFollowups?: number;
 }): string {
-  const who = input.name.trim() || input.email;
+  const who = prospectDisplay(input.name, input.email);
   const label = input.company ? `${who}, ${input.company}` : who;
   const lead = `Looks like a sales pitch to ${label} ('${input.subject}').`;
   const manual = input.manualFollowups ?? 0;

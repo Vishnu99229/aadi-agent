@@ -455,7 +455,156 @@ function readCostRates(
   };
 }
 
+export type AgentRouting = "off" | "fast" | "full";
+
+/**
+ * How much of a chat turn goes to the specialist agents:
+ * off  = Aadi's own loop handles every turn (tools still run through their owners);
+ * fast = plus direct answers that need no model call;
+ * full = plus single-domain turns to that specialist, and delegated workflows.
+ */
+function readAgentRouting(): AgentRouting {
+  const raw = process.env.AGENT_ROUTING?.trim().toLowerCase();
+  return raw === "off" || raw === "fast" ? raw : "full";
+}
+
+export type GoalTier = "light" | "standard" | "deep";
+export const GOAL_TIERS: readonly GoalTier[] = ["light", "standard", "deep"];
+const GOAL_BACKENDS = ["claude", "haiku", "gemini", "deepseek"] as const;
+export type GoalBackend = (typeof GOAL_BACKENDS)[number];
+
+export interface GoalDelegationConfig {
+  /** Off: delegate_tasks still runs named capabilities, but no specialist gets a goal loop. */
+  enabled: boolean;
+  /** Model per complexity tier. A tier left out uses the chat model choice. */
+  tierBackends: Partial<Record<GoalTier, GoalBackend>>;
+  /** Optional model per agent, ahead of the tier. */
+  agentBackends: Record<string, GoalBackend>;
+  /** Goal loops of one workflow running at the same time. */
+  maxConcurrent: number;
+  /** Deepest task depth a goal may run at. Aadi's own plan is depth 1. */
+  maxDepth: number;
+  /** Model calls one goal loop may make. */
+  maxIterations: number;
+  /** Model calls across every goal loop of one workflow. */
+  maxModelCalls: number;
+  /** Wall-clock limit for one workflow's goals, from when it was planned. */
+  workflowTimeoutMs: number;
+  /** Ordinary cap for one workflow. */
+  workflowBudgetUsd: number;
+  /** Ordinary cap for one goal loop. */
+  goalBudgetUsd: number;
+  /** Cap when Vishnu's own words ask for a large job. */
+  largeWorkflowBudgetUsd: number;
+  largeGoalBudgetUsd: number;
+}
+
+/** "light=gemini,deep=claude" → { light: "gemini", deep: "claude" }. */
+function readBackendMap(name: string, keyPattern: RegExp): Record<string, GoalBackend> {
+  const out: Record<string, GoalBackend> = {};
+  for (const entry of (process.env[name] ?? "").split(",")) {
+    const [rawKey, rawValue] = entry.split("=").map((part) => part?.trim().toLowerCase() ?? "");
+    if (!rawKey && !rawValue) {
+      continue;
+    }
+    if (!rawKey || !keyPattern.test(rawKey) || !(GOAL_BACKENDS as readonly string[]).includes(rawValue ?? "")) {
+      throw new Error(`${name}: "${entry.trim()}" must be key=${GOAL_BACKENDS.join("|")}.`);
+    }
+    out[rawKey] = rawValue as GoalBackend;
+  }
+  return out;
+}
+
+function readPositive(name: string, fallback: number, options: { integer?: boolean; max?: number } = {}): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0 || (options.integer && !Number.isInteger(value))) {
+    throw new Error(`${name} must be a positive ${options.integer ? "whole number" : "number"}.`);
+  }
+  return options.max !== undefined ? Math.min(value, options.max) : value;
+}
+
+function readGoalDelegation(): GoalDelegationConfig {
+  return {
+    enabled: parseBool(process.env.AGENT_GOAL_DELEGATION, false),
+    tierBackends: readBackendMap("AGENT_GOAL_BACKENDS", /^(light|standard|deep)$/),
+    agentBackends: readBackendMap("AGENT_GOAL_AGENT_BACKENDS", /^[a-z][a-z0-9_-]{0,30}$/),
+    maxConcurrent: readPositive("AGENT_GOAL_MAX_CONCURRENT", 2, { integer: true, max: 3 }),
+    maxDepth: readPositive("AGENT_GOAL_MAX_DEPTH", 1, { integer: true, max: 2 }),
+    maxIterations: readPositive("AGENT_GOAL_MAX_ITERATIONS", 6, { integer: true, max: 10 }),
+    maxModelCalls: readPositive("AGENT_GOAL_MAX_MODEL_CALLS", 16, { integer: true, max: 60 }),
+    workflowTimeoutMs: readPositive("AGENT_GOAL_TIMEOUT_SECONDS", 240, { max: 900 }) * 1000,
+    workflowBudgetUsd: readPositive("AGENT_GOAL_WORKFLOW_BUDGET_USD", 0.05, { max: 5 }),
+    goalBudgetUsd: readPositive("AGENT_GOAL_BUDGET_USD", 0.02, { max: 5 }),
+    largeWorkflowBudgetUsd: readPositive("AGENT_GOAL_LARGE_WORKFLOW_BUDGET_USD", 0.5, { max: 5 }),
+    largeGoalBudgetUsd: readPositive("AGENT_GOAL_LARGE_GOAL_BUDGET_USD", 0.2, { max: 5 }),
+  };
+}
+
+export interface RemoteAgentConfig {
+  id: string;
+  url: string;
+  /** Read from A2A_REMOTE_<ID>_TOKEN. Never logged. */
+  token: string;
+}
+
+/**
+ * A2A_REMOTE_AGENTS is a comma-separated allowlist of "id=url". Only these
+ * endpoints are ever contacted, and only over loopback or https.
+ */
+function readRemoteAgents(): RemoteAgentConfig[] {
+  const out: RemoteAgentConfig[] = [];
+  for (const entry of (process.env.A2A_REMOTE_AGENTS ?? "").split(",")) {
+    const [rawId, ...rest] = entry.trim().split("=");
+    const id = rawId?.trim().toLowerCase() ?? "";
+    const url = rest.join("=").trim();
+    if (!id || !url) {
+      continue;
+    }
+    if (!/^[a-z][a-z0-9_-]{0,30}$/.test(id)) {
+      throw new Error(`A2A_REMOTE_AGENTS: "${id}" is not a valid agent id.`);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`A2A_REMOTE_AGENTS: the URL for "${id}" is not valid.`);
+    }
+    const loopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]";
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+      throw new Error(`A2A_REMOTE_AGENTS: "${id}" must use https, or http on loopback.`);
+    }
+    const token = process.env[`A2A_REMOTE_${id.toUpperCase().replace(/-/g, "_")}_TOKEN`]?.trim() ?? "";
+    out.push({ id, url: url.replace(/\/+$/, ""), token });
+  }
+  return out;
+}
+
+function readA2aPort(): number {
+  const port = Number(process.env.A2A_SERVER_PORT ?? "41241");
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error("A2A_SERVER_PORT must be a port number between 1024 and 65535.");
+  }
+  return port;
+}
+
+const a2aServerToken = process.env.A2A_SERVER_TOKEN?.trim() ?? "";
+const a2aServerEnabled = parseBool(process.env.A2A_SERVER_ENABLED, false);
+if (a2aServerEnabled && a2aServerToken.length < 24) {
+  throw new Error("A2A_SERVER_ENABLED needs A2A_SERVER_TOKEN set to at least 24 characters.");
+}
+
 export const config = {
+  agentRouting: readAgentRouting(),
+  goalDelegation: readGoalDelegation(),
+  /** The A2A endpoint is off unless switched on, and only ever listens on loopback. */
+  a2aServerEnabled,
+  a2aServerPort: readA2aPort(),
+  a2aServerToken,
+  a2aRemoteAgents: readRemoteAgents(),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN!,
   ownerTelegramId,
   googleSheetId,

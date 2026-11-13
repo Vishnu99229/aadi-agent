@@ -45,6 +45,12 @@ export interface ToolCall {
   name: string;
   input: unknown;
   execution: "client" | "provider";
+  /**
+   * Gemini's encrypted reasoning state for this function call. Google requires
+   * it back, unchanged, on the next request of the same turn
+   * (extra_content.google.thought_signature). Opaque: never logged.
+   */
+  thoughtSignature?: string;
 }
 
 export interface ToolInputSchema extends Record<string, unknown> {
@@ -168,6 +174,8 @@ export interface CompleteResult {
   toolCalls: ToolCall[];
   usage: LlmUsage;
   stopReason: LlmStopReason;
+  /** The backend that answered, which differs from the one asked after a fallback. */
+  servedBy?: LlmBackend;
 }
 
 const anthropic = config.anthropicApiKey
@@ -673,9 +681,18 @@ function toOpenAiUserContent(
   });
 }
 
+/** Gemini's OpenAI-compatible tool call carries the signature here. See thought-signatures. */
+export function readGeminiThoughtSignature(toolCall: unknown): string | undefined {
+  const google = (toolCall as { extra_content?: { google?: { thought_signature?: unknown } } } | null)
+    ?.extra_content?.google;
+  const signature = google?.thought_signature;
+  return typeof signature === "string" && signature.length > 0 ? signature : undefined;
+}
+
 export function toOpenRouterMessages(
   system: LlmSystemPrompt,
   messages: LlmMessage[],
+  options: { preserveThoughtSignatures?: boolean } = {},
 ): ChatCompletionMessageParam[] {
   return [
     { role: "system", content: system.cacheable },
@@ -704,12 +721,17 @@ export function toOpenRouterMessages(
       };
       if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) {
         assistant.tool_calls = message.toolCalls.map((toolCall) => ({
-          type: "function",
+          type: "function" as const,
           id: toolCall.id,
           function: {
             name: toolCall.name,
             arguments: JSON.stringify(toolCall.input),
           },
+          // Only Gemini validates this, and only the signature it issued. Other
+          // providers must not be sent a vendor field they didn't ask for.
+          ...(options.preserveThoughtSignatures && toolCall.thoughtSignature
+            ? { extra_content: { google: { thought_signature: toolCall.thoughtSignature } } }
+            : {}),
         }));
       }
       return assistant;
@@ -765,6 +787,30 @@ function parseToolInput(argumentsText: string): unknown {
   }
 }
 
+function geminiToolCalls(message: {
+  content?: string | null;
+  tool_calls?: unknown[] | null;
+  extra_content?: { google?: { thought_signature?: unknown } };
+}): ToolCall[] {
+  const calls = (message.tool_calls ?? []).filter(
+    (toolCall): toolCall is { id?: string; type?: string; function?: { name?: string; arguments?: string } } =>
+      (toolCall as { type?: string }).type === "function",
+  );
+  const messageSignature = readGeminiThoughtSignature(message);
+  return calls.map((toolCall, index) => {
+    const own = readGeminiThoughtSignature(toolCall);
+    // Parallel calls carry the signature on the first function call only.
+    const thoughtSignature = own ?? (index === 0 ? messageSignature : undefined);
+    return {
+      id: toolCall.id ?? `call-${index}`,
+      name: toolCall.function?.name ?? "",
+      input: parseToolInput(toolCall.function?.arguments ?? ""),
+      execution: "client" as const,
+      ...(thoughtSignature ? { thoughtSignature } : {}),
+    };
+  });
+}
+
 function openAiStopReason(reason: string | null): LlmStopReason {
   switch (reason) {
     case "stop":
@@ -802,7 +848,9 @@ async function completeWithOpenAiCompatible(
   const response = await client.chat.completions.create(
     {
       model,
-      messages: toOpenRouterMessages(system, params.messages),
+      messages: toOpenRouterMessages(system, params.messages, {
+        preserveThoughtSignatures: label === "gemini",
+      }),
       ...(tools.length > 0 ? { tools } : {}),
       ...(forced ? { tool_choice: forced } : {}),
       max_tokens: params.maxTokens ?? MAX_TOKENS,
@@ -849,15 +897,7 @@ async function completeWithOpenAiCompatible(
 
   return {
     textParts: choice.message.content ? [choice.message.content] : [],
-    toolCalls:
-      choice.message.tool_calls
-        ?.filter((toolCall) => toolCall.type === "function")
-        .map((toolCall) => ({
-          id: toolCall.id,
-          name: toolCall.function.name,
-          input: parseToolInput(toolCall.function.arguments),
-          execution: "client" as const,
-        })) ?? [],
+    toolCalls: geminiToolCalls(choice.message),
     usage,
     stopReason: openAiStopReason(choice.finish_reason),
   };
@@ -1003,7 +1043,7 @@ export async function complete(
       if (failures.length > 0) {
         console.error(`LLM: using ${backend}.`);
       }
-      return result;
+      return { ...result, servedBy: backend };
     } catch (error) {
       const reason = shortBackendReason(error);
       console.error(`Backend ${backend} failed (${reason}); trying next.`);

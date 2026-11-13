@@ -11,6 +11,8 @@ import {
   stripSignature,
 } from "../src/google/mail.ts";
 import { encodeMimeHeader } from "../src/google/mime.ts";
+import { DRAFT_CARD_ONLY, isDraftCardOnly, shortenDraftReply } from "../src/draft_confirm.ts";
+import { unreceiptedClaims } from "../src/receipt.ts";
 import { fakeGmail, TEST_SIGNATURE_HTML, type GmailLog } from "./fakes.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -125,4 +127,26 @@ const workAccount = {
 }
 
 setGmailClientForTests(undefined);
+
+{
+  const body = "Testing the Email Agent's drafting functionality. This sentence is long enough to count as the draft body itself.";
+  const repeated = `Draft ready for review.\n\nTo: Qa Draft <qa-draft@example.com>\nSubject: Aadi Draft Test\n\n${body}`;
+  const short = shortenDraftReply(repeated, [body]);
+  assert(isDraftCardOnly(short), "a reply that only repeats the draft is not sent again");
+  assert(short === DRAFT_CARD_ONLY, "the card is the only Telegram message");
+  assert(shortenDraftReply("Draft ready.", [body]) === "Draft ready.", "a short reply that does not quote the body is left alone");
+  assert(shortenDraftReply(repeated, [body, "A different draft body that is also longer than forty characters."]).includes(body), "two different drafts are not rewritten");
+  const review = `Account review: stage Prospect.\n\n${body}`;
+  const kept = shortenDraftReply(review, [body]);
+  assert(kept.startsWith("Account review") && !kept.includes(body.slice(0, 40)), "other findings stay; the draft body does not");
+  assert(
+    unreceiptedClaims("Draft ready for approval. Waiting for your Send tap.", []).includes("offered"),
+    "a draft card is not claimed without a tool",
+  );
+  assert(
+    unreceiptedClaims("Draft ready for approval.", [{ name: "draft_new_email", success: true }]).length === 0,
+    "a successful draft tool covers the card claim",
+  );
+}
+
 console.log("Email format checks passed.");

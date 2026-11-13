@@ -1,5 +1,20 @@
 import { Bot, InlineKeyboard, Keyboard, type Api, type Context } from "grammy";
+import { isDraftCardOnly } from "./draft_confirm.js";
 import { runAgent } from "./agent.js";
+import { issueGrant, revokeGrant } from "./agents/auth.js";
+import { listWorkflows } from "./agents/store.js";
+import type { CardButton } from "./agents/helpers.js";
+import {
+  answerContactQuestion,
+  contactQuestionAsked,
+  contactQuestionMark,
+  dropContactQuestion,
+  hasOpenContactQuestion,
+  pickContactOption,
+  type ContactAnswer,
+} from "./contact_questions.js";
+import { runCapability, runOwnerTurn, tryDirectAnswer } from "./agents/orchestrator.js";
+import { parseSettingPhrase } from "./settings_logic.js";
 import { handleCommandSendCallback } from "./command_email.js";
 import { looksLikeCommandTurn } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
@@ -60,6 +75,7 @@ import { handlePromiseDuplicateCallback } from "./promises.js";
 import { handleModelCallback, sendModelPanel } from "./model_panel.js";
 import {
   consumeBuildFollowup,
+  formatRecentBuilds,
   handleBuildCallback,
   handleBuildVoice,
   notSetupMessage,
@@ -88,9 +104,9 @@ import {
 import { deliverWrapUp, handleNoteCallback } from "./notes.js";
 import { START_GREETING } from "./start_greeting.js";
 import {
+  drainJobSteps,
   handleJobChatCommand,
   jobsListText,
-  processNextJobStep,
   tryStartBigJob,
 } from "./job_worker.js";
 import { isWrapUpText, stripWrapUpPrefix } from "./wrapup_triggers.js";
@@ -109,10 +125,7 @@ import {
   markMeetingWrapped,
   sendNextMeetingBrief,
 } from "./meetings.js";
-import {
-  formatAccountsList,
-  handleAccountUpdateCallback,
-} from "./accounts.js";
+import { handleAccountUpdateCallback } from "./accounts.js";
 import { sendDatabaseBackup } from "./backup.js";
 import { handleAttachmentAlertCallback } from "./attachment_alerts.js";
 import { formatHealthReport } from "./scheduler.js";
@@ -256,6 +269,8 @@ async function completeChatReply(
     voiceReply?: boolean;
     /** Language detection source (usually the voice transcript). */
     voiceSourceText?: string;
+    /** Buttons for a typed reply, read once the work is done. */
+    replyButtons?: () => CardButton[][];
   } = {},
 ): Promise<void> {
   const forwarded = options.forwarded === true;
@@ -291,6 +306,9 @@ async function completeChatReply(
       return;
     }
     closeTurn(gate, "ok", startedAt);
+    if (isDraftCardOnly(settled.reply)) {
+      return;
+    }
     if (options.voiceReply && ctx.chat) {
       const chatId = ctx.chat.id;
       const cards = held?.close() ?? [];
@@ -312,7 +330,12 @@ async function completeChatReply(
         await postUnpostedCards(ctx, cards);
       }
     } else {
-      await sendPlainText(ctx, settled.reply);
+      const rows = options.replyButtons?.() ?? [];
+      if (rows.length > 0) {
+        await replyWithButtons(ctx, settled.reply, rows);
+      } else {
+        await sendPlainText(ctx, settled.reply);
+      }
     }
   } finally {
     // Failed, timed out or empty: any card the turn made still gets shown. One made
@@ -408,6 +431,9 @@ function menuKeyboard(): InlineKeyboard {
     .text("Morning brief", "menu:brief")
     .row()
     .text("Sequences", "menu:sequences")
+    .row()
+    .text("Outbox", "menu:outbox")
+    .text("Settings", "menu:settings")
     .row()
     .text("Upcoming bills", "menu:bills")
     .row()
@@ -506,6 +532,115 @@ async function setReplyKeyboard(ctx: Context, on: boolean): Promise<void> {
   });
 }
 
+function keyboardFrom(rows: CardButton[][]): InlineKeyboard | undefined {
+  if (rows.length === 0) {
+    return undefined;
+  }
+  const keyboard = new InlineKeyboard();
+  for (const row of rows) {
+    for (const button of row) {
+      keyboard.text(button.text, button.data);
+    }
+    keyboard.row();
+  }
+  return keyboard;
+}
+
+/** A card an agent produced: its text, with its buttons when it has any. */
+async function replyWithButtons(ctx: Context, text: string, rows: CardButton[][]): Promise<void> {
+  const keyboard = keyboardFrom(rows);
+  const chunks = splitForTelegram(text);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const last = index === chunks.length - 1;
+    await ctx.reply(chunks[index]!, last && keyboard ? { reply_markup: keyboard } : {});
+  }
+}
+
+/** A slash command carried out by the agent that owns it. */
+async function replyFromAgent(
+  ctx: Context,
+  agentId: string,
+  capability: string,
+  input: Record<string, unknown> = {},
+): Promise<void> {
+  const answer = await whileTyping(ctx, () =>
+    runCapability({ agentId, capability, input, origin: "command", chatId: ctx.chat?.id }),
+  );
+  await replyWithButtons(ctx, answer.text, answer.buttons);
+}
+
+function settingsKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Model setup", "settings:model")
+    .row()
+    .text(`Voice replies: ${voiceRepliesEnabled() ? "on" : "off"}`, "settings:voice")
+    .row()
+    .text(`Keyboard: ${replyKeyboardOn() ? "shown" : "hidden"}`, "settings:keyboard");
+}
+
+function settingsCaption(): string {
+  return `Settings\n${menuCaption()}\nVoice replies after your voice notes: ${voiceRepliesEnabled() ? "on" : "off"}.\nQuick-action keyboard: ${replyKeyboardOn() ? "shown" : "hidden"}.`;
+}
+
+async function sendSettingsPanel(ctx: Context): Promise<void> {
+  await ctx.reply(settingsCaption(), { reply_markup: settingsKeyboard() });
+}
+
+async function setVoiceReplies(ctx: Context, on: boolean): Promise<void> {
+  setVoiceRepliesEnabled(on);
+  await ctx.reply(
+    on ? "Voice replies on. I'll speak after your voice notes." : "Voice replies off. Text only after voice notes.",
+  );
+}
+
+/** Big jobs, code builds and delegated agent work, in one list. */
+function unifiedJobsText(): string {
+  const workflows = listWorkflows({ origins: ["delegate", "a2a"], limit: 8 });
+  const agentLines =
+    workflows.length === 0
+      ? "None"
+      : workflows.map((row) => `${row.state} — ${row.title.replace(/\s+/g, " ").slice(0, 70)}`).join("\n");
+  return [
+    "Big jobs",
+    jobsListText(),
+    "",
+    "Code builds",
+    isBuildConfigured(config.cursorApiKey, config.githubToken) ? formatRecentBuilds() : "Build isn't set up.",
+    "",
+    "Agent workflows",
+    agentLines,
+  ].join("\n");
+}
+
+async function sendNextMeeting(ctx: Context): Promise<void> {
+  try {
+    const text = await whileTyping(ctx, () => sendNextMeetingBrief(ctx.api));
+    await sendPlainText(ctx, text);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Next meeting brief failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
+}
+
+async function sendWrapUp(ctx: Context, text: string, usage: string): Promise<void> {
+  if (!text) {
+    await ctx.reply(usage);
+    return;
+  }
+  try {
+    await whileTyping(ctx, () => deliverWrapUp(ctx, text));
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Wrap-up failed (${errorType}).`);
+    await ctx.reply(`Something broke: ${shortError(error)}`);
+  }
+}
+
+function commandArgument(ctx: Context, command: string): string {
+  return (ctx.message?.text ?? "").replace(new RegExp(`^/${command}(?:@\\w+)?\\s*`, "i"), "").trim();
+}
+
 bot.command("start", async (ctx) => {
   await ctx.reply(START_GREETING);
 });
@@ -537,6 +672,7 @@ bot.command("menu", async (ctx) => {
   await sendMenu(ctx);
 });
 
+// Older name for /settings model. Kept working, no longer in the menu.
 bot.command("model", async (ctx) => {
   await sendModelPanel(ctx);
 });
@@ -552,6 +688,7 @@ bot.command("build", async (ctx) => {
   }
 });
 
+// Older name for the builds part of /jobs. Kept working, no longer in the menu.
 bot.command("builds", async (ctx) => {
   if (!isBuildConfigured(config.cursorApiKey, config.githubToken)) {
     await ctx.reply(notSetupMessage());
@@ -564,30 +701,76 @@ bot.command("showkeyboard", async (ctx) => {
   await setReplyKeyboard(ctx, true);
 });
 
+// Older name for /settings voice. Kept working, no longer in the menu.
 bot.command("voice", async (ctx) => {
-  const arg = (ctx.message?.text ?? "")
-    .replace(/^\/voice(?:@\w+)?\s*/i, "")
-    .trim()
-    .toLowerCase();
-  if (arg === "on") {
-    setVoiceRepliesEnabled(true);
-    await ctx.reply("Voice replies on. I'll speak after your voice notes.");
-    return;
-  }
-  if (arg === "off") {
-    setVoiceRepliesEnabled(false);
-    await ctx.reply("Voice replies off. Text only after voice notes.");
+  const arg = commandArgument(ctx, "voice").toLowerCase();
+  if (arg === "on" || arg === "off") {
+    await setVoiceReplies(ctx, arg === "on");
     return;
   }
   await ctx.reply(
-    `Voice replies are ${voiceRepliesEnabled() ? "on" : "off"}. Use /voice on or /voice off.`,
+    `Voice replies are ${voiceRepliesEnabled() ? "on" : "off"}. Use /settings voice on or /settings voice off.`,
   );
+});
+
+/** Model choice, voice replies and the quick-action keyboard, in one place. */
+bot.command("settings", async (ctx) => {
+  const [topic, value] = commandArgument(ctx, "settings").toLowerCase().split(/\s+/);
+  if (topic === "model") {
+    await sendModelPanel(ctx);
+    return;
+  }
+  if (topic === "voice" && (value === "on" || value === "off")) {
+    await setVoiceReplies(ctx, value === "on");
+    return;
+  }
+  if (topic === "keyboard" && (value === "on" || value === "off" || value === "show" || value === "hide")) {
+    await setReplyKeyboard(ctx, value === "on" || value === "show");
+    return;
+  }
+  await sendSettingsPanel(ctx);
+});
+
+bot.callbackQuery(/^settings:(model|voice|keyboard)$/, async (ctx) => {
+  const action = ctx.match[1];
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  if (action === "model") {
+    await sendModelPanel(ctx);
+    return;
+  }
+  if (action === "voice") {
+    await setVoiceReplies(ctx, !voiceRepliesEnabled());
+  } else {
+    await setReplyKeyboard(ctx, !replyKeyboardOn());
+  }
+  try {
+    await ctx.editMessageText(settingsCaption(), { reply_markup: settingsKeyboard() });
+  } catch {
+    // The panel may already match; the change still applied.
+  }
+});
+
+/**
+ * Everything due to go out without another tap: scheduled emails and follow-up
+ * sequences. With a name after it, offers a follow-up sequence for that person.
+ */
+bot.command("outbox", async (ctx) => {
+  if (!allowInboundCommands(ctx.message)) {
+    await ctx.reply("A forwarded message can't do that.");
+    return;
+  }
+  if (commandArgument(ctx, "outbox")) {
+    await whileTyping(ctx, () => handleSequenceCommand(ctx));
+    return;
+  }
+  await replyFromAgent(ctx, "email", "outbox");
 });
 
 bot.command("hidekeyboard", async (ctx) => {
   await setReplyKeyboard(ctx, false);
 });
 
+// Older names for /outbox. Kept working, no longer in the menu.
 bot.command("sequence", async (ctx) => {
   await whileTyping(ctx, () => handleSequenceCommand(ctx));
 });
@@ -600,16 +783,42 @@ bot.command("sequences", async (ctx) => {
   await handleSequencesCommand(ctx);
 });
 
+/** Big jobs, code builds and delegated agent work. */
 bot.command("jobs", async (ctx) => {
-  await ctx.reply(jobsListText());
+  await sendPlainText(ctx, unifiedJobsText());
 });
 
 bot.command("health", async (ctx) => {
   await sendPlainText(ctx, formatHealthReport());
 });
 
+/**
+ * Meetings in one place: the auto-handled threads, "/meetings next" for the next
+ * meeting's brief, and "/meetings wrapup <notes>" to file notes after a call.
+ */
 bot.command("meetings", async (ctx) => {
-  await sendPlainText(ctx, formatMeetingsReport());
+  const argument = commandArgument(ctx, "meetings");
+  if (/^next\b/i.test(argument)) {
+    await sendNextMeeting(ctx);
+    return;
+  }
+  const wrapUp = /^wrap\s*-?\s*up\b\s*([\s\S]*)$/i.exec(argument);
+  if (wrapUp) {
+    await sendWrapUp(
+      ctx,
+      wrapUp[1]!.trim(),
+      "Send notes after /meetings wrapup, for example: /meetings wrapup discussed pricing with Acme.",
+    );
+    return;
+  }
+  await ctx.reply(formatMeetingsReport().slice(0, 3900), {
+    reply_markup: new InlineKeyboard().text("Next meeting brief", "meetings:next"),
+  });
+});
+
+bot.callbackQuery("meetings:next", async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  await sendNextMeeting(ctx);
 });
 
 bot.command("cost", async (ctx) => {
@@ -617,7 +826,7 @@ bot.command("cost", async (ctx) => {
 });
 
 bot.command("accounts", async (ctx) => {
-  await sendPlainText(ctx, formatAccountsList());
+  await replyFromAgent(ctx, "sales", "pipeline");
 });
 
 bot.command("backup", async (ctx) => {
@@ -637,32 +846,17 @@ bot.command("backup", async (ctx) => {
   }
 });
 
+// Older names for /meetings next and /meetings wrapup. Kept working, no longer in the menu.
 bot.command("next", async (ctx) => {
-  try {
-    const text = await whileTyping(ctx, () => sendNextMeetingBrief(ctx.api));
-    await sendPlainText(ctx, text);
-  } catch (error) {
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Next meeting brief failed (${errorType}).`);
-    await ctx.reply(`Something broke: ${shortError(error)}`);
-  }
+  await sendNextMeeting(ctx);
 });
 
 bot.command("wrapup", async (ctx) => {
-  const text = (ctx.message?.text ?? "")
-    .replace(/^\/wrapup(?:@\w+)?\s*/i, "")
-    .trim();
-  if (!text) {
-    await ctx.reply("Send notes after /wrapup, for example: /wrapup discussed pricing with Acme.");
-    return;
-  }
-  try {
-    await whileTyping(ctx, () => deliverWrapUp(ctx, text));
-  } catch (error) {
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Wrap-up failed (${errorType}).`);
-    await ctx.reply(`Something broke: ${shortError(error)}`);
-  }
+  await sendWrapUp(
+    ctx,
+    commandArgument(ctx, "wrapup"),
+    "Send notes after /wrapup, for example: /wrapup discussed pricing with Acme.",
+  );
 });
 
 bot.callbackQuery(/^retry:(\d+)$/, async (ctx) => {
@@ -679,6 +873,33 @@ bot.callbackQuery(/^retry:(\d+)$/, async (ctx) => {
     return;
   }
   await handleUserText(ctx, ctx.from.id, retryText);
+});
+
+/** Carries out the request Vishnu made before he was asked "which one?". */
+async function continueAfterContactAnswer(
+  ctx: Context,
+  userId: number,
+  answer: Exclude<ContactAnswer, { kind: "none" }>,
+  options: { voiceReply?: boolean } = {},
+): Promise<void> {
+  if (answer.kind === "reply") {
+    await replyWithButtons(ctx, answer.text, answer.buttons);
+    return;
+  }
+  await handleUserText(ctx, userId, answer.request, { ...options, contactNote: answer.note });
+}
+
+// A tap chooses who is looked up. It is not Vishnu's typed turn, so the re-run
+// reads and drafts freely but anything that sends still needs its own approval.
+bot.callbackQuery(/^contact:(pick|drop):(\d+)(?::(\d+))?$/, async (ctx) => {
+  await ctx.answerCallbackQuery().catch(() => undefined);
+  await ctx.editMessageReplyMarkup().catch(() => undefined);
+  const id = Number(ctx.match[2]);
+  const answer =
+    ctx.match[1] === "pick" ? pickContactOption(id, Number(ctx.match[3] ?? -1)) : dropContactQuestion(id);
+  if (answer.kind !== "none") {
+    await continueAfterContactAnswer(ctx, ctx.from.id, answer);
+  }
 });
 
 bot.callbackQuery(/^meet:/, async (ctx) => {
@@ -821,7 +1042,7 @@ bot.callbackQuery(/^build:/, async (ctx) => {
   }
 });
 
-bot.callbackQuery(/^menu:(model|brief|sequences|bills|tasks|keyboard)$/, async (ctx) => {
+bot.callbackQuery(/^menu:(model|brief|sequences|outbox|settings|bills|tasks|keyboard)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCallbackQuery();
   if (action === "keyboard") {
@@ -845,6 +1066,14 @@ bot.callbackQuery(/^menu:(model|brief|sequences|bills|tasks|keyboard)$/, async (
     }
     if (action === "sequences") {
       await sendSequencesPanel(ctx);
+      return;
+    }
+    if (action === "outbox") {
+      await replyFromAgent(ctx, "email", "outbox");
+      return;
+    }
+    if (action === "settings") {
+      await sendSettingsPanel(ctx);
       return;
     }
     if (action === "bills") {
@@ -951,17 +1180,34 @@ async function handleUserText(
   ctx: Context,
   userId: number,
   userText: string,
-  options: { forwarded?: boolean; voiceReply?: boolean } = {},
+  options: { forwarded?: boolean; voiceReply?: boolean; contactNote?: string } = {},
 ): Promise<void> {
   if (await tryGratitudeReaction(ctx, userText)) {
     return;
+  }
+
+  // His own reply to "which Hardik?" picks the person and re-runs what he asked
+  // for, so he doesn't have to say it again. A forward can't answer it.
+  if (
+    ctx.chat &&
+    options.contactNote === undefined &&
+    options.forwarded !== true &&
+    !isForwardedMessage(ctx.message) &&
+    hasOpenContactQuestion(ctx.chat.id)
+  ) {
+    const chatId = ctx.chat.id;
+    const answer = await whileTyping(ctx, () => answerContactQuestion(chatId, userText));
+    if (answer.kind !== "none") {
+      await continueAfterContactAnswer(ctx, userId, answer, { voiceReply: options.voiceReply });
+      return;
+    }
   }
 
   const jobCommand = handleJobChatCommand(userText);
   if (jobCommand) {
     await ctx.reply(jobCommand);
     if (/^Continuing /i.test(jobCommand)) {
-      void processNextJobStep();
+      void drainJobSteps().catch(() => undefined);
     }
     return;
   }
@@ -1038,6 +1284,18 @@ Call update_draft exactly once with the draft ID above and the complete revised 
     await replyInKind(ctx, result.message, spoken, userText);
     return;
   }
+  // A setting said in plain words ("turn voice replies off") is Aadi's own to change.
+  const setting = confirmation ? parseSettingPhrase(userText) : undefined;
+  if (setting) {
+    if (setting.kind === "voice") {
+      await setVoiceReplies(ctx, setting.on);
+    } else if (setting.kind === "keyboard") {
+      await setReplyKeyboard(ctx, setting.on);
+    } else {
+      await sendSettingsPanel(ctx);
+    }
+    return;
+  }
   // If the last thing Aadi showed was a forget-memory list and Vishnu
   // replied with an unambiguous batch answer like "both" or "1 and 2",
   // delete those memories directly. Prevents the agent loop from
@@ -1081,6 +1339,8 @@ Call update_draft exactly once with the draft ID above and the complete revised 
         }),
       );
       if (started) {
+        // Keep going with the next steps now, rather than at the next minute tick.
+        void drainJobSteps().catch(() => undefined);
         return;
       }
     } catch (error) {
@@ -1104,12 +1364,39 @@ Call update_draft exactly once with the draft ID above and the complete revised 
         ? "meetings"
         : "chat";
   const quoted = quotedMessageText(ctx.message?.reply_to_message);
-  const modelText = withQuotedContext(userText, quoted);
+  const modelText = `${withQuotedContext(userText, quoted)}${options.contactNote ? `\n\n${options.contactNote}` : ""}`;
+  const contactMark = contactQuestionMark(ctx.chat?.id);
+  // Some questions one agent can answer by itself, with no model call.
+  if (confirmation) {
+    const grant = issueGrant({ source: "owner_chat", confirmation, ownerText: userText });
+    try {
+      const direct = await whileTyping(ctx, () =>
+        tryDirectAnswer(userText, { chatId: ctx.chat?.id, quoted: Boolean(quoted), grant }),
+      );
+      if (direct) {
+        if (direct.buttons.length > 0 || !spoken) {
+          await replyWithButtons(ctx, direct.text, direct.buttons);
+        } else {
+          await replyInKind(ctx, direct.text, spoken, userText);
+        }
+        return;
+      }
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Direct answer failed (${errorType}); using the model.`);
+    } finally {
+      revokeGrant(grant.ref);
+    }
+  }
   await completeChatReply(
     ctx,
     userText,
     () =>
-      runAgent(modelText, {
+      runOwnerTurn(modelText, {
+        ownerText: userText,
+        quoted: Boolean(quoted),
+        chatId: ctx.chat?.id,
+        postCard: (text, buttons) => replyWithButtons(ctx, text, buttons),
         guardText: userText,
         task,
         usageTask: drafting
@@ -1126,6 +1413,7 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       forwarded,
       voiceReply: spoken,
       voiceSourceText: userText,
+      replyButtons: () => contactQuestionAsked(ctx.chat?.id, contactMark)?.buttons ?? [],
     },
   );
   void captureFromUserMessage(userText).catch((error: unknown) => {

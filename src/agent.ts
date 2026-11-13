@@ -3,6 +3,8 @@ import type { LlmBackend, LlmMessage, LlmTool, ToolCall, ToolChoice } from "./ll
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
 import { shouldForceCalendarTool } from "./calendar_guard.js";
+import { contactQuestionAsked, contactQuestionMark } from "./contact_questions.js";
+import { draftBodyFromCall, shortenDraftReply } from "./draft_confirm.js";
 import { looksLikeDeferredAction } from "./deferred_action.js";
 import {
   documentMultiReadRetryPrompt,
@@ -47,7 +49,16 @@ import {
   formatPendingDraftContext,
   type SendConfirmation,
 } from "./approvals.js";
-import { assertTestSeam } from "./test_seam.js";
+import { issueGrant, revokeGrant, type AuthGrant } from "./agents/auth.js";
+import {
+  closeTurnContext,
+  dispatchTool,
+  newTurnContext,
+  type TurnContext,
+} from "./agents/dispatch.js";
+import { specialistFor } from "./agents/index.js";
+import { toolOwnership } from "./agents/registry.js";
+import { AgentTaskError } from "./agents/types.js";
 import type { ReactionSession } from "./contextual_react.js";
 import {
   isSuccessfulToolResult,
@@ -109,16 +120,81 @@ function formatCurrentTime(): string {
   }).format(new Date());
 }
 
-type ToolInterceptor = (call: ToolCall, turn: ToolTurn) => string | undefined;
-let toolInterceptor: ToolInterceptor | undefined;
+export { setToolInterceptorForTests } from "./agents/dispatch.js";
 
-/** Lets a test or eval see which tools the model would call and answer them
- *  itself, so nothing real runs. Returning undefined runs the real tool. */
-export function setToolInterceptorForTests(
-  interceptor: ToolInterceptor | undefined,
-): void {
-  assertTestSeam("setToolInterceptorForTests");
-  toolInterceptor = interceptor;
+/** What a meta-tool tells the loop to do besides answering the model. */
+export interface MetaToolResult {
+  content: string;
+  isError?: boolean;
+  /** Give the loop Aadi's own prompt and every tool from here on. */
+  widen?: boolean;
+  /** End the loop now with this as the reply. */
+  stop?: string;
+  /**
+   * Tools that other agents ran while carrying this out. They count toward the
+   * turn's "was the command actually run" check exactly as if called here.
+   */
+  toolsRun?: ReadonlyArray<{ tool: string; ok: boolean; content: string }>;
+  /**
+   * The work is paused for Vishnu's answer or still running elsewhere. The turn's
+   * "was the command run" check stands down, so the model isn't pushed into
+   * doing the action itself with a guessed value, or doing it twice.
+   */
+  deferred?: boolean;
+}
+
+/**
+ * A tool the loop's caller carries out itself: handing work to other agents,
+ * asking for more input, or handing the turn back to Aadi. These are never part
+ * of TOOL_ORDER, so the cached tool prefix is unchanged.
+ */
+export interface MetaTool {
+  definition: Extract<LlmTool, { type: "function" }>;
+  handler: (input: unknown, turn: ToolTurn) => Promise<MetaToolResult> | MetaToolResult;
+}
+
+/** Filled in by runAgent so the caller can see what the turn did and cost. */
+export interface RunReport {
+  agentId: string;
+  llmCalls: number;
+  costUsd: number;
+  /** Context size of the first call. */
+  inputTokens: number;
+  /** Every call's input, cache included, and output. */
+  totalInputTokens: number;
+  outputTokens: number;
+  backend?: string;
+  widened: boolean;
+  stopped?: string;
+  /** The stop was "which person do you mean?": Vishnu's answer re-runs his request. */
+  contactQuestion?: boolean;
+  tools: Array<{ tool: string; owner: string; ok: boolean; reused?: boolean; ms: number }>;
+}
+
+export function newRunReport(): RunReport {
+  return {
+    agentId: "aadi",
+    llmCalls: 0,
+    costUsd: 0,
+    inputTokens: 0,
+    totalInputTokens: 0,
+    outputTokens: 0,
+    widened: false,
+    tools: [],
+  };
+}
+
+/** Where a delegated run sits in its workflow, and what it may do. */
+export interface DelegationContext {
+  grant?: AuthGrant;
+  parentTaskId: string;
+  workflowId: string;
+  correlationId: string;
+  depth: number;
+  signal?: AbortSignal;
+  budgetUsd?: number;
+  /** Shared by every goal loop of the workflow: calls, spend and time. */
+  meter?: { reserve(): string | undefined; add(costUsd: number): void };
 }
 
 function sendIntentContext(confirmation: SendConfirmation | undefined): string {
@@ -128,50 +204,58 @@ function sendIntentContext(confirmation: SendConfirmation | undefined): string {
   return formatPendingDraftContext(confirmation);
 }
 
+/** What this loop may call and how each call is carried out. */
+interface ToolScope {
+  turnContext: TurnContext;
+  meta: Map<string, MetaTool>;
+  widen: () => void;
+  stop: (reply: string) => void;
+  /** Records tools that ran on this loop's behalf inside a delegated job. */
+  credit: (runs: ReadonlyArray<{ tool: string; ok: boolean; content: string }>) => void;
+  /** The command is in hand elsewhere (paused or still running). */
+  defer: () => void;
+}
+
+/** Every tool call goes to the agent that owns the tool, through the dispatcher. */
 async function runTool(
   call: ToolCall,
   turn: ToolTurn,
-  allowed?: ReadonlySet<string>,
+  state: ToolScope,
 ): Promise<Extract<LlmMessage, { role: "tool" }>> {
-  if (allowed && !allowed.has(call.name)) {
-    return {
-      role: "tool",
-      toolCallId: call.id,
-      content: "Tool is not available for a forwarded message.",
-      isError: true,
-    };
+  const meta = state.meta.get(call.name);
+  if (meta) {
+    try {
+      const result = await meta.handler(call.input, turn);
+      if (result.widen) {
+        state.widen();
+      }
+      if (result.stop !== undefined) {
+        state.stop(result.stop);
+      }
+      if (result.toolsRun && result.toolsRun.length > 0) {
+        state.credit(result.toolsRun);
+      }
+      if (result.deferred) {
+        state.defer();
+      }
+      return {
+        role: "tool",
+        toolCallId: call.id,
+        content: result.content,
+        ...(result.isError ? { isError: true } : {}),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { role: "tool", toolCallId: call.id, content: `Tool failed: ${message}`, isError: true };
+    }
   }
-  const intercepted = toolInterceptor?.(call, turn);
-  if (intercepted !== undefined) {
-    return { role: "tool", toolCallId: call.id, content: intercepted };
-  }
-  const tool = customTools[call.name];
-
-  if (!tool) {
-    return {
-      role: "tool",
-      toolCallId: call.id,
-      content: `Unknown tool: ${call.name}`,
-      isError: true,
-    };
-  }
-
-  try {
-    const result = await tool.handler(call.input, turn);
-    return {
-      role: "tool",
-      toolCallId: call.id,
-      content: result,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      role: "tool",
-      toolCallId: call.id,
-      content: `Tool failed: ${message}`,
-      isError: true,
-    };
-  }
+  const outcome = await dispatchTool(call, turn, state.turnContext);
+  return {
+    role: "tool",
+    toolCallId: call.id,
+    content: outcome.content,
+    ...(outcome.isError ? { isError: true } : {}),
+  };
 }
 
 function saveAssistantReply(reply: string, saveAssistantMessage: boolean): string {
@@ -204,6 +288,18 @@ export interface RunAgentOptions {
   voiceAnswer?: "spoken" | "written";
   /** When set, only these tools are offered and executed. */
   toolNames?: readonly string[];
+  /** Run as this specialist: its own prompt and only its own tools. */
+  agentId?: string;
+  /** Tools the caller carries out itself. Offered after the fixed tool list. */
+  metaTools?: readonly MetaTool[];
+  /** Set when this run is a task Aadi delegated, not a chat turn. */
+  delegation?: DelegationContext;
+  /** Filled in with what the run did and cost. */
+  report?: RunReport;
+  /** Extra lines for the part of the system prompt that changes each turn. */
+  extraContext?: string;
+  /** Fewer steps than the default limit, for a delegated task. */
+  maxIterations?: number;
 }
 
 async function summariseOlderMessages(
@@ -314,7 +410,17 @@ export async function runAgent(
   const saveUserMessage = options.saveUserMessage ?? true;
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
   const promptUrl = new URL("../prompts/system.md", import.meta.url);
-  const basePrompt = await readFile(promptUrl, "utf8");
+  const specialist = options.agentId ? specialistFor(options.agentId) : undefined;
+  if (options.agentId && !specialist) {
+    throw new Error(`Unknown agent: ${options.agentId}`);
+  }
+  // Aadi's own prompt is read only when Aadi's loop runs (or a specialist hands back).
+  const readAadiPrompt = async (): Promise<string> => (await readFile(promptUrl, "utf8")).trim();
+  const basePrompt = specialist ? await specialist.prompt() : await readAadiPrompt();
+  const report = options.report;
+  if (report) {
+    report.agentId = specialist?.definition.id ?? "aadi";
+  }
   const recentUpload = recentUploadLine();
   const memories = memoryContextLine(userText);
   const history = await historyForAgent(options.skipHistory === true);
@@ -326,7 +432,10 @@ export async function runAgent(
     dynamic: [
       `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
       sendIntentContext(options.sendConfirmation),
-      config.sendOnCommandEnabled ? SEND_ON_COMMAND_NOTE : "",
+      config.sendOnCommandEnabled && (!specialist || specialist.usesCommandTools())
+        ? SEND_ON_COMMAND_NOTE
+        : "",
+      options.extraContext ?? "",
       options.voiceAnswer === "spoken"
         ? SPOKEN_ANSWER_NOTE
         : options.voiceAnswer === "written"
@@ -349,6 +458,9 @@ export async function runAgent(
   const collectedText: string[] = [];
   const task = options.task ?? "chat";
   const backend = options.backend ?? getTaskBackend(task);
+  if (report) {
+    report.backend = backend;
+  }
   const effort =
     backend === "claude" || backend === "haiku"
       ? getTaskEffort(task)
@@ -360,28 +472,124 @@ export async function runAgent(
   const toolsUsed = new Set<string>();
   const documentsRead = new Set<number>();
   const guardText = options.guardText ?? userText;
-  const allowedTools = options.toolNames ? new Set(options.toolNames) : undefined;
-  const activeTools: LlmTool[] = options.toolNames
-    ? options.toolNames.map((name) => {
-        const tool = customTools[name];
-        if (!tool) {
-          throw new Error(`Unknown tool: ${name}`);
+  // The nudges below read Vishnu's message. A delegated task isn't his message.
+  const nudgeText = options.delegation ? "" : guardText;
+  const defaults = defaultToolNames(config.sendOnCommandEnabled);
+  const scopedNames: readonly string[] | undefined =
+    options.toolNames ??
+    (specialist
+      ? defaults.filter((name) => specialist.toolNames().includes(name))
+      : undefined);
+  const metaTools = new Map((options.metaTools ?? []).map((tool) => [tool.definition.name, tool]));
+  const metaDefinitions: LlmTool[] = (options.metaTools ?? []).map((tool) => tool.definition);
+  let activeTools: LlmTool[] = [
+    ...(scopedNames
+      ? scopedNames.map((name) => {
+          const tool = customTools[name];
+          if (!tool) {
+            throw new Error(`Unknown tool: ${name}`);
+          }
+          return tool.definition;
+        })
+      : toolDefinitions),
+    ...metaDefinitions,
+  ];
+  // Aadi issues one grant per turn. Agents only ever see its ref.
+  const ownGrant = options.delegation
+    ? undefined
+    : issueGrant({
+        source: options.sendConfirmation ? "owner_chat" : options.toolNames ? "forwarded" : "background",
+        confirmation: options.sendConfirmation,
+        ownerText: guardText,
+        ctx: options.ctx,
+      });
+  const turnContext = newTurnContext({
+    actor: specialist?.definition.id,
+    origin: options.delegation ? "delegate" : "chat",
+    title: options.delegation ? `${specialist?.definition.id ?? "aadi"} goal` : "chat turn",
+    chatId: options.sendConfirmation?.chatId,
+    grant: options.delegation ? options.delegation.grant : ownGrant,
+    allowed: scopedNames ? new Set(scopedNames) : undefined,
+    notAllowedMessage: options.toolNames
+      ? undefined
+      : specialist
+        ? `That tool belongs to another agent. Call escalate_to_aadi if the request needs it.`
+        : undefined,
+    parentTaskId: options.delegation?.parentTaskId,
+    workflowId: options.delegation?.workflowId,
+    correlationId: options.delegation?.correlationId,
+    depth: options.delegation ? options.delegation.depth + 1 : 0,
+  });
+  let stoppedReply: string | undefined;
+  // A tool that can't tell who he means opens a question for this chat. The loop
+  // ends on it, so the model can't go on and pick someone itself.
+  const askChatId = (options.delegation?.grant?.confirmation ?? options.sendConfirmation)?.chatId;
+  const contactMark = contactQuestionMark(askChatId);
+  let commandDeferred = false;
+  let widened = false;
+  let aadiPrompt: string | undefined;
+  const allowedTools: ToolScope = {
+    turnContext,
+    meta: metaTools,
+    widen: () => {
+      widened = true;
+    },
+    stop: (reply) => {
+      stoppedReply = reply;
+    },
+    defer: () => {
+      commandDeferred = true;
+    },
+    credit: (runs) => {
+      for (const run of runs) {
+        toolsUsed.add(run.tool);
+        receipts.push({ name: run.tool, success: run.ok });
+        if (isFamilyTool(run.tool)) {
+          freshResults.push(run.content);
         }
-        return tool.definition;
-      })
-    : toolDefinitions;
+        if (isActionTool(run.tool)) {
+          actionResults.push(run.content);
+        }
+      }
+    },
+  };
+  /** A specialist that needs another domain hands the turn back to Aadi. */
+  const widenToAadi = async (): Promise<void> => {
+    if (!specialist || turnContext.allowed === undefined || options.delegation) {
+      return;
+    }
+    aadiPrompt ??= await readAadiPrompt();
+    system.cacheable = aadiPrompt;
+    activeTools = [
+      ...toolDefinitions,
+      ...metaDefinitions.filter((tool) => tool.type === "function" && tool.name !== "escalate_to_aadi"),
+    ];
+    turnContext.allowed = undefined;
+    turnContext.actor = "aadi";
+    if (report) {
+      report.widened = true;
+    }
+    console.log(`agent routing: ${specialist.definition.id} handed the turn back to Aadi`);
+  };
+  const outsideScope = (name: string): boolean =>
+    turnContext.allowed !== undefined && !turnContext.allowed.has(name);
   let succeeded = false;
   let toolFailed = false;
   let receiptRetryUsed = false;
   const receipts: ToolReceipt[] = [];
+  const draftBodies: string[] = [];
   let searchSources: SearchHit[] = [];
+  /** The official release pages a release check read. They are cited ahead of search hits. */
+  let releaseSources: SearchHit[] = [];
 
   // An explicit command in his own message has to be answered by a tool that runs
   // this turn. Models, DeepSeek especially, can otherwise repeat an old answer
   // from the chat history without checking anything. Forwarded messages have no
   // confirmation and a fixed tool list, so this never applies to them.
-  const intents: CommandKind[] =
+  const ownTurnIntents: CommandKind[] =
     options.sendConfirmation && !options.toolNames ? commandIntents(guardText) : [];
+  // A delegated task is one step of his request, so the whole-turn check stays with Aadi.
+  const intents: CommandKind[] = options.delegation ? [] : ownTurnIntents;
   const earlierReplies = history.messages
     .filter((message) => message.role !== "user")
     .map((message) => message.content);
@@ -408,8 +616,31 @@ export async function runAgent(
     console.log(`Command turn: kinds=${intents.join(",")} forced=${firstForced?.name ?? "none"}`);
   }
 
+  const maxIterations = Math.max(1, Math.min(MAX_ITERATIONS, options.maxIterations ?? MAX_ITERATIONS));
+  let spentUsd = 0;
+
   try {
-  for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
+  for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
+    if (options.delegation?.signal?.aborted) {
+      throw new AgentTaskError({ code: "canceled", message: "Canceled.", retryable: false });
+    }
+    if (options.delegation?.budgetUsd !== undefined && spentUsd >= options.delegation.budgetUsd) {
+      throw new AgentTaskError({
+        code: "budget_exceeded",
+        message: `Stopped: this task used its model budget ($${options.delegation.budgetUsd.toFixed(2)}).`,
+        retryable: false,
+        uncertain: turnContext.trace.some((entry) => entry.ok),
+      });
+    }
+    const refused = options.delegation?.meter?.reserve();
+    if (refused) {
+      throw new AgentTaskError({
+        code: "budget_exceeded",
+        message: refused,
+        retryable: false,
+        uncertain: turnContext.trace.some((entry) => entry.ok),
+      });
+    }
     const response = await complete({
       system,
       tools: activeTools,
@@ -420,6 +651,9 @@ export async function runAgent(
       ...(toolChoice ? { toolChoice } : {}),
     });
     toolChoice = undefined;
+    // A fallback sees the tool results of the provider that failed. Repeating
+    // those calls would run the side effect twice, so identical calls are replayed.
+    turnContext.suppressRepeat = response.servedBy !== undefined && response.servedBy !== backend;
 
     const responseText = response.textParts.join("\n").trim();
     if (responseText) {
@@ -430,11 +664,29 @@ export async function runAgent(
     for (const name of calledTools) {
       toolsUsed.add(name);
     }
+    spentUsd += response.usage.estimatedCostUsd;
+    options.delegation?.meter?.add(response.usage.estimatedCostUsd);
+    if (report) {
+      report.backend = response.servedBy ?? backend;
+      report.llmCalls += 1;
+      report.costUsd += response.usage.estimatedCostUsd;
+      report.totalInputTokens +=
+        response.usage.inputTokens +
+        (response.usage.cacheCreationInputTokens ?? 0) +
+        (response.usage.cacheReadInputTokens ?? 0);
+      report.outputTokens += response.usage.outputTokens;
+      if (report.llmCalls === 1) {
+        report.inputTokens =
+          response.usage.inputTokens +
+          (response.usage.cacheCreationInputTokens ?? 0) +
+          (response.usage.cacheReadInputTokens ?? 0);
+      }
+    }
     const cacheCreationTokens = response.usage.cacheCreationInputTokens ?? 0;
     const cacheReadTokens = response.usage.cacheReadInputTokens ?? 0;
 
     console.log(
-      `Agent iteration ${iteration}: backend=${backend}, tools=[${calledTools.join(", ")}], input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}, cache_creation_input_tokens=${cacheCreationTokens}, cache_read_input_tokens=${cacheReadTokens}, estimated_cost_usd=${response.usage.estimatedCostUsd.toFixed(6)}`,
+      `Agent iteration ${iteration}: agent=${turnContext.actor}, backend=${backend}, tools=[${calledTools.join(", ")}], input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}, cache_creation_input_tokens=${cacheCreationTokens}, cache_read_input_tokens=${cacheReadTokens}, estimated_cost_usd=${response.usage.estimatedCostUsd.toFixed(6)}`,
     );
 
     if (response.stopReason === "tool_use") {
@@ -464,6 +716,10 @@ export async function runAgent(
       const toolResults = await Promise.all(
         clientToolCalls.map((call) => runTool(call, turn, allowedTools)),
       );
+      if (widened) {
+        widened = false;
+        await widenToAadi();
+      }
       if (toolResults.some((result) => result.isError)) {
         toolFailed = true;
       }
@@ -475,6 +731,10 @@ export async function runAgent(
           name: call.name,
           success,
         });
+        const draftBody = draftBodyFromCall(call.name, call.input, success);
+        if (draftBody) {
+          draftBodies.push(draftBody);
+        }
         if (call.name === "read_document") {
           const id = (call.input as { id?: unknown }).id;
           if (typeof id === "number" && Number.isSafeInteger(id) && id > 0) {
@@ -485,6 +745,12 @@ export async function runAgent(
           const hits = parseSearchSources(result.content);
           if (hits.length > 0) {
             searchSources = hits;
+          }
+        }
+        if (call.name === "latest_release" && success) {
+          const pages = parseSearchSources(result.content);
+          if (pages.length > 0) {
+            releaseSources = pages;
           }
         }
         if (isFamilyTool(call.name)) {
@@ -503,12 +769,27 @@ export async function runAgent(
         toolCalls: response.toolCalls,
       });
       messages.push(...toolResults);
+      const whichPerson = stoppedReply === undefined ? contactQuestionAsked(askChatId, contactMark) : undefined;
+      if (whichPerson) {
+        console.log(`contact question: asked iteration=${iteration}`);
+        stoppedReply = whichPerson.text;
+        if (report) {
+          report.contactQuestion = true;
+        }
+      }
+      if (stoppedReply !== undefined) {
+        if (report) {
+          report.stopped = stoppedReply;
+        }
+        succeeded = !toolFailed;
+        return saveAssistantReply(stoppedReply, saveAssistantMessage);
+      }
       continue;
     }
 
-    const missingKinds = intents.filter(
-      (kind) => !commandFamilyTools(kind).some((name) => toolsUsed.has(name)),
-    );
+    const missingKinds = commandDeferred
+      ? []
+      : intents.filter((kind) => !commandFamilyTools(kind).some((name) => toolsUsed.has(name)));
     if (response.toolCalls.length === 0 && missingKinds.length > 0) {
       // A sequence request names the person in his words, so code runs the check
       // itself rather than trusting the model's answer.
@@ -569,10 +850,13 @@ export async function runAgent(
     if (
       !calendarRetryUsed &&
       response.toolCalls.length === 0 &&
-      shouldForceCalendarTool(guardText, [...toolsUsed])
+      shouldForceCalendarTool(nudgeText, [...toolsUsed])
     ) {
       calendarRetryUsed = true;
       console.log(`Calendar-tool retry: iteration=${iteration}`);
+      if (outsideScope("list_events")) {
+        await widenToAadi();
+      }
       messages.push({
         role: "assistant",
         textParts: response.textParts,
@@ -607,7 +891,7 @@ export async function runAgent(
     }
 
     const neededDocIds = resolveReferencedDocumentIds(
-      guardText,
+      nudgeText,
       getRecentUploads(),
     );
     const missingDocIds = neededDocIds.filter((id) => !documentsRead.has(id));
@@ -618,6 +902,9 @@ export async function runAgent(
       missingDocIds.length > 0
     ) {
       documentMultiReadRetryUsed = true;
+      if (outsideScope("read_document")) {
+        await widenToAadi();
+      }
       console.log(
         `Document-multi-read retry: iteration=${iteration} ids=${missingDocIds.join(",")}`,
       );
@@ -638,10 +925,13 @@ export async function runAgent(
       !documentRewriteRetryUsed &&
       response.toolCalls.length === 0 &&
       !toolsUsed.has("read_document") &&
-      looksLikeDocumentRewrite(guardText) &&
+      looksLikeDocumentRewrite(nudgeText) &&
       recentUpload
     ) {
       documentRewriteRetryUsed = true;
+      if (outsideScope("read_document")) {
+        await widenToAadi();
+      }
       console.log(
         `Document-rewrite retry: iteration=${iteration} document_id=${recentUpload.documentId}`,
       );
@@ -688,7 +978,10 @@ export async function runAgent(
         saveAssistantMessage,
       );
     }
-    const missing = unreceiptedClaims(finalReply, receipts);
+    const missing = unreceiptedClaims(finalReply, receipts, {
+      ownerText: guardText,
+      isReadTool: (name) => toolOwnership(name)?.effect === "read",
+    });
     if (missing.length > 0) {
       if (!receiptRetryUsed) {
         receiptRetryUsed = true;
@@ -713,7 +1006,12 @@ export async function runAgent(
     }
     succeeded = !toolFailed;
     return saveAssistantReply(
-      withSearchCitations(finalReply, searchSources),
+      // When the release list itself was read, it is the source. Articles a
+      // search also turned up are cited only if the reply used them.
+      withSearchCitations(
+        shortenDraftReply(finalReply, draftBodies),
+        releaseSources.length > 0 ? releaseSources : searchSources,
+      ),
       saveAssistantMessage,
     );
   }
@@ -721,10 +1019,15 @@ export async function runAgent(
   const partialReply =
     collectedText.join("\n\n") || "I couldn't finish the request.";
   return saveAssistantReply(
-    `${partialReply}\n\nNote: I hit the 8-iteration safety limit.`,
+    `${partialReply}\n\nNote: I hit the ${maxIterations}-iteration safety limit.`,
     saveAssistantMessage,
   );
   } finally {
+    if (report) {
+      report.tools = turnContext.trace;
+    }
+    closeTurnContext(turnContext);
+    revokeGrant(ownGrant?.ref);
     void Promise.resolve(options.reactions?.finish(succeeded)).catch(
       () => undefined,
     );

@@ -37,6 +37,7 @@ import * as listUpcomingDates from "./list_upcoming_dates.js";
 import * as listReminders from "./list_reminders.js";
 import * as listSalesFacts from "./list_sales_facts.js";
 import * as listTasks from "./list_tasks.js";
+import * as latestRelease from "./latest_release.js";
 import * as learnQa from "./learn_qa.js";
 import * as listMemories from "./list_memories.js";
 import * as proposeCalendarEvent from "./propose_calendar_event.js";
@@ -51,6 +52,7 @@ import * as readDraft from "./read_draft.js";
 import * as readDriveFile from "./read_drive_file.js";
 import * as removeAccount from "./remove_account.js";
 import * as removeSalesFact from "./remove_sales_fact.js";
+import * as resolveContact from "./resolve_contact.js";
 import * as readEmail from "./read_email.js";
 import * as readSheet from "./read_sheet.js";
 import * as searchDrive from "./search_drive.js";
@@ -106,11 +108,13 @@ const modules = {
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
   ignore_bill: ignoreBill,
+  latest_release: latestRelease,
   learn_qa_bank: learnQa,
   list_accounts: listAccounts,
   list_attachments: listAttachments,
   list_bills: listBills,
   list_dates: listDates,
+  resolve_contact: resolveContact,
   list_documents: listDocuments,
   list_events: listEvents,
   list_upcoming_dates: listUpcomingDates,
@@ -215,6 +219,8 @@ export const TOOL_ORDER = [
   "add_sales_fact",
   "list_sales_facts",
   "remove_sales_fact",
+  "resolve_contact",
+  "latest_release",
   "list_documents",
 ] as const;
 
@@ -249,6 +255,7 @@ export const FORWARDED_TOOLS = [
   "search_notes",
   "search_qa_bank",
   "web_search",
+  "latest_release",
   "read_draft",
   "draft_new_email",
   "search_history",

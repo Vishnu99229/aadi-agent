@@ -91,6 +91,16 @@ function testMomDraft(): void {
   assert(draft.subject === "MoM – Pinnacle weekly – 14 Oct 2026", draft.subject);
   assert(draft.to.join(",") === "priya@pinnacle.in,amit@epicode.in", draft.to.join(","));
   assert(!draft.to.some((email) => isSelfEmail(email)), "self excluded from To");
+  const previousSelf = process.env.SELF_EMAIL_ADDRESSES;
+  process.env.SELF_EMAIL_ADDRESSES = "rajan.vish294@gmail.com";
+  assert(isSelfEmail("rajan.vish294@gmail.com"), "a configured address is an owner identity");
+  assert(isSelfEmail("vishnu.rajan@epicode.in"), "the existing work address stays an owner identity");
+  assert(!isSelfEmail("qa-prospect@example.com"), "a prospect is not an owner identity");
+  if (previousSelf === undefined) {
+    delete process.env.SELF_EMAIL_ADDRESSES;
+  } else {
+    process.env.SELF_EMAIL_ADDRESSES = previousSelf;
+  }
   assert(draft.body.startsWith("Dear All,"), "greeting");
   assert(draft.body.includes("Regards,\nVishnu"), "sign-off");
   assert(draft.body.includes("Owner: Vishnu"), "vishnu owner");

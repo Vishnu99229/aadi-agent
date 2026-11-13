@@ -8,6 +8,7 @@ import {
   createDocument,
   getJob,
   listJobSteps,
+  listJobs,
   recoverStuckJobSteps,
   updateJob,
   updateJobStep,
@@ -18,9 +19,12 @@ import {
   evaluateDoneCheck,
   extractNumberedQuestions,
   formatFinalMessage,
+  isStandaloneEmailDraft,
   looksLikeBigJob,
   parseJobCommand,
+  referencesDocument,
   sanitizePlan,
+  withoutDocumentExtraction,
 } from "../src/job_logic.ts";
 import { planJobFromOwnerMessage } from "../src/job_plan.ts";
 import {
@@ -28,7 +32,9 @@ import {
   persistPlannedJob,
   processNextJobStep,
   setJobExecutorForTests,
+  tryStartBigJob,
 } from "../src/job_worker.ts";
+import { recordRecentUpload, setRecentUploadsForTests } from "../src/recent_upload.ts";
 import { setCompleteForTests } from "../src/llm.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -48,6 +54,64 @@ function testDetectAndSanitize(): void {
     !looksLikeBigJob("What's the deadline in this email?"),
     "a single email question is not a big job",
   );
+  const dictated =
+    'Draft an email to vishnu.rajan@epicode.in with the subject "Aadi Batch 2 Test" and the message "Testing Aadi\'s new Email Agent." Show me the draft for review. Do not send it.';
+  assert(isStandaloneEmailDraft(dictated), "a dictated email is not a document job");
+  assert(!referencesDocument(dictated), "for review does not reference a document");
+  assert(!looksLikeBigJob(dictated), "draft for review does not start extraction");
+  assert(!looksLikeBigJob(dictated, 40), "a stale long upload does not turn a dictated email into extraction");
+  const attached =
+    "Review the attached RFP, answer every question, and draft an email to Priya summarising it.";
+  assert(referencesDocument(attached) && looksLikeBigJob(attached), "an attached document plus a draft is still a job");
+  const dropped = withoutDocumentExtraction(
+    {
+      title: "Job",
+      steps: [
+        {
+          id: "1",
+          type: "extract",
+          input_ref: { raw: "telegram_message" },
+          depends_on: [],
+          done_condition: { kind: "count_gte", field: "items", min: 1 },
+        },
+        {
+          id: "2",
+          type: "draft",
+          input_ref: { to: "vishnu.rajan@epicode.in" },
+          depends_on: ["1"],
+          done_condition: { kind: "draft_ready" },
+        },
+      ],
+    },
+    false,
+  );
+  assert(
+    dropped.steps.length === 1 && dropped.steps[0]?.type === "draft" && dropped.steps[0].depends_on.length === 0,
+    "without a document, extract is dropped and the draft is not left waiting on it",
+  );
+  const kept = withoutDocumentExtraction(
+    {
+      title: "Job",
+      steps: [
+        {
+          id: "1",
+          type: "extract",
+          input_ref: {},
+          depends_on: [],
+          done_condition: { kind: "count_gte", field: "items", min: 1 },
+        },
+        {
+          id: "2",
+          type: "draft",
+          input_ref: {},
+          depends_on: ["1"],
+          done_condition: { kind: "draft_ready" },
+        },
+      ],
+    },
+    true,
+  );
+  assert(kept.steps.length === 2 && kept.steps[0]?.type === "extract", "a stored document keeps the extract step");
   const plan = sanitizePlan(
     {
       title: "RFP review",
@@ -314,6 +378,62 @@ async function testDocumentCannotInjectSteps(): Promise<void> {
   setCompleteForTests(undefined);
 }
 
+async function testDictatedEmailSkipsTheJob(): Promise<void> {
+  const dictated =
+    'Draft an email to vishnu.rajan@epicode.in with the subject "Aadi Batch 2 Test" and the message "Testing Aadi\'s new Email Agent." Show me the draft for review. Do not send it.';
+  setRecentUploadsForTests([
+    { documentId: 999, fileName: "old-rfp.pdf", kind: "pdf", uploadedAt: Date.now() },
+  ]);
+  let announced = false;
+  const started = await tryStartBigJob({
+    ownerText: dictated,
+    chatId: 1,
+    api: {
+      sendMessage: async () => {
+        announced = true;
+        return { message_id: 1 };
+      },
+    } as never,
+  });
+  assert(started === undefined && !announced, "a dictated email does not start a job");
+  assert(
+    !listJobs(20).some((job) => job.owner_text === dictated),
+    "no extract/draft job is stored for a dictated email",
+  );
+
+  const document = createDocument("rfp.pdf", "work", "Q1. What is the deadline?\n", null);
+  recordRecentUpload(document.id, "rfp.pdf", "pdf");
+  setCompleteForTests(async () =>
+    modelReply({
+      text: JSON.stringify({
+        title: "RFP email",
+        steps: [
+          { id: "1", type: "extract", input_ref: {}, depends_on: [], done_condition: "items exist" },
+          { id: "2", type: "draft", input_ref: { to: "Priya" }, depends_on: ["1"], done_condition: "draft ready" },
+        ],
+      }),
+    }),
+  );
+  setJobExecutorForTests(async () => ({ items: ["deadline"] }));
+  const withFile = "Review the attached RFP, answer every question, and draft an email to Priya summarising it.";
+  const announcement = await tryStartBigJob({
+    ownerText: withFile,
+    chatId: 1,
+    api: { sendMessage: async () => ({ message_id: 2 }) } as never,
+  });
+  assert(typeof announcement === "string", "a request that names an attached document still starts a job");
+  const job = listJobs(20).find((row) => row.owner_text === withFile);
+  assert(job !== undefined, "the attachment job is stored");
+  assert(
+    listJobSteps(job!.job_id).some((step) => step.type === "extract"),
+    "extraction runs only because a document was provided",
+  );
+  updateJob(job!.job_id, { status: "cancelled" });
+  setCompleteForTests(undefined);
+  setJobExecutorForTests(undefined);
+  setRecentUploadsForTests([]);
+}
+
 function testCancelParse(): void {
   const parsed = parseJobCommand("cancel the RFP job");
   assert(parsed?.action === "cancel", "cancel action");
@@ -343,6 +463,7 @@ async function main(): Promise<void> {
   await testBudgetPause();
   await testFinalMessageUnchecked();
   await testDocumentCannotInjectSteps();
+  await testDictatedEmailSkipsTheJob();
   testCancelParse();
   console.log("test-jobs: ok");
 }

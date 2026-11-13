@@ -28,8 +28,8 @@ import { plainTextBody, stripSignature } from "./google/mail.js";
 import { assertTestSeam } from "./test_seam.js";
 
 const PREVIEW_LIMIT = 3800;
-/** Long drafts stay off the card. The full text is a separate tap. */
-const DRAFT_SUMMARY_CHARS = 1000;
+/** Only a draft that would not fit in one Telegram message is shortened on the card. */
+const DRAFT_SUMMARY_CHARS = 3200;
 const TELEGRAM_TEXT_LIMIT = 4000;
 const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
 
@@ -78,6 +78,8 @@ export interface DraftApprovalPreview {
   googleAccount: "personal" | "work";
   extraLines?: string[];
   cc?: string;
+  /** Plain-text mailbox signature appended to the Gmail draft. */
+  signature?: string;
 }
 
 export interface DraftEditContext {
@@ -129,13 +131,16 @@ function truncate(text: string, limit: number): string {
 function previewText(preview: DraftApprovalPreview): string {
   const mailbox =
     preview.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
-  const extra = (preview.extraLines ?? []).filter((line) => line.trim());
+  const extra = (preview.extraLines ?? []).filter(
+    (line) => line.trim() && !/^cc:/i.test(line.trim()),
+  );
+  const signature = preview.signature?.trim();
   const prefix = [
     "Draft waiting for approval",
     "",
     `Account: ${mailbox}`,
     `To: ${preview.to}`,
-    ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : []),
+    ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : ["Cc: none"]),
     `Subject: ${preview.subject}`,
     ...(extra.length ? ["", ...extra] : []),
     "",
@@ -155,7 +160,9 @@ function previewText(preview: DraftApprovalPreview): string {
     ].join("\n");
   }
 
-  return `${prefix}${truncate(preview.body, PREVIEW_LIMIT - prefix.length)}`;
+  const signatureBlock = signature ? `\n\n-- \n${signature}` : "\n\nSignature: appended from the mailbox when this is sent.";
+  const room = PREVIEW_LIMIT - prefix.length - signatureBlock.length;
+  return `${prefix}${truncate(preview.body, Math.max(200, room))}${signatureBlock}`;
 }
 
 const DRAFT_STALE_MS = 3 * 60 * 60 * 1000;

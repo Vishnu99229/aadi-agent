@@ -36,7 +36,10 @@ import {
   parseDoneCondition,
   parseJobCommand,
   parseResultRef,
+  isStandaloneEmailDraft,
   looksLikeBigJob,
+  referencesDocument,
+  withoutDocumentExtraction,
   type PlannedJob,
 } from "./job_logic.js";
 import { planJobFromOwnerMessage } from "./job_plan.js";
@@ -649,15 +652,23 @@ export async function tryStartBigJob(input: {
   const chunks =
     input.chunkCount ??
     (document ? documentChunkCount(document.extracted_text) : 0);
-  if (!looksLikeBigJob(input.ownerText, chunks)) {
+  // A dictated email, including "show me the draft for review", is the Email
+  // Agent's draft. A recent upload he did not mention is not a document to extract.
+  if (isStandaloneEmailDraft(input.ownerText) || !looksLikeBigJob(input.ownerText, referencesDocument(input.ownerText) ? chunks : 0)) {
     return undefined;
   }
-  const plan = await planJobFromOwnerMessage(input.ownerText, {
-    documentId: document?.id,
-    fileName: document?.file_name ?? upload?.fileName,
-    chars: document?.extracted_text.length,
-    chunks,
-  });
+  const plan = withoutDocumentExtraction(
+    await planJobFromOwnerMessage(input.ownerText, {
+      documentId: document?.id,
+      fileName: document?.file_name ?? upload?.fileName,
+      chars: document?.extracted_text.length,
+      chunks,
+    }),
+    Boolean(document),
+  );
+  if (plan.steps.length === 0 || plan.steps.every((step) => step.type === "draft")) {
+    return undefined;
+  }
   const job = persistPlannedJob(input.ownerText, plan, { chatId: input.chatId });
   const text = formatPlanMessage(plan);
   try {
@@ -714,6 +725,36 @@ export function jobsListText(): string {
   return formatJobsList(listJobs(20));
 }
 
+const DRAIN_MAX_MS = 8 * 60 * 1000;
+let draining = false;
+
+/**
+ * Runs job steps back to back for as long as each one finishes cleanly, so a
+ * job doesn't wait a minute between steps. A step that fails or has to be
+ * retried ends the run; the minute tick picks it up, which is also what
+ * recovers a job after a restart.
+ */
+export async function drainJobSteps(maxMs = DRAIN_MAX_MS): Promise<number> {
+  if (draining) {
+    return 0;
+  }
+  draining = true;
+  const startedAt = Date.now();
+  let steps = 0;
+  try {
+    while (Date.now() - startedAt < maxMs) {
+      const outcome = await processNextJobStep();
+      if (outcome !== "done" && outcome !== "yield") {
+        break;
+      }
+      steps += 1;
+    }
+  } finally {
+    draining = false;
+  }
+  return steps;
+}
+
 export function registerJobWorker(api: Api): IntervalJob {
   notifyApi = api;
   recoverStuckJobSteps(JOB_STUCK_MS);
@@ -721,7 +762,7 @@ export function registerJobWorker(api: Api): IntervalJob {
     "job-queue",
     60_000,
     async () => {
-      await processNextJobStep();
+      await drainJobSteps();
     },
     { runImmediately: true, jobTimeoutMs: 10 * 60 * 1000 },
   );

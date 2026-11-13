@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -45,9 +46,29 @@ export function readDeployVersion(cwd = process.cwd()): DeployVersion | undefine
   }
 }
 
-export function formatVersionLine(info: DeployVersion | undefined): string {
+/** The checkout's commit, when this process was not deployed (no VERSION file). */
+export function readLocalGitHash(cwd = process.cwd()): string {
+  try {
+    const hash = execFileSync("git", ["-C", cwd, "rev-parse", "--short=7", "HEAD"], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return /^[0-9a-f]{4,12}$/i.test(hash) ? hash.toLowerCase() : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * A VERSION file is a real deploy. Without one, this is a local checkout:
+ * show its commit and do not call it deployed.
+ */
+export function formatVersionLine(info: DeployVersion | undefined, localHash = ""): string {
   if (!info) {
-    return "version: unknown, deployed unknown";
+    return localHash
+      ? `version: ${localHash} (local, not deployed)`
+      : "version: unknown (local, not deployed)";
   }
   return `version: ${info.hash}, deployed ${info.deployed}`;
 }

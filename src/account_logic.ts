@@ -89,6 +89,34 @@ export function parseRelationship(value: unknown): AccountRelationship {
   throw new Error('relationship must be "partner" or "end_client".');
 }
 
+/**
+ * "Sales prospect" is an end client at stage Prospect, not a partner.
+ * His words win over a relationship the model guessed. A named partner
+ * ("partner", and not a prospect) stays a partner.
+ */
+export function accountFromOwnerWords(
+  userText: string,
+  given: { relationship?: unknown; stage?: unknown } = {},
+): { relationship: AccountRelationship; stage: string; prospect: boolean } {
+  const text = userText.trim();
+  const prospect = /\b(?:sales\s+)?prospects?\b/i.test(text);
+  const saysPartner = /\bpartners?\b/i.test(text);
+  const saysEndClient = /\bend[\s-]?clients?\b/i.test(text);
+  let relationship: AccountRelationship;
+  if (prospect || (saysEndClient && !saysPartner)) {
+    relationship = "end_client";
+  } else if (saysPartner && !prospect) {
+    relationship = "partner";
+  } else if (given.relationship === "end_client" || given.relationship === "partner") {
+    relationship = given.relationship;
+  } else {
+    relationship = "partner";
+  }
+  const givenStage = typeof given.stage === "string" ? given.stage.trim() : "";
+  const stage = prospect && (givenStage === "" || /^prospect$/i.test(givenStage)) ? "Prospect" : givenStage;
+  return { relationship, stage, prospect };
+}
+
 export function parseStringList(value: unknown): string[] {
   if (value === undefined || value === null || value === "") {
     return [];

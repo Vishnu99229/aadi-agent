@@ -1,12 +1,14 @@
 import type { LlmTool } from "../llm.js";
 import { getAccount, updateAccount } from "../db.js";
 import {
+  accountFromOwnerWords,
   findAccountByName,
   parseRelationship,
   parseStringList,
   parseWaitingOn,
 } from "../account_logic.js";
 import { decodedAccounts } from "../accounts.js";
+import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -60,7 +62,7 @@ function parseDue(value: unknown): string | null | undefined {
   return date.toISOString();
 }
 
-export function handler(input: unknown): string {
+export function handler(input: unknown, turn?: ToolTurn): string {
   const values = input as {
     id?: unknown;
     name?: unknown;
@@ -119,12 +121,22 @@ export function handler(input: unknown): string {
   } else if (values.via_partner === null || values.via_partner === "") {
     viaPartnerId = null;
   }
-  const relationship =
-    values.relationship === undefined
+  const fromWords = accountFromOwnerWords(turn?.userText ?? "", {
+    relationship: values.relationship,
+    stage: values.stage,
+  });
+  const relationship = fromWords.prospect
+    ? fromWords.relationship
+    : values.relationship === undefined
       ? undefined
       : parseRelationship(values.relationship);
+  const stage = fromWords.prospect
+    ? fromWords.stage
+    : typeof values.stage === "string"
+      ? values.stage.trim()
+      : undefined;
   const updated = updateAccount(id, {
-    stage: typeof values.stage === "string" ? values.stage.trim() : undefined,
+    stage,
     nextStep:
       typeof values.next_step === "string" ? values.next_step.trim() : undefined,
     nextStepDue: parseDue(values.next_step_due),

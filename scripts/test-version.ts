@@ -9,6 +9,7 @@ import {
   formatVersionLine,
   parseVersionFile,
   readDeployVersion,
+  readLocalGitHash,
 } from "../src/version.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -33,9 +34,14 @@ function testParseAndFormat(): void {
   assert(long?.hash === "abcdef0", "shortens a full SHA to 7 chars");
   assert(parseVersionFile("") === undefined, "empty VERSION is unknown");
   assert(
-    formatVersionLine(undefined) === "version: unknown, deployed unknown",
-    "missing VERSION uses unknown",
+    formatVersionLine(undefined) === "version: unknown (local, not deployed)",
+    "missing VERSION is local, not a deploy",
   );
+  assert(
+    formatVersionLine(undefined, "e730b4d") === "version: e730b4d (local, not deployed)",
+    "a local commit is shown and not called deployed",
+  );
+  assert(!formatVersionLine(undefined, "e730b4d").includes("deployed unknown"), "local health never says deployed unknown");
 }
 
 function testReadAndHealth(): void {
@@ -59,9 +65,9 @@ function testReadAndHealth(): void {
     );
     assert(
       formatHealthReport(new Date(), join(dir, "missing-subdir")).includes(
-        "version: unknown, deployed unknown",
+        "version: unknown (local, not deployed)",
       ),
-      "health shows unknown when VERSION is missing",
+      "health shows a local checkout when VERSION is missing",
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -116,6 +122,7 @@ function testDeployScriptsWriteVersion(): void {
   assert(self.includes("INNER_SHA="), "/build reads the zipball commit hash");
 }
 
+assert(/^[0-9a-f]{7}$/.test(readLocalGitHash(ROOT)), "this checkout has a local commit hash");
 testParseAndFormat();
 testReadAndHealth();
 testWriteVersionScript();
