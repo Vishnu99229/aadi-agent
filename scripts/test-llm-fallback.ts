@@ -175,7 +175,8 @@ const { runAgent, setToolInterceptorForTests } = await import("../src/agent.ts")
 const { modelReply } = await import("./fakes.ts");
 const executions: string[] = [];
 setToolInterceptorForTests((call) => {
-  executions.push(`${call.name}`);
+  const query = (call.input as { query?: unknown }).query;
+  executions.push(typeof query === "string" ? `${call.name}:${query}` : call.name);
   return `${call.name} done`;
 });
 setNamedBackendCompleteForTests(async (backend, params) => {
@@ -191,6 +192,7 @@ setNamedBackendCompleteForTests(async (backend, params) => {
       return modelReply({
         tools: [
           { name: "web_search", input: { query: "a2a" } },
+          { name: "web_search", input: { query: "a2a protocol" } },
           { name: "add_task", input: { text: "read the notes", tag: "work" } },
         ],
       });
@@ -209,13 +211,13 @@ const fallbackReply = await runAgent("Check A2A.", {
   guardText: "Check A2A.",
 });
 assert(
-  executions.join(",") === "web_search,add_task",
-  `a fallback must not run a tool that already succeeded (${executions.join(",")})`,
+  executions.join(",") === "web_search:a2a,web_search:a2a protocol,add_task",
+  `identical fallback call skipped, different arguments still ran (${executions.join(",")})`,
 );
 assert(fallbackReply.includes("Noted."), `fallback still answers (${fallbackReply})`);
 setNamedBackendCompleteForTests(undefined);
 setToolInterceptorForTests(undefined);
 
 console.log(
-  `test-llm-fallback: ok chain=${withKeys.join(",")} hopped=${attempted.join(",")} replayed=web_search`,
+  `test-llm-fallback: ok chain=${withKeys.join(",")} hopped=${attempted.join(",")} replayed=web_search:a2a kept=web_search:a2a protocol`,
 );
