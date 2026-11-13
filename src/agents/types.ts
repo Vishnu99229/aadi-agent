@@ -19,6 +19,9 @@ export type LocalAgentId = (typeof LOCAL_AGENT_IDS)[number];
 /** Tools no one domain owns (the clock, an emoji reaction). */
 export const CORE_OWNER = "aadi";
 
+/** The name every specialist's free-form capability goes by. */
+export const GOAL_CAPABILITY = "goal";
+
 /** Registry-driven, so a new agent needs no change here. */
 export type AgentId = string;
 

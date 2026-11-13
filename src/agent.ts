@@ -158,7 +158,12 @@ export interface RunReport {
   agentId: string;
   llmCalls: number;
   costUsd: number;
+  /** Context size of the first call. */
   inputTokens: number;
+  /** Every call's input, cache included, and output. */
+  totalInputTokens: number;
+  outputTokens: number;
+  backend?: string;
   widened: boolean;
   stopped?: string;
   /** The stop was "which person do you mean?": Vishnu's answer re-runs his request. */
@@ -167,7 +172,16 @@ export interface RunReport {
 }
 
 export function newRunReport(): RunReport {
-  return { agentId: "aadi", llmCalls: 0, costUsd: 0, inputTokens: 0, widened: false, tools: [] };
+  return {
+    agentId: "aadi",
+    llmCalls: 0,
+    costUsd: 0,
+    inputTokens: 0,
+    totalInputTokens: 0,
+    outputTokens: 0,
+    widened: false,
+    tools: [],
+  };
 }
 
 /** Where a delegated run sits in its workflow, and what it may do. */
@@ -179,6 +193,8 @@ export interface DelegationContext {
   depth: number;
   signal?: AbortSignal;
   budgetUsd?: number;
+  /** Shared by every goal loop of the workflow: calls, spend and time. */
+  meter?: { reserve(): string | undefined; add(costUsd: number): void };
 }
 
 function sendIntentContext(confirmation: SendConfirmation | undefined): string {
@@ -442,6 +458,9 @@ export async function runAgent(
   const collectedText: string[] = [];
   const task = options.task ?? "chat";
   const backend = options.backend ?? getTaskBackend(task);
+  if (report) {
+    report.backend = backend;
+  }
   const effort =
     backend === "claude" || backend === "haiku"
       ? getTaskEffort(task)
@@ -613,6 +632,15 @@ export async function runAgent(
         uncertain: turnContext.trace.some((entry) => entry.ok),
       });
     }
+    const refused = options.delegation?.meter?.reserve();
+    if (refused) {
+      throw new AgentTaskError({
+        code: "budget_exceeded",
+        message: refused,
+        retryable: false,
+        uncertain: turnContext.trace.some((entry) => entry.ok),
+      });
+    }
     const response = await complete({
       system,
       tools: activeTools,
@@ -623,6 +651,9 @@ export async function runAgent(
       ...(toolChoice ? { toolChoice } : {}),
     });
     toolChoice = undefined;
+    // A fallback sees the tool results of the provider that failed. Repeating
+    // those calls would run the side effect twice, so identical calls are replayed.
+    turnContext.suppressRepeat = response.servedBy !== undefined && response.servedBy !== backend;
 
     const responseText = response.textParts.join("\n").trim();
     if (responseText) {
@@ -634,9 +665,16 @@ export async function runAgent(
       toolsUsed.add(name);
     }
     spentUsd += response.usage.estimatedCostUsd;
+    options.delegation?.meter?.add(response.usage.estimatedCostUsd);
     if (report) {
+      report.backend = response.servedBy ?? backend;
       report.llmCalls += 1;
       report.costUsd += response.usage.estimatedCostUsd;
+      report.totalInputTokens +=
+        response.usage.inputTokens +
+        (response.usage.cacheCreationInputTokens ?? 0) +
+        (response.usage.cacheReadInputTokens ?? 0);
+      report.outputTokens += response.usage.outputTokens;
       if (report.llmCalls === 1) {
         report.inputTokens =
           response.usage.inputTokens +

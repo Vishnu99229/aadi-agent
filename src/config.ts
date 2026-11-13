@@ -468,6 +468,82 @@ function readAgentRouting(): AgentRouting {
   return raw === "off" || raw === "fast" ? raw : "full";
 }
 
+export type GoalTier = "light" | "standard" | "deep";
+export const GOAL_TIERS: readonly GoalTier[] = ["light", "standard", "deep"];
+const GOAL_BACKENDS = ["claude", "haiku", "gemini", "deepseek"] as const;
+export type GoalBackend = (typeof GOAL_BACKENDS)[number];
+
+export interface GoalDelegationConfig {
+  /** Off: delegate_tasks still runs named capabilities, but no specialist gets a goal loop. */
+  enabled: boolean;
+  /** Model per complexity tier. A tier left out uses the chat model choice. */
+  tierBackends: Partial<Record<GoalTier, GoalBackend>>;
+  /** Optional model per agent, ahead of the tier. */
+  agentBackends: Record<string, GoalBackend>;
+  /** Goal loops of one workflow running at the same time. */
+  maxConcurrent: number;
+  /** Deepest task depth a goal may run at. Aadi's own plan is depth 1. */
+  maxDepth: number;
+  /** Model calls one goal loop may make. */
+  maxIterations: number;
+  /** Model calls across every goal loop of one workflow. */
+  maxModelCalls: number;
+  /** Wall-clock limit for one workflow's goals, from when it was planned. */
+  workflowTimeoutMs: number;
+  /** Ordinary cap for one workflow. */
+  workflowBudgetUsd: number;
+  /** Ordinary cap for one goal loop. */
+  goalBudgetUsd: number;
+  /** Cap when Vishnu's own words ask for a large job. */
+  largeWorkflowBudgetUsd: number;
+  largeGoalBudgetUsd: number;
+}
+
+/** "light=gemini,deep=claude" → { light: "gemini", deep: "claude" }. */
+function readBackendMap(name: string, keyPattern: RegExp): Record<string, GoalBackend> {
+  const out: Record<string, GoalBackend> = {};
+  for (const entry of (process.env[name] ?? "").split(",")) {
+    const [rawKey, rawValue] = entry.split("=").map((part) => part?.trim().toLowerCase() ?? "");
+    if (!rawKey && !rawValue) {
+      continue;
+    }
+    if (!rawKey || !keyPattern.test(rawKey) || !(GOAL_BACKENDS as readonly string[]).includes(rawValue ?? "")) {
+      throw new Error(`${name}: "${entry.trim()}" must be key=${GOAL_BACKENDS.join("|")}.`);
+    }
+    out[rawKey] = rawValue as GoalBackend;
+  }
+  return out;
+}
+
+function readPositive(name: string, fallback: number, options: { integer?: boolean; max?: number } = {}): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0 || (options.integer && !Number.isInteger(value))) {
+    throw new Error(`${name} must be a positive ${options.integer ? "whole number" : "number"}.`);
+  }
+  return options.max !== undefined ? Math.min(value, options.max) : value;
+}
+
+function readGoalDelegation(): GoalDelegationConfig {
+  return {
+    enabled: parseBool(process.env.AGENT_GOAL_DELEGATION, false),
+    tierBackends: readBackendMap("AGENT_GOAL_BACKENDS", /^(light|standard|deep)$/),
+    agentBackends: readBackendMap("AGENT_GOAL_AGENT_BACKENDS", /^[a-z][a-z0-9_-]{0,30}$/),
+    maxConcurrent: readPositive("AGENT_GOAL_MAX_CONCURRENT", 2, { integer: true, max: 3 }),
+    maxDepth: readPositive("AGENT_GOAL_MAX_DEPTH", 1, { integer: true, max: 2 }),
+    maxIterations: readPositive("AGENT_GOAL_MAX_ITERATIONS", 6, { integer: true, max: 10 }),
+    maxModelCalls: readPositive("AGENT_GOAL_MAX_MODEL_CALLS", 16, { integer: true, max: 60 }),
+    workflowTimeoutMs: readPositive("AGENT_GOAL_TIMEOUT_SECONDS", 240, { max: 900 }) * 1000,
+    workflowBudgetUsd: readPositive("AGENT_GOAL_WORKFLOW_BUDGET_USD", 0.05, { max: 5 }),
+    goalBudgetUsd: readPositive("AGENT_GOAL_BUDGET_USD", 0.02, { max: 5 }),
+    largeWorkflowBudgetUsd: readPositive("AGENT_GOAL_LARGE_WORKFLOW_BUDGET_USD", 0.5, { max: 5 }),
+    largeGoalBudgetUsd: readPositive("AGENT_GOAL_LARGE_GOAL_BUDGET_USD", 0.2, { max: 5 }),
+  };
+}
+
 export interface RemoteAgentConfig {
   id: string;
   url: string;
@@ -523,6 +599,7 @@ if (a2aServerEnabled && a2aServerToken.length < 24) {
 
 export const config = {
   agentRouting: readAgentRouting(),
+  goalDelegation: readGoalDelegation(),
   /** The A2A endpoint is off unless switched on, and only ever listens on loopback. */
   a2aServerEnabled,
   a2aServerPort: readA2aPort(),

@@ -6,6 +6,7 @@ import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import { issueGrant } from "../src/agents/auth.ts";
+import { setGoalLimitsForTests } from "../src/agents/goal_policy.ts";
 import { dispatchTool, newTurnContext } from "../src/agents/dispatch.ts";
 import { delegate } from "../src/agents/engine.ts";
 import { localSpecialists, SPECIALISTS, specialistFor } from "../src/agents/index.ts";
@@ -261,6 +262,7 @@ for (const [name, input] of [
 passed.push("dispatcher: background and forwarded turns can't send or book; own-turn can; another agent's request runs only tools opened to it; duplicate write in a turn runs once");
 
 // ---- a delegated goal's wording is not Vishnu's words ----
+setGoalLimitsForTests({ enabled: true });
 toolCalls = [];
 let seenUserText = "unset";
 setToolInterceptorForTests((call: ToolCall, turn) => {
@@ -283,6 +285,7 @@ await delegate({ agentId: "email", capability: "goal", input: { goal: "Vishnu sa
 assert(toolCalls.includes("send_email") && seenUserText === "tell bob hello", `under his approval the send gate sees his words, not the goal's (${seenUserText})`);
 assert(!seenUserText.includes("carol"), "so a recipient named only in the goal is not in his words");
 passed.push("delegated goal: the goal text is never treated as Vishnu's words or approval");
+setGoalLimitsForTests(undefined);
 
 // ---- commands ----
 const indexSource = readFileSync("src/index.ts", "utf8");

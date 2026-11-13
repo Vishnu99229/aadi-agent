@@ -35,7 +35,9 @@ import {
   type WorkflowOrigin,
   type WorkflowRecord,
 } from "./store.js";
+import { forgetGoalMetersForTests, goalLimits } from "./goal_policy.js";
 import {
+  GOAL_CAPABILITY,
   isTerminal,
   type AgentTaskResult,
   type DelegationRequest,
@@ -478,8 +480,14 @@ async function driveWorkflow(workflowId: string): Promise<WorkflowSummary> {
         continue;
       }
       // startTask puts a task in `running` at once, so this count is already current.
-      const inFlight = tasks.filter((item) => running.has(item.task_id)).length;
-      if (inFlight >= MAX_CONCURRENT_TASKS) {
+      const inFlight = tasks.filter((item) => running.has(item.task_id));
+      if (inFlight.length >= MAX_CONCURRENT_TASKS) {
+        continue;
+      }
+      if (
+        task.capability === GOAL_CAPABILITY &&
+        inFlight.filter((item) => item.capability === GOAL_CAPABILITY).length >= goalLimits().maxConcurrent
+      ) {
         continue;
       }
       if (startTask(task.task_id)) {
@@ -841,6 +849,7 @@ export function simulateRestartForTests(): void {
   }
   running.clear();
   activeWorkflows.clear();
+  forgetGoalMetersForTests();
 }
 
 export type { WorkflowRecord };

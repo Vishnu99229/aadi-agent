@@ -54,5 +54,32 @@ assert(
   (assistant2.tool_calls as unknown[]).length === 1,
   "tool_calls has one entry",
 );
+assert(
+  !JSON.stringify(assistant2).includes("thought_signature"),
+  "a signature is not sent to a provider that didn't issue one",
+);
+
+const signature = "sig-opaque-value-do-not-alter";
+const echoed = toOpenRouterMessages(
+  system,
+  [
+    { role: "user", content: "run" },
+    {
+      role: "assistant",
+      textParts: [],
+      toolCalls: [
+        { id: "t1", name: "foo", input: { x: 1 }, execution: "client", thoughtSignature: signature },
+        { id: "t2", name: "bar", input: {}, execution: "client" },
+      ],
+    },
+  ],
+  { preserveThoughtSignatures: true },
+);
+const echoedCalls = (echoed.at(-1) as { tool_calls: Array<{ extra_content?: { google?: { thought_signature?: string } } }> }).tool_calls;
+assert(
+  echoedCalls[0]?.extra_content?.google?.thought_signature === signature,
+  "Gemini gets the signature back unchanged, on the call that carried it",
+);
+assert(echoedCalls[1]?.extra_content === undefined, "a parallel call without a signature is not given one");
 
 console.log("test-llm-messages: OK");

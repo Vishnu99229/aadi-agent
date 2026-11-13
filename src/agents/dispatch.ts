@@ -93,6 +93,10 @@ export interface TurnContext {
   skipRecord?: boolean;
   /** Results of writes already done this turn, so a repeated call can't do it twice. */
   doneWrites: Map<string, string>;
+  /** Every successful call this turn, so a provider fallback can be handed the same result. */
+  doneCalls: Map<string, string>;
+  /** The model answering this step is a fallback. An identical call is not run again. */
+  suppressRepeat: boolean;
   /** One entry per call, in order: what ran and who ran it. */
   trace: Array<{ tool: string; owner: string; ok: boolean; reused?: boolean; ms: number }>;
 }
@@ -125,6 +129,8 @@ export function newTurnContext(input: {
     correlationId: input.correlationId,
     skipRecord: input.skipRecord,
     doneWrites: new Map(),
+    doneCalls: new Map(),
+    suppressRepeat: false,
     trace: [],
   };
 }
@@ -202,11 +208,16 @@ export async function dispatchTool(
   }
 
   const repeatable = ownership.effect === "read";
-  const key = repeatable ? "" : stableKey(call.name, call.input);
-  if (!repeatable && ctx.doneWrites.has(key)) {
+  const key = stableKey(call.name, call.input);
+  // A write is never run twice in a turn. A read is, unless this answer is a
+  // fallback for a provider that already ran the same call.
+  const prior = ctx.doneCalls.get(key);
+  if (prior !== undefined && (!repeatable || ctx.suppressRepeat)) {
     ctx.trace.push({ tool: call.name, owner: ownership.owner, ok: true, reused: true, ms: 0 });
-    console.log(`agent dispatch: duplicate skipped agent=${ownership.owner} capability=${call.name}`);
-    return { content: ctx.doneWrites.get(key)! };
+    console.log(
+      `agent dispatch: duplicate skipped agent=${ownership.owner} capability=${call.name} fallback=${ctx.suppressRepeat}`,
+    );
+    return { content: prior };
   }
 
   let taskId: string | undefined;
@@ -253,8 +264,11 @@ export async function dispatchTool(
   }
   const ms = Date.now() - startedAt;
   const ok = isSuccessfulToolResult(outcome.content, outcome.isError);
-  if (!repeatable && ok) {
-    ctx.doneWrites.set(key, outcome.content);
+  if (ok) {
+    ctx.doneCalls.set(key, outcome.content);
+    if (!repeatable) {
+      ctx.doneWrites.set(key, outcome.content);
+    }
   }
   ctx.trace.push({ tool: call.name, owner: ownership.owner, ok, ms });
   if (ctx.parentTaskId && ctx.workflowId) {

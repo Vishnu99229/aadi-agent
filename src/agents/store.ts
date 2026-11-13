@@ -170,6 +170,29 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_agent_approvals_task
     ON agent_approvals (task_id, state);
+
+  CREATE TABLE IF NOT EXISTS agent_goal_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    model TEXT NOT NULL,
+    llm_calls INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    error_code TEXT,
+    result_chars INTEGER NOT NULL,
+    tools_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_agent_goal_runs_workflow
+    ON agent_goal_runs (workflow_id, id);
 `);
 
 // A database created before the inline column existed gets it added.
@@ -1052,6 +1075,70 @@ export function parseContextRefs(task: TaskRecord): ContextRef[] {
   }
 }
 
+/** One run of a specialist's goal loop: who ran it, on which model, and what it cost. */
+export interface GoalRunRecord {
+  task_id: string;
+  workflow_id: string;
+  agent_id: string;
+  tier: string;
+  backend: string;
+  model: string;
+  llm_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  latency_ms: number;
+  outcome: TaskState;
+  error_code: string | null;
+  /** Length of the result only; the text itself stays in the task's result. */
+  result_chars: number;
+  tools_json: string;
+  created_at: string;
+}
+
+export function recordGoalRun(run: Omit<GoalRunRecord, "created_at">): void {
+  db.prepare(
+    `INSERT INTO agent_goal_runs
+       (task_id, workflow_id, agent_id, tier, backend, model, llm_calls, input_tokens, output_tokens,
+        cost_usd, latency_ms, outcome, error_code, result_chars, tools_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    run.task_id,
+    run.workflow_id,
+    run.agent_id,
+    run.tier,
+    run.backend,
+    run.model,
+    run.llm_calls,
+    run.input_tokens,
+    run.output_tokens,
+    run.cost_usd,
+    run.latency_ms,
+    run.outcome,
+    run.error_code,
+    run.result_chars,
+    run.tools_json,
+    nowIso(),
+  );
+}
+
+export function listGoalRuns(workflowId: string): GoalRunRecord[] {
+  return db
+    .prepare(`SELECT * FROM agent_goal_runs WHERE workflow_id = ? ORDER BY id`)
+    .all(workflowId) as GoalRunRecord[];
+}
+
+/** What a workflow's goal loops have already used, as recorded. */
+export function workflowGoalUsage(workflowId: string): { llmCalls: number; costUsd: number; createdAt?: string } {
+  const used = db
+    .prepare(
+      `SELECT COALESCE(SUM(llm_calls), 0) AS calls, COALESCE(SUM(cost_usd), 0) AS cost
+       FROM agent_goal_runs WHERE workflow_id = ?`,
+    )
+    .get(workflowId) as { calls: number; cost: number };
+  return { llmCalls: used.calls, costUsd: used.cost, createdAt: getWorkflow(workflowId)?.created_at };
+}
+
 /** Keeps the tables small: finished workflows older than the cutoff go. */
 export function pruneFinishedWorkflows(olderThanDays = 14, now = new Date()): number {
   const cutoff = new Date(now.getTime() - olderThanDays * 86_400_000).toISOString();
@@ -1080,6 +1167,7 @@ export function pruneFinishedWorkflows(olderThanDays = 14, now = new Date()): nu
         db.prepare(`DELETE FROM agent_idempotency WHERE task_id = ?`).run(task.task_id);
       }
       db.prepare(`DELETE FROM agent_tasks WHERE workflow_id = ?`).run(workflow_id);
+      db.prepare(`DELETE FROM agent_goal_runs WHERE workflow_id = ?`).run(workflow_id);
       for (const task of tasks) {
         // A conversation can outlive the workflow that opened it.
         const stillUsed = db
