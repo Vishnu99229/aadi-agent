@@ -21,16 +21,40 @@ const NOT_A_COMMAND: ReadonlyArray<readonly [RegExp, string]> = [
   [new RegExp(`\\bi(?:'ll|’ll| will|'m going to|’m going to| am going to)\\s+${SEND_WORD}\\b`, "i"), "he described a plan"],
 ];
 
+const DRAFT_WORD = /\b(?:draft|prepare|write|compose)\b/i;
+/** "Draft this, but don't send" / "without sending": the draft is allowed, the send is not. */
+const SEND_IS_FORBIDDEN =
+  /\b(?:don'?t|don’t|do not|never|without)\b[^.?!\n]{0,40}\bsend(?:ing)?\b/i;
+
+/**
+ * Drop constraints that limit a requested action ("without attendees",
+ * "don't send") so the rest of the sentence can still be the action.
+ * A bare "don't send" or "don't delete" is left as a refusal.
+ */
+export function withoutActionConstraints(text: string): string {
+  return text
+    .replace(ATTENDEE_LIMIT, " ")
+    .replace(
+      /\bwithout\s+(?:any\s+|no\s+)?(?:attendees?|guests?|invitations?|invites?)\b/gi,
+      " ",
+    )
+    .replace(/\bwithout\s+sending(?:\s+(?:any\s+)?(?:invitations?|invites?|emails?|mail))?\b/gi, " ")
+    .replace(SEND_IS_FORBIDDEN, " ");
+}
+
 /** Why these words aren't a command to send, or undefined when they may be.
  *  "Draft", "write" and "prepare" stay reviewable unless he also said send. "Reply to X"
- *  is a command to send. */
+ *  is a command to send. "Draft but don't send" is a draft, not a refusal to act. */
 export function notASendCommand(ownWords: string): string | undefined {
+  if (DRAFT_WORD.test(ownWords) && SEND_IS_FORBIDDEN.test(ownWords)) {
+    return "he asked for a draft";
+  }
   for (const [pattern, reason] of NOT_A_COMMAND) {
     if (pattern.test(ownWords)) {
       return reason;
     }
   }
-  if (/\b(?:draft|prepare|write|compose)\b/i.test(ownWords) && !/\bsend\b/i.test(ownWords)) {
+  if (DRAFT_WORD.test(ownWords) && !/\bsend\b/i.test(ownWords)) {
     return "he asked for a draft";
   }
   return undefined;
@@ -58,7 +82,7 @@ const ATTENDEE_LIMIT =
 
 /** The calendar version of notASendCommand. */
 export function notAnEventCommand(ownWords: string): string | undefined {
-  const text = ownWords.replace(ATTENDEE_LIMIT, " ");
+  const text = withoutActionConstraints(ownWords);
   for (const [pattern, reason] of NOT_AN_EVENT_COMMAND) {
     if (pattern.test(text)) {
       return reason;

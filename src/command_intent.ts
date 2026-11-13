@@ -1,4 +1,4 @@
-import { notAnEventCommand, notASendCommand } from "./command_logic.js";
+import { notAnEventCommand, notASendCommand, withoutActionConstraints } from "./command_logic.js";
 import { isExplicitSequenceRequest } from "./sequence_logic.js";
 
 /** Commands where a reply must come from a tool that ran this turn, never from
@@ -341,7 +341,9 @@ export function commandIntents(ownWords: string): CommandKind[] {
   if (any(STOP_SEQUENCE) && !notAnInstruction(text, { negationAllowed: true })) {
     found.add("sequence_stop");
   }
-  const plain = !notAnInstruction(text);
+  // "don't send" and "without attendees" constrain the action. They do not
+  // cancel a draft or a create that the same sentence asks for.
+  const plain = !notAnInstruction(withoutActionConstraints(text));
   if (plain && any(SET_TIMEZONE)) {
     found.add("sequence_timezone");
   }

@@ -1,4 +1,5 @@
 import { Bot, InlineKeyboard, Keyboard, type Api, type Context } from "grammy";
+import { isDraftCardOnly } from "./draft_confirm.js";
 import { runAgent } from "./agent.js";
 import { issueGrant, revokeGrant } from "./agents/auth.js";
 import { listWorkflows } from "./agents/store.js";
@@ -305,6 +306,9 @@ async function completeChatReply(
       return;
     }
     closeTurn(gate, "ok", startedAt);
+    if (isDraftCardOnly(settled.reply)) {
+      return;
+    }
     if (options.voiceReply && ctx.chat) {
       const chatId = ctx.chat.id;
       const cards = held?.close() ?? [];

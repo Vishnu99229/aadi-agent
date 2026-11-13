@@ -10,7 +10,8 @@ import {
 } from "../draft_recipients.js";
 import { parseAddressList } from "../mail_helpers.js";
 import { getGoogleAccount } from "../google/auth.js";
-import { createNewEmailDraft, signatureHtmlFor } from "../google/mail.js";
+import { createNewEmailDraft, signatureHtmlFor, signaturePlainText } from "../google/mail.js";
+import { notASendCommand } from "../command_logic.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 
@@ -105,16 +106,19 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   const account = await getGoogleAccount(
     values.account === "personal" ? "personal" : "work",
   );
+  const signatureHtml = await signatureHtmlFor(account);
   const { draftId } = await createNewEmailDraft({
     account,
     to: [toHeader],
     cc: ccHeader ? [ccHeader] : undefined,
     subject,
     body: values.body,
-    signatureHtml: await signatureHtmlFor(account),
+    signatureHtml,
   });
 
-  const sendImmediately = values.send_immediately === true;
+  const sendImmediately =
+    values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
+  const signature = signaturePlainText(signatureHtml);
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({
       draftId,
@@ -134,7 +138,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     subject,
     body: values.body,
     googleAccount: account.id,
-    extraLines: ccHeader ? [`Cc: ${ccHeader}`] : undefined,
+    ...(signature ? { signature } : {}),
   });
 
   return `Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`;

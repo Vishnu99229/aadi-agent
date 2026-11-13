@@ -74,7 +74,7 @@ const TOOLS_FOR: Record<ClaimAction, ReadonlySet<string>> = {
   answered: new Set(["search_qa_bank", "learn_qa_bank"]),
   completed: new Set(["complete_task"]),
   searched: new Set(["web_search", "latest_release"]),
-  offered: new Set(["start_sequence"]),
+  offered: new Set(["start_sequence", "draft_new_email", "draft_reply", "draft_mom"]),
 };
 
 const CLAIM_RE: Record<ClaimAction, RegExp> = {
@@ -93,7 +93,7 @@ const CLAIM_RE: Record<ClaimAction, RegExp> = {
   searched:
     /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?(?:searched|looked (?:it|that|this) up)\b|\b(?:from|via) (?:the )?(?:web|internet|search results?)\b|\bas of (?:today|now|this (?:morning|afternoon|evening))\b|\b(?:latest|breaking) (?:news|headlines?)\b|\bcurrent (?:price|rate|score|standings?|headline)\b|\blive (?:score|price|rate|updates?)\b|\baccording to (?:search|the web|sources?|reports?)\b|\b(?:search )?results? (?:show|say|from)\b/i,
   offered:
-    /\boffer posted\b|\bsequence card is shown\b|\bstart card sent\b|\bcard is shown above\b|\bwaiting for (?:your|vishnu's) start tap\b/i,
+    /\boffer posted\b|\bsequence card is shown\b|\bstart card sent\b|\bcard is shown above\b|\bwaiting for (?:your|vishnu's) start tap\b|\bdraft (?:is )?ready\b|\bwaiting for your send tap\b|\bapproval card\b/i,
 };
 
 const NEGATION =
