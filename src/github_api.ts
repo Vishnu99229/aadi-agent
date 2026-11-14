@@ -2,7 +2,8 @@ import { parsePullNumber } from "./build_logic.js";
 import { config } from "./config.js";
 import { redactSecrets } from "./security/env_guard.js";
 
-const GITHUB_API = "https://api.github.com";
+/** GITHUB_API_URL is for GitHub Enterprise or a local stand-in in tests. */
+const GITHUB_API = process.env.GITHUB_API_URL?.trim().replace(/\/+$/, "") || "https://api.github.com";
 const API_VERSION = "2022-11-28";
 
 function githubHeaders(): HeadersInit {
@@ -393,4 +394,136 @@ export async function revertMergedPull(
   } catch {
     return { ok: false, mergeSha };
   }
+}
+
+// ---- Reads for the Build Agent's own reasoning. Nothing below writes. ----
+
+export interface RepoCommit {
+  sha: string;
+  message: string;
+  author: string;
+  date: string;
+}
+
+export async function listRecentCommits(branch = "main", limit = 8): Promise<RepoCommit[]> {
+  const { data } = await githubFetch<
+    Array<{ sha?: string; commit?: { message?: string; author?: { name?: string; date?: string } } }>
+  >("GET", `${repoPath()}/commits?sha=${encodeURIComponent(branch)}&per_page=${Math.min(Math.max(limit, 1), 30)}`);
+  return (Array.isArray(data) ? data : []).map((item) => ({
+    sha: (item.sha ?? "").slice(0, 12),
+    message: (item.commit?.message ?? "").split("\n")[0]!.slice(0, 120),
+    author: item.commit?.author?.name ?? "",
+    date: item.commit?.author?.date ?? "",
+  }));
+}
+
+export interface OpenPull {
+  number: number;
+  title: string;
+  branch: string;
+  draft: boolean;
+  url: string;
+  updatedAt: string;
+}
+
+export async function listOpenPulls(limit = 10): Promise<OpenPull[]> {
+  const { data } = await githubFetch<
+    Array<{ number?: number; title?: string; head?: { ref?: string }; draft?: boolean; html_url?: string; updated_at?: string }>
+  >("GET", `${repoPath()}/pulls?state=open&per_page=${Math.min(Math.max(limit, 1), 30)}`);
+  return (Array.isArray(data) ? data : []).map((item) => ({
+    number: item.number ?? 0,
+    title: (item.title ?? "").slice(0, 120),
+    branch: item.head?.ref ?? "",
+    draft: item.draft === true,
+    url: item.html_url ?? "",
+    updatedAt: item.updated_at ?? "",
+  }));
+}
+
+export interface FailedCheckDetail {
+  name: string;
+  conclusion: string;
+  title: string;
+  summary: string;
+  annotations: Array<{ path: string; line: number; level: string; message: string }>;
+  failedSteps: string[];
+}
+
+/**
+ * What a failed check says about itself: its title and summary, its
+ * annotations (file, line, message), and for GitHub Actions the steps that
+ * failed. Enough to tell a test failure from a type error from a setup problem
+ * without downloading logs.
+ */
+export async function getFailedCheckDetails(sha: string, limit = 4): Promise<FailedCheckDetail[]> {
+  const { data } = await githubFetch<{
+    check_runs?: Array<{
+      id?: number;
+      name?: string;
+      status?: string;
+      conclusion?: string | null;
+      output?: { title?: string | null; summary?: string | null; annotations_count?: number };
+    }>;
+  }>("GET", `${repoPath()}/commits/${encodeURIComponent(sha)}/check-runs?per_page=50`);
+  const failing = (data.check_runs ?? []).filter((run) =>
+    ["failure", "timed_out", "cancelled", "action_required", "startup_failure"].includes((run.conclusion ?? "").toLowerCase()),
+  );
+  const details: FailedCheckDetail[] = [];
+  for (const run of failing.slice(0, limit)) {
+    let annotations: FailedCheckDetail["annotations"] = [];
+    if (run.id && (run.output?.annotations_count ?? 0) > 0) {
+      try {
+        const { data: notes } = await githubFetch<
+          Array<{ path?: string; start_line?: number; annotation_level?: string; message?: string }>
+        >("GET", `${repoPath()}/check-runs/${run.id}/annotations?per_page=10`);
+        annotations = (Array.isArray(notes) ? notes : []).map((note) => ({
+          path: note.path ?? "",
+          line: note.start_line ?? 0,
+          level: note.annotation_level ?? "",
+          message: redactSecrets((note.message ?? "").replace(/\s+/g, " ").slice(0, 300)),
+        }));
+      } catch {
+        annotations = [];
+      }
+    }
+    details.push({
+      name: run.name ?? "check",
+      conclusion: run.conclusion ?? "",
+      title: redactSecrets((run.output?.title ?? "").slice(0, 200)),
+      summary: redactSecrets((run.output?.summary ?? "").replace(/\s+/g, " ").slice(0, 800)),
+      annotations,
+      failedSteps: [],
+    });
+  }
+  // GitHub Actions: which steps of which jobs failed.
+  try {
+    const { data: runs } = await githubFetch<{ workflow_runs?: Array<{ id?: number; name?: string; conclusion?: string | null }> }>(
+      "GET",
+      `${repoPath()}/actions/runs?head_sha=${encodeURIComponent(sha)}&per_page=5`,
+    );
+    for (const workflowRun of (runs.workflow_runs ?? []).filter((item) => item.conclusion === "failure").slice(0, 2)) {
+      const { data: jobs } = await githubFetch<{
+        jobs?: Array<{ name?: string; conclusion?: string | null; steps?: Array<{ name?: string; conclusion?: string | null }> }>;
+      }>("GET", `${repoPath()}/actions/runs/${workflowRun.id}/jobs?per_page=20`);
+      for (const job of (jobs.jobs ?? []).filter((item) => item.conclusion === "failure")) {
+        const steps = (job.steps ?? []).filter((step) => step.conclusion === "failure").map((step) => step.name ?? "step");
+        const existing = details.find((item) => item.name === job.name);
+        if (existing) {
+          existing.failedSteps.push(...steps);
+        } else {
+          details.push({
+            name: job.name ?? workflowRun.name ?? "job",
+            conclusion: "failure",
+            title: "",
+            summary: "",
+            annotations: [],
+            failedSteps: steps,
+          });
+        }
+      }
+    }
+  } catch {
+    // Actions details are a bonus; the check runs above already say what failed.
+  }
+  return details;
 }

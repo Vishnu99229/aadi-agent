@@ -73,6 +73,10 @@ import {
 } from "./bills.js";
 import { handlePromiseDuplicateCallback } from "./promises.js";
 import { handleModelCallback, sendModelPanel } from "./model_panel.js";
+import { handleAgentModelCallback, sendAgentModelsPanel } from "./agent_model_panel.js";
+import { formatAgentsReport } from "./metrics.js";
+import { resolveAgentModel } from "./models/agent_models.js";
+import { modelLabel } from "./models/registry.js";
 import {
   consumeBuildFollowup,
   formatRecentBuilds,
@@ -390,6 +394,8 @@ async function handleForwardedContent(ctx: Context, content: string): Promise<vo
         toolNames: FORWARDED_TOOLS,
         sendConfirmation: undefined,
         guardText: wrapped,
+        // Aadi reads it and talks to Vishnu about it, so Aadi's own model answers.
+        modelAgent: "aadi",
       }),
     { forwarded: true, retryText: content },
   );
@@ -426,7 +432,7 @@ function replyKeyboard(): Keyboard {
 
 function menuKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text("Model setup", "menu:model")
+    .text("Agent models", "menu:model")
     .row()
     .text("Morning brief", "menu:brief")
     .row()
@@ -446,11 +452,9 @@ function menuKeyboard(): InlineKeyboard {
 }
 
 function menuCaption(): string {
-  const backend = getTaskBackend("chat");
-  if (!supportsEffort(backend)) {
-    return `Aadi — chat uses ${modelDisplayName(backend)}.`;
-  }
-  return `Aadi — chat uses ${modelDisplayName(backend)} · ${getTaskEffort("chat")}.`;
+  // Aadi talks to Vishnu on Aadi's own model (Agent Models), not a task setting.
+  const now = resolveAgentModel("aadi").models[0];
+  return `Aadi — talks on ${modelLabel(now)}.`;
 }
 
 function isAccountOrMeetingQuestion(text: string): boolean {
@@ -571,7 +575,9 @@ async function replyFromAgent(
 
 function settingsKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text("Model setup", "settings:model")
+    .text("Agent models", "settings:agents")
+    .row()
+    .text("Advanced models", "settings:model")
     .row()
     .text(`Voice replies: ${voiceRepliesEnabled() ? "on" : "off"}`, "settings:voice")
     .row()
@@ -672,9 +678,16 @@ bot.command("menu", async (ctx) => {
   await sendMenu(ctx);
 });
 
-// Older name for /settings model. Kept working, no longer in the menu.
+// Older name for /settings model. Kept working, no longer in the menu. It now
+// opens Agent Models; the per-task models are behind its Advanced button.
 bot.command("model", async (ctx) => {
-  await sendModelPanel(ctx);
+  await sendAgentModelsPanel(ctx);
+});
+
+/** Per-agent measurements for the experiment: /agents (24 hours) or /agents week. */
+bot.command("agents", async (ctx) => {
+  const window = commandArgument(ctx, "agents").toLowerCase().startsWith("week") ? "week" : "day";
+  await sendPlainText(ctx, formatAgentsReport(window));
 });
 
 bot.command("build", async (ctx) => {
@@ -716,7 +729,11 @@ bot.command("voice", async (ctx) => {
 /** Model choice, voice replies and the quick-action keyboard, in one place. */
 bot.command("settings", async (ctx) => {
   const [topic, value] = commandArgument(ctx, "settings").toLowerCase().split(/\s+/);
-  if (topic === "model") {
+  if (topic === "agents" || topic === "agent") {
+    await sendAgentModelsPanel(ctx);
+    return;
+  }
+  if (topic === "model" || topic === "models" || topic === "advanced") {
     await sendModelPanel(ctx);
     return;
   }
@@ -731,9 +748,13 @@ bot.command("settings", async (ctx) => {
   await sendSettingsPanel(ctx);
 });
 
-bot.callbackQuery(/^settings:(model|voice|keyboard)$/, async (ctx) => {
+bot.callbackQuery(/^settings:(agents|model|voice|keyboard)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCallbackQuery().catch(() => undefined);
+  if (action === "agents") {
+    await sendAgentModelsPanel(ctx);
+    return;
+  }
   if (action === "model") {
     await sendModelPanel(ctx);
     return;
@@ -1015,6 +1036,10 @@ bot.callbackQuery(/^md:/, async (ctx) => {
   await handleModelCallback(ctx);
 });
 
+bot.callbackQuery(/^am:/, async (ctx) => {
+  await handleAgentModelCallback(ctx, sendModelPanel);
+});
+
 bot.callbackQuery(/^cmdsend:(?:hold|cancelsched):/, async (ctx) => {
   await handleScheduledSendCallback(ctx);
 });
@@ -1057,7 +1082,7 @@ bot.callbackQuery(/^menu:(model|brief|sequences|outbox|settings|bills|tasks|keyb
 
   try {
     if (action === "model") {
-      await sendModelPanel(ctx);
+      await sendAgentModelsPanel(ctx);
       return;
     }
     if (action === "brief") {

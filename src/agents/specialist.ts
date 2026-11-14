@@ -9,8 +9,11 @@ import { dispatchTool, newTurnContext, type TurnContext } from "./dispatch.js";
 import type { AgentHandle, ExecutionEnv, ReconcileVerdict } from "./handle.js";
 import type { RoutingHints } from "./registry.js";
 import { validateSchema } from "./schema.js";
-import { capsForTask, goalBackend, goalLimits, goalMeter, modelIdFor, parseGoalTier } from "./goal_policy.js";
+import { capsForTask, goalLimits, goalMeter } from "./goal_policy.js";
 import { recordGoalRun } from "./store.js";
+import { getAgentModelSetting, isReasoningTier, resolveAgentModel } from "../models/agent_models.js";
+import { getModel, modelForLegacyBackend } from "../models/registry.js";
+import { recordAgentRun } from "../metrics.js";
 import {
   AgentTaskError,
   AuthRequiredSignal,
@@ -145,8 +148,12 @@ async function runGoal(
   }
   const { runAgent, newRunReport } = await import("../agent.js");
   const goal = String(input.goal ?? "").trim();
-  const tier = parseGoalTier(input.complexity);
-  const backend = goalBackend(agent.definition.id, tier);
+  // The goal's complexity, when Aadi gave one, else the agent's own tier.
+  const tier = isReasoningTier(input.complexity) ? input.complexity : getAgentModelSetting(agent.definition.id).tier;
+  // The same resolver every other path of this agent uses. Logged and recorded;
+  // runAgent resolves again at call time so a paused provider is skipped.
+  const planned = resolveAgentModel(agent.definition.id, { tier });
+  const backend = planned.models[0]?.key ?? "none";
   const dialogue = ctx.checkpoint.get<GoalTurn[]>(DIALOGUE_CHECKPOINT) ?? [];
   const last = dialogue.at(-1);
   if (ctx.resume && last && last.answer === undefined) {
@@ -167,7 +174,8 @@ async function runGoal(
   try {
     reply = await runAgent(text, {
       agentId: agent.definition.id,
-      backend,
+      modelAgent: agent.definition.id,
+      modelTier: tier,
       saveUserMessage: false,
       saveAssistantMessage: false,
       skipHistory: true,
@@ -209,7 +217,7 @@ async function runGoal(
     tier,
     backend: served,
     ...(served !== backend ? { requested_backend: backend } : {}),
-    model: modelIdFor(served),
+    model: getModel(served)?.modelId ?? modelForLegacyBackend(served)?.modelId ?? served,
     llm_calls: report.llmCalls,
     input_tokens: report.totalInputTokens,
     output_tokens: report.outputTokens,
@@ -218,6 +226,16 @@ async function runGoal(
   };
   const tools = report.tools.map((entry) => ({ tool: entry.tool, agent: entry.owner, ok: entry.ok }));
   const errorCode = failure instanceof AgentTaskError ? failure.detail.code : failure === undefined ? null : "failed";
+  recordAgentRun({
+    agentId: run.agent,
+    kind: "goal",
+    workflowId: ctx.request.workflowId,
+    taskId: ctx.request.taskId,
+    report,
+    latencyMs: run.ms,
+    outcome,
+    errorCode,
+  });
   try {
     recordGoalRun({
       task_id: ctx.request.taskId,

@@ -24,7 +24,8 @@ export const knowledgeAgent: SpecialistDefinition = {
     { name: "read_sheet", effect: "read", retry: "safe" },
     { name: "search_qa_bank", effect: "read", retry: "safe" },
     { name: "web_search", effect: "read", retry: "safe", remoteExposed: true },
-    { name: "latest_release", effect: "read", retry: "safe" },
+    // Public GitHub release data only: nothing of Vishnu's, so other agents may ask for it.
+    { name: "latest_release", effect: "read", retry: "safe", remoteExposed: true },
     { name: "search_memories", effect: "read", retry: "safe" },
     { name: "list_memories", effect: "read", retry: "safe" },
     { name: "search_history", effect: "read", retry: "safe" },

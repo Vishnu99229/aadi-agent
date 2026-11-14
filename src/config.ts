@@ -476,10 +476,6 @@ export type GoalBackend = (typeof GOAL_BACKENDS)[number];
 export interface GoalDelegationConfig {
   /** Off: delegate_tasks still runs named capabilities, but no specialist gets a goal loop. */
   enabled: boolean;
-  /** Model per complexity tier. A tier left out uses the chat model choice. */
-  tierBackends: Partial<Record<GoalTier, GoalBackend>>;
-  /** Optional model per agent, ahead of the tier. */
-  agentBackends: Record<string, GoalBackend>;
   /** Goal loops of one workflow running at the same time. */
   maxConcurrent: number;
   /** Deepest task depth a goal may run at. Aadi's own plan is depth 1. */
@@ -527,11 +523,18 @@ function readPositive(name: string, fallback: number, options: { integer?: boole
   return options.max !== undefined ? Math.min(value, options.max) : value;
 }
 
+// Older settings, still checked so a typo fails at startup. A goal now uses its
+// agent's own model (src/models/agent_models.ts). AGENT_GOAL_AGENT_BACKENDS is
+// read there as that agent's default for every path; a tier no longer picks a
+// model outside Auto, so AGENT_GOAL_BACKENDS is only warned about.
+readBackendMap("AGENT_GOAL_AGENT_BACKENDS", /^[a-z][a-z0-9_-]{0,30}$/);
+if (Object.keys(readBackendMap("AGENT_GOAL_BACKENDS", /^(light|standard|deep)$/)).length > 0) {
+  console.warn("AGENT_GOAL_BACKENDS is ignored: each agent's model is set in /settings -> Agent models or AGENT_MODELS.");
+}
+
 function readGoalDelegation(): GoalDelegationConfig {
   return {
     enabled: parseBool(process.env.AGENT_GOAL_DELEGATION, false),
-    tierBackends: readBackendMap("AGENT_GOAL_BACKENDS", /^(light|standard|deep)$/),
-    agentBackends: readBackendMap("AGENT_GOAL_AGENT_BACKENDS", /^[a-z][a-z0-9_-]{0,30}$/),
     maxConcurrent: readPositive("AGENT_GOAL_MAX_CONCURRENT", 2, { integer: true, max: 3 }),
     maxDepth: readPositive("AGENT_GOAL_MAX_DEPTH", 1, { integer: true, max: 2 }),
     maxIterations: readPositive("AGENT_GOAL_MAX_ITERATIONS", 6, { integer: true, max: 10 }),
@@ -591,10 +594,80 @@ function readA2aPort(): number {
   return port;
 }
 
-const a2aServerToken = process.env.A2A_SERVER_TOKEN?.trim() ?? "";
+export interface A2aServerClient {
+  /** Who is calling, for the log and for scoping its tasks. */
+  id: string;
+  /** Read from A2A_CLIENT_<ID>_TOKEN (or A2A_SERVER_TOKEN for "default"). Never logged. */
+  token: string;
+}
+
+/**
+ * Each agent that may call Aadi has its own bearer credential:
+ * A2A_SERVER_CLIENTS=vm,laptop with A2A_CLIENT_VM_TOKEN and A2A_CLIENT_LAPTOP_TOKEN.
+ * A2A_SERVER_TOKEN on its own still works, as the client "default".
+ */
+function readA2aClients(): A2aServerClient[] {
+  const out: A2aServerClient[] = [];
+  for (const raw of (process.env.A2A_SERVER_CLIENTS ?? "").split(",")) {
+    const id = raw.trim().toLowerCase();
+    if (!id) {
+      continue;
+    }
+    if (!/^[a-z][a-z0-9_-]{0,30}$/.test(id)) {
+      throw new Error(`A2A_SERVER_CLIENTS: "${id}" is not a valid client id.`);
+    }
+    const token = process.env[`A2A_CLIENT_${id.toUpperCase().replace(/-/g, "_")}_TOKEN`]?.trim() ?? "";
+    if (token.length < 24) {
+      throw new Error(`A2A_CLIENT_${id.toUpperCase().replace(/-/g, "_")}_TOKEN must be at least 24 characters.`);
+    }
+    out.push({ id, token });
+  }
+  const shared = process.env.A2A_SERVER_TOKEN?.trim() ?? "";
+  if (shared && !out.some((client) => client.id === "default")) {
+    out.push({ id: "default", token: shared });
+  }
+  if (new Set(out.map((client) => client.token)).size !== out.length) {
+    throw new Error("Each A2A client needs its own token.");
+  }
+  return out;
+}
+
+/** https, or http on loopback (an SSH tunnel). */
+function checkA2aUrl(label: string, raw: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`${label}: "${raw}" is not a valid URL.`);
+  }
+  const loopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]";
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    throw new Error(`${label} must use https, or http on loopback.`);
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+function readA2aUrl(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  return raw ? checkA2aUrl(name, raw) : undefined;
+}
+
+/** Push callbacks go only to these origins. Empty: push notifications are not offered. */
+function readPushOrigins(): string[] {
+  return (process.env.A2A_PUSH_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => new URL(checkA2aUrl("A2A_PUSH_ALLOWED_ORIGINS", item)).origin);
+}
+
 const a2aServerEnabled = parseBool(process.env.A2A_SERVER_ENABLED, false);
-if (a2aServerEnabled && a2aServerToken.length < 24) {
-  throw new Error("A2A_SERVER_ENABLED needs A2A_SERVER_TOKEN set to at least 24 characters.");
+const a2aServerClients = readA2aClients();
+const a2aServerToken = process.env.A2A_SERVER_TOKEN?.trim() ?? "";
+if (a2aServerEnabled && (a2aServerClients.length === 0 || a2aServerClients.some((client) => client.token.length < 24))) {
+  throw new Error(
+    "A2A_SERVER_ENABLED needs a client credential of at least 24 characters (A2A_SERVER_CLIENTS with A2A_CLIENT_<ID>_TOKEN, or A2A_SERVER_TOKEN).",
+  );
 }
 
 export const config = {
@@ -604,6 +677,12 @@ export const config = {
   a2aServerEnabled,
   a2aServerPort: readA2aPort(),
   a2aServerToken,
+  a2aServerClients,
+  /** The address other agents reach Aadi on (Tailscale or a tunnel). The server still binds loopback. */
+  a2aPublicUrl: readA2aUrl("A2A_PUBLIC_URL"),
+  a2aPushAllowedOrigins: readPushOrigins(),
+  /** Where a remote agent can push updates for Aadi's own long tasks. Unset: no push requested. */
+  a2aPushCallbackUrl: readA2aUrl("A2A_PUSH_CALLBACK_URL"),
   a2aRemoteAgents: readRemoteAgents(),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN!,
   ownerTelegramId,

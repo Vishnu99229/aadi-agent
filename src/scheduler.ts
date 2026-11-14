@@ -1,3 +1,4 @@
+import { agentModelSummary } from "./models/agent_models.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { config } from "./config.js";
 import { getJobRun, isMorningBriefEnabled, listJobRuns, recordJobRun } from "./db.js";
@@ -556,6 +557,22 @@ export function lastRanLabel(iso: string | null, now: Date): string {
   return `last ran ${hhmm} ${pad2(ranParts.day)}/${pad2(ranParts.month)}`;
 }
 
+/**
+ * The agent setup in effect: routing, goal delegation, each agent's model (and
+ * what it falls back to right now), and whether the A2A endpoint is on. Ids
+ * and model keys only, never a credential.
+ */
+export function formatAgentHealthLines(): string[] {
+  const clients = config.a2aServerClients.map((client) => client.id).join(",") || "none";
+  return [
+    `agents: routing ${config.agentRouting}, goal delegation ${config.goalDelegation.enabled ? "on" : "off"}`,
+    `agent models: ${agentModelSummary().join(" ")}`,
+    config.a2aServerEnabled
+      ? `a2a server: on, bound 127.0.0.1:${config.a2aServerPort}, clients ${clients}, push ${config.a2aPushAllowedOrigins.length > 0 ? "on" : "off"}${config.a2aPublicUrl ? `, advertised ${config.a2aPublicUrl}` : ""}`
+      : "a2a server: off",
+  ];
+}
+
 export function formatHealthReport(now = new Date(), cwd = process.cwd()): string {
   const runs = new Map(listJobRuns().map((row) => [row.name, row]));
   const lines = [
@@ -563,6 +580,7 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
     formatVersionLine(readDeployVersion(cwd), readLocalGitHash(cwd)),
     formatTurnsHealthLine(now),
     formatCreditHealthLine(now.getTime()),
+    ...formatAgentHealthLines(),
   ];
   const beatPath = heartbeatPath(cwd);
   if (existsSync(beatPath)) {

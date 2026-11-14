@@ -29,6 +29,7 @@ import {
   type WorkflowOrigin,
 } from "./store.js";
 import type { AgentTaskResult } from "./types.js";
+import { newTurnMeter, recordLateWorkflow, recordTurn, type TurnMeter, type TurnWorkflow } from "../metrics.js";
 
 /**
  * Aadi as orchestrator. It decides who handles a turn, hands work to the
@@ -174,6 +175,7 @@ export async function tryDirectAnswer(
     return undefined;
   }
   const startedAt = Date.now();
+  const meter = newTurnMeter();
   const answer = await runCapability({
     agentId: route.agentId,
     capability: route.capability,
@@ -188,6 +190,14 @@ export async function tryDirectAnswer(
   }
   saveMessage("user", ownerText);
   saveMessage("assistant", answer.text);
+  recordTurn({
+    chatId: options.chatId,
+    route: `direct:${route.agentId}.${route.capability}`,
+    path: "fast",
+    agentId: route.agentId,
+    meter,
+    success: true,
+  });
   console.log(
     `agent routing: route=direct agent=${route.agentId} capability=${route.capability} llm_calls=0 ms=${Date.now() - startedAt}`,
   );
@@ -311,7 +321,23 @@ function goalIdempotencyKey(turn: ToolTurn, agentId: string, goal: string): stri
 const GOAL_GUIDANCE =
   'When one message asks for two or more judgments, and a later one depends on an earlier one or they can be made side by side, give each judgment capability "goal" with the judgment in words and a complexity: light for a short judgment, standard by default, deep only for real analysis. Do not make those judgments yourself after one lookup. A single lookup or a plain command is a tool call, not a goal.';
 
-function delegateTool(chatId: number | undefined, postCard: CardPoster | undefined): MetaTool {
+function workflowMeasure(summary: WorkflowSummary, startedAt: number, late = false): TurnWorkflow {
+  return {
+    workflowId: summary.workflowId,
+    ms: Date.now() - startedAt,
+    failed: summary.state === "failed" || summary.tasks.every((task) => task.state === "failed" || task.state === "rejected"),
+    authRequired: summary.tasks.filter((task) => task.state === "auth-required").length,
+    uncertain: summary.tasks.filter((task) => task.error?.uncertain === true).length,
+    late,
+  };
+}
+
+function delegateTool(
+  chatId: number | undefined,
+  postCard: CardPoster | undefined,
+  meter?: TurnMeter,
+  turnRef?: { id?: number },
+): MetaTool {
   const goals = goalLimits().enabled;
   return {
     definition: {
@@ -337,7 +363,8 @@ function delegateTool(chatId: number | undefined, postCard: CardPoster | undefin
                       complexity: {
                         type: "string",
                         enum: ["light", "standard", "deep"],
-                        description: 'For capability "goal": how much reasoning it needs. Picks the model.',
+                        description:
+                          'For capability "goal": how much reasoning it needs. Sets the agent\'s reasoning effort, or picks the model when the agent is on Auto. The agent always keeps its own model setting.',
                       },
                     }
                   : {}),
@@ -416,6 +443,7 @@ function delegateTool(chatId: number | undefined, postCard: CardPoster | undefin
         return { content: problems.join(" "), isError: true };
       }
       let running: Promise<WorkflowSummary>;
+      const workflowStartedAt = Date.now();
       try {
         running = startWorkflow({
           title: String(values.title ?? "Delegated job"),
@@ -433,11 +461,15 @@ function delegateTool(chatId: number | undefined, postCard: CardPoster | undefin
         new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), WORKFLOW_WAIT_MS)),
       ]);
       if (!finished) {
+        if (meter) {
+          meter.pending += 1;
+        }
         void running
           .then(async (late) => {
             takeWorkflowToolRuns(late.workflowId);
             rememberOwnerWords(late, grant);
             logGoalTotals(late);
+            recordLateWorkflow(turnRef?.id, workflowMeasure(late, workflowStartedAt, true));
             await postCards(late, postCard);
             await lateNotifier?.(`That job finished.\n${summaryForOwner(late)}`);
           })
@@ -453,6 +485,7 @@ function delegateTool(chatId: number | undefined, postCard: CardPoster | undefin
       }
       rememberOwnerWords(finished, grant);
       logGoalTotals(finished);
+      meter?.workflows.push(workflowMeasure(finished, workflowStartedAt));
       const cards = await postCards(finished, postCard);
       return {
         content: `${summaryForModel(finished)}${cards > 0 ? `\n${cards} card(s) with buttons were posted to Vishnu.` : ""}`,
@@ -626,25 +659,53 @@ export async function runOwnerTurn(modelText: string, options: OwnerTurnOptions)
   const route: Route = picked.kind === "direct" ? { kind: "aadi", reason: "direct answer fell back" } : picked;
   const report = newRunReport();
   const startedAt = Date.now();
-  let reply: string;
-  if (route.kind === "specialist") {
-    reply = await runAgent(modelText, {
-      ...agentOptions,
-      agentId: route.agentId,
-      metaTools: [escalateTool],
-      report,
-    });
-  } else {
-    const full = config.agentRouting === "full" && agentOptions.sendConfirmation !== undefined;
-    const waiting = full ? pausedContext(chatId) : "";
-    reply = await runAgent(modelText, {
-      ...agentOptions,
-      metaTools: full
-        ? [delegateTool(chatId, postCard), ...(waiting ? [continueTool(chatId, postCard), cancelTool(chatId)] : [])]
-        : [],
-      extraContext: waiting,
-      report,
-    });
+  const meter = newTurnMeter();
+  const turnRef: { id?: number } = {};
+  let reply = "";
+  let failure: unknown;
+  try {
+    if (route.kind === "specialist") {
+      // The specialist reasons with its own model setting, the same as in a goal.
+      reply = await runAgent(modelText, {
+        ...agentOptions,
+        agentId: route.agentId,
+        modelAgent: route.agentId,
+        metaTools: [escalateTool],
+        report,
+      });
+    } else {
+      const full = config.agentRouting === "full" && agentOptions.sendConfirmation !== undefined;
+      const waiting = full ? pausedContext(chatId) : "";
+      reply = await runAgent(modelText, {
+        ...agentOptions,
+        modelAgent: "aadi",
+        metaTools: full
+          ? [
+              delegateTool(chatId, postCard, meter, turnRef),
+              ...(waiting ? [continueTool(chatId, postCard), cancelTool(chatId)] : []),
+            ]
+          : [],
+        extraContext: waiting,
+        report,
+      });
+    }
+  } catch (error) {
+    failure = error;
+  }
+  const path =
+    route.kind === "specialist" ? "specialist" : meter.workflows.length + meter.pending > 0 ? "delegated" : "aadi";
+  turnRef.id = recordTurn({
+    chatId,
+    route: route.kind === "specialist" ? `specialist:${route.agentId}` : `aadi:${route.reason}`,
+    path,
+    agentId: route.kind === "specialist" ? route.agentId : "aadi",
+    report,
+    meter,
+    success: failure === undefined && report.succeeded !== false,
+    error: failure === undefined ? undefined : failure instanceof Error ? failure.name : "UnknownError",
+  });
+  if (failure !== undefined) {
+    throw failure;
   }
   if (routeOut) {
     routeOut.value = route;

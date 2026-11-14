@@ -1,11 +1,11 @@
-import { getTaskBackend, type ChatBackend } from "../chat_backend.js";
 import { config, GOAL_TIERS, type GoalDelegationConfig, type GoalTier } from "../config.js";
 import { assertTestSeam } from "../test_seam.js";
 import { workflowGoalUsage } from "./store.js";
 
 /**
- * How much independent work a delegated workflow may do: which model each goal
- * loop gets, and the limits shared by every goal loop of one workflow.
+ * How much independent work a delegated workflow may do: the limits shared by
+ * every goal loop of one workflow. Which model a goal loop uses is the agent's
+ * own setting (src/models/agent_models.ts), the same as on its other turns.
  */
 let overrides: Partial<GoalDelegationConfig> = {};
 const meters = new Map<string, { calls: number; costUsd: number; startedAt: number }>();
@@ -54,50 +54,6 @@ export function capsForTask(
 
 export function parseGoalTier(value: unknown): GoalTier {
   return typeof value === "string" && (GOAL_TIERS as readonly string[]).includes(value) ? (value as GoalTier) : "standard";
-}
-
-function backendReady(backend: ChatBackend): boolean {
-  if (backend === "gemini") {
-    return config.geminiApiKey !== "";
-  }
-  if (backend === "deepseek") {
-    return config.deepseekApiKey !== "";
-  }
-  return config.anthropicApiKey !== "" && (backend === "haiku" || config.claudeModel !== "");
-}
-
-/** The model id a backend calls, for the record. */
-export function modelIdFor(backend: string): string {
-  switch (backend) {
-    case "claude":
-      return config.claudeModel;
-    case "haiku":
-      return config.backgroundModel;
-    case "deepseek":
-      return config.deepseekModel;
-    case "deepseek-reasoner":
-      return config.deepseekReasonerModel;
-    case "local-gemma":
-      return config.localLlmModel;
-    default:
-      return config.geminiModel;
-  }
-}
-
-/**
- * The agent's own setting first, then the goal's tier, then whatever chat uses.
- * A choice whose API key is missing falls back to the chat model.
- */
-export function goalBackend(agentId: string, tier: GoalTier): ChatBackend {
-  const limits = goalLimits();
-  const wanted = limits.agentBackends[agentId] ?? limits.tierBackends[tier];
-  if (wanted && backendReady(wanted)) {
-    return wanted;
-  }
-  if (wanted) {
-    console.log(`agent goal: ${wanted} has no API key; agent=${agentId} tier=${tier} uses the chat model`);
-  }
-  return getTaskBackend("chat");
 }
 
 export interface GoalMeter {

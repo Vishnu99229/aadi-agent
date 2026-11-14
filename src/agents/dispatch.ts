@@ -99,6 +99,8 @@ export interface TurnContext {
   suppressRepeat: boolean;
   /** One entry per call, in order: what ran and who ran it. */
   trace: Array<{ tool: string; owner: string; ok: boolean; reused?: boolean; ms: number }>;
+  /** Calls refused because the turn's grant doesn't allow them. */
+  refused: number;
 }
 
 export function newTurnContext(input: {
@@ -132,6 +134,7 @@ export function newTurnContext(input: {
     doneCalls: new Map(),
     suppressRepeat: false,
     trace: [],
+    refused: 0,
   };
 }
 
@@ -201,6 +204,7 @@ export async function dispatchTool(
     remoteExposed: ownership.remoteExposed,
   });
   if (!decision.ok) {
+    ctx.refused += 1;
     console.log(
       `agent dispatch: refused agent=${ownership.owner} capability=${call.name} source=${ctx.grant?.source ?? "none"}`,
     );

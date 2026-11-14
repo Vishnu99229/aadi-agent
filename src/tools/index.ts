@@ -66,6 +66,11 @@ import * as startSequence from "./start_sequence.js";
 import * as stopSequence from "./stop_sequence.js";
 import * as updateAccount from "./update_account.js";
 import * as updateDraft from "./update_draft.js";
+import * as buildInfo from "./build_info.js";
+import * as listRecentBuilds from "./list_recent_builds.js";
+import * as getBuildChecks from "./get_build_checks.js";
+import * as getRepoState from "./get_repo_state.js";
+import * as prepareBuild from "./prepare_build.js";
 
 export interface ToolTurn {
   /** 1 = the model's first step, decided from Vishnu's message alone. */
@@ -152,6 +157,11 @@ const modules = {
   update_account: updateAccount,
   update_memory: updateMemory,
   update_draft: updateDraft,
+  get_build: buildInfo,
+  list_recent_builds: listRecentBuilds,
+  get_build_checks: getBuildChecks,
+  get_repo_state: getRepoState,
+  prepare_build: prepareBuild,
 } as const satisfies Record<string, RegisteredTool>;
 
 /** Fixed order so the Anthropic cached prefix never changes with object-key churn or optional tools. */
@@ -224,8 +234,21 @@ export const TOOL_ORDER = [
   "list_documents",
 ] as const;
 
+/**
+ * Tools only a specialist's own loop is offered. They are not in TOOL_ORDER, so
+ * Aadi's tool list and its cached prefix are unchanged: Aadi reaches them by
+ * routing the turn to that specialist or delegating a goal to it.
+ */
+export const SPECIALIST_ONLY_TOOLS = [
+  "get_build",
+  "list_recent_builds",
+  "get_build_checks",
+  "get_repo_state",
+  "prepare_build",
+] as const;
+
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(
-  TOOL_ORDER.map((name) => [name, modules[name]]),
+  [...TOOL_ORDER, ...SPECIALIST_ONLY_TOOLS].map((name) => [name, modules[name]]),
 );
 
 /** Read and draft tools a forwarded message may use. Nothing here sends, books, or writes. */

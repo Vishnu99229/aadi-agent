@@ -1,4 +1,5 @@
 import { config, type ModelCostRates } from "./config.js";
+import { registryRatesForModelId } from "./models/registry.js";
 import {
   insertUsageLog,
   listUsageLogs,
@@ -114,6 +115,11 @@ export function ratesForModel(
   promptTokens: number,
   now = new Date(),
 ): ModelCostRates {
+  // OpenAI, Kimi, Opus and MODELS_EXTRA are priced by the model registry.
+  const fromRegistry = registryRatesForModelId(model);
+  if (fromRegistry) {
+    return with1hWriteRate(fromRegistry);
+  }
   if (isHaiku55Model(model) || model === config.backgroundModel) {
     const base = with1hWriteRate(config.backgroundCostRates);
     if (promptTokens <= HAIKU_LONG_CONTEXT_TOKENS) {

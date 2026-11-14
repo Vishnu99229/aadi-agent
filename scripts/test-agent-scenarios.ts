@@ -357,10 +357,18 @@ passed.push("C: a missing due date pauses the task (input-required); it can be d
 // Scenario D: Build Agent
 // =====================================================================
 const build = getAgent("build")!;
-assert(build.manifest.tools.length === 0, "the Build Agent has no model tools");
 assert(
-  build.getCapabilities().map((item) => item.name).sort().join(",") === "build_status,list_builds,request_build",
-  "its capabilities are request, list and status: nothing that starts, merges or deploys",
+  build.manifest.tools.join(",") === "get_build,list_recent_builds,get_build_checks,get_repo_state,prepare_build,get_current_time",
+  `the Build Agent's model tools read builds, CI and the repo, and prepare a card (${build.manifest.tools.join(",")})`,
+);
+const buildCapabilities = build.getCapabilities().map((item) => item.name);
+assert(
+  ["build_status", "list_builds", "request_build", "goal"].every((name) => buildCapabilities.includes(name)),
+  `its capabilities include request, list, status and its own goal loop (${buildCapabilities.join(",")})`,
+);
+assert(
+  !buildCapabilities.some((name) => /merge|deploy|start_build|approve|revert/.test(name)),
+  "nothing that starts, merges or deploys",
 );
 assert(build.getCapabilities().every((item) => item.effect !== "external"), "none of them acts outside Aadi");
 const asked = await delegate({

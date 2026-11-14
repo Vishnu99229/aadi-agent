@@ -7,6 +7,7 @@ import {
   upsertLlmBackendFlag,
 } from "./db.js";
 import { assertTestSeam } from "./test_seam.js";
+import { providerConfigured, type ModelSpec, type ProviderId } from "./models/registry.js";
 
 export type LlmBackend =
   | "claude"
@@ -59,7 +60,9 @@ export function backendHasKey(backend: LlmBackend): boolean {
 
 export function isCreditOrAuthError(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error);
-  return /credit balance is too low|insufficient.?credit|insufficient.?balance|\b402\b|invalid api key|authentication|unauthorized/i.test(
+  // OpenAI says "401 Incorrect API key" and "insufficient_quota"; Moonshot and
+  // DeepSeek say "Invalid Authentication" or "insufficient balance".
+  return /credit balance is too low|insufficient.?credit|insufficient.?balance|insufficient.?quota|exceeded your current quota|\b40[12]\b|invalid api key|incorrect api key|authentication|unauthorized/i.test(
     text,
   );
 }
@@ -91,7 +94,7 @@ function restChain(): LlmBackend[] {
 }
 
 export function isLlmBackendFlagged(
-  backend: LlmBackend,
+  backend: LlmBackend | ProviderFlagKey,
   now = Date.now(),
 ): boolean {
   const mem = memory.get(backend);
@@ -192,6 +195,61 @@ export function getFallbackChain(
     ordered.push(backend);
   }
   return ordered;
+}
+
+/** Providers with no older backend name are flagged under their own id. */
+type ProviderFlagKey = "openai" | "kimi";
+
+/** The flag a provider's credit or auth failure is recorded under. */
+function providerFlagKey(provider: ProviderId): LlmBackend | ProviderFlagKey {
+  switch (provider) {
+    case "anthropic":
+      return "claude";
+    case "gemini":
+      return "gemini";
+    case "deepseek":
+      return "deepseek";
+    default:
+      return provider;
+  }
+}
+
+/** A credit or auth failure takes the whole provider out for six hours. */
+export function flagProvider(provider: ProviderId, reason: string, now = Date.now()): void {
+  const key = providerFlagKey(provider);
+  if (key === "openai" || key === "kimi") {
+    const trimmed = reason.replace(/\s+/g, " ").trim().slice(0, 80);
+    memory.set(key, { reason: trimmed, flaggedAt: now });
+    upsertLlmBackendFlag(key, trimmed, new Date(now).toISOString());
+    return;
+  }
+  flagLlmBackend(key, reason, now);
+  if (key === "deepseek") {
+    flagLlmBackend("deepseek-reasoner", reason, now);
+  }
+}
+
+export function isProviderFlagged(provider: ProviderId, now = Date.now()): boolean {
+  if (provider === "anthropic") {
+    return anthropicCreditBlocked(now);
+  }
+  return isLlmBackendFlagged(providerFlagKey(provider), now);
+}
+
+/** Has a key and is not flagged: worth trying. */
+export function isModelUsable(spec: ModelSpec, now = Date.now()): boolean {
+  return providerConfigured(spec.provider) && !isProviderFlagged(spec.provider, now);
+}
+
+/** Why a model can't be tried right now, or undefined when it can. */
+export function modelUnavailableReason(spec: ModelSpec, now = Date.now()): string | undefined {
+  if (!providerConfigured(spec.provider)) {
+    return "no API key";
+  }
+  if (isProviderFlagged(spec.provider, now)) {
+    return "paused after a credit or auth error";
+  }
+  return undefined;
 }
 
 export function clearLlmBackendFlagsForTests(): void {

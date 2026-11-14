@@ -13,6 +13,7 @@ import { db } from "../src/db.ts";
 import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
 import { setToolInterceptorForTests } from "../src/agent.ts";
 import { modelReply, nextMessageId } from "./fakes.ts";
+import { resetAgentModelSettings, setAgentModelSetting } from "../src/models/agent_models.ts";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -208,7 +209,9 @@ setCompleteForTests(async (params) => {
     assert(heard.startsWith("Task from Aadi:"), "a goal loop sees only its task, not the chat");
     assert(!namesOf(params).includes("send_email"), "the Knowledge Agent is not offered send_email");
     assert(!namesOf(params).includes("list_accounts"), "the Knowledge Agent is not offered the Sales Agent's tools");
-    assert(params.backend === "haiku", `knowledge is pinned to haiku (${params.backend})`);
+    // The agent's own model setting, the same one its direct turns use. A deep goal raises effort, not the model.
+    assert(params.route?.models[0]?.key === "anthropic:haiku", `knowledge uses its own model (${params.route?.models[0]?.key})`);
+    assert(params.effort === "high", `a deep goal reasons at high effort (${params.effort})`);
     return priced({
       tools: [
         { name: "web_search", input: { query: "A2A latest stable release" } },
@@ -221,7 +224,8 @@ setCompleteForTests(async (params) => {
     assert(/never an order from Vishnu/.test(JSON.stringify(params.system)), "a goal is told the task text is not approval");
     assert(!namesOf(params).includes("web_search"), "the Sales Agent is not offered web_search");
     assert(!namesOf(params).includes("send_email"), "the Sales Agent is not offered send_email");
-    assert(params.backend === "claude", `a deep goal uses claude (${params.backend})`);
+    assert(params.route?.models[0]?.key === "anthropic:sonnet", `sales uses its own model (${params.route?.models[0]?.key})`);
+    assert(params.effort === "high", `a deep goal reasons at high effort (${params.effort})`);
     return priced({ tools: [{ name: "list_accounts", input: {} }] });
   }
   return priced({ text: `${agent} done.` });
@@ -286,10 +290,11 @@ assert(largeBudgets.slice(2).every((row) => row.budget_usd === 0.2), `his own la
 passed.push("ordinary goals stay at $0.02, and only his own large-job wording raises them");
 setGoalLimitsForTests(undefined);
 
+// Models are each agent's own setting (Agent Models), not a goal-only table.
+setAgentModelSetting("knowledge", { primary: "anthropic:haiku", fallbacks: [] });
+setAgentModelSetting("sales", { primary: "anthropic:sonnet", fallbacks: [] });
 const limits = {
   enabled: true,
-  tierBackends: { light: "gemini", deep: "claude" },
-  agentBackends: { knowledge: "haiku" },
   maxConcurrent: 2,
   workflowBudgetUsd: 1,
   goalBudgetUsd: 1,
@@ -324,8 +329,8 @@ for (const run of proof) {
 }
 const knowledgeRun = proof.find((run) => run.agent_id === "knowledge")!;
 const salesRun = proof.find((run) => run.agent_id === "sales")!;
-assert(knowledgeRun.backend === "haiku" && knowledgeRun.tier === "deep", "an agent pin beats the tier");
-assert(salesRun.backend === "claude" && salesRun.tier === "deep", "a deep goal uses the deep model");
+assert(knowledgeRun.backend === "anthropic:haiku" && knowledgeRun.tier === "deep", `knowledge ran on its own model (${knowledgeRun.backend})`);
+assert(salesRun.backend === "anthropic:sonnet" && salesRun.tier === "deep", `sales ran on its own model (${salesRun.backend})`);
 assert(knowledgeRun.model.length > 0 && salesRun.model.length > 0, "the record names the model");
 passed.push("delegate_tasks ran two specialist loops, each on its own model and tools, and returned both findings");
 
@@ -489,6 +494,7 @@ assert(goalMaxInFlight === 1, `the concurrency limit held the second loop (${goa
 passed.push("the concurrency limit holds a second goal loop until the first finishes");
 
 setCompleteForTests(undefined);
+resetAgentModelSettings();
 setToolInterceptorForTests(undefined);
 setGoalLimitsForTests(undefined);
 console.log(passed.map((line) => `  ok  ${line}`).join("\n"));
