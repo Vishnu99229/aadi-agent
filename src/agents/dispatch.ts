@@ -12,6 +12,10 @@ import {
   type WorkflowOrigin,
 } from "./store.js";
 import { CORE_OWNER } from "./types.js";
+import { cacheBypassed, cacheGet, cachePut, invalidateOwner, isCacheable } from "./cache.js";
+import { CACHE_POLICIES, ownerWantsFresh, VOLATILE } from "./cache_policy.js";
+import { contactQuestionAsked, contactQuestionMark } from "../contact_questions.js";
+import { acquire } from "../governor.js";
 
 /**
  * The single route from a model's tool call to a tool handler. Whoever asks
@@ -98,9 +102,13 @@ export interface TurnContext {
   /** The model answering this step is a fallback. An identical call is not run again. */
   suppressRepeat: boolean;
   /** One entry per call, in order: what ran and who ran it. */
-  trace: Array<{ tool: string; owner: string; ok: boolean; reused?: boolean; ms: number }>;
+  trace: Array<{ tool: string; owner: string; ok: boolean; reused?: boolean; cached?: boolean; ms: number }>;
   /** Calls refused because the turn's grant doesn't allow them. */
   refused: number;
+  /** Calls answered from the shared result cache. */
+  cacheHits: number;
+  /** Calls running right now, so an identical write started alongside waits for it. */
+  inflight: Map<string, Promise<ToolOutcome>>;
 }
 
 export function newTurnContext(input: {
@@ -135,6 +143,8 @@ export function newTurnContext(input: {
     suppressRepeat: false,
     trace: [],
     refused: 0,
+    cacheHits: 0,
+    inflight: new Map(),
   };
 }
 
@@ -157,6 +167,15 @@ function stableKey(name: string, input: unknown): string {
   } catch {
     return `${name}:?`;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function withoutFresh(input: Record<string, unknown>): Record<string, unknown> {
+  const { fresh: _fresh, ...rest } = input;
+  return rest;
 }
 
 function ensureWorkflow(ctx: TurnContext): void {
@@ -211,8 +230,11 @@ export async function dispatchTool(
     return { content: `Not done: ${decision.reason}`, isError: true };
   }
 
+  // `fresh` is for the cache only; the tool never sees it.
+  const fresh = isRecord(call.input) && call.input.fresh === true;
+  const input = isRecord(call.input) && "fresh" in call.input ? withoutFresh(call.input) : call.input;
   const repeatable = ownership.effect === "read";
-  const key = stableKey(call.name, call.input);
+  const key = stableKey(call.name, input);
   // A write is never run twice in a turn. A read is, unless this answer is a
   // fallback for a provider that already ran the same call.
   const prior = ctx.doneCalls.get(key);
@@ -224,6 +246,59 @@ export async function dispatchTool(
     return { content: prior };
   }
 
+  // The same write started twice in one step (parallel calls): the second waits
+  // for the first and gets its result instead of doing it again.
+  const running = ctx.inflight.get(key);
+  if (running && (!repeatable || ctx.suppressRepeat)) {
+    const first = await running;
+    ctx.trace.push({ tool: call.name, owner: ownership.owner, ok: !first.isError, reused: true, ms: 0 });
+    console.log(`agent dispatch: duplicate joined agent=${ownership.owner} capability=${call.name}`);
+    return first;
+  }
+  const execution = runCall(call, input, key, repeatable, fresh, ownership, turn, ctx);
+  ctx.inflight.set(key, execution);
+  try {
+    return await execution;
+  } finally {
+    ctx.inflight.delete(key);
+  }
+}
+
+async function runCall(
+  call: ToolCall,
+  input: unknown,
+  key: string,
+  repeatable: boolean,
+  fresh: boolean,
+  ownership: NonNullable<ReturnType<typeof toolOwnership>>,
+  turn: ToolTurn,
+  ctx: TurnContext,
+): Promise<ToolOutcome> {
+  const tool = toolRegistry[call.name]!;
+  // The shared cache, behind every check above: only a caller allowed this tool
+  // under its own grant ever sees a cached result for it. Data that changes
+  // with his day is fetched again when his words ask for the current state.
+  const cacheable = repeatable && isCacheable(call.name, input);
+  const policy = CACHE_POLICIES[call.name];
+  const wantsFresh = fresh || (policy !== undefined && VOLATILE.has(policy.freshness) && ownerWantsFresh(turn.userText ?? ctx.grant?.ownerText));
+  if (cacheable && wantsFresh) {
+    cacheBypassed(call.name, ctx.actor);
+  } else if (cacheable) {
+    const hit = cacheGet(call.name, input, ctx.actor);
+    if (hit) {
+      ctx.doneCalls.set(key, hit.result);
+      ctx.cacheHits += 1;
+      ctx.trace.push({ tool: call.name, owner: ownership.owner, ok: true, cached: true, ms: 0 });
+      if (ctx.parentTaskId && ctx.workflowId) {
+        noteWorkflowToolRun(ctx.workflowId, { tool: call.name, ok: true, content: hit.result });
+      }
+      console.log(`agent dispatch: cache hit actor=${ctx.actor} capability=${call.name} key=${hit.cacheKey}`);
+      return { content: hit.result };
+    }
+  }
+  const askChat = turn.confirmation?.chatId ?? ctx.chatId;
+  const askMark = cacheable ? contactQuestionMark(askChat) : 0;
+
   let taskId: string | undefined;
   if (!ctx.skipRecord) {
     try {
@@ -234,7 +309,7 @@ export async function dispatchTool(
         parentTaskId: ctx.parentTaskId,
         agentId: ownership.owner,
         capability: call.name,
-        input: call.input,
+        input,
         authRef: ctx.grant?.ref,
         depth: ctx.depth,
         leaseOwner: WORKER_ID,
@@ -247,6 +322,8 @@ export async function dispatchTool(
     }
   }
 
+  // A slot in the global scheduler; queued, not refused, when tools are busy.
+  const slot = await acquire("tools");
   const startedAt = Date.now();
   let outcome: ToolOutcome;
   // A test stand-in that throws is simulating a crash, not a tool error: it is
@@ -261,10 +338,12 @@ export async function dispatchTool(
       crash = { error };
       throw error;
     }
-    outcome = { content: intercepted !== undefined ? intercepted : await tool.handler(call.input, turn) };
+    outcome = { content: intercepted !== undefined ? intercepted : await tool.handler(input, turn) };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     outcome = { content: `Tool failed: ${message}`, isError: true };
+  } finally {
+    slot.release();
   }
   const ms = Date.now() - startedAt;
   const ok = isSuccessfulToolResult(outcome.content, outcome.isError);
@@ -272,6 +351,17 @@ export async function dispatchTool(
     ctx.doneCalls.set(key, outcome.content);
     if (!repeatable) {
       ctx.doneWrites.set(key, outcome.content);
+      // Something changed: this agent's cached reads may no longer be true.
+      invalidateOwner(ownership.owner);
+    }
+  }
+  // A read that asked Vishnu "which one?" opened a question; its answer isn't a reusable result.
+  if (ok && cacheable && !contactQuestionAsked(askChat, askMark)) {
+    try {
+      cachePut(call.name, input, outcome.content, ctx.actor);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`agent dispatch: cache write failed (${errorType}).`);
     }
   }
   ctx.trace.push({ tool: call.name, owner: ownership.owner, ok, ms });

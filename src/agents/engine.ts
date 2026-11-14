@@ -36,6 +36,9 @@ import {
   type WorkflowRecord,
 } from "./store.js";
 import { forgetGoalMetersForTests, goalLimits } from "./goal_policy.js";
+import { messageBytes, resultMessage, taskMessage, toAgentResult, toMessagePriority } from "./protocol.js";
+import { recordAgentMessage, recordWorkflowRun } from "../metrics.js";
+import { currentPriority } from "../governor.js";
 import {
   GOAL_CAPABILITY,
   isTerminal,
@@ -291,6 +294,11 @@ async function executeClaimed(task: TaskRecord): Promise<void> {
 
   const env = buildEnv(task, controller, usage);
   const request = toRequest(task);
+  // The typed task message, handed to the agent as an object (never serialized
+  // to travel inside this process). Its size is measured for the experiment.
+  const message = taskMessage(request, env.dependencies, { priority: toMessagePriority(currentPriority()) });
+  env.message = message;
+  recordAgentMessage(task.workflow_id, messageBytes(message));
   appendConversationMessage(task.context_id, task.task_id, "orchestrator", {
     capability: task.capability,
     attempt: task.attempts,
@@ -346,6 +354,7 @@ async function executeClaimed(task: TaskRecord): Promise<void> {
     usage.llmCalls += result.usage.llmCalls;
     usage.costUsd += result.usage.costUsd;
   }
+  recordAgentMessage(task.workflow_id, messageBytes(resultMessage(message, toAgentResult(result))));
   let state = result.state;
   let error = result.error;
   let note: string | undefined;
@@ -446,6 +455,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function driveWorkflow(workflowId: string): Promise<WorkflowSummary> {
+  const driveStartedAt = Date.now();
+  let maxParallel = 0;
   for (;;) {
     const tasks = listWorkflowTasks(workflowId);
     const byId = new Map(tasks.map((task) => [task.task_id, task]));
@@ -497,6 +508,7 @@ async function driveWorkflow(workflowId: string): Promise<WorkflowSummary> {
     const inFlight = tasks
       .map((task) => running.get(task.task_id)?.promise)
       .filter((promise): promise is Promise<void> => promise !== undefined);
+    maxParallel = Math.max(maxParallel, inFlight.length);
     if (inFlight.length > 0) {
       await Promise.race(inFlight);
       continue;
@@ -526,7 +538,20 @@ async function driveWorkflow(workflowId: string): Promise<WorkflowSummary> {
     break;
   }
   refreshWorkflowState(workflowId);
-  return summarizeWorkflow(workflowId)!;
+  const summary = summarizeWorkflow(workflowId)!;
+  const records = listWorkflowTasks(workflowId);
+  recordWorkflowRun({
+    workflowId,
+    origin: getWorkflow(workflowId)?.origin,
+    tasks: records.length,
+    agents: records.map((task) => task.agent_id),
+    maxParallel,
+    ms: Date.now() - driveStartedAt,
+    // Results the engine handed from one agent to the next with no model call in between.
+    directHandoffs: records.filter((task) => taskDependencies(task.task_id).length > 0).length,
+    completed: summary.tasks.every((task) => task.state === "completed"),
+  });
+  return summary;
 }
 
 /**

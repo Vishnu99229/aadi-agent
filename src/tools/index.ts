@@ -1,5 +1,6 @@
 import type { LlmTool } from "../llm.js";
 import type { SendConfirmation } from "../approvals.js";
+import { CACHEABLE_TOOLS, FRESH_PROPERTY } from "../agents/cache_policy.js";
 import * as accountStatus from "./account_status.js";
 import * as bookMeeting from "./book_meeting.js";
 import * as confirmSendPendingDraft from "./confirm_send_pending_draft.js";
@@ -247,8 +248,26 @@ export const SPECIALIST_ONLY_TOOLS = [
   "prepare_build",
 ] as const;
 
+/**
+ * A cacheable read also takes `fresh`, so a model can ask for the latest data
+ * instead of the shared cache's copy. The dispatcher strips it before the tool runs.
+ */
+function withFreshOption(name: string, tool: RegisteredTool): RegisteredTool {
+  if (!CACHEABLE_TOOLS.includes(name)) {
+    return tool;
+  }
+  const schema = tool.definition.inputSchema;
+  return {
+    ...tool,
+    definition: {
+      ...tool.definition,
+      inputSchema: { ...schema, properties: { ...(schema.properties ?? {}), fresh: FRESH_PROPERTY } },
+    },
+  };
+}
+
 export const tools: Record<string, RegisteredTool> = Object.fromEntries(
-  [...TOOL_ORDER, ...SPECIALIST_ONLY_TOOLS].map((name) => [name, modules[name]]),
+  [...TOOL_ORDER, ...SPECIALIST_ONLY_TOOLS].map((name) => [name, withFreshOption(name, modules[name])]),
 );
 
 /** Read and draft tools a forwarded message may use. Nothing here sends, books, or writes. */

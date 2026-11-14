@@ -20,6 +20,11 @@ import { setGoogleAccountForTests } from "../src/google/auth.ts";
 import { setCompleteForTests, type CompleteParams, type ToolCall } from "../src/llm.ts";
 import { modelReply, nextMessageId } from "./fakes.ts";
 
+// The scenarios reuse message ids with different fixture content. Real email
+// content never changes under an id, so the shared cache would serve the earlier
+// fixture. The cache has its own suite (test-optimizations.ts).
+process.env.CACHE_ENABLED = "false";
+
 function assert(condition: boolean, message: string): void {
   if (!condition) {
     throw new Error(message);

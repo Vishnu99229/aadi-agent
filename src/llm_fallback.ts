@@ -8,6 +8,7 @@ import {
 } from "./db.js";
 import { assertTestSeam } from "./test_seam.js";
 import { providerConfigured, type ModelSpec, type ProviderId } from "./models/registry.js";
+import { circuitAllows } from "./models/circuit.js";
 
 export type LlmBackend =
   | "claude"
@@ -248,6 +249,12 @@ export function modelUnavailableReason(spec: ModelSpec, now = Date.now()): strin
   }
   if (isProviderFlagged(spec.provider, now)) {
     return "paused after a credit or auth error";
+  }
+  // An open circuit whose cooldown is over starts its health probe here, so a
+  // provider an agent routes around still gets tested and can come back.
+  // The provider first: a model is only tested on its own when its provider is healthy.
+  if (!circuitAllows(spec.provider, now) || !circuitAllows(`model:${spec.key}`, now)) {
+    return "circuit open";
   }
   return undefined;
 }

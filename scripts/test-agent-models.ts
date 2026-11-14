@@ -307,7 +307,7 @@ assert(JSON.stringify(before) === JSON.stringify(after), "changing the Email Age
 seen = [];
 await delegate({ agentId: "email", capability: "goal", input: { goal: "Find Hardik's latest email." }, grant: ownerGrant("find Hardik's latest email") });
 assert(seen[0]?.model === "kimi:main" && seen[0].system === before.prompt, "its next goal runs on Kimi with the same prompt");
-const offered = seen[0]!.tools.filter((name) => name !== "request_input");
+const offered = seen[0]!.tools.filter((name) => name !== "request_input" && name !== "report_result");
 assert(offered.every((name) => before.tools.split(",").includes(name)), `and is offered only the Email Agent's own tools (${offered.join(",")})`);
 assert(seen[0]!.tools.includes("search_emails") && !seen[0]!.tools.includes("list_accounts"), "and the same tools");
 passed.push("identity is the agent's, not the model's: same prompt, tools and permissions on OpenAI, Claude or Kimi");

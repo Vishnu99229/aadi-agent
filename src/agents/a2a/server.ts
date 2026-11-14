@@ -30,6 +30,7 @@ import { getTask } from "../store.js";
 import type { AgentTaskResult } from "../types.js";
 import { logTaskEnd, logTaskStart, logTaskTraffic } from "./log.js";
 import { receivePush } from "./push_receiver.js";
+import { runWithPriority, withSlot } from "../../governor.js";
 import { newMessage, partsData, partsText, textPart, toWireArtifact, toWireState } from "./mapping.js";
 import { SYSTEM_SKILLS } from "./system_skills.js";
 import {
@@ -291,7 +292,12 @@ function isFinal(state: WireState | undefined): boolean {
 class AadiExecutor implements AgentExecutor {
   private readonly running = new Map<string, AbortController>();
 
+  /** Another agent's request: its own place in the global scheduler, below Vishnu's turns. */
   async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
+    await runWithPriority("a2a", () => withSlot("a2a", () => this.run(requestContext, eventBus)));
+  }
+
+  private async run(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
     const { taskId, contextId, userMessage } = requestContext;
     const owner = ownerOf(requestContext.context);
     const exchange = exchangeOf(requestContext.context);

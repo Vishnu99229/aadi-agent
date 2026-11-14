@@ -1,5 +1,8 @@
 import type { RunReport } from "./agent.js";
 import { db, getSetting, listUsageLogs, setSetting } from "./db.js";
+import { cacheStats } from "./agents/cache.js";
+import { queueStats } from "./governor.js";
+import { circuitActivations, formatProviderHealth } from "./models/circuit.js";
 import {
   AGENT_MODEL_LABELS,
   fallbackLabel,
@@ -73,6 +76,103 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_metric_agent_runs_workflow ON metric_agent_runs (workflow_id);
 `);
 
+/** Columns added after the tables first shipped; added in place when missing. */
+function addColumn(table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((item) => item.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+for (const table of ["metric_turns", "metric_agent_runs"]) {
+  addColumn(table, "queue_ms", "INTEGER NOT NULL DEFAULT 0");
+  addColumn(table, "ctx_original_tokens", "INTEGER NOT NULL DEFAULT 0");
+  addColumn(table, "ctx_compressed_tokens", "INTEGER NOT NULL DEFAULT 0");
+  addColumn(table, "compress_ms", "INTEGER NOT NULL DEFAULT 0");
+  addColumn(table, "cache_hits", "INTEGER NOT NULL DEFAULT 0");
+  addColumn(table, "tools_json", "TEXT NOT NULL DEFAULT '[]'");
+}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS metric_workflows (
+    workflow_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    origin TEXT,
+    tasks INTEGER NOT NULL DEFAULT 0,
+    agents_json TEXT NOT NULL DEFAULT '[]',
+    max_parallel INTEGER NOT NULL DEFAULT 0,
+    ms INTEGER NOT NULL DEFAULT 0,
+    messages INTEGER NOT NULL DEFAULT 0,
+    message_bytes INTEGER NOT NULL DEFAULT 0,
+    direct_handoffs INTEGER NOT NULL DEFAULT 0,
+    completed INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_metric_workflows_created ON metric_workflows (created_at);
+`);
+
+// Also created by feedback.ts, which writes it; the report reads it.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS metric_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    turn_id INTEGER,
+    chat_id INTEGER,
+    kind TEXT NOT NULL CHECK (kind IN ('correction', 'retry', 'dissatisfaction')),
+    category TEXT NOT NULL,
+    agent_id TEXT,
+    model TEXT,
+    route TEXT,
+    tools_json TEXT NOT NULL DEFAULT '[]'
+  );
+`);
+
+function ensureWorkflowRow(workflowId: string, origin?: string): void {
+  db.prepare(`INSERT OR IGNORE INTO metric_workflows (workflow_id, created_at, origin) VALUES (?, ?, ?)`).run(
+    workflowId,
+    new Date().toISOString(),
+    origin ?? null,
+  );
+}
+
+/** One typed message between agents (task, result, question, error). */
+export function recordAgentMessage(workflowId: string, bytes: number): void {
+  swallow("agent message", () => {
+    ensureWorkflowRow(workflowId);
+    db.prepare(`UPDATE metric_workflows SET messages = messages + 1, message_bytes = message_bytes + ? WHERE workflow_id = ?`).run(
+      Math.max(0, Math.round(bytes)),
+      workflowId,
+    );
+  });
+}
+
+/** How a workflow ran: tasks, agents, how many at once, and results passed straight on. */
+export function recordWorkflowRun(input: {
+  workflowId: string;
+  origin?: string;
+  tasks: number;
+  agents: string[];
+  maxParallel: number;
+  ms: number;
+  directHandoffs: number;
+  completed: boolean;
+}): void {
+  swallow("workflow", () => {
+    ensureWorkflowRow(input.workflowId, input.origin);
+    db.prepare(
+      `UPDATE metric_workflows SET origin = COALESCE(?, origin), tasks = ?, agents_json = ?, max_parallel = MAX(max_parallel, ?),
+         ms = ms + ?, direct_handoffs = ?, completed = ? WHERE workflow_id = ?`,
+    ).run(
+      input.origin ?? null,
+      input.tasks,
+      JSON.stringify([...new Set(input.agents)]),
+      input.maxParallel,
+      Math.round(input.ms),
+      input.directHandoffs,
+      input.completed ? 1 : 0,
+      input.workflowId,
+    );
+  });
+}
+
 const STARTED_KEY = "metrics_started_at";
 
 /** The first time this version ran: the start of the experiment's counters. */
@@ -120,8 +220,9 @@ export function recordAgentRun(input: AgentRunInput): void {
       `INSERT INTO metric_agent_runs (
          created_at, turn_id, workflow_id, task_id, agent_id, kind, primary_model, served_model,
          fallback, model_calls, input_tokens, output_tokens, cost_usd, latency_ms, first_model_ms,
-         tool_calls, tool_errors, outcome, error_code
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         tool_calls, tool_errors, outcome, error_code,
+         queue_ms, ctx_original_tokens, ctx_compressed_tokens, compress_ms, cache_hits, tools_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       new Date().toISOString(),
       input.turnId ?? null,
@@ -142,6 +243,12 @@ export function recordAgentRun(input: AgentRunInput): void {
       tools.filter((entry) => !entry.ok).length,
       input.outcome,
       input.errorCode ?? null,
+      Math.round(report?.queueMs ?? 0),
+      report?.context?.originalTokens ?? 0,
+      report?.context?.compressedTokens ?? 0,
+      Math.round(report?.context?.ms ?? 0),
+      report?.cacheHits ?? 0,
+      JSON.stringify(tools.map((entry) => entry.tool).slice(0, 30)),
     );
   });
 }
@@ -190,17 +297,39 @@ interface GoalTotals {
   cost: number;
   fallbacks: number;
   tools: number;
+  queueMs: number;
+  ctxOriginal: number;
+  ctxCompressed: number;
+  compressMs: number;
+  cacheHits: number;
+  toolNames: string[];
 }
 
 function goalTotals(workflowIds: readonly string[]): GoalTotals {
-  const empty: GoalTotals = { agents: [], models: [], calls: 0, input: 0, output: 0, cost: 0, fallbacks: 0, tools: 0 };
+  const empty: GoalTotals = {
+    agents: [],
+    models: [],
+    calls: 0,
+    input: 0,
+    output: 0,
+    cost: 0,
+    fallbacks: 0,
+    tools: 0,
+    queueMs: 0,
+    ctxOriginal: 0,
+    ctxCompressed: 0,
+    compressMs: 0,
+    cacheHits: 0,
+    toolNames: [],
+  };
   if (workflowIds.length === 0) {
     return empty;
   }
   const placeholders = workflowIds.map(() => "?").join(", ");
   const rows = db
     .prepare(
-      `SELECT agent_id, served_model, model_calls, input_tokens, output_tokens, cost_usd, fallback, tool_calls
+      `SELECT agent_id, served_model, model_calls, input_tokens, output_tokens, cost_usd, fallback, tool_calls,
+              queue_ms, ctx_original_tokens, ctx_compressed_tokens, compress_ms, cache_hits, tools_json
        FROM metric_agent_runs WHERE kind = 'goal' AND workflow_id IN (${placeholders})`,
     )
     .all(...workflowIds) as Array<{
@@ -212,8 +341,24 @@ function goalTotals(workflowIds: readonly string[]): GoalTotals {
     cost_usd: number;
     fallback: number;
     tool_calls: number;
+    queue_ms: number;
+    ctx_original_tokens: number;
+    ctx_compressed_tokens: number;
+    compress_ms: number;
+    cache_hits: number;
+    tools_json: string;
   }>;
   return rows.reduce((totals, row) => {
+    totals.queueMs += row.queue_ms;
+    totals.ctxOriginal += row.ctx_original_tokens;
+    totals.ctxCompressed += row.ctx_compressed_tokens;
+    totals.compressMs += row.compress_ms;
+    totals.cacheHits += row.cache_hits;
+    try {
+      totals.toolNames.push(...(JSON.parse(row.tools_json) as string[]));
+    } catch {
+      // A malformed list only loses names.
+    }
     totals.agents.push(row.agent_id);
     if (row.served_model) {
       totals.models.push(row.served_model);
@@ -257,8 +402,9 @@ export function recordTurn(input: TurnRecordInput): number | undefined {
         `INSERT INTO metric_turns (
            created_at, chat_id, route, path, agents_json, models_json, fallbacks, model_calls,
            input_tokens, output_tokens, cost_usd, tool_calls, duplicate_skipped, first_model_ms,
-           total_ms, workflow_ms, workflows, workflows_failed, success, auth_required, uncertain, error
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           total_ms, workflow_ms, workflows, workflows_failed, success, auth_required, uncertain, error,
+           queue_ms, ctx_original_tokens, ctx_compressed_tokens, compress_ms, cache_hits, tools_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         new Date().toISOString(),
@@ -283,6 +429,12 @@ export function recordTurn(input: TurnRecordInput): number | undefined {
         (report?.authRefused ?? 0) + input.meter.workflows.reduce((sum, item) => sum + item.authRequired, 0),
         input.meter.workflows.reduce((sum, item) => sum + item.uncertain, 0),
         input.error ? input.error.slice(0, 200) : null,
+        Math.round(report?.queueMs ?? 0) + goals.queueMs,
+        (report?.context?.originalTokens ?? 0) + goals.ctxOriginal,
+        (report?.context?.compressedTokens ?? 0) + goals.ctxCompressed,
+        Math.round(report?.context?.ms ?? 0) + goals.compressMs,
+        (report?.cacheHits ?? 0) + goals.cacheHits,
+        JSON.stringify([...tools.map((entry) => entry.tool), ...goals.toolNames].slice(0, 40)),
       );
     turnId = Number(result.lastInsertRowid);
     if (input.path !== "fast" || input.report) {
@@ -544,6 +696,119 @@ export function formatAgentsReport(window: "day" | "week", now = new Date()): st
   lines.push(`Fallback model calls: ${totals.fallbacks} · Duplicate tool calls skipped: ${totals.duplicatesSkipped}`);
   lines.push(`Failed turns: ${totals.failedTurns} · Auth-required: ${totals.authRequired} · Uncertain outcomes: ${totals.uncertain}`);
   lines.push("");
+  lines.push(...formatOptimizations(fromIso, toIso, totals));
+  lines.push("");
   lines.push("Costs are estimates from the configured rates. These are measurements, not a verdict.");
   return lines.join("\n");
+}
+
+export interface OptimizationStats {
+  contextOriginalTokens: number;
+  contextCompressedTokens: number;
+  contextTokensAvoided: number;
+  compressionRatio: number | undefined;
+  avgCompressMs: number;
+  cacheHitRate: number | undefined;
+  cacheHits: number;
+  cacheMisses: number;
+  cacheTokensSaved: number;
+  cacheLlmCallsSaved: number;
+  queueWaits: number;
+  avgQueueMs: number;
+  p95QueueMs: number;
+  circuitActivations: number;
+  delegatedWorkflows: number;
+  parallelWorkflows: number;
+  avgAgentsPerDelegated: number;
+  agentMessages: number;
+  avgMessageBytes: number;
+  directHandoffs: number;
+  fastPath: number;
+  llmCallsAvoided: number;
+  corrections: number;
+  retries: number;
+  dissatisfaction: number;
+}
+
+export function optimizationStats(fromIso: string, toIso: string, totals = turnTotals(fromIso, toIso)): OptimizationStats {
+  const context = db
+    .prepare(
+      `SELECT COALESCE(SUM(ctx_original_tokens), 0) AS original, COALESCE(SUM(ctx_compressed_tokens), 0) AS compressed,
+              COALESCE(AVG(CASE WHEN ctx_original_tokens > 0 THEN compress_ms END), 0) AS ms
+       FROM metric_agent_runs WHERE created_at >= ? AND created_at < ?`,
+    )
+    .get(fromIso, toIso) as { original: number; compressed: number; ms: number };
+  const workflows = db
+    .prepare(
+      `SELECT agents_json, max_parallel, messages, message_bytes, direct_handoffs, origin, tasks
+       FROM metric_workflows WHERE created_at >= ? AND created_at < ?`,
+    )
+    .all(fromIso, toIso) as Array<{
+    agents_json: string;
+    max_parallel: number;
+    messages: number;
+    message_bytes: number;
+    direct_handoffs: number;
+    origin: string | null;
+    tasks: number;
+  }>;
+  const delegated = workflows.filter((row) => row.origin === "delegate");
+  const messages = workflows.reduce((sum, row) => sum + row.messages, 0);
+  const bytes = workflows.reduce((sum, row) => sum + row.message_bytes, 0);
+  const directHandoffs = workflows.reduce((sum, row) => sum + row.direct_handoffs, 0);
+  const cache = cacheStats(fromIso, toIso);
+  const queue = queueStats(fromIso, toIso);
+  const feedback = db
+    .prepare(`SELECT kind, COUNT(*) AS n FROM metric_feedback WHERE created_at >= ? AND created_at < ? GROUP BY kind`)
+    .all(fromIso, toIso) as Array<{ kind: string; n: number }>;
+  const count = (kind: string) => feedback.find((row) => row.kind === kind)?.n ?? 0;
+  return {
+    contextOriginalTokens: context.original,
+    contextCompressedTokens: context.compressed,
+    contextTokensAvoided: Math.max(0, context.original - context.compressed),
+    compressionRatio: context.original > 0 ? context.compressed / context.original : undefined,
+    avgCompressMs: context.ms,
+    cacheHitRate: cache.hitRate,
+    cacheHits: cache.hits,
+    cacheMisses: cache.misses,
+    cacheTokensSaved: cache.tokensSaved,
+    cacheLlmCallsSaved: cache.llmCallsSaved,
+    queueWaits: queue.waits,
+    avgQueueMs: queue.avgMs,
+    p95QueueMs: queue.p95Ms,
+    circuitActivations: circuitActivations(fromIso, toIso),
+    delegatedWorkflows: delegated.length,
+    parallelWorkflows: delegated.filter((row) => row.max_parallel >= 2).length,
+    avgAgentsPerDelegated: delegated.length
+      ? delegated.reduce((sum, row) => sum + new Set(JSON.parse(row.agents_json) as string[]).size, 0) / delegated.length
+      : 0,
+    agentMessages: messages,
+    avgMessageBytes: messages ? bytes / messages : 0,
+    directHandoffs,
+    fastPath: totals.fastPath,
+    // Conservative: a fast-path answer would have taken at least one model call,
+    // a cached web search is one, and a result handed straight to the next agent
+    // saves Aadi one planning call.
+    llmCallsAvoided: totals.fastPath + cache.llmCallsSaved + directHandoffs,
+    corrections: count("correction"),
+    retries: count("retry"),
+    dissatisfaction: count("dissatisfaction"),
+  };
+}
+
+function formatOptimizations(fromIso: string, toIso: string, totals: TurnTotals): string[] {
+  const stats = optimizationStats(fromIso, toIso, totals);
+  const pct = (value: number | undefined) => (value === undefined ? "n/a" : `${Math.round(value * 100)}%`);
+  return [
+    "Optimizations",
+    `Context tokens avoided: ${stats.contextTokensAvoided} (${stats.contextOriginalTokens} -> ${stats.contextCompressedTokens}, ratio ${pct(stats.compressionRatio)}, ${stats.avgCompressMs.toFixed(1)}ms to compress)`,
+    `Cache: hit rate ${pct(stats.cacheHitRate)} (${stats.cacheHits} hits, ${stats.cacheMisses} misses) · calls saved ${stats.cacheHits} · tokens not regenerated ${stats.cacheTokensSaved} · model calls saved ${stats.cacheLlmCallsSaved}`,
+    `Scheduler queue: ${stats.queueWaits} wait(s), avg ${Math.round(stats.avgQueueMs)}ms, p95 ${Math.round(stats.p95QueueMs)}ms`,
+    `Circuit breaker activations: ${stats.circuitActivations} · Fallback model calls: ${totals.fallbacks}`,
+    `Parallel workflows: ${stats.parallelWorkflows} of ${stats.delegatedWorkflows} delegated · avg agents per delegated request: ${stats.avgAgentsPerDelegated.toFixed(1)}`,
+    `Agent-to-agent messages: ${stats.agentMessages} · avg size ${Math.round(stats.avgMessageBytes)} bytes · results handed on directly: ${stats.directHandoffs}`,
+    `Estimated model calls avoided: ${stats.llmCallsAvoided} (fast path ${stats.fastPath}, cache ${stats.cacheLlmCallsSaved}, direct handoffs ${stats.directHandoffs})`,
+    `User corrections: ${stats.corrections} · retries: ${stats.retries} · dissatisfaction: ${stats.dissatisfaction}`,
+    formatProviderHealth(),
+  ];
 }

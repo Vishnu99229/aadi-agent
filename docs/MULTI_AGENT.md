@@ -149,6 +149,97 @@ fallback and tier; each has Primary model, Fallback model, Auto and Reasoning
 tier. Primary and Fallback pick a provider, then show only that provider's
 available models. Choices are saved in SQLite and survive a restart.
 
+## Efficiency
+
+The aim is the fewest model calls, the least context and the least repeated
+work for a fast, correct answer. Deterministic code goes first wherever it can
+do the job reliably.
+
+**Typed messages** (`src/agents/protocol.ts`). The engine hands each agent an
+`AgentMessage` object: goal, references, constraints, compact dependency
+results, expected output, priority, deadline and an authorization *reference*.
+Inside the process it is never serialized to travel; its JSON size is only
+measured. Results come back as `AgentResult`: status, summary, data,
+confidence, references, suggested next steps. A goal loop can end with
+`report_result` to return exactly that. Agents exchange conclusions,
+evidence references and next actions, never reasoning transcripts.
+
+**References** (`src/agents/refs.ts`): `email:work:<id>`, `calendar:work:<id>@<date>`,
+`account:<name>`, `document:<id>`, `memory:<query>`, `draft:<id>`, `build:<id>`,
+`contact:<name>`, `artifact:<task>/<id>`, `cache:<key>`. Each names the tool
+that opens it. A reference grants nothing: an agent sees "not yours to open"
+for a tool it doesn't have, and the dispatcher refuses the call anyway.
+
+**Communication.** Specialists never talk to each other directly. A specialist
+returns a result with suggested next steps; Aadi decides. In a planned
+workflow the engine passes a finished step's result straight to the steps that
+depend on it, with no Aadi model call in between, and runs independent steps
+side by side.
+
+**Context compression** (`src/agents/context.ts`), all in code, no model call:
+
+- a delegated goal gets its typed message, with earlier steps as summary,
+  data and references instead of their raw text and tool traces;
+- a specialist's own turn gets no chat history for a request that stands on
+  its own, and only the previous exchange (clipped, earlier tool output turned
+  into references) when the request plainly follows on from it; plus the
+  sentences of the running summary that share a word with the request;
+- Aadi keeps its full window.
+
+Original and compressed context tokens, and the time spent compressing, are
+recorded for every run.
+
+**Shared result cache** (`src/agents/cache.ts`, policies in
+`cache_policy.ts`). Expensive reads only: latest releases (30 min), web
+research (30 min), Drive search and file reads (10 min), stored documents and
+emails by id (24 h / 10 min), account lookups (5 min), contact resolution
+(2 min), calendar snapshots (1 min), build checks (1 min), and Gmail searches
+on exact addresses (1 min; a search that names a person depends on remembered
+"which one?" choices, so it is never cached). Entries keep key, tool,
+normalized arguments, result, times, freshness class, source references and
+the agent that made them. The cache sits behind the dispatcher's allowlist and
+authorization, so a caller only sees results for tools it may call. Writes are
+never cached, a successful write clears that agent's changeable reads (mail,
+calendar, accounts, contacts), a read that opened a "which one?" question is
+not kept, and a tool call can pass `fresh: true`. Words like "again", "now" or
+"latest" in Vishnu's message skip the cache for mail, calendar, accounts,
+contacts and builds.
+
+**Global scheduler** (`src/governor.ts`). Every model call (per provider),
+goal loop, tool call, heavy CPU job (PDF parsing, a local model) and A2A
+request takes a slot from a process-wide pool. Full pools queue; nothing
+ordinary fails. Priority: Vishnu's active turn (and everything it started),
+then his taps, then due sends and reminders, then A2A requests, then delegated
+work with no live turn, then background scans. While he is mid-turn,
+background work gets at most `GOV_BACKGROUND_WHILE_ACTIVE` model calls. Queue
+time is recorded apart from run time.
+
+**Circuit breakers** (`src/models/circuit.ts`), per provider and per model:
+success rate, timeouts, 429s, 5xx, malformed responses, tool calls the
+provider formatted badly, latency and failures in a row. CLOSED, then OPEN
+after too many failures or severe latency (new work goes to the agent's
+fallback), then HALF_OPEN after the cooldown with one small health probe:
+success closes it, failure reopens it for longer. Credit and auth failures
+keep their own six-hour pause. Switching provider never repeats a tool that
+already ran in the turn. Health is in `/health` and `/agents`.
+
+**Evaluation and recommendations** (`src/models/evaluation.ts`). Every agent
+and model pair is measured from real runs: requests, goal runs, success,
+corrections, retries, dissatisfaction, tool and provider errors, fallbacks,
+latency (average, p50, p95), tokens, cost, model calls, workflow completion,
+auth-required and uncertain outcomes. `/agents recommendations` compares each
+agent's model with others that served the same agent (at least
+`RECOMMEND_MIN_RUNS` runs each in `RECOMMEND_WINDOW_DAYS`), suggests a change
+when one succeeded more often or was clearly faster or cheaper at similar
+success, and offers Accept and Reject. Nothing changes without Accept; a
+rejected suggestion isn't repeated in the window.
+
+**Corrections** (`src/feedback.ts`). "No, I meant…", "wrong meeting",
+"too formal", "that's outdated", "not what I asked", a complaint, the Retry
+button, or the same request again within three minutes are tied to the
+previous turn's agent, model, route and tools. Ordinary follow-ups ("and
+also…", "no thanks") are not counted.
+
 ## Build Agent
 
 The Build Agent has its own goal loop, prompt and model. It reads builds
@@ -371,8 +462,14 @@ phone`), and give each calling agent its own credential.
 agent's model, turns, goal runs, success and failure rate, average, p50 and p95
 latency, average and total cost, average model calls, fallback rate and tool
 error rate; then delegated workflows, fast-path requests, average delegated and
-non-delegated latency, total LLM cost, fallbacks and failed workflows. It
-reports numbers only and makes no claim about whether the architecture helped.
+non-delegated latency, total LLM cost, fallbacks and failed workflows. Under
+"Optimizations" it adds context tokens avoided and the compression ratio,
+cache hit rate and calls, tokens and model calls saved, scheduler queue
+latency, circuit-breaker activations, parallel workflows, average agents per
+delegated request, agent-to-agent message count and size, results handed on
+directly, estimated model calls avoided (fast path + cached web searches +
+direct handoffs), corrections and provider health. It reports numbers only and
+makes no claim about whether the architecture helped.
 Counting starts at the first boot of this version (`metrics_started_at`).
 
 ## Commands
@@ -428,6 +525,7 @@ Its skills then appear to Aadi as `<id>` capabilities marked (remote).
 | `npm run test:agent-models` | registry, per-agent primary and fallback, Auto, unavailable and paused providers, settings persisted across a real restart, the model on every reasoning path and on none of the fast paths, identity unchanged when the model changes, provider fallback after a tool ran, all six goal loops, the Build Agent's own review, measurements, the settings screen |
 | `npm run test:model-adapters` | OpenAI (Responses), Claude, Gemini, DeepSeek and Kimi adapters against local stand-ins for each API; provider state kept per provider; route fallback on auth errors, missing keys and images |
 | `npm run test:a2a-v1` | card discovery, per-client credentials, HTTP+JSON, SSE states, a dropped stream resumed by task id without re-running, a repeated message not re-run, tasks kept across a restart, push for a long task, the structured outgoing message, a hostile remote reply, private skills refused, the log |
+| `npm run test:optimizations` | references and their permissions, the typed protocol and report_result, context compression, the shared cache (reuse, TTL, fresh, invalidation, writes never cached), the scheduler's priority queue and background hold, the global goal-loop cap, circuit breakers with one probe, corrections, recommendations with Accept/Reject, a parallel workflow with direct handoffs, and the report |
 | `npm run live:models` | asks each provider with a key for its model list and checks every registry id; no completion, nothing spent |
 
 All the `test:` suites above are part of `npm test`.

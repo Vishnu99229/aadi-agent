@@ -27,7 +27,9 @@ import {
   type LlmBackend,
 } from "./llm_fallback.js";
 import { buildResponsesRequest, parseResponsesOutput } from "./models/openai_responses.js";
-import { modelForLegacyBackend, providerApiKey, type ModelSpec } from "./models/registry.js";
+import { availableModels, modelForLegacyBackend, providerApiKey, type ModelSpec, type ProviderId } from "./models/registry.js";
+import { circuitAllows, classifyFailure, recordCall, setCircuitProbe, type CallOutcome } from "./models/circuit.js";
+import { acquire, providerPool } from "./governor.js";
 import { assertTestSeam } from "./test_seam.js";
 import {
   estimateLlmCostUsd,
@@ -216,6 +218,8 @@ export interface CompleteResult {
   /** The exact model id that answered. */
   servedModel?: string;
   providerItems?: ProviderItems;
+  /** Time spent waiting for a provider slot in the global scheduler. */
+  queueMs?: number;
 }
 
 /**
@@ -1192,6 +1196,94 @@ export function setRouteModelCompleteForTests(
   routeModelOverride = fake;
 }
 
+/** The provider a backend name calls. */
+function providerOfBackend(backend: LlmBackend): ProviderId | "local" {
+  switch (backend) {
+    case "claude":
+    case "haiku":
+      return "anthropic";
+    case "gemini":
+      return "gemini";
+    case "deepseek":
+    case "deepseek-reasoner":
+      return "deepseek";
+    default:
+      return "local";
+  }
+}
+
+/** A tool call whose arguments didn't parse is the provider's formatting, not the tool's. */
+function outcomeOf(result: CompleteResult): CallOutcome {
+  return result.toolCalls.some((call) => call.execution === "client" && typeof call.input === "string") ? "tool_format" : "ok";
+}
+
+/**
+ * One provider call under the global scheduler and the provider's circuit
+ * breaker: waits for a slot (queue time is reported apart), then records how
+ * the call went and how long it took.
+ */
+async function governedCall(
+  provider: string,
+  modelKey: string | undefined,
+  call: () => Promise<CompleteResult>,
+): Promise<CompleteResult> {
+  const slot = await acquire(providerPool(provider));
+  // A local model runs on this machine's CPU: it also takes the one CPU slot.
+  const cpu = provider === "local" ? await acquire("cpu") : undefined;
+  const startedAt = Date.now();
+  try {
+    const result = await call();
+    const outcome = outcomeOf(result);
+    const ms = Date.now() - startedAt;
+    recordCall(provider, outcome, ms);
+    if (modelKey) {
+      recordCall(`model:${modelKey}`, outcome, ms);
+    }
+    return { ...result, queueMs: (result.queueMs ?? 0) + slot.waitedMs + (cpu?.waitedMs ?? 0) };
+  } catch (error) {
+    const ms = Date.now() - startedAt;
+    const outcome = classifyFailure(error);
+    recordCall(provider, outcome, ms);
+    if (modelKey) {
+      recordCall(`model:${modelKey}`, outcome, ms);
+    }
+    throw error;
+  } finally {
+    cpu?.release();
+    slot.release();
+  }
+}
+
+function circuitOpenFor(spec: ModelSpec): boolean {
+  // Both must be healthy; the model is only asked once the provider is.
+  return !circuitAllows(spec.provider) || !circuitAllows(`model:${spec.key}`);
+}
+
+// The small test request a half-open circuit sends: the provider's cheapest
+// available model, a two-word prompt, no tools.
+setCircuitProbe(async (key) => {
+  const provider = key.startsWith("model:") ? key.split(":")[1] : key;
+  const spec = key.startsWith("model:")
+    ? availableModels().find((item) => `model:${item.key}` === key)
+    : availableModels(provider as ProviderId).sort((left, right) => left.cost.outputCostPerMillion - right.cost.outputCostPerMillion)[0];
+  if (!spec) {
+    return false;
+  }
+  try {
+    const result = await completeWithModel(spec, {
+      system: { cacheable: "Health check. Reply with OK." },
+      messages: [{ role: "user", content: "ping" }],
+      tools: [],
+      maxTokens: 16,
+      task: "other",
+      timeoutMs: 15_000,
+    });
+    return result.stopReason !== "refusal";
+  } catch {
+    return false;
+  }
+});
+
 function modelFits(spec: ModelSpec, needs: { image: boolean; pdf: boolean; json: boolean }): boolean {
   return (!needs.image || spec.supportsVision) && (!needs.pdf || spec.supportsPdf);
 }
@@ -1211,21 +1303,27 @@ async function completeOnRoute(params: CompleteParams): Promise<CompleteResult> 
     return complete({ ...params, route: undefined, backend: undefined });
   }
   const failures: string[] = [];
+  const usable = fitting.filter((spec) => modelUnavailableReason(spec) === undefined || modelUnavailableReason(spec) === "circuit open");
+  const healthy = usable.filter((spec) => !circuitOpenFor(spec));
+  // Every usable model's circuit is open: try the first anyway rather than fail the turn.
+  const order = healthy.length > 0 ? healthy : usable.slice(0, 1);
   for (const spec of fitting) {
-    const unavailable = modelUnavailableReason(spec);
-    if (unavailable) {
-      failures.push(`${spec.key}:${unavailable}`);
+    if (!order.includes(spec)) {
+      const reason = modelUnavailableReason(spec) ?? "circuit open";
+      failures.push(`${spec.key}:${reason}`);
       continue;
     }
     try {
-      const result = routeModelOverride
-        ? await routeModelOverride(spec, params)
-        : await completeWithModel(spec, {
-            ...params,
-            route: undefined,
-            // Forced tool use only goes to a provider that accepts it.
-            toolChoice: spec.forcesTools ? params.toolChoice : undefined,
-          });
+      const result = await governedCall(spec.provider, spec.key, () =>
+        routeModelOverride
+          ? routeModelOverride(spec, params)
+          : completeWithModel(spec, {
+              ...params,
+              route: undefined,
+              // Forced tool use only goes to a provider that accepts it.
+              toolChoice: spec.forcesTools ? params.toolChoice : undefined,
+            }),
+      );
       if (failures.length > 0) {
         console.error(`LLM: agent=${route.agentId} using ${spec.key} after [${failures.join("; ")}].`);
       }
@@ -1275,21 +1373,31 @@ export async function complete(
     throw new Error("All LLM backends failed: none usable");
   }
   const failures: string[] = [];
+  const openSkipped: LlmBackend[] = [];
   for (const backend of chain) {
     if (!isBackendUsable(backend)) {
       continue;
     }
+    const provider = providerOfBackend(backend);
+    const last = backend === chain[chain.length - 1];
+    if (provider !== "local" && !circuitAllows(provider) && !(last && openSkipped.length === chain.length - 1)) {
+      openSkipped.push(backend);
+      failures.push(`${backend}:circuit open`);
+      continue;
+    }
     try {
-      const result = await completeWithNamedBackend(backend, {
-        ...params,
-        backend,
-        model: backend === primary ? params.model : undefined,
-        jsonSchema: params.jsonSchema,
-        effort:
-          backend === "claude" || backend === "haiku"
-            ? params.effort
-            : undefined,
-      });
+      const result = await governedCall(provider === "local" ? "local" : provider, modelForLegacyBackend(backend)?.key, () =>
+        completeWithNamedBackend(backend, {
+          ...params,
+          backend,
+          model: backend === primary ? params.model : undefined,
+          jsonSchema: params.jsonSchema,
+          effort:
+            backend === "claude" || backend === "haiku"
+              ? params.effort
+              : undefined,
+        }),
+      );
       if (failures.length > 0) {
         console.error(`LLM: using ${backend}.`);
       }

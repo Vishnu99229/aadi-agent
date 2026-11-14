@@ -1,3 +1,4 @@
+import { runWithPriority } from "./governor.js";
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import { config } from "./config.js";
 import {
@@ -156,9 +157,10 @@ export async function registerReminderScheduler(
   for (const reminder of getDueReminders(new Date().toISOString())) {
     missedAtStartup.add(reminder.id);
   }
-  await processDue(api);
+  await runWithPriority("urgent", () => processDue(api));
   const interval = setInterval(() => {
-    void processDue(api);
+    // Reminders are due now: they go ahead of agent and background work.
+    void runWithPriority("urgent", () => processDue(api));
   }, 60_000);
   console.log(`Reminder scheduler registered (every minute, ${TIME_ZONE}).`);
   return interval;

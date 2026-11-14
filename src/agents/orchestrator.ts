@@ -30,6 +30,8 @@ import {
 } from "./store.js";
 import type { AgentTaskResult } from "./types.js";
 import { newTurnMeter, recordLateWorkflow, recordTurn, type TurnMeter, type TurnWorkflow } from "../metrics.js";
+import { toAgentResult } from "./protocol.js";
+import { parseRef } from "./refs.js";
 
 /**
  * Aadi as orchestrator. It decides who handles a turn, hands work to the
@@ -232,12 +234,19 @@ export function setLateNotifier(notifier: LateNotifier | undefined): void {
 }
 
 function taskLine(task: TaskSummary): Record<string, unknown> {
+  // The agent's result in the protocol's shape: conclusion, facts, references,
+  // suggested next steps. Bookkeeping (tool traces, run stats) stays out.
+  const structured = toAgentResult({ state: task.state, text: task.text, output: task.output, error: task.error });
   return {
     key: task.key,
     agent: task.agentId,
     capability: task.capability,
     state: task.state,
     ...(task.text ? { result: task.text.slice(0, 1500) } : {}),
+    ...(structured.data ? { data: structured.data } : {}),
+    ...(structured.confidence !== undefined ? { confidence: structured.confidence } : {}),
+    ...(structured.artifacts ? { refs: structured.artifacts } : {}),
+    ...(structured.suggestedNextSteps ? { suggested_next_steps: structured.suggestedNextSteps } : {}),
     ...(task.nextAction ? { next_action: task.nextAction } : {}),
     ...(task.state === "input-required" || task.state === "auth-required"
       ? { task_id: task.taskId, question: task.inputRequired?.question ?? task.text ?? "" }
@@ -319,7 +328,7 @@ function goalIdempotencyKey(turn: ToolTurn, agentId: string, goal: string): stri
 }
 
 const GOAL_GUIDANCE =
-  'When one message asks for two or more judgments, and a later one depends on an earlier one or they can be made side by side, give each judgment capability "goal" with the judgment in words and a complexity: light for a short judgment, standard by default, deep only for real analysis. Do not make those judgments yourself after one lookup. A single lookup or a plain command is a tool call, not a goal.';
+  'When one message asks for two or more judgments, and a later one depends on an earlier one or they can be made side by side, give each judgment capability "goal" with the judgment in words and a complexity: light for a short judgment, standard by default, deep only for real analysis. Do not make those judgments yourself after one lookup. A single lookup or a plain command is a tool call, not a goal. Give each goal only what it needs: references (email:work:<id>, account:<name>, document:<id>, calendar:work:<id>@<date>) instead of copied content, constraints such as { "do_not_send": true }, and the expected output. Steps that don\'t depend on each other run in parallel; a step that needs another\'s result lists it in depends_on and receives it directly.';
 
 function workflowMeasure(summary: WorkflowSummary, startedAt: number, late = false): TurnWorkflow {
   return {
@@ -360,6 +369,13 @@ function delegateTool(
                 ...(goals
                   ? {
                       goal: { type: "string", description: 'For capability "goal": what to get done.' },
+                      refs: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: 'For capability "goal": references instead of content, e.g. "email:work:18c92".',
+                      },
+                      constraints: { type: "object", description: 'For capability "goal": limits, e.g. { "do_not_send": true }.' },
+                      expected_output: { type: "string", description: 'For capability "goal": what the answer must contain.' },
                       complexity: {
                         type: "string",
                         enum: ["light", "standard", "deep"],
@@ -415,8 +431,20 @@ function delegateTool(
         const isGoal = capability === GOAL_CAPABILITY;
         const goalText = isGoal ? String(task.goal ?? (task.input as { goal?: unknown } | undefined)?.goal ?? "") : "";
         const complexity = task.complexity ?? (task.input as { complexity?: unknown } | undefined)?.complexity;
+        const taskInput = (task.input && typeof task.input === "object" ? task.input : {}) as Record<string, unknown>;
+        const refs = (Array.isArray(task.refs) ? task.refs : Array.isArray(taskInput.refs) ? taskInput.refs : [])
+          .filter((ref): ref is string => typeof ref === "string" && parseRef(ref) !== undefined)
+          .slice(0, 12);
+        const constraints = task.constraints ?? taskInput.constraints;
+        const expected = task.expected_output ?? taskInput.expected_output;
         const input = isGoal
-          ? { goal: goalText, ...(typeof complexity === "string" ? { complexity: parseGoalTier(complexity) } : {}) }
+          ? {
+              goal: goalText,
+              ...(typeof complexity === "string" ? { complexity: parseGoalTier(complexity) } : {}),
+              ...(refs.length > 0 ? { refs } : {}),
+              ...(constraints && typeof constraints === "object" && !Array.isArray(constraints) ? { constraints } : {}),
+              ...(typeof expected === "string" && expected.trim() ? { expected_output: expected.slice(0, 500) } : {}),
+            }
           : task.input && typeof task.input === "object"
             ? (task.input as Record<string, unknown>)
             : {};

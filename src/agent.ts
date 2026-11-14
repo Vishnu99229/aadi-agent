@@ -1,6 +1,7 @@
 import { config } from "./config.js";
 import type { LlmBackend, LlmMessage, LlmTool, ModelRoute, ToolCall, ToolChoice } from "./llm.js";
 import { resolveAgentModel, type ReasoningTier, type ResolvedAgentModel } from "./models/agent_models.js";
+import { historyForSpecialist, type ContextMeasure } from "./agents/context.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
 import { shouldForceCalendarTool } from "./calendar_guard.js";
@@ -178,6 +179,12 @@ export interface RunReport {
   firstModelMs?: number;
   /** Tool calls the dispatcher refused for lack of authorization. */
   authRefused?: number;
+  /** Time spent queued in the global scheduler (model and tool slots). */
+  queueMs?: number;
+  /** Tool calls answered from the shared result cache. */
+  cacheHits?: number;
+  /** Context this run was given, against what it would have been given uncompressed. */
+  context?: ContextMeasure;
   /** The run ended with an answer and no failed tool or unrun command. */
   succeeded?: boolean;
   widened: boolean;
@@ -448,7 +455,30 @@ export async function runAgent(
   }
   const recentUpload = recentUploadLine();
   const memories = memoryContextLine(userText);
-  const history = await historyForAgent(options.skipHistory === true);
+  // A specialist's own turn gets only what the request needs from the chat,
+  // never the whole conversation. Aadi keeps its full window.
+  let history: { summary: string; messages: StoredMessage[] };
+  let historyRefs: string[] = [];
+  if (specialist && !options.delegation && options.skipHistory !== true) {
+    const compressStarted = Date.now();
+    const storedUntil = Number(getSetting(CONVERSATION_SUMMARY_UNTIL_KEY) ?? 0);
+    const recent = stubLongToolOutputs(
+      getRecentMessages(historyLimits().keepMax).filter((message) => message.id > storedUntil),
+    );
+    const compressed = historyForSpecialist(
+      options.guardText ?? userText,
+      recent,
+      getSetting(CONVERSATION_SUMMARY_KEY) ?? "",
+      compressStarted,
+    );
+    history = { summary: compressed.summary, messages: compressed.messages };
+    historyRefs = compressed.refs;
+    if (report) {
+      report.context = compressed.measure;
+    }
+  } else {
+    history = await historyForAgent(options.skipHistory === true);
+  }
   if (saveUserMessage) {
     saveMessage("user", userText);
   }
@@ -471,6 +501,9 @@ export async function runAgent(
       memories,
       history.summary
         ? `Earlier conversation summary:\n${history.summary}`
+        : "",
+      historyRefs.length > 0
+        ? `Earlier tool results referenced (open with your tools if needed): ${historyRefs.join(", ")}`
         : "",
     ]
       .filter(Boolean)
@@ -729,6 +762,9 @@ export async function runAgent(
       toolsUsed.add(name);
     }
     spentUsd += response.usage.estimatedCostUsd;
+    if (report && response.queueMs) {
+      report.queueMs = (report.queueMs ?? 0) + response.queueMs;
+    }
     options.delegation?.meter?.add(response.usage.estimatedCostUsd);
     if (report) {
       const served = response.servedBy ?? primaryKey;
@@ -1099,6 +1135,7 @@ export async function runAgent(
     if (report) {
       report.tools = turnContext.trace;
       report.authRefused = turnContext.refused;
+      report.cacheHits = turnContext.cacheHits;
       report.succeeded = succeeded;
     }
     closeTurnContext(turnContext);
