@@ -73,7 +73,10 @@ for (const agent of localSpecialists()) {
   }
 }
 const remoteOpen = localSpecialists().flatMap((agent) => agent.remoteCapabilities().map((capability) => `${agent.definition.id}.${capability.name}:${capability.effect}`));
-assert(remoteOpen.join(",") === "knowledge.web_search:read", `only a read with nothing private is open to other agents (${remoteOpen.join(",")})`);
+assert(
+  remoteOpen.join(",") === "knowledge.web_search:read,knowledge.latest_release:read",
+  `only reads of public data are open to other agents (${remoteOpen.join(",")})`,
+);
 const external = ownership.filter((entry) => entry.effect === "external").map((entry) => entry.tool).sort();
 for (const tool of ["send_email", "confirm_send_pending_draft", "book_meeting", "create_meeting", "create_event", "move_event", "delete_calendar_event", "add_calendar_attendee", "cancel_scheduled_send", "discard_pending_draft"]) {
   assert(external.includes(tool), `${tool} is marked as acting outside Aadi`);
@@ -291,8 +294,8 @@ setGoalLimitsForTests(undefined);
 const indexSource = readFileSync("src/index.ts", "utf8");
 const menu = [...(/const MENU_COMMANDS = \[([\s\S]*?)\] as const;/.exec(indexSource)?.[1] ?? "").matchAll(/command: "(\w+)"/g)].map((match) => match[1]);
 assert(
-  menu.join(",") === "start,menu,brief,weekly,meetings,accounts,outbox,memory,settings,jobs,build,cost,health,backup,reset",
-  `the menu is the 15 canonical commands (${menu.join(",")})`,
+  menu.join(",") === "start,menu,brief,weekly,meetings,accounts,outbox,memory,settings,agents,jobs,build,cost,health,backup,reset",
+  `the menu is the 16 canonical commands (${menu.join(",")})`,
 );
 const botSource = readFileSync("src/bot.ts", "utf8");
 const registered = [...botSource.matchAll(/bot\.command\("(\w+)"/g)].map((match) => match[1]!);
@@ -301,7 +304,7 @@ const aliases = ["sequence", "sequences", "scheduledsends", "next", "wrapup", "m
 assert(aliases.every((command) => registered.includes(command)), "every old command still works");
 assert(aliases.every((command) => !menu.includes(command)), "and none of them is in the menu");
 assert(new Set(registered).size === registered.length, "no command is registered twice");
-passed.push(`commands: 15 in the menu, ${aliases.length} old names kept as hidden aliases`);
+passed.push(`commands: 16 in the menu, ${aliases.length} old names kept as hidden aliases`);
 
 // ---- prompts ----
 for (const agent of localSpecialists()) {

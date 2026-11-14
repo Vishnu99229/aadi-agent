@@ -1,4 +1,5 @@
 import type { AuthGrant } from "./auth.js";
+import type { AgentMessage } from "./protocol.js";
 import type {
   AgentManifest,
   AgentTaskResult,
@@ -44,6 +45,8 @@ export interface ExecutionEnv {
   budgetUsd?: number;
   /** Which attempt this is, from 1. */
   attempt: number;
+  /** The typed task message for this run (refs, constraints, dependency results). */
+  message?: AgentMessage;
 }
 
 export type ReconcileVerdict = "done" | "not_done" | "unknown";

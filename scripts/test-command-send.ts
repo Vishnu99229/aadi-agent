@@ -17,6 +17,7 @@ import {
   referencesAttachment,
 } from "../src/command_logic.ts";
 import { commandIntents } from "../src/command_intent.ts";
+import { resetAgentModelSettings, resolveAgentModel, setAgentModelSetting } from "../src/models/agent_models.ts";
 import { commandWriterInput, COMMAND_WRITER_SYSTEM } from "../src/command_writer.ts";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -1089,16 +1090,18 @@ for (const phrase of ["what's the weather", "summarise this document", "how much
     return { ok: true, result: true } as never;
   });
   await bot.init();
-  // Command and chat both default to Gemini; give command its own backend so routing is visible.
-  const commandDefault = getTaskBackend("command");
-  setTaskBackend("command", getTaskBackend("chat") === "claude" ? "gemini" : "claude");
-  const commandBackend = getTaskBackend("command");
-  const chatBackend = getTaskBackend("chat");
-  const seen: unknown[] = [];
+  // Owner turns run on the model of the agent that handles them (Agent Models),
+  // not on a per-task system model. Give Email and Aadi different models so the
+  // routing is visible. The "command" system model only writes the email text.
+  setAgentModelSetting("email", { primary: "anthropic:haiku", fallbacks: [] });
+  setAgentModelSetting("aadi", { primary: "anthropic:sonnet", fallbacks: [] });
+  const seen: Array<{ agent: string; model: string }> = [];
   chatScript = (params) => {
-    seen.push(params.backend);
+    seen.push({ agent: params.route?.agentId ?? "none", model: params.route?.models[0]?.key ?? String(params.backend) });
     return modelReply({ text: "Okay." });
   };
+  const onOwnModel = (calls: typeof seen): boolean =>
+    calls.length > 0 && calls.every((call) => call.model === resolveAgentModel(call.agent).models[0]?.key);
   const say = async (text: string, extra: object = {}): Promise<void> => {
     const id = nextTurn() + 5000;
     await bot.handleUpdate({
@@ -1115,17 +1118,20 @@ for (const phrase of ["what's the weather", "summarise this document", "how much
     await new Promise((resolve) => setTimeout(resolve, 30));
   };
   await say("send Arjun an email saying hello");
-  assert(seen.length > 0 && seen.every((item) => item === commandBackend), `a send command runs on the Command backend, got ${seen.join()}`);
+  assert(
+    seen.length > 0 && seen.every((call) => call.agent === "email" && call.model === "anthropic:haiku"),
+    `a send command runs on the Email Agent's own model, got ${JSON.stringify(seen)}`,
+  );
   const normal = seen.length;
   await say("what's the weather like");
-  assert(seen.length > normal && seen.slice(normal).every((item) => item === chatBackend), `chat stays on its model, got ${seen.slice(normal).join()}`);
+  assert(onOwnModel(seen.slice(normal)) && seen.slice(normal).every((call) => call.agent !== "email"), `chat runs on its own agent's model, got ${JSON.stringify(seen.slice(normal))}`);
   settings.sendOnCommandEnabled = false;
   const off = seen.length;
   await say("send Arjun an email saying hello");
-  assert(seen.length > off && seen.slice(off).every((item) => item === chatBackend), "off: no routing");
+  assert(onOwnModel(seen.slice(off)), `off: still the handling agent's own model, got ${JSON.stringify(seen.slice(off))}`);
   settings.sendOnCommandEnabled = true;
   chatScript = undefined;
-  setTaskBackend("command", commandDefault);
+  resetAgentModelSettings();
 }
 
 // ======== scheduled sends ========

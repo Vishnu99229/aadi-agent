@@ -29,12 +29,12 @@ export const MODEL_TASKS: ModelTask[] = [
 ];
 
 export const TASK_LABELS: Record<ModelTask, string> = {
-  chat: "Chat and questions",
+  chat: "Chat fallback and summaries",
   brief: "Morning brief and weekly review",
   documents: "Documents (PDFs, contracts, RFPs)",
   meetings: "Meeting briefs and account status",
   drafting: "Email drafting",
-  command: "Command turns (send, calendar)",
+  command: "Command email writing",
   background: "Background scans",
   vision: "Vision (image analysis)",
 };
@@ -244,7 +244,11 @@ export function formatModelSetupText(options?: {
   updatedTasks?: ModelTask[];
 }): string {
   const updated = new Set(options?.updatedTasks ?? []);
-  const lines = ["Model setup"];
+  const lines = [
+    "Advanced models (system)",
+    "Models for system work: briefs, documents, meeting briefs, draft writing, background scans and vision. Agents think with their own models in /settings -> Agent models.",
+    "",
+  ];
   for (const task of MODEL_TASKS) {
     const suffix = updated.has(task) ? " ✅ updated" : "";
     lines.push(`${formatTaskSetupLine(task)}${suffix}`);

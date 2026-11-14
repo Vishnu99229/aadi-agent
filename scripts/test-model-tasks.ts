@@ -122,7 +122,7 @@ const saved = applyTaskChoice("chat", "haiku", "medium");
 assert(saved.switched, "chat choice saves");
 assert(getTaskEffort("chat") === "medium", "chat effort is medium");
 assert(
-  formatTaskSetupLine("chat") === "Chat and questions — Haiku 5.5 · medium",
+  formatTaskSetupLine("chat") === "Chat fallback and summaries — Haiku 5.5 · medium",
   "chat setup line matches selection",
 );
 
@@ -133,7 +133,7 @@ assert(getTaskBackend("background") === "gemini", "background uses gemini too");
 assert(
   formatModelSetupText({
     updatedTasks: ["chat"],
-  }).includes("Chat and questions — Gemini 3.6 Flash ✅ updated"),
+  }).includes("Chat fallback and summaries — Gemini 3.6 Flash ✅ updated"),
   "updated gemini line",
 );
 assert(

@@ -1,5 +1,7 @@
 import { config } from "./config.js";
-import type { LlmBackend, LlmMessage, LlmTool, ToolCall, ToolChoice } from "./llm.js";
+import type { LlmBackend, LlmMessage, LlmTool, ModelRoute, ToolCall, ToolChoice } from "./llm.js";
+import { resolveAgentModel, type ReasoningTier, type ResolvedAgentModel } from "./models/agent_models.js";
+import { historyForSpecialist, type ContextMeasure } from "./agents/context.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
 import { shouldForceCalendarTool } from "./calendar_guard.js";
@@ -41,6 +43,7 @@ import {
   recentUploadLine,
 } from "./recent_upload.js";
 import {
+  SPECIALIST_ONLY_TOOLS,
   TOOL_ORDER,
   tools as customTools,
   type ToolTurn,
@@ -164,6 +167,26 @@ export interface RunReport {
   totalInputTokens: number;
   outputTokens: number;
   backend?: string;
+  /** The agent whose model setting this run used ("aadi" or a specialist id). */
+  modelAgent?: string;
+  /** The model the agent's setting put first for this run. */
+  primaryModel?: string;
+  /** What answered each model call, in order. */
+  servedModels: string[];
+  /** Model calls answered by something other than the primary. */
+  fallbacks: number;
+  /** Milliseconds from the start of the run to the first model answer. */
+  firstModelMs?: number;
+  /** Tool calls the dispatcher refused for lack of authorization. */
+  authRefused?: number;
+  /** Time spent queued in the global scheduler (model and tool slots). */
+  queueMs?: number;
+  /** Tool calls answered from the shared result cache. */
+  cacheHits?: number;
+  /** Context this run was given, against what it would have been given uncompressed. */
+  context?: ContextMeasure;
+  /** The run ended with an answer and no failed tool or unrun command. */
+  succeeded?: boolean;
   widened: boolean;
   stopped?: string;
   /** The stop was "which person do you mean?": Vishnu's answer re-runs his request. */
@@ -179,6 +202,8 @@ export function newRunReport(): RunReport {
     inputTokens: 0,
     totalInputTokens: 0,
     outputTokens: 0,
+    servedModels: [],
+    fallbacks: 0,
     widened: false,
     tools: [],
   };
@@ -300,6 +325,13 @@ export interface RunAgentOptions {
   extraContext?: string;
   /** Fewer steps than the default limit, for a delegated task. */
   maxIterations?: number;
+  /**
+   * The agent doing the reasoning ("aadi" or a specialist id). When set, the
+   * model comes from that agent's own model setting, not from task or backend.
+   */
+  modelAgent?: string;
+  /** A goal's complexity, which replaces the agent's own tier for this run. */
+  modelTier?: ReasoningTier;
 }
 
 async function summariseOlderMessages(
@@ -423,7 +455,30 @@ export async function runAgent(
   }
   const recentUpload = recentUploadLine();
   const memories = memoryContextLine(userText);
-  const history = await historyForAgent(options.skipHistory === true);
+  // A specialist's own turn gets only what the request needs from the chat,
+  // never the whole conversation. Aadi keeps its full window.
+  let history: { summary: string; messages: StoredMessage[] };
+  let historyRefs: string[] = [];
+  if (specialist && !options.delegation && options.skipHistory !== true) {
+    const compressStarted = Date.now();
+    const storedUntil = Number(getSetting(CONVERSATION_SUMMARY_UNTIL_KEY) ?? 0);
+    const recent = stubLongToolOutputs(
+      getRecentMessages(historyLimits().keepMax).filter((message) => message.id > storedUntil),
+    );
+    const compressed = historyForSpecialist(
+      options.guardText ?? userText,
+      recent,
+      getSetting(CONVERSATION_SUMMARY_KEY) ?? "",
+      compressStarted,
+    );
+    history = { summary: compressed.summary, messages: compressed.messages };
+    historyRefs = compressed.refs;
+    if (report) {
+      report.context = compressed.measure;
+    }
+  } else {
+    history = await historyForAgent(options.skipHistory === true);
+  }
   if (saveUserMessage) {
     saveMessage("user", userText);
   }
@@ -447,6 +502,9 @@ export async function runAgent(
       history.summary
         ? `Earlier conversation summary:\n${history.summary}`
         : "",
+      historyRefs.length > 0
+        ? `Earlier tool results referenced (open with your tools if needed): ${historyRefs.join(", ")}`
+        : "",
     ]
       .filter(Boolean)
       .join("\n"),
@@ -457,14 +515,37 @@ export async function runAgent(
 
   const collectedText: string[] = [];
   const task = options.task ?? "chat";
-  const backend = options.backend ?? getTaskBackend(task);
-  if (report) {
-    report.backend = backend;
-  }
-  const effort =
-    backend === "claude" || backend === "haiku"
-      ? getTaskEffort(task)
+  const startedAt = Date.now();
+  // An agent's reasoning runs on that agent's own models. Everything else
+  // (briefs, documents, background work) keeps its system model.
+  let resolved: ResolvedAgentModel | undefined =
+    options.modelAgent && !options.backend
+      ? resolveAgentModel(options.modelAgent, { tier: options.modelTier })
       : undefined;
+  const legacyBackend: LlmBackend = options.backend ?? getTaskBackend(task);
+  const routeFor = (value: ResolvedAgentModel | undefined): ModelRoute | undefined =>
+    value && value.models.length > 0 ? { agentId: value.agentId, models: value.models } : undefined;
+  let route = routeFor(resolved);
+  /** What the run asked for first: a backend name, or the route's first model key. */
+  let primaryKey: string = route?.models[0]?.key ?? legacyBackend;
+  const backend = legacyBackend;
+  if (report) {
+    report.backend = primaryKey;
+    report.modelAgent = route ? options.modelAgent : undefined;
+    report.primaryModel = primaryKey;
+  }
+  if (resolved) {
+    console.log(
+      `agent model: agent=${resolved.agentId} mode=${resolved.mode} tier=${resolved.tier} route=[${resolved.models.map((spec) => spec.key).join(", ")}]${resolved.skipped.length > 0 ? ` skipped=[${resolved.skipped.map((item) => `${item.key}:${item.reason}`).join("; ")}]` : ""}${resolved.safetyNet ? " safety_net=true" : ""}`,
+    );
+  }
+  let effort =
+    route
+      ? resolved!.effort
+      : backend === "claude" || backend === "haiku"
+        ? getTaskEffort(task)
+        : undefined;
+  const routeForcesTools = (): boolean => route?.models[0]?.forcesTools ?? false;
   let deferredRetryUsed = false;
   let calendarRetryUsed = false;
   let documentRewriteRetryUsed = false;
@@ -478,7 +559,11 @@ export async function runAgent(
   const scopedNames: readonly string[] | undefined =
     options.toolNames ??
     (specialist
-      ? defaults.filter((name) => specialist.toolNames().includes(name))
+      ? [
+          ...defaults.filter((name) => specialist.toolNames().includes(name)),
+          // Tools only this specialist is offered (Aadi's own list doesn't have them).
+          ...SPECIALIST_ONLY_TOOLS.filter((name) => specialist.toolNames().includes(name)),
+        ]
       : undefined);
   const metaTools = new Map((options.metaTools ?? []).map((tool) => [tool.definition.name, tool]));
   const metaDefinitions: LlmTool[] = (options.metaTools ?? []).map((tool) => tool.definition);
@@ -560,6 +645,16 @@ export async function runAgent(
     }
     aadiPrompt ??= await readAadiPrompt();
     system.cacheable = aadiPrompt;
+    // Aadi carries on with Aadi's own model, as on any of Aadi's turns.
+    if (route) {
+      resolved = resolveAgentModel("aadi");
+      route = routeFor(resolved);
+      primaryKey = route?.models[0]?.key ?? legacyBackend;
+      effort = resolved.effort;
+      if (report) {
+        report.modelAgent = "aadi";
+      }
+    }
     activeTools = [
       ...toolDefinitions,
       ...metaDefinitions.filter((tool) => tool.type === "function" && tool.name !== "escalate_to_aadi"),
@@ -605,7 +700,8 @@ export async function runAgent(
   const isActionTool = (name: string): boolean =>
     intents.some((kind) => COMMAND_TOOLS[kind].includes(name));
   const forcing = (kinds: readonly CommandKind[]): { name: string } | undefined => {
-    const name = backendForcesTools(backend) ? forcedCommandTool(kinds) : undefined;
+    const forces = route ? routeForcesTools() : backendForcesTools(backend);
+    const name = forces ? forcedCommandTool(kinds) : undefined;
     return name ? { name } : undefined;
   };
   const firstForced = forcing(intents);
@@ -645,7 +741,7 @@ export async function runAgent(
       system,
       tools: activeTools,
       messages,
-      backend,
+      ...(route ? { route } : { backend }),
       task: options.usageTask ?? usageTaskForAgent(options.task),
       effort,
       ...(toolChoice ? { toolChoice } : {}),
@@ -653,7 +749,8 @@ export async function runAgent(
     toolChoice = undefined;
     // A fallback sees the tool results of the provider that failed. Repeating
     // those calls would run the side effect twice, so identical calls are replayed.
-    turnContext.suppressRepeat = response.servedBy !== undefined && response.servedBy !== backend;
+    // This holds whichever provider or agent model the fallback lands on.
+    turnContext.suppressRepeat = response.servedBy !== undefined && response.servedBy !== primaryKey;
 
     const responseText = response.textParts.join("\n").trim();
     if (responseText) {
@@ -665,9 +762,20 @@ export async function runAgent(
       toolsUsed.add(name);
     }
     spentUsd += response.usage.estimatedCostUsd;
+    if (report && response.queueMs) {
+      report.queueMs = (report.queueMs ?? 0) + response.queueMs;
+    }
     options.delegation?.meter?.add(response.usage.estimatedCostUsd);
     if (report) {
-      report.backend = response.servedBy ?? backend;
+      const served = response.servedBy ?? primaryKey;
+      report.backend = served;
+      report.servedModels.push(served);
+      if (served !== primaryKey) {
+        report.fallbacks += 1;
+      }
+      if (report.firstModelMs === undefined) {
+        report.firstModelMs = Date.now() - startedAt;
+      }
       report.llmCalls += 1;
       report.costUsd += response.usage.estimatedCostUsd;
       report.totalInputTokens +=
@@ -686,7 +794,7 @@ export async function runAgent(
     const cacheReadTokens = response.usage.cacheReadInputTokens ?? 0;
 
     console.log(
-      `Agent iteration ${iteration}: agent=${turnContext.actor}, backend=${backend}, tools=[${calledTools.join(", ")}], input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}, cache_creation_input_tokens=${cacheCreationTokens}, cache_read_input_tokens=${cacheReadTokens}, estimated_cost_usd=${response.usage.estimatedCostUsd.toFixed(6)}`,
+      `Agent iteration ${iteration}: agent=${turnContext.actor}, backend=${response.servedBy ?? primaryKey}, tools=[${calledTools.join(", ")}], input_tokens=${response.usage.inputTokens}, output_tokens=${response.usage.outputTokens}, cache_creation_input_tokens=${cacheCreationTokens}, cache_read_input_tokens=${cacheReadTokens}, estimated_cost_usd=${response.usage.estimatedCostUsd.toFixed(6)}`,
     );
 
     if (response.stopReason === "tool_use") {
@@ -767,6 +875,7 @@ export async function runAgent(
         role: "assistant",
         textParts: response.textParts,
         toolCalls: response.toolCalls,
+        ...(response.providerItems ? { providerItems: response.providerItems } : {}),
       });
       messages.push(...toolResults);
       const whichPerson = stoppedReply === undefined ? contactQuestionAsked(askChatId, contactMark) : undefined;
@@ -1025,6 +1134,9 @@ export async function runAgent(
   } finally {
     if (report) {
       report.tools = turnContext.trace;
+      report.authRefused = turnContext.refused;
+      report.cacheHits = turnContext.cacheHits;
+      report.succeeded = succeeded;
     }
     closeTurnContext(turnContext);
     revokeGrant(ownGrant?.ref);

@@ -64,7 +64,8 @@ const MENU_COMMANDS = [
   { command: "accounts", description: "List tracked accounts, stale first" },
   { command: "outbox", description: "Scheduled emails and follow-up sequences" },
   { command: "memory", description: "List saved memories and forget any" },
-  { command: "settings", description: "Model, voice replies and keyboard" },
+  { command: "settings", description: "Agent models, voice replies and keyboard" },
+  { command: "agents", description: "Agent and model measurements (add week)" },
   { command: "jobs", description: "Big jobs, code builds and agent workflows" },
   { command: "build", description: "Ask a Cursor agent to change Aadi's code" },
   { command: "cost", description: "Model spend so far" },
@@ -88,6 +89,12 @@ async function replaceBotCommandMenu(): Promise<void> {
 }
 
 await logGoogleAccounts();
+{
+  const { initMetrics } = await import("./metrics.js");
+  const { agentModelSummary } = await import("./models/agent_models.js");
+  console.log(`Measurements counting since ${initMetrics()}.`);
+  console.log(`Agent models: ${agentModelSummary().join(" ")}`);
+}
 bot.start({
   onStart: async () => {
     await replaceBotCommandMenu();

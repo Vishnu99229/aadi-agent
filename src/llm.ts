@@ -18,12 +18,18 @@ import { config } from "./config.js";
 import { assertLocalModelAllowed } from "./local_llm_guard.js";
 import {
   flagLlmBackend,
+  flagProvider,
   getFallbackChain,
   isBackendUsable,
   isCreditOrAuthError,
+  modelUnavailableReason,
   shortBackendReason,
   type LlmBackend,
 } from "./llm_fallback.js";
+import { buildResponsesRequest, parseResponsesOutput } from "./models/openai_responses.js";
+import { availableModels, modelForLegacyBackend, providerApiKey, type ModelSpec, type ProviderId } from "./models/registry.js";
+import { circuitAllows, classifyFailure, recordCall, setCircuitProbe, type CallOutcome } from "./models/circuit.js";
+import { acquire, providerPool } from "./governor.js";
 import { assertTestSeam } from "./test_seam.js";
 import {
   estimateLlmCostUsd,
@@ -35,10 +41,13 @@ import {
 
 const MAX_TOKENS = 4096;
 const MAX_SERVER_CONTINUATIONS = 8;
-/** Official OpenAI-compatible base (api-docs.deepseek.com). */
-const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+/** Official OpenAI-compatible base (api-docs.deepseek.com). Overridable for tests and proxies. */
+const DEEPSEEK_BASE_URL = () => process.env.DEEPSEEK_BASE_URL?.trim() || "https://api.deepseek.com";
 /** Google Gemini's OpenAI-compatible endpoint. */
-const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
+const GEMINI_BASE_URL = () =>
+  process.env.GEMINI_BASE_URL?.trim() || "https://generativelanguage.googleapis.com/v1beta/openai/";
+/** Moonshot's international OpenAI-compatible endpoint (api.moonshot.cn inside China). */
+const KIMI_BASE_URL = () => process.env.KIMI_BASE_URL?.trim() || "https://api.moonshot.ai/v1";
 
 export interface ToolCall {
   id: string;
@@ -74,13 +83,34 @@ export type LlmContentPart =
 
 export type LlmMessage =
   | { role: "user"; content: string | LlmContentPart[] }
-  | { role: "assistant"; textParts: string[]; toolCalls: ToolCall[] }
+  | {
+      role: "assistant";
+      textParts: string[];
+      toolCalls: ToolCall[];
+      /**
+       * Provider state that must go back to the same provider on the next step
+       * of the turn (OpenAI's encrypted reasoning items, Kimi's reasoning text).
+       * Other providers ignore it. Opaque: never logged.
+       */
+      providerItems?: ProviderItems;
+    }
   | {
       role: "tool";
       toolCallId: string;
       content: string;
       isError?: boolean;
     };
+
+export interface ProviderItems {
+  provider: string;
+  items: unknown[];
+}
+
+/** An agent's models in the order to try them (agent_models.ts resolves it). */
+export interface ModelRoute {
+  agentId: string;
+  models: ModelSpec[];
+}
 
 export type LlmTool =
   | {
@@ -150,6 +180,12 @@ export interface CompleteParams {
    *  rejects forced tool use with a 400, so on Claude this is ignored and the
    *  caller's own check has to cover it. */
   toolChoice?: ToolChoice;
+  /**
+   * An agent's own models. When set it replaces backend: the models are tried
+   * in order, each through its provider's adapter, and nothing outside the
+   * route is used unless a message needs a capability none of them has.
+   */
+  route?: ModelRoute;
 }
 
 export type ToolChoice = "required" | { name: string };
@@ -174,29 +210,84 @@ export interface CompleteResult {
   toolCalls: ToolCall[];
   usage: LlmUsage;
   stopReason: LlmStopReason;
-  /** The backend that answered, which differs from the one asked after a fallback. */
-  servedBy?: LlmBackend;
+  /**
+   * What answered: a backend name, or a model key on a route. It differs from
+   * what was asked for after a fallback.
+   */
+  servedBy?: string;
+  /** The exact model id that answered. */
+  servedModel?: string;
+  providerItems?: ProviderItems;
+  /** Time spent waiting for a provider slot in the global scheduler. */
+  queueMs?: number;
 }
 
-const anthropic = config.anthropicApiKey
-  ? new Anthropic({ apiKey: config.anthropicApiKey })
-  : undefined;
+/**
+ * Provider clients are made on first use, from the key in the environment.
+ * Keys are never stored anywhere else.
+ */
+const clients = new Map<string, Anthropic | OpenAI>();
 
-const gemini = config.geminiApiKey
-  ? new OpenAI({
-      apiKey: config.geminiApiKey,
-      baseURL: GEMINI_BASE_URL,
-      timeout: 45_000,
-    })
-  : undefined;
+function lazyClient<T extends Anthropic | OpenAI>(name: string, make: () => T | undefined): T | undefined {
+  const existing = clients.get(name);
+  if (existing) {
+    return existing as T;
+  }
+  const made = make();
+  if (made) {
+    clients.set(name, made);
+  }
+  return made;
+}
 
-const deepseek = config.deepseekApiKey
-  ? new OpenAI({
-      apiKey: config.deepseekApiKey,
-      baseURL: DEEPSEEK_BASE_URL,
-      timeout: 45_000,
-    })
-  : undefined;
+function anthropicClient(): Anthropic | undefined {
+  return lazyClient("anthropic", () =>
+    config.anthropicApiKey
+      ? new Anthropic({
+          apiKey: config.anthropicApiKey,
+          ...(process.env.ANTHROPIC_BASE_URL?.trim() ? { baseURL: process.env.ANTHROPIC_BASE_URL.trim() } : {}),
+        })
+      : undefined,
+  );
+}
+
+function geminiClient(): OpenAI | undefined {
+  return lazyClient("gemini", () =>
+    config.geminiApiKey ? new OpenAI({ apiKey: config.geminiApiKey, baseURL: GEMINI_BASE_URL(), timeout: 45_000 }) : undefined,
+  );
+}
+
+function deepseekClient(): OpenAI | undefined {
+  return lazyClient("deepseek", () =>
+    config.deepseekApiKey ? new OpenAI({ apiKey: config.deepseekApiKey, baseURL: DEEPSEEK_BASE_URL(), timeout: 45_000 }) : undefined,
+  );
+}
+
+function openaiClient(): OpenAI | undefined {
+  return lazyClient("openai", () => {
+    const apiKey = providerApiKey("openai");
+    return apiKey
+      ? new OpenAI({
+          apiKey,
+          ...(process.env.OPENAI_BASE_URL?.trim() ? { baseURL: process.env.OPENAI_BASE_URL.trim() } : {}),
+          timeout: 60_000,
+        })
+      : undefined;
+  });
+}
+
+function kimiClient(): OpenAI | undefined {
+  return lazyClient("kimi", () => {
+    const apiKey = providerApiKey("kimi");
+    return apiKey ? new OpenAI({ apiKey, baseURL: KIMI_BASE_URL(), timeout: 60_000 }) : undefined;
+  });
+}
+
+/** Tests point a provider at a local fake server, then make the client again. */
+export function resetProviderClientsForTests(): void {
+  assertTestSeam("resetProviderClientsForTests");
+  clients.clear();
+}
 
 const localLlm = new OpenAI({
   apiKey: "ollama",
@@ -556,6 +647,7 @@ function anthropicStopReason(
 async function completeWithClaude(
   params: CompleteParams,
 ): Promise<CompleteResult> {
+  const anthropic = anthropicClient();
   if (!anthropic) {
     throw new Error("Claude client is not configured.");
   }
@@ -692,7 +784,7 @@ export function readGeminiThoughtSignature(toolCall: unknown): string | undefine
 export function toOpenRouterMessages(
   system: LlmSystemPrompt,
   messages: LlmMessage[],
-  options: { preserveThoughtSignatures?: boolean } = {},
+  options: { preserveThoughtSignatures?: boolean; reasoningProvider?: string } = {},
 ): ChatCompletionMessageParam[] {
   return [
     { role: "system", content: system.cacheable },
@@ -719,6 +811,15 @@ export function toOpenRouterMessages(
         content:
           message.textParts.length > 0 ? message.textParts.join("\n") : null,
       };
+      // Kimi's thinking models need their reasoning text back within a turn.
+      // Only the provider that wrote it is sent it.
+      const reasoningText =
+        options.reasoningProvider && message.providerItems?.provider === options.reasoningProvider
+          ? message.providerItems.items.find((item): item is string => typeof item === "string")
+          : undefined;
+      if (reasoningText) {
+        (assistant as { reasoning_content?: string }).reasoning_content = reasoningText;
+      }
       if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) {
         assistant.tool_calls = message.toolCalls.map((toolCall) => ({
           type: "function" as const,
@@ -831,7 +932,7 @@ async function completeWithOpenAiCompatible(
   params: CompleteParams,
   model: string,
   label: string,
-  options: { thinking?: boolean } = {},
+  options: { thinking?: boolean; forcesTools?: boolean } = {},
 ): Promise<CompleteResult> {
   const tools = toOpenRouterTools(params.tools);
   let system = params.system;
@@ -844,12 +945,14 @@ async function completeWithOpenAiCompatible(
       dynamic: [system.dynamic, jsonMode.systemExtra].filter(Boolean).join("\n"),
     };
   }
-  const forced = tools.length > 0 && !options.thinking ? openAiToolChoice(params.toolChoice) : undefined;
+  const forced =
+    tools.length > 0 && !options.thinking && options.forcesTools !== false ? openAiToolChoice(params.toolChoice) : undefined;
   const response = await client.chat.completions.create(
     {
       model,
       messages: toOpenRouterMessages(system, params.messages, {
         preserveThoughtSignatures: label === "gemini",
+        reasoningProvider: label === "kimi" ? "kimi" : undefined,
       }),
       ...(tools.length > 0 ? { tools } : {}),
       ...(forced ? { tool_choice: forced } : {}),
@@ -865,7 +968,7 @@ async function completeWithOpenAiCompatible(
         : isDeepSeekLabel(label)
           ? { thinking: { type: "disabled" } }
           : label === "gemini"
-            ? { reasoning_effort: "low" as const }
+            ? { reasoning_effort: params.effort ?? ("low" as const) }
             : {}),
     } as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
     params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
@@ -895,12 +998,92 @@ async function completeWithOpenAiCompatible(
     true,
   );
 
+  const reasoningText =
+    label === "kimi" ? (choice.message as { reasoning_content?: unknown }).reasoning_content : undefined;
   return {
     textParts: choice.message.content ? [choice.message.content] : [],
     toolCalls: geminiToolCalls(choice.message),
     usage,
     stopReason: openAiStopReason(choice.finish_reason),
+    ...(typeof reasoningText === "string" && reasoningText
+      ? { providerItems: { provider: "kimi", items: [reasoningText] } }
+      : {}),
   };
+}
+
+/** OpenAI through the Responses API (openai_responses.ts does the translation). */
+async function completeWithOpenAiResponses(
+  client: OpenAI,
+  params: CompleteParams,
+  spec: ModelSpec,
+): Promise<CompleteResult> {
+  const request = buildResponsesRequest(params, spec);
+  const response = await client.responses.create(
+    request as unknown as OpenAI.Responses.ResponseCreateParamsNonStreaming,
+    params.timeoutMs ? { timeout: params.timeoutMs } : undefined,
+  );
+  const parsed = parseResponsesOutput(response as unknown as Parameters<typeof parseResponsesOutput>[0]);
+  const usage = recordUsage(
+    params,
+    spec.modelId,
+    {
+      inputTokens: parsed.usage.inputTokens,
+      outputTokens: parsed.usage.outputTokens,
+      cacheReadInputTokens: parsed.usage.cachedTokens,
+    },
+    true,
+  );
+  return {
+    textParts: parsed.textParts,
+    toolCalls: parsed.toolCalls,
+    usage,
+    stopReason: parsed.stopReason,
+    ...(parsed.providerItems ? { providerItems: parsed.providerItems } : {}),
+  };
+}
+
+function missingKey(provider: string, envName: string): Error {
+  return new Error(`${provider} requires ${envName} in .env (add it locally; Aadi never writes .env).`);
+}
+
+/** One call to one model, through its provider's adapter. */
+export async function completeWithModel(spec: ModelSpec, params: CompleteParams): Promise<CompleteResult> {
+  const call = { ...params, model: spec.modelId };
+  switch (spec.provider) {
+    case "anthropic":
+      return completeWithClaude(call);
+    case "openai": {
+      const client = openaiClient();
+      if (!client) {
+        throw missingKey("openai", "OPENAI_API_KEY");
+      }
+      return completeWithOpenAiResponses(client, call, spec);
+    }
+    case "gemini": {
+      const client = geminiClient();
+      if (!client) {
+        throw missingKey("gemini", "GEMINI_API_KEY");
+      }
+      return completeWithOpenAiCompatible(client, call, spec.modelId, "gemini", { forcesTools: spec.forcesTools });
+    }
+    case "deepseek": {
+      const client = deepseekClient();
+      if (!client) {
+        throw missingKey("deepseek", "DEEPSEEK_API_KEY");
+      }
+      return completeWithOpenAiCompatible(client, call, spec.modelId, spec.thinking ? "deepseek-reasoner" : "deepseek", {
+        thinking: spec.thinking === true,
+        forcesTools: spec.forcesTools,
+      });
+    }
+    case "kimi": {
+      const client = kimiClient();
+      if (!client) {
+        throw missingKey("kimi", "KIMI_API_KEY");
+      }
+      return completeWithOpenAiCompatible(client, call, spec.modelId, "kimi", { forcesTools: spec.forcesTools });
+    }
+  }
 }
 
 let fakeComplete:
@@ -924,6 +1107,7 @@ async function completeWithNamedBackend(
     return completeWithClaude({ ...params, model });
   }
   if (backend === "gemini") {
+    const gemini = geminiClient();
     if (!gemini) {
       throw new Error(
         "gemini requires GEMINI_API_KEY in .env (add it locally; Aadi never writes .env).",
@@ -937,6 +1121,7 @@ async function completeWithNamedBackend(
     );
   }
   if (backend === "deepseek" || backend === "deepseek-reasoner") {
+    const deepseek = deepseekClient();
     if (!deepseek) {
       throw new Error(
         "deepseek requires DEEPSEEK_API_KEY in .env (add it locally; Aadi never writes .env).",
@@ -999,6 +1184,162 @@ function messagesHaveImage(params: CompleteParams): boolean {
   );
 }
 
+let routeModelOverride:
+  | ((spec: ModelSpec, params: CompleteParams) => Promise<CompleteResult>)
+  | undefined;
+
+/** Stands in for the provider call on an agent route; the route logic still runs. */
+export function setRouteModelCompleteForTests(
+  fake: ((spec: ModelSpec, params: CompleteParams) => Promise<CompleteResult>) | undefined,
+): void {
+  assertTestSeam("setRouteModelCompleteForTests");
+  routeModelOverride = fake;
+}
+
+/** The provider a backend name calls. */
+function providerOfBackend(backend: LlmBackend): ProviderId | "local" {
+  switch (backend) {
+    case "claude":
+    case "haiku":
+      return "anthropic";
+    case "gemini":
+      return "gemini";
+    case "deepseek":
+    case "deepseek-reasoner":
+      return "deepseek";
+    default:
+      return "local";
+  }
+}
+
+/** A tool call whose arguments didn't parse is the provider's formatting, not the tool's. */
+function outcomeOf(result: CompleteResult): CallOutcome {
+  return result.toolCalls.some((call) => call.execution === "client" && typeof call.input === "string") ? "tool_format" : "ok";
+}
+
+/**
+ * One provider call under the global scheduler and the provider's circuit
+ * breaker: waits for a slot (queue time is reported apart), then records how
+ * the call went and how long it took.
+ */
+async function governedCall(
+  provider: string,
+  modelKey: string | undefined,
+  call: () => Promise<CompleteResult>,
+): Promise<CompleteResult> {
+  const slot = await acquire(providerPool(provider));
+  // A local model runs on this machine's CPU: it also takes the one CPU slot.
+  const cpu = provider === "local" ? await acquire("cpu") : undefined;
+  const startedAt = Date.now();
+  try {
+    const result = await call();
+    const outcome = outcomeOf(result);
+    const ms = Date.now() - startedAt;
+    recordCall(provider, outcome, ms);
+    if (modelKey) {
+      recordCall(`model:${modelKey}`, outcome, ms);
+    }
+    return { ...result, queueMs: (result.queueMs ?? 0) + slot.waitedMs + (cpu?.waitedMs ?? 0) };
+  } catch (error) {
+    const ms = Date.now() - startedAt;
+    const outcome = classifyFailure(error);
+    recordCall(provider, outcome, ms);
+    if (modelKey) {
+      recordCall(`model:${modelKey}`, outcome, ms);
+    }
+    throw error;
+  } finally {
+    cpu?.release();
+    slot.release();
+  }
+}
+
+function circuitOpenFor(spec: ModelSpec): boolean {
+  // Both must be healthy; the model is only asked once the provider is.
+  return !circuitAllows(spec.provider) || !circuitAllows(`model:${spec.key}`);
+}
+
+// The small test request a half-open circuit sends: the provider's cheapest
+// available model, a two-word prompt, no tools.
+setCircuitProbe(async (key) => {
+  const provider = key.startsWith("model:") ? key.split(":")[1] : key;
+  const spec = key.startsWith("model:")
+    ? availableModels().find((item) => `model:${item.key}` === key)
+    : availableModels(provider as ProviderId).sort((left, right) => left.cost.outputCostPerMillion - right.cost.outputCostPerMillion)[0];
+  if (!spec) {
+    return false;
+  }
+  try {
+    const result = await completeWithModel(spec, {
+      system: { cacheable: "Health check. Reply with OK." },
+      messages: [{ role: "user", content: "ping" }],
+      tools: [],
+      maxTokens: 16,
+      task: "other",
+      timeoutMs: 15_000,
+    });
+    return result.stopReason !== "refusal";
+  } catch {
+    return false;
+  }
+});
+
+function modelFits(spec: ModelSpec, needs: { image: boolean; pdf: boolean; json: boolean }): boolean {
+  return (!needs.image || spec.supportsVision) && (!needs.pdf || spec.supportsPdf);
+}
+
+/**
+ * Tries an agent's models in order. A model whose key is missing or whose
+ * provider is paused after a credit error is skipped. A credit or auth failure
+ * pauses that provider for everyone. When a message holds an image or a PDF no
+ * model on the route can read, the system's own chain for that is used.
+ */
+async function completeOnRoute(params: CompleteParams): Promise<CompleteResult> {
+  const route = params.route!;
+  const needs = { image: messagesHaveImage(params), pdf: messagesHavePdf(params), json: Boolean(params.jsonSchema) };
+  const fitting = route.models.filter((spec) => modelFits(spec, needs));
+  if (fitting.length === 0) {
+    console.log(`LLM: agent=${route.agentId} route has no model for this content; using the system chain.`);
+    return complete({ ...params, route: undefined, backend: undefined });
+  }
+  const failures: string[] = [];
+  const usable = fitting.filter((spec) => modelUnavailableReason(spec) === undefined || modelUnavailableReason(spec) === "circuit open");
+  const healthy = usable.filter((spec) => !circuitOpenFor(spec));
+  // Every usable model's circuit is open: try the first anyway rather than fail the turn.
+  const order = healthy.length > 0 ? healthy : usable.slice(0, 1);
+  for (const spec of fitting) {
+    if (!order.includes(spec)) {
+      const reason = modelUnavailableReason(spec) ?? "circuit open";
+      failures.push(`${spec.key}:${reason}`);
+      continue;
+    }
+    try {
+      const result = await governedCall(spec.provider, spec.key, () =>
+        routeModelOverride
+          ? routeModelOverride(spec, params)
+          : completeWithModel(spec, {
+              ...params,
+              route: undefined,
+              // Forced tool use only goes to a provider that accepts it.
+              toolChoice: spec.forcesTools ? params.toolChoice : undefined,
+            }),
+      );
+      if (failures.length > 0) {
+        console.error(`LLM: agent=${route.agentId} using ${spec.key} after [${failures.join("; ")}].`);
+      }
+      return { ...result, servedBy: spec.key, servedModel: spec.modelId };
+    } catch (error) {
+      const reason = shortBackendReason(error);
+      console.error(`LLM: agent=${route.agentId} model ${spec.key} failed (${reason}); trying next.`);
+      if (isCreditOrAuthError(error)) {
+        flagProvider(spec.provider, reason);
+      }
+      failures.push(`${spec.key}:${reason}`);
+    }
+  }
+  throw new Error(`All models for ${route.agentId} failed: [${failures.join("; ")}]`);
+}
+
 export function setNamedBackendCompleteForTests(
   fake:
     | ((backend: LlmBackend, params: CompleteParams) => Promise<CompleteResult>)
@@ -1012,7 +1353,14 @@ export async function complete(
   params: CompleteParams,
 ): Promise<CompleteResult> {
   if (fakeComplete) {
-    return fakeComplete(params);
+    const result = await fakeComplete(params);
+    // A scripted model on a route answers as the route's first model.
+    return params.route && result.servedBy === undefined && params.route.models[0]
+      ? { ...result, servedBy: params.route.models[0].key, servedModel: params.route.models[0].modelId }
+      : result;
+  }
+  if (params.route && params.route.models.length > 0) {
+    return completeOnRoute(params);
   }
   const primary = params.backend ?? getTaskBackend("chat");
   const chain = params.noFallback
@@ -1025,25 +1373,35 @@ export async function complete(
     throw new Error("All LLM backends failed: none usable");
   }
   const failures: string[] = [];
+  const openSkipped: LlmBackend[] = [];
   for (const backend of chain) {
     if (!isBackendUsable(backend)) {
       continue;
     }
+    const provider = providerOfBackend(backend);
+    const last = backend === chain[chain.length - 1];
+    if (provider !== "local" && !circuitAllows(provider) && !(last && openSkipped.length === chain.length - 1)) {
+      openSkipped.push(backend);
+      failures.push(`${backend}:circuit open`);
+      continue;
+    }
     try {
-      const result = await completeWithNamedBackend(backend, {
-        ...params,
-        backend,
-        model: backend === primary ? params.model : undefined,
-        jsonSchema: params.jsonSchema,
-        effort:
-          backend === "claude" || backend === "haiku"
-            ? params.effort
-            : undefined,
-      });
+      const result = await governedCall(provider === "local" ? "local" : provider, modelForLegacyBackend(backend)?.key, () =>
+        completeWithNamedBackend(backend, {
+          ...params,
+          backend,
+          model: backend === primary ? params.model : undefined,
+          jsonSchema: params.jsonSchema,
+          effort:
+            backend === "claude" || backend === "haiku"
+              ? params.effort
+              : undefined,
+        }),
+      );
       if (failures.length > 0) {
         console.error(`LLM: using ${backend}.`);
       }
-      return { ...result, servedBy: backend };
+      return { ...result, servedBy: backend, servedModel: modelForLegacyBackend(backend)?.modelId ?? params.model };
     } catch (error) {
       const reason = shortBackendReason(error);
       console.error(`Backend ${backend} failed (${reason}); trying next.`);

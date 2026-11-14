@@ -73,6 +73,13 @@ import {
 } from "./bills.js";
 import { handlePromiseDuplicateCallback } from "./promises.js";
 import { handleModelCallback, sendModelPanel } from "./model_panel.js";
+import { handleAgentModelCallback, sendAgentModelsPanel } from "./agent_model_panel.js";
+import { formatAgentsReport } from "./metrics.js";
+import { runWithPriority } from "./governor.js";
+import { noteOwnerMessage, noteRetryTap } from "./feedback.js";
+import { computeRecommendations, decideRecommendation, formatRecommendations } from "./models/evaluation.js";
+import { resolveAgentModel } from "./models/agent_models.js";
+import { modelLabel } from "./models/registry.js";
 import {
   consumeBuildFollowup,
   formatRecentBuilds,
@@ -182,6 +189,10 @@ installNetworkRetry(bot.api);
 installCaptionEditFallback(bot.api);
 
 bot.use(ownerOnly(config.ownerTelegramId));
+
+// Vishnu's messages run first in the global scheduler; his taps on cards next.
+// Everything a turn starts (model calls, tools, workflows) inherits it.
+bot.use((ctx, next) => runWithPriority(ctx.callbackQuery ? "continuation" : "foreground", () => next()));
 
 // Telegram re-delivers the last un-acknowledged update after a crash or
 // deploy. Without this guard Aadi would process the same message twice and
@@ -390,6 +401,8 @@ async function handleForwardedContent(ctx: Context, content: string): Promise<vo
         toolNames: FORWARDED_TOOLS,
         sendConfirmation: undefined,
         guardText: wrapped,
+        // Aadi reads it and talks to Vishnu about it, so Aadi's own model answers.
+        modelAgent: "aadi",
       }),
     { forwarded: true, retryText: content },
   );
@@ -426,7 +439,7 @@ function replyKeyboard(): Keyboard {
 
 function menuKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text("Model setup", "menu:model")
+    .text("Agent models", "menu:model")
     .row()
     .text("Morning brief", "menu:brief")
     .row()
@@ -446,11 +459,9 @@ function menuKeyboard(): InlineKeyboard {
 }
 
 function menuCaption(): string {
-  const backend = getTaskBackend("chat");
-  if (!supportsEffort(backend)) {
-    return `Aadi — chat uses ${modelDisplayName(backend)}.`;
-  }
-  return `Aadi — chat uses ${modelDisplayName(backend)} · ${getTaskEffort("chat")}.`;
+  // Aadi talks to Vishnu on Aadi's own model (Agent Models), not a task setting.
+  const now = resolveAgentModel("aadi").models[0];
+  return `Aadi — talks on ${modelLabel(now)}.`;
 }
 
 function isAccountOrMeetingQuestion(text: string): boolean {
@@ -571,7 +582,9 @@ async function replyFromAgent(
 
 function settingsKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text("Model setup", "settings:model")
+    .text("Agent models", "settings:agents")
+    .row()
+    .text("Advanced models", "settings:model")
     .row()
     .text(`Voice replies: ${voiceRepliesEnabled() ? "on" : "off"}`, "settings:voice")
     .row()
@@ -672,9 +685,35 @@ bot.command("menu", async (ctx) => {
   await sendMenu(ctx);
 });
 
-// Older name for /settings model. Kept working, no longer in the menu.
+// Older name for /settings model. Kept working, no longer in the menu. It now
+// opens Agent Models; the per-task models are behind its Advanced button.
 bot.command("model", async (ctx) => {
-  await sendModelPanel(ctx);
+  await sendAgentModelsPanel(ctx);
+});
+
+/**
+ * Per-agent measurements for the experiment: /agents (24 hours), /agents week,
+ * and /agents recommendations (model suggestions he can accept or reject).
+ */
+bot.command("agents", async (ctx) => {
+  const argument = commandArgument(ctx, "agents").toLowerCase();
+  if (argument.startsWith("rec")) {
+    const recommendations = computeRecommendations();
+    const keyboard = new InlineKeyboard();
+    for (const item of recommendations) {
+      keyboard.text(`Accept: ${item.agentId}`, `rec:a:${item.id}`).text("Reject", `rec:r:${item.id}`).row();
+    }
+    await ctx.reply(formatRecommendations(recommendations), recommendations.length > 0 ? { reply_markup: keyboard } : {});
+    return;
+  }
+  await sendPlainText(ctx, formatAgentsReport(argument.startsWith("week") ? "week" : "day"));
+});
+
+/** Only his tap changes an agent's model. */
+bot.callbackQuery(/^rec:(a|r):(\d+)$/, async (ctx) => {
+  const decision = decideRecommendation(Number(ctx.match[2]), ctx.match[1] === "a");
+  await ctx.answerCallbackQuery(decision.ok ? "Saved" : decision.message.slice(0, 200)).catch(() => undefined);
+  await ctx.reply(decision.message);
 });
 
 bot.command("build", async (ctx) => {
@@ -716,7 +755,11 @@ bot.command("voice", async (ctx) => {
 /** Model choice, voice replies and the quick-action keyboard, in one place. */
 bot.command("settings", async (ctx) => {
   const [topic, value] = commandArgument(ctx, "settings").toLowerCase().split(/\s+/);
-  if (topic === "model") {
+  if (topic === "agents" || topic === "agent") {
+    await sendAgentModelsPanel(ctx);
+    return;
+  }
+  if (topic === "model" || topic === "models" || topic === "advanced") {
     await sendModelPanel(ctx);
     return;
   }
@@ -731,9 +774,13 @@ bot.command("settings", async (ctx) => {
   await sendSettingsPanel(ctx);
 });
 
-bot.callbackQuery(/^settings:(model|voice|keyboard)$/, async (ctx) => {
+bot.callbackQuery(/^settings:(agents|model|voice|keyboard)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCallbackQuery().catch(() => undefined);
+  if (action === "agents") {
+    await sendAgentModelsPanel(ctx);
+    return;
+  }
   if (action === "model") {
     await sendModelPanel(ctx);
     return;
@@ -868,11 +915,14 @@ bot.callbackQuery(/^retry:(\d+)$/, async (ctx) => {
     return;
   }
   console.log(`turn id=${turnId} outcome=retry`);
+  if (ctx.chat) {
+    noteRetryTap(ctx.chat.id);
+  }
   if (turnWasForwarded(turnId)) {
     await handleForwardedContent(ctx, retryText);
     return;
   }
-  await handleUserText(ctx, ctx.from.id, retryText);
+  await handleUserText(ctx, ctx.from.id, retryText, { retried: true });
 });
 
 /** Carries out the request Vishnu made before he was asked "which one?". */
@@ -1015,6 +1065,10 @@ bot.callbackQuery(/^md:/, async (ctx) => {
   await handleModelCallback(ctx);
 });
 
+bot.callbackQuery(/^am:/, async (ctx) => {
+  await handleAgentModelCallback(ctx, sendModelPanel);
+});
+
 bot.callbackQuery(/^cmdsend:(?:hold|cancelsched):/, async (ctx) => {
   await handleScheduledSendCallback(ctx);
 });
@@ -1057,7 +1111,7 @@ bot.callbackQuery(/^menu:(model|brief|sequences|outbox|settings|bills|tasks|keyb
 
   try {
     if (action === "model") {
-      await sendModelPanel(ctx);
+      await sendAgentModelsPanel(ctx);
       return;
     }
     if (action === "brief") {
@@ -1180,7 +1234,7 @@ async function handleUserText(
   ctx: Context,
   userId: number,
   userText: string,
-  options: { forwarded?: boolean; voiceReply?: boolean; contactNote?: string } = {},
+  options: { forwarded?: boolean; voiceReply?: boolean; contactNote?: string; retried?: boolean } = {},
 ): Promise<void> {
   if (await tryGratitudeReaction(ctx, userText)) {
     return;
@@ -1200,6 +1254,17 @@ async function handleUserText(
     if (answer.kind !== "none") {
       await continueAfterContactAnswer(ctx, userId, answer, { voiceReply: options.voiceReply });
       return;
+    }
+  }
+
+  // A correction, a complaint or the same request again says something about
+  // the previous answer. Recorded only; it changes nothing about this turn.
+  if (ctx.chat && options.contactNote === undefined && options.forwarded !== true && options.retried !== true && !isForwardedMessage(ctx.message)) {
+    try {
+      noteOwnerMessage(ctx.chat.id, userText);
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`feedback: note failed (${errorType}).`);
     }
   }
 

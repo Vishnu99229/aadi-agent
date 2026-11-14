@@ -1,3 +1,4 @@
+import { withSlot } from "./governor.js";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 const MIN_TEXT_LAYER_CHARS = 80;
@@ -30,7 +31,15 @@ function hasEol(item: unknown): boolean {
   );
 }
 
+/** PDF parsing is the heaviest local CPU work: one at a time, behind Vishnu's turns. */
 export async function extractPdfText(
+  bytes: Uint8Array,
+  maxPages?: number,
+): Promise<PdfTextExtract> {
+  return withSlot("cpu", () => parsePdfText(bytes, maxPages));
+}
+
+async function parsePdfText(
   bytes: Uint8Array,
   maxPages?: number,
 ): Promise<PdfTextExtract> {

@@ -1,3 +1,6 @@
+import { agentModelSummary } from "./models/agent_models.js";
+import { formatGovernorLine, runWithPriority, type Priority } from "./governor.js";
+import { formatProviderHealth } from "./models/circuit.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { config } from "./config.js";
 import { getJobRun, isMorningBriefEnabled, listJobRuns, recordJobRun } from "./db.js";
@@ -303,6 +306,18 @@ export function alreadySucceededThisSlot(
   return new Date(last.last_success_at).getTime() >= slot.getTime();
 }
 
+/**
+ * Where a scheduled job sits in the global scheduler. Sends and meeting
+ * replies that are due run as urgent; recovery and big jobs as delegated work;
+ * scans, indexing and digests as background, which yields to Vishnu's turns.
+ */
+const URGENT_JOBS = new Set(["scheduled-send", "sequence-send", "meeting-pending", "meeting-prebrief", "meeting-poll", "meeting-inbox"]);
+const DELEGATED_JOBS = new Set(["agent-recovery", "job-queue", "build-poll"]);
+
+export function priorityForJob(name: string): Priority {
+  return URGENT_JOBS.has(name) ? "urgent" : DELEGATED_JOBS.has(name) ? "delegated" : "background";
+}
+
 export function everyMs(
   name: string,
   intervalMs: number,
@@ -345,7 +360,7 @@ export function everyMs(
     stats.started += 1;
     const startedAt = Date.now();
     try {
-      await withTimeout(fn(), timeoutMs, `job-timeout:${name}`);
+      await withTimeout(runWithPriority(priorityForJob(name), fn), timeoutMs, `job-timeout:${name}`);
       stats.succeeded += 1;
       recordJobRun(name, "ok");
       if (process.env.AADI_DB_PATH !== ":memory:") {
@@ -387,7 +402,7 @@ export async function runTrackedJob(
   }
   clockInFlight.add(name);
   try {
-    await fn();
+    await runWithPriority(priorityForJob(name), fn);
     recordJobRun(name, "ok");
   } catch (error) {
     recordJobFailure(name, error);
@@ -556,6 +571,24 @@ export function lastRanLabel(iso: string | null, now: Date): string {
   return `last ran ${hhmm} ${pad2(ranParts.day)}/${pad2(ranParts.month)}`;
 }
 
+/**
+ * The agent setup in effect: routing, goal delegation, each agent's model (and
+ * what it falls back to right now), and whether the A2A endpoint is on. Ids
+ * and model keys only, never a credential.
+ */
+export function formatAgentHealthLines(): string[] {
+  const clients = config.a2aServerClients.map((client) => client.id).join(",") || "none";
+  return [
+    `agents: routing ${config.agentRouting}, goal delegation ${config.goalDelegation.enabled ? "on" : "off"}`,
+    `agent models: ${agentModelSummary().join(" ")}`,
+    formatProviderHealth(),
+    formatGovernorLine(),
+    config.a2aServerEnabled
+      ? `a2a server: on, bound 127.0.0.1:${config.a2aServerPort}, clients ${clients}, push ${config.a2aPushAllowedOrigins.length > 0 ? "on" : "off"}${config.a2aPublicUrl ? `, advertised ${config.a2aPublicUrl}` : ""}`
+      : "a2a server: off",
+  ];
+}
+
 export function formatHealthReport(now = new Date(), cwd = process.cwd()): string {
   const runs = new Map(listJobRuns().map((row) => [row.name, row]));
   const lines = [
@@ -563,6 +596,7 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
     formatVersionLine(readDeployVersion(cwd), readLocalGitHash(cwd)),
     formatTurnsHealthLine(now),
     formatCreditHealthLine(now.getTime()),
+    ...formatAgentHealthLines(),
   ];
   const beatPath = heartbeatPath(cwd);
   if (existsSync(beatPath)) {

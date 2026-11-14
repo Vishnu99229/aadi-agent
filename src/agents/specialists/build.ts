@@ -12,15 +12,25 @@ export const buildAgent: SpecialistDefinition = {
   id: "build",
   name: "Build Agent",
   description:
-    "Asks a Cursor cloud agent to change Aadi's code, follows the pull request and its checks, and reports where each build stands.",
-  version: "1.0.0",
+    "Reasons about changes to Aadi's own code: reads builds, pull requests, CI results and the repository, explains failures, judges whether a build looks ready, and prepares a Cursor build request for Vishnu's Start tap.",
+  version: "2.0.0",
   promptFile: "build.md",
-  tools: [],
-  noGoal: true,
-  // The Build Agent has no model loop, so a message that matches here stays with
-  // Aadi instead of going to another agent's loop.
+  // Reads, plus one tool that only prepares a card. Nothing here can start,
+  // merge or deploy: those stay behind Vishnu's Start and Deploy taps.
+  tools: [
+    { name: "get_build", effect: "read", retry: "safe" },
+    { name: "list_recent_builds", effect: "read", retry: "safe" },
+    { name: "get_build_checks", effect: "read", retry: "safe" },
+    { name: "get_repo_state", effect: "read", retry: "safe" },
+    { name: "prepare_build", effect: "draft", retry: "never" },
+  ],
+  sharedTools: ["get_current_time"],
   routing: {
-    patterns: [/\b(?:deploy\w*|code|codebase|builds?|pull\s+requests?|prs?|cursor|merge[sd]?|repo(?:sitory)?)\b/i],
+    patterns: [
+      /\b(?:deploy(?:s|ed|ing|ment)?|codebase|builds?|pull\s+requests?|cursor|repo(?:sitory)?|merge[sd]?\s+(?:the\s+)?(?:pr|pull)|ci\s+(?:run|check|fail\w*)|(?:failing|failed)\s+(?:tests?|checks?))\b/i,
+      /\bPRs?\b/,
+      /\b(?:aadi(?:'s|’s)?|the|my|your)\s+code\b|\bcode\s+(?:change|problem|issue|fix)\w*\b/i,
+    ],
     commandKinds: [],
   },
   capabilities: [

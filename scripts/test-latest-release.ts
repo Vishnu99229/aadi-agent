@@ -214,7 +214,12 @@ const knowledge = specialistFor("knowledge")!;
 assert(knowledge.toolNames().includes("latest_release") && knowledge.toolNames().includes("web_search"), "the Knowledge Agent has both tools");
 const owner = allToolOwnership().find((entry) => entry.tool === "latest_release");
 assert(owner?.owner === "knowledge" && owner.effect === "read", "latest_release is a Knowledge Agent read");
-assert(localSpecialists().flatMap((agent) => agent.remoteCapabilities().map((item) => item.name)).includes("latest_release") === false, "it is not opened to other agents");
+// Public GitHub release data only, so other agents may ask for it over A2A (knowledge.latest_release).
+const opened = localSpecialists().flatMap((agent) => agent.remoteCapabilities());
+assert(
+  opened.some((item) => item.name === "latest_release" && item.effect === "read") && owner.remoteExposed === true,
+  "it is opened to other agents, as a read",
+);
 assert((FORWARDED_TOOLS as readonly string[]).includes("latest_release") && tools.latest_release !== undefined, "a forwarded message may use it, as it may web_search");
 ok("routing: a question about the latest version or release goes to the Knowledge Agent without the word \"search\"; payments and press releases do not");
 

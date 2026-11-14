@@ -1,3 +1,4 @@
+import { assertTestSeam } from "./test_seam.js";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { Api, InlineKeyboard, type Context } from "grammy";
@@ -111,8 +112,37 @@ function buildsListKeyboard(rows: BuildRecord[]): InlineKeyboard {
   return keyboard;
 }
 
+let testApi: Api | undefined;
+
+/** Tests hand in a fake Telegram so a card can be checked without sending one. */
+export function setBuildsTestApi(api: Api | undefined): void {
+  assertTestSeam("setBuildsTestApi");
+  testApi = api;
+}
+
 function ownerApi(): Api {
-  return new Api(config.telegramBotToken);
+  return testApi ?? new Api(config.telegramBotToken);
+}
+
+/**
+ * Prepares a build the way /build does and posts its Start / Cancel card to
+ * Vishnu. Nothing starts here: the Cursor agent only runs after his Start tap,
+ * handled by the existing build:go callback.
+ */
+export async function prepareBuildCard(task: string): Promise<{ buildId: number; posted: boolean }> {
+  const build = createBuild(task.trim());
+  console.log(`Build ${build.id}: status -> pending_confirm (prepared by the Build Agent)`);
+  let posted = false;
+  try {
+    await ownerApi().sendMessage(config.ownerTelegramId, confirmBuildText(build.task), {
+      reply_markup: confirmKeyboard(build.id),
+    });
+    posted = true;
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Build ${build.id}: could not post the Start card (${errorType}).`);
+  }
+  return { buildId: build.id, posted };
 }
 
 async function editOrReply(
