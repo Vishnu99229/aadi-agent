@@ -128,6 +128,10 @@ setContactCalendarForTests(
                 attendees: [
                   { email: "tripthi.anchan@epicode.in", displayName: "Tripthi Anchan" },
                   { email: "nithish@epicode.in", displayName: "Nithish Bharadwaj" },
+                  {
+                    email: "comments-noreply@docs.google.com",
+                    displayName: "Nithish Bharadwaj",
+                  },
                 ],
               },
             ],
@@ -141,6 +145,9 @@ addMail("Nithish Bharadwaj <nithish@epicode.in>");
 addMail("Tripthi Anchan <tripthi.anchan@epicode.in>");
 addMail("Sendhil Kumar <sendhil@epicode.in>");
 addMail("Nithish Bharadwaj <nithish@epicode.in>", "Vishnu <personal@gmail.com>");
+addMail("Nithish Bharadwaj <comments-noreply@docs.google.com>");
+addMail("Tripthi Anchan <drive-shares-noreply@google.com>");
+addMail("Sendhil Kumar <comments-noreply@docs.google.com>");
 
 const booked: Array<{ attendees: Array<{ email: string }>; title?: string; startIso?: string }> = [];
 setOwnerMeetingTestHooks({
@@ -184,6 +191,11 @@ setOwnerMeetingTestHooks({
   assert.equal(nithish.kind, "one");
   if (nithish.kind === "one") {
     assert.equal(nithish.contact.emails[0], "nithish@epicode.in");
+  }
+  const bare = await resolveContact("Nithish");
+  assert.equal(bare.kind, "one", "Docs comment mailboxes must not create a second Nithish");
+  if (bare.kind === "one") {
+    assert.equal(bare.contact.emails[0], "nithish@epicode.in");
   }
 }
 

@@ -208,7 +208,7 @@ async function calendarSightings(
     const startMs = Date.parse(event.start?.dateTime ?? event.start?.date ?? "");
     for (const attendee of event.attendees ?? []) {
       const email = attendee.email?.trim().toLowerCase();
-      if (!email || attendee.self || attendee.resource) {
+      if (!email || attendee.self || attendee.resource || isAutomatedAddress(email)) {
         continue;
       }
       sightings.push({

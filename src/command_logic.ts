@@ -4,8 +4,11 @@ const ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
 const NOT_NAME_WORDS = new Set([
   "at", "from", "of", "the", "in", "to", "mr", "mrs", "ms", "sir", "madam", "ji", "and", "team",
 ]);
+/** Mailboxes that carry a person's display name but are not that person:
+ *  Google Docs comments, Drive shares, calendar notifications, and any
+ *  local-part that contains no-reply. */
 const AUTOMATED_ADDRESS =
-  /^(?:no-?reply|do-?not-?reply|mailer-daemon|postmaster|notifications?|bounces?|alerts?|newsletters?|updates?)(?:[+._-][^@]*)?@|@(?:[a-z0-9-]+\.)*calendar\.google\.com$/i;
+  /(?:^|[+._-])(?:no-?reply|do-?not-?reply)(?:[+._-][^@]*)?@|^(?:mailer-daemon|postmaster|notifications?|bounces?|alerts?|newsletters?|updates?|calendar-notification)(?:[+._-][^@]*)?@|@(?:[a-z0-9-]+\.)*(?:docs\.google\.com|calendar\.google\.com)$/i;
 
 const SEND_WORD = "(?:send|email|e-mail|mail|reply|respond|write|follow[ -]?up)";
 
