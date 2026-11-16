@@ -198,10 +198,14 @@ export function refreshIgnoreRules(now = new Date()): void {
   activeRules(now);
 }
 
-export function matchingIgnoreRule(
-  subject: IgnoreSubject,
-  now = new Date(),
-): IgnoreRuleRecord | undefined {
+type PreparedSubject = {
+  subject: IgnoreSubject;
+  matchKey: string;
+  entityId: string;
+  aliases: string[];
+};
+
+function prepareSubject(subject: IgnoreSubject): PreparedSubject {
   const matchKey = normalizeIgnoreKey(subject.matchKey);
   const entityId =
     subject.entityId === undefined || subject.entityId === null
@@ -216,39 +220,49 @@ export function matchingIgnoreRule(
       aliases.push(normalizeIgnoreKey(domain));
     }
   }
-  for (const rule of activeRules(now)) {
-    if (!tagMatches(rule.tag, subject.tag)) {
-      continue;
-    }
-    if (rule.entity_type !== subject.entityType) {
-      if (
-        !(
-          (rule.entity_type === "notification" &&
-            (subject.entityType === "bill" || subject.entityType === "email_source")) ||
-          (rule.entity_type === "email_source" && subject.entityType === "notification")
-        )
-      ) {
-        continue;
-      }
-    }
-    if (rule.match_scope === "record") {
-      if (entityId && rule.entity_id === entityId) {
-        return rule;
-      }
-      if (
-        subject.entityType === "reminder" &&
-        subject.seriesId != null &&
-        recordRuleSeriesId(rule) === subject.seriesId
-      ) {
-        return rule;
-      }
-      continue;
-    }
-    if (keysOverlap(rule.match_key, matchKey, aliases)) {
-      return rule;
+  return { subject, matchKey, entityId, aliases };
+}
+
+/**
+ * The one answer to "does this rule cover this item". Suppression and
+ * restoration both use it, so ending a rule settles exactly what it hid:
+ * same tag, same entity type, same record or series, same keys.
+ */
+function ruleCoversSubject(rule: IgnoreRuleRecord, prepared: PreparedSubject): boolean {
+  const { subject, matchKey, entityId, aliases } = prepared;
+  if (!tagMatches(rule.tag, subject.tag)) {
+    return false;
+  }
+  if (rule.entity_type !== subject.entityType) {
+    if (
+      !(
+        (rule.entity_type === "notification" &&
+          (subject.entityType === "bill" || subject.entityType === "email_source")) ||
+        (rule.entity_type === "email_source" && subject.entityType === "notification")
+      )
+    ) {
+      return false;
     }
   }
-  return undefined;
+  if (rule.match_scope === "record") {
+    if (entityId && rule.entity_id === entityId) {
+      return true;
+    }
+    return (
+      subject.entityType === "reminder" &&
+      subject.seriesId != null &&
+      recordRuleSeriesId(rule) === subject.seriesId
+    );
+  }
+  return keysOverlap(rule.match_key, matchKey, aliases);
+}
+
+export function matchingIgnoreRule(
+  subject: IgnoreSubject,
+  now = new Date(),
+): IgnoreRuleRecord | undefined {
+  const prepared = prepareSubject(subject);
+  return activeRules(now).find((rule) => ruleCoversSubject(rule, prepared));
 }
 
 /**
@@ -275,46 +289,47 @@ export function isIgnored(subject: IgnoreSubject, now = new Date()): boolean {
   return matchingIgnoreRule(subject, now) !== undefined;
 }
 
-export function billIsIgnored(bill: BillRecord, now = new Date()): boolean {
+function billSubject(bill: BillRecord): IgnoreSubject {
   const canonical = canonicalBiller(bill.biller);
-  return isIgnored(
-    {
-      entityType: "bill",
-      entityId: bill.id,
-      matchKey: normalizeBillerKey(canonical),
-      tag: "personal",
-      aliases: [bill.biller, canonical, normalizeBillerKey(bill.biller)],
-    },
-    now,
-  );
+  return {
+    entityType: "bill",
+    entityId: bill.id,
+    matchKey: normalizeBillerKey(canonical),
+    tag: "personal",
+    aliases: [bill.biller, canonical, normalizeBillerKey(bill.biller)],
+  };
+}
+
+function taskSubject(task: TaskRecord): IgnoreSubject {
+  return {
+    entityType: "task",
+    entityId: task.id,
+    matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
+    tag: task.tag,
+    aliases: [task.text],
+  };
+}
+
+function reminderSubject(reminder: ReminderRecord): IgnoreSubject {
+  return {
+    entityType: "reminder",
+    entityId: reminder.id,
+    matchKey: reminder.text,
+    tag: reminder.tag,
+    seriesId: reminderSeriesId(reminder),
+  };
+}
+
+export function billIsIgnored(bill: BillRecord, now = new Date()): boolean {
+  return isIgnored(billSubject(bill), now);
 }
 
 export function taskIsIgnored(task: TaskRecord, now = new Date()): boolean {
-  return isIgnored(
-    {
-      entityType: "task",
-      entityId: task.id,
-      matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
-      tag: task.tag,
-      aliases: [task.text],
-    },
-    now,
-  );
+  return isIgnored(taskSubject(task), now);
 }
 
 export function reminderIsIgnored(reminder: ReminderRecord, now = new Date()): boolean {
-  if (
-    isIgnored(
-      {
-        entityType: "reminder",
-        entityId: reminder.id,
-        matchKey: reminder.text,
-        tag: reminder.tag,
-        seriesId: reminderSeriesId(reminder),
-      },
-      now,
-    )
-  ) {
+  if (isIgnored(reminderSubject(reminder), now)) {
     return true;
   }
   if (reminder.related_bill_id) {
@@ -556,40 +571,13 @@ export function restoreAfterIgnore(rule: IgnoreRuleRecord, now = new Date()): vo
   }
 }
 
-function billMatchesRule(
-  bill: BillRecord | undefined,
-  rule: IgnoreRuleRecord,
-): boolean {
-  if (!bill) {
-    return false;
-  }
-  if (rule.match_scope === "record") {
-    return rule.entity_id != null && String(bill.id) === rule.entity_id;
-  }
-  if (rule.entity_id && String(bill.id) === rule.entity_id) {
-    return true;
-  }
-  return keysOverlap(
-    rule.match_key,
-    normalizeBillerKey(canonicalBiller(bill.biller)),
-    [bill.biller],
-  );
+/** Restore only what the rule suppressed: the same predicate, tag included. */
+function billMatchesRule(bill: BillRecord, rule: IgnoreRuleRecord): boolean {
+  return ruleCoversSubject(rule, prepareSubject(billSubject(bill)));
 }
 
-function taskMatchesRule(
-  task: TaskRecord | undefined,
-  rule: IgnoreRuleRecord,
-): boolean {
-  if (!task) {
-    return false;
-  }
-  if (rule.match_scope === "record") {
-    return rule.entity_id != null && String(task.id) === rule.entity_id;
-  }
-  if (rule.entity_id && String(task.id) === rule.entity_id) {
-    return true;
-  }
-  return keysOverlap(rule.match_key, normalizeIgnoreKey(task.text), [task.text]);
+function taskMatchesRule(task: TaskRecord, rule: IgnoreRuleRecord): boolean {
+  return ruleCoversSubject(rule, prepareSubject(taskSubject(task)));
 }
 
 function addDaysYmd(ymd: string, days: number): string {
@@ -687,17 +675,10 @@ function restoreTaskReminders(rule: IgnoreRuleRecord, now: Date): void {
 
 /** Same match a reminder rule used while it was active, including linked rows. */
 function ruleSuppressesReminder(rule: IgnoreRuleRecord, reminder: ReminderRecord): boolean {
-  if (rule.entity_type !== "reminder" || !tagMatches(rule.tag, reminder.tag)) {
-    return false;
-  }
-  if (rule.match_scope === "record") {
-    if (rule.entity_id != null && rule.entity_id === String(reminder.id)) {
-      return true;
-    }
-    const seriesId = reminderSeriesId(reminder);
-    return seriesId != null && recordRuleSeriesId(rule) === seriesId;
-  }
-  return keysOverlap(rule.match_key, normalizeIgnoreKey(reminder.text), [reminder.text]);
+  return (
+    rule.entity_type === "reminder" &&
+    ruleCoversSubject(rule, prepareSubject(reminderSubject(reminder)))
+  );
 }
 
 function restoreReminderRules(rule: IgnoreRuleRecord, now: Date): void {

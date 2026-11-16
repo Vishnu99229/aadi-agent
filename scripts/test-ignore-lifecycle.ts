@@ -23,6 +23,7 @@ import {
   getDueReminders,
   getReminder,
   getReminders,
+  getTask,
   insertIgnoreRule,
   listActiveIgnoreRules,
   listIgnoreRuleEvents,
@@ -34,8 +35,10 @@ import {
   applyIgnore,
   billIsIgnored,
   matchingIgnoreRule,
+  refreshIgnoreRules,
   reminderIsIgnored,
   resumeIgnore,
+  taskIsIgnored,
 } from "../src/ignore.ts";
 import { registerReminderScheduler } from "../src/reminders.ts";
 import { handler as cancelReminder } from "../src/tools/cancel_reminder.ts";
@@ -1066,6 +1069,75 @@ function remindersOf(billId: number): number {
     [String(live[0]!.id)],
     `list shows the new occurrence, not the cancelled one: ${JSON.stringify(listed)}`,
   );
+}
+
+// Codex 4. Ending a work-only task rule leaves a same-named personal task alone.
+{
+  const work = createTask("Prepare the board deck", "work", null);
+  const personal = createTask("Prepare the board deck", "personal", null);
+  const workPing = createReminder("Board deck (work)", "work", "2026-11-20T09:00:00.000Z", "none", {
+    relatedTaskId: work.id,
+  });
+  const personalPing = createReminder(
+    "Board deck (personal)",
+    "personal",
+    "2026-11-20T09:00:00.000Z",
+    "none",
+    { relatedTaskId: personal.id },
+  );
+  const personalDaily = createReminder(
+    "Board deck daily",
+    "personal",
+    "2026-11-20T09:30:00.000Z",
+    "daily",
+    { relatedTaskId: personal.id },
+  );
+  applyIgnore({
+    entityType: "task",
+    matchKey: "prepare the board deck",
+    matchScope: "source",
+    tag: "work",
+    entityId: String(work.id),
+    duration: "temporary",
+    expiresAt: "2026-11-20T09:45:00.000Z",
+    instruction: "Ignore the work board deck task until 9:45",
+    authRef: "owner_chat:test",
+  });
+  const during = new Date("2026-11-20T09:40:00.000Z");
+  assert.equal(taskIsIgnored(getTask(work.id)!, during), true);
+  assert.equal(taskIsIgnored(getTask(personal.id)!, during), false, "work rule, personal task");
+  assert.equal(reminderIsIgnored(getReminder(personalPing.id)!, during), false);
+  refreshIgnoreRules(new Date("2026-11-20T10:00:00.000Z"));
+  assert.equal(getReminder(workPing.id)!.status, "cancelled", "the hidden work ping does not burst");
+  assert.equal(getReminder(personalPing.id)!.status, "pending", "an unhidden ping is not lost");
+  assert.equal(getReminder(personalDaily.id)!.status, "pending");
+  assert.equal(
+    getReminders().filter((row) => row.series_id === personalDaily.series_id).length,
+    1,
+    "an unhidden daily series is not advanced",
+  );
+}
+
+// Codex 4b. The same holds for bills: a work-tag bill rule never covered a personal bill.
+{
+  const now = new Date("2026-11-20T10:00:00.000Z");
+  const bill = createBill("Tagcheck Telecom", 650, "INR", "2026-11-25", "p2-4b")!;
+  const ping = createReminder("Tagcheck ping", "personal", "2026-11-20T03:30:00.000Z", "none", {
+    relatedBillId: bill.id,
+  });
+  const rule = applyIgnore({
+    entityType: "bill",
+    matchKey: "tagcheck telecom",
+    matchScope: "source",
+    tag: "work",
+    instruction: "Ignore work Tagcheck Telecom bills",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(billIsIgnored(getBill(bill.id)!, now), false);
+  const before = remindersOf(bill.id);
+  resumeIgnore(rule.id, "owner_chat:test", "resume work telecom", now);
+  assert.equal(getReminder(ping.id)!.status, "pending");
+  assert.equal(remindersOf(bill.id), before, "no slots rebuilt for a bill the rule never hid");
 }
 
 {
