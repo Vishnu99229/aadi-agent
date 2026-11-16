@@ -13,6 +13,13 @@ if (process.env.AADI_DB_PATH !== ":memory:") {
   process.exit(1);
 }
 
+const ownerTurn = (userText: string) => ({
+  iteration: 1,
+  calledTools: [] as string[],
+  userText,
+  confirmation: { chatId: 1, messageId: 1 },
+});
+
 assert.equal(addOneMonthYmd("2026-11-15"), "2026-12-15", "simple +1 month");
 assert.equal(addOneMonthYmd("2026-12-15"), "2027-01-15", "year rollover");
 assert.equal(
@@ -34,7 +41,16 @@ const jio2 = createBill("Jio Postpaid", 349, "INR", "2026-12-01", "thr-jio2")!;
 assert(yt && netflix && jio && jio2, "seed bills failed");
 
 {
-  const result = ignoreBill({ query: "youtube" });
+  const refused = ignoreBill({ query: "youtube" });
+  assert.match(
+    refused,
+    /own chat or voice message/i,
+    `background ignore_bill must refuse, got: ${refused}`,
+  );
+}
+
+{
+  const result = ignoreBill({ query: "youtube" }, ownerTurn("Ignore YouTube bills permanently"));
   assert.match(
     result,
     /stop tracking YouTube Premium bills/i,
@@ -49,7 +65,7 @@ assert(yt && netflix && jio && jio2, "seed bills failed");
 }
 
 {
-  const result = ignoreBill({ query: "NETFLIX" });
+  const result = ignoreBill({ query: "NETFLIX" }, ownerTurn("Ignore Netflix"));
   assert.match(result, /Netflix bills/i, `got: ${result}`);
   assert.equal(getBill(netflix.id)!.status, "upcoming");
   assert.equal(billIsIgnored(getBill(netflix.id)!), true);
@@ -60,7 +76,7 @@ assert(yt && netflix && jio && jio2, "seed bills failed");
     jio: getBill(jio.id)!.status,
     jio2: getBill(jio2.id)!.status,
   };
-  const result = ignoreBill({ query: "jio" });
+  const result = ignoreBill({ query: "jio" }, ownerTurn("Ignore jio"));
   assert.match(result, /^Found 2 matching bills/, `got: ${result}`);
   assert.match(result, /Jio Fiber/, "list includes Jio Fiber");
   assert.match(result, /Jio Postpaid/, "list includes Jio Postpaid");
@@ -70,19 +86,22 @@ assert(yt && netflix && jio && jio2, "seed bills failed");
 
 {
   const before = listActiveIgnoreRules().length;
-  const result = ignoreBill({ query: "verizon" });
+  const result = ignoreBill({ query: "verizon" }, ownerTurn("Ignore verizon bills"));
   assert.match(result, /stop tracking/i, `unknown biller still stores a source rule, got: ${result}`);
   assert.equal(listActiveIgnoreRules().length, before + 1, "future verizon bills are suppressed");
 }
 
 {
-  const result = ignoreBill({ query: "youtube" });
+  const result = ignoreBill({ query: "youtube" }, ownerTurn("Ignore youtube"));
   assert.match(result, /Already ignoring/i, `repeat ignore is idempotent, got: ${result}`);
 }
 
 {
   const airtel = createBill("Airtel", 599, "INR", "2026-11-18", "thr-airtel")!;
-  const result = ignoreBill({ query: "airtel", skip_cycle: true });
+  const result = ignoreBill(
+    { query: "airtel", skip_cycle: true },
+    ownerTurn("Skip Airtel this month"),
+  );
   assert.match(result, /^Skipped Airtel for this month\./, `got: ${result}`);
   assert.equal(getBill(airtel.id)!.status, "ignored");
   const next = getBills().find(

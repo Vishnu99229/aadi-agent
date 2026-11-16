@@ -84,20 +84,18 @@ export function handler(input: unknown, turn: ToolTurn = { iteration: 1, calledT
     }
     const query = values.query.trim();
     const userText = turn.userText?.trim() ?? "";
+    if (!ownerMayChangeIgnore(turn)) {
+      return "Ignore preferences can only be changed from Vishnu's own chat or voice message.";
+    }
     if (wantsCycleSkip(query, values.skip_cycle === true, userText)) {
       return skipCurrentCycle(query);
     }
-    if (turn.confirmation !== undefined || userText) {
-      if (!ownerMayChangeIgnore(turn)) {
-        return "Ignore preferences can only be changed from Vishnu's own chat or voice message.";
-      }
-      if (userText && !looksLikeIgnoreInstruction(userText) && values.skip_cycle !== true) {
-        // ignore_bill is still the bill-family command tool; his words may be
-        // "drop the YouTube bill" which looksLikeIgnoreInstruction also matches.
-        if (!/\b(?:ignore|skip|dismiss|drop|clear)\b/i.test(userText)) {
-          return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
-        }
-      }
+    if (
+      userText &&
+      !looksLikeIgnoreInstruction(userText) &&
+      !/\b(?:ignore|skip|dismiss|drop|clear)\b/i.test(userText)
+    ) {
+      return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
     }
     const matches = searchUpcomingBills(query);
     if (matches.length > 1) {
