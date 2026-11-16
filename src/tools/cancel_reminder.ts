@@ -46,7 +46,7 @@ export function handler(input: unknown): string {
   if (reminder.status !== "pending") {
     throw new Error(`Reminder ${reminder.id} has already been sent.`);
   }
-  if (!transitionReminderStatus(reminder.id, "pending", "cancelled")) {
+  if (!transitionReminderStatus(reminder.id, "pending", "cancelled", "user")) {
     throw new Error(`Reminder ${reminder.id} could not be cancelled.`);
   }
 

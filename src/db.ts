@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { addOneMonthYmd } from "./bill_cycle.js";
 import { assertTestSeam } from "./test_seam.js";
 
 export type MessageRole = "user" | "assistant" | "tool";
@@ -65,6 +66,8 @@ export interface TaskRecord {
 
 export type ReminderRecurrence = "none" | "daily" | "weekly" | "weekdays";
 export type ReminderStatus = "pending" | "sent" | "cancelled";
+/** Why a reminder left `pending`. `ignore` is the only reason restore may undo. */
+export type ReminderStatusReason = "user" | "completion" | "ignore" | "other";
 
 export interface ReminderRecord {
   id: number;
@@ -76,6 +79,9 @@ export interface ReminderRecord {
   created_at: string;
   related_task_id: number | null;
   related_bill_id: number | null;
+  /** Stable id shared by every occurrence of one recurring schedule. */
+  series_id: number | null;
+  status_reason: ReminderStatusReason | null;
 }
 
 export const DB_PATH = process.env.AADI_DB_PATH?.trim() || "./aadi.db";
@@ -91,6 +97,60 @@ function tableHasColumn(table: string, column: string): boolean {
     name: string;
   }>;
   return rows.some((row) => row.name === column);
+}
+
+/** Record rules are unique by entity id. Source and category rules stay unique
+ *  by normalized key. Safe to run on every open: it only drops the old index. */
+function migrateIgnoreRuleIndexes(): void {
+  const table = db
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ignore_rules'`,
+    )
+    .get() as { name: string } | undefined;
+  if (!table) {
+    return;
+  }
+  const duplicates = db
+    .prepare(
+      `SELECT entity_type, entity_id, tag, MIN(id) AS keep_id
+         FROM ignore_rules
+        WHERE status = 'active'
+          AND match_scope = 'record'
+          AND entity_id IS NOT NULL
+        GROUP BY entity_type, entity_id, tag
+       HAVING COUNT(*) > 1`,
+    )
+    .all() as Array<{
+    entity_type: string;
+    entity_id: string;
+    tag: string;
+    keep_id: number;
+  }>;
+  const retiredAt = new Date().toISOString();
+  for (const row of duplicates) {
+    db.prepare(
+      `UPDATE ignore_rules
+          SET status = 'resumed', resumed_at = ?
+        WHERE status = 'active'
+          AND match_scope = 'record'
+          AND entity_type = ?
+          AND entity_id = ?
+          AND tag = ?
+          AND id != ?`,
+    ).run(retiredAt, row.entity_type, row.entity_id, row.tag, row.keep_id);
+  }
+  db.exec(`
+    DROP INDEX IF EXISTS idx_ignore_rules_active_key;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_record
+      ON ignore_rules (entity_type, entity_id, match_scope, tag)
+      WHERE status = 'active' AND match_scope = 'record' AND entity_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_record_key
+      ON ignore_rules (entity_type, match_key, match_scope, tag)
+      WHERE status = 'active' AND match_scope = 'record' AND entity_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_source
+      ON ignore_rules (entity_type, match_key, match_scope, tag)
+      WHERE status = 'active' AND match_scope IN ('source', 'category');
+  `);
 }
 
 db.exec(`
@@ -384,9 +444,6 @@ db.exec(`
       CHECK (status IN ('active', 'resumed', 'expired'))
   );
 
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_key
-    ON ignore_rules (entity_type, match_key, match_scope, tag)
-    WHERE status = 'active';
   CREATE INDEX IF NOT EXISTS idx_ignore_rules_lookup
     ON ignore_rules (status, entity_type, match_key);
   CREATE INDEX IF NOT EXISTS idx_ignore_rules_expiry
@@ -438,6 +495,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_canonical_contacts_name
     ON canonical_contacts (name_key);
 `);
+
+migrateIgnoreRuleIndexes();
 
 const buildsSchema =
   (
@@ -896,6 +955,19 @@ if (!tableHasColumn("reminders", "related_task_id")) {
 if (!tableHasColumn("reminders", "related_bill_id")) {
   db.exec(`ALTER TABLE reminders ADD COLUMN related_bill_id INTEGER`);
 }
+if (!tableHasColumn("reminders", "series_id")) {
+  db.exec(`ALTER TABLE reminders ADD COLUMN series_id INTEGER`);
+}
+if (!tableHasColumn("reminders", "status_reason")) {
+  db.exec(`ALTER TABLE reminders ADD COLUMN status_reason TEXT`);
+}
+// Each existing recurring row is its own series. Never merge on text.
+db.exec(
+  `UPDATE reminders
+      SET series_id = id
+    WHERE series_id IS NULL
+      AND recurrence != 'none'`,
+);
 
 // Autonomy / rules engine: when a draft passes auto_send_approved, the
 // pending action's auto_send_at carries the scheduled send instant.
@@ -932,6 +1004,75 @@ if (!tableHasColumn("bills", "suspected_duplicate_of")) {
 // it, which is fine - dedupe only runs on the trailing 7 days.
 if (!tableHasColumn("bills", "source_text")) {
   db.exec(`ALTER TABLE bills ADD COLUMN source_text TEXT`);
+}
+// Why a bill left `upcoming`. Resuming an ignore may only undo `ignore`.
+// The backfill runs once, in the same transaction that adds the column.
+if (!tableHasColumn("bills", "status_reason")) {
+  db.transaction(() => {
+    db.exec(`ALTER TABLE bills ADD COLUMN status_reason TEXT`);
+    backfillLegacyBillIgnoreProvenance();
+  })();
+}
+
+/**
+ * Before this column, three paths set a bill to `ignored`: the bill-card
+ * Ignore button, duplicate removal and skip-this-cycle. The card only acted
+ * on `upcoming` bills. Duplicate removal always leaves `suspected_duplicate_of`
+ * set. A cycle skip always leaves a row for the same biller on the next
+ * cycle's due date (it creates one, or one already existed). So an ignored
+ * row with neither, whose first record rule is the active rule its own card
+ * created, was changed by that card. Anything else stays NULL and Resume
+ * never resets it.
+ */
+export function backfillLegacyBillIgnoreProvenance(): number {
+  const candidates = db
+    .prepare(
+      `SELECT b.id, b.biller, b.due_date, b.thread_id
+         FROM bills b
+         JOIN ignore_rules r
+           ON r.entity_type = 'bill'
+          AND r.match_scope = 'record'
+          AND r.entity_id = CAST(b.id AS TEXT)
+          AND r.status = 'active'
+          AND r.instruction = 'telegram:bill-ignore'
+          AND r.auth_ref = 'telegram:callback:' || b.id
+        WHERE b.status = 'ignored'
+          AND b.status_reason IS NULL
+          AND b.suspected_duplicate_of IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM ignore_rules earlier
+             WHERE earlier.entity_type = 'bill'
+               AND earlier.match_scope = 'record'
+               AND earlier.entity_id = r.entity_id
+               AND earlier.id < r.id
+          )`,
+    )
+    .all() as Array<{ id: number; biller: string; due_date: string; thread_id: string }>;
+  const nextCycle = db.prepare(
+    `SELECT 1 FROM bills
+      WHERE id != ?
+        AND due_date = ?
+        AND (LOWER(biller) = LOWER(?) OR thread_id = ?)
+      LIMIT 1`,
+  );
+  const mark = db.prepare(
+    `UPDATE bills SET status_reason = 'ignore'
+      WHERE id = ? AND status = 'ignored' AND status_reason IS NULL`,
+  );
+  let marked = 0;
+  for (const bill of candidates) {
+    let nextDue: string;
+    try {
+      nextDue = addOneMonthYmd(bill.due_date);
+    } catch {
+      continue;
+    }
+    if (nextCycle.get(bill.id, nextDue, bill.biller, bill.thread_id)) {
+      continue;
+    }
+    marked += mark.run(bill.id).changes;
+  }
+  return marked;
 }
 
 if (!tableHasColumn("accounts", "relationship")) {
@@ -1583,11 +1724,12 @@ export function markTaskDone(id: number): boolean {
 }
 
 const REMINDER_COLUMNS = `id, text, tag, remind_at, recurrence, status,
-  created_at, related_task_id, related_bill_id`;
+  created_at, related_task_id, related_bill_id, series_id, status_reason`;
 
 export interface ReminderLinks {
   relatedTaskId?: number | null;
   relatedBillId?: number | null;
+  seriesId?: number | null;
 }
 
 export function createReminder(
@@ -1606,15 +1748,22 @@ export function createReminder(
         : null;
   const billId =
     links && typeof links === "object" ? (links.relatedBillId ?? null) : null;
+  const seriesId =
+    links && typeof links === "object" ? (links.seriesId ?? null) : null;
   const result = db
     .prepare(
       `INSERT INTO reminders (
-         text, tag, remind_at, recurrence, related_task_id, related_bill_id
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
+         text, tag, remind_at, recurrence, related_task_id, related_bill_id, series_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(text, tag, remindAt, recurrence, taskId, billId);
-
-  return getReminder(Number(result.lastInsertRowid))!;
+    .run(text, tag, remindAt, recurrence, taskId, billId, seriesId);
+  const id = Number(result.lastInsertRowid);
+  if (recurrence !== "none" && seriesId == null) {
+    db.prepare(
+      `UPDATE reminders SET series_id = id WHERE id = ? AND series_id IS NULL`,
+    ).run(id);
+  }
+  return getReminder(id)!;
 }
 
 export function getReminder(id: number): ReminderRecord | undefined {
@@ -1654,7 +1803,7 @@ export function cancelPendingRemindersForTask(taskId: number): number {
   const result = db
     .prepare(
       `UPDATE reminders
-       SET status = 'cancelled'
+       SET status = 'cancelled', status_reason = 'completion'
        WHERE related_task_id = ? AND status = 'pending'`,
     )
     .run(taskId);
@@ -1667,7 +1816,7 @@ export function cancelPendingRemindersForBill(billId: number): number {
   const result = db
     .prepare(
       `UPDATE reminders
-       SET status = 'cancelled'
+       SET status = 'cancelled', status_reason = 'completion'
        WHERE related_bill_id = ? AND status = 'pending'`,
     )
     .run(billId);
@@ -1678,14 +1827,40 @@ export function transitionReminderStatus(
   id: number,
   from: ReminderStatus,
   to: ReminderStatus,
+  reason?: ReminderStatusReason | null,
 ): boolean {
-  const result = db
-    .prepare(
-      `UPDATE reminders
-       SET status = ?
-       WHERE id = ? AND status = ?`,
-    )
-    .run(to, id, from);
+  if (to === "pending" && from === "cancelled") {
+    const current = db
+      .prepare(`SELECT status_reason FROM reminders WHERE id = ?`)
+      .get(id) as { status_reason: string | null } | undefined;
+    if (current?.status_reason !== "ignore") {
+      return false;
+    }
+  }
+  const result =
+    to === "cancelled"
+      ? db
+          .prepare(
+            `UPDATE reminders
+                SET status = ?, status_reason = ?
+              WHERE id = ? AND status = ?`,
+          )
+          .run(to, reason ?? "other", id, from)
+      : to === "pending"
+        ? db
+            .prepare(
+              `UPDATE reminders
+                  SET status = ?, status_reason = NULL
+                WHERE id = ? AND status = ?`,
+            )
+            .run(to, id, from)
+        : db
+            .prepare(
+              `UPDATE reminders
+                  SET status = ?
+                WHERE id = ? AND status = ?`,
+            )
+            .run(to, id, from);
 
   return result.changes === 1;
 }
@@ -1987,6 +2162,8 @@ export function expireOldPendingAttachmentAlerts(hours: number): number {
 }
 
 export type BillStatus = "upcoming" | "paid" | "ignored";
+/** Why a bill left `upcoming`. Only `ignore` (legacy card Ignore) is undone by Resume. */
+export type BillStatusReason = "ignore" | "skip_cycle" | "duplicate" | "paid" | "other";
 
 export interface BillRecord {
   id: number;
@@ -1999,6 +2176,7 @@ export interface BillRecord {
   created_at: string;
   suspected_duplicate_of: number | null;
   source_text: string | null;
+  status_reason: BillStatusReason | null;
 }
 
 export type ImportantDateType = "birthday" | "anniversary" | "other";
@@ -2015,7 +2193,7 @@ export interface ImportantDateRecord {
 }
 
 const BILL_COLUMNS = `id, biller, amount, currency, due_date, thread_id,
-  status, created_at, suspected_duplicate_of, source_text`;
+  status, created_at, suspected_duplicate_of, source_text, status_reason`;
 
 export function createBill(
   biller: string,
@@ -2151,14 +2329,30 @@ export function transitionBillStatus(
   id: number,
   from: BillStatus | BillStatus[],
   to: BillStatus,
+  reason?: BillStatusReason,
 ): boolean {
   const statuses = Array.isArray(from) ? from : [from];
   const placeholders = statuses.map(() => "?").join(", ");
+  const nextReason =
+    to === "upcoming" ? null : (reason ?? (to === "paid" ? "paid" : "other"));
   const result = db
     .prepare(
-      `UPDATE bills SET status = ? WHERE id = ? AND status IN (${placeholders})`,
+      `UPDATE bills SET status = ?, status_reason = ?
+        WHERE id = ? AND status IN (${placeholders})`,
     )
-    .run(to, id, ...statuses);
+    .run(to, nextReason, id, ...statuses);
+  return result.changes === 1;
+}
+
+/** Undo only a status change the Ignore feature itself made. A later skip,
+ *  duplicate removal or payment carries its own reason and is left alone. */
+export function restoreIgnoreOwnedBill(id: number): boolean {
+  const result = db
+    .prepare(
+      `UPDATE bills SET status = 'upcoming', status_reason = NULL
+        WHERE id = ? AND status = 'ignored' AND status_reason = 'ignore'`,
+    )
+    .run(id);
   return result.changes === 1;
 }
 
@@ -5267,6 +5461,25 @@ export function getActiveIgnoreRuleByKey(
     .get(entityType, matchKey, matchScope, tag) as IgnoreRuleRecord | undefined;
 }
 
+export function getActiveIgnoreRuleByRecord(
+  entityType: IgnoreEntityType,
+  entityId: string,
+  matchScope: IgnoreMatchScope,
+  tag: IgnoreTag,
+): IgnoreRuleRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${IGNORE_RULE_COLUMNS}
+         FROM ignore_rules
+        WHERE status = 'active'
+          AND entity_type = ?
+          AND entity_id = ?
+          AND match_scope = ?
+          AND tag = ?`,
+    )
+    .get(entityType, entityId, matchScope, tag) as IgnoreRuleRecord | undefined;
+}
+
 export function listActiveIgnoreRules(): IgnoreRuleRecord[] {
   return db
     .prepare(
@@ -5343,7 +5556,7 @@ export function markIgnoreRuleExpired(
   return result.changes === 1;
 }
 
-export function expireDueIgnoreRules(nowIso: string): number {
+export function expireDueIgnoreRules(nowIso: string): IgnoreRuleRecord[] {
   const due = db
     .prepare(
       `SELECT id FROM ignore_rules
@@ -5353,12 +5566,15 @@ export function expireDueIgnoreRules(nowIso: string): number {
           AND expires_at <= ?`,
     )
     .all(nowIso) as Array<{ id: number }>;
-  let count = 0;
+  const expired: IgnoreRuleRecord[] = [];
   for (const row of due) {
     if (markIgnoreRuleExpired(row.id, nowIso)) {
       recordIgnoreRuleEvent(row.id, "expired", "scheduler", null, nowIso);
-      count += 1;
+      const rule = getIgnoreRule(row.id);
+      if (rule) {
+        expired.push(rule);
+      }
     }
   }
-  return count;
+  return expired;
 }

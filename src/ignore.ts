@@ -5,11 +5,11 @@
  */
 import { canonicalBiller, normalizeBillerKey } from "./bill_aliases.js";
 import {
-  cancelPendingRemindersForBill,
-  cancelPendingRemindersForTask,
+  createReminder,
   expireDueIgnoreRules,
   getAccounts,
   getActiveIgnoreRuleByKey,
+  getActiveIgnoreRuleByRecord,
   getBill,
   getBills,
   getIgnoreRule,
@@ -22,6 +22,7 @@ import {
   listActiveIgnoreRules,
   markIgnoreRuleResumed,
   recordIgnoreRuleEvent,
+  restoreIgnoreOwnedBill,
   transitionReminderStatus,
   type BillRecord,
   type IgnoreDuration,
@@ -31,6 +32,7 @@ import {
   type IgnoreTag,
   type ItemTag,
   type ReminderRecord,
+  type ReminderRecurrence,
   type TaskRecord,
 } from "./db.js";
 
@@ -45,6 +47,8 @@ export type IgnoreSubject = {
   relatedBillId?: number | null;
   relatedTaskId?: number | null;
   fromHeader?: string;
+  /** Recurring reminders only: the stable schedule id. */
+  seriesId?: number | null;
 };
 
 export type IgnoreApplyInput = {
@@ -173,20 +177,49 @@ function tagMatches(ruleTag: IgnoreTag, subjectTag?: ItemTag): boolean {
 }
 
 function activeRules(now = new Date()): IgnoreRuleRecord[] {
-  const stamp = now.getTime();
-  if (cachedActive && stamp - cachedAt < CACHE_MS) {
+  const expired = expireDueIgnoreRules(nowIso(now));
+  if (expired.length > 0) {
+    invalidateIgnoreCache();
+  }
+  for (const rule of expired) {
+    restoreAfterIgnore(rule, expiryBoundary(rule, now));
+  }
+  const stamp = Date.now();
+  if (expired.length === 0 && cachedActive && stamp - cachedAt < CACHE_MS) {
     return cachedActive;
   }
-  expireDueIgnoreRules(nowIso(now));
   cachedActive = listActiveIgnoreRules();
   cachedAt = stamp;
   return cachedActive;
 }
 
-export function matchingIgnoreRule(
-  subject: IgnoreSubject,
-  now = new Date(),
-): IgnoreRuleRecord | undefined {
+/**
+ * An expired rule stopped hiding things at expires_at, not when we noticed.
+ * Settle against that instant: occurrences due before it were suppressed and
+ * are dropped; anything due after it was never hidden, so it stays pending
+ * and the scheduler delivers it (as "missed while offline" after a restart).
+ */
+function expiryBoundary(rule: IgnoreRuleRecord, now: Date): Date {
+  const at = rule.expires_at ? new Date(rule.expires_at) : now;
+  if (Number.isNaN(at.getTime()) || at.getTime() > now.getTime()) {
+    return now;
+  }
+  return at;
+}
+
+/** Expire temporary rules and restore what they were suppressing. */
+export function refreshIgnoreRules(now = new Date()): void {
+  activeRules(now);
+}
+
+type PreparedSubject = {
+  subject: IgnoreSubject;
+  matchKey: string;
+  entityId: string;
+  aliases: string[];
+};
+
+function prepareSubject(subject: IgnoreSubject): PreparedSubject {
   const matchKey = normalizeIgnoreKey(subject.matchKey);
   const entityId =
     subject.entityId === undefined || subject.entityId === null
@@ -201,77 +234,116 @@ export function matchingIgnoreRule(
       aliases.push(normalizeIgnoreKey(domain));
     }
   }
-  for (const rule of activeRules(now)) {
-    if (!tagMatches(rule.tag, subject.tag)) {
-      continue;
-    }
-    if (rule.entity_type !== subject.entityType) {
-      if (
-        !(
-          (rule.entity_type === "notification" &&
-            (subject.entityType === "bill" || subject.entityType === "email_source")) ||
-          (rule.entity_type === "email_source" && subject.entityType === "notification")
-        )
-      ) {
-        continue;
-      }
-    }
-    if (rule.match_scope === "record") {
-      if (entityId && rule.entity_id === entityId) {
-        return rule;
-      }
-      continue;
-    }
-    if (keysOverlap(rule.match_key, matchKey, aliases)) {
-      return rule;
+  return { subject, matchKey, entityId, aliases };
+}
+
+/**
+ * The one answer to "does this rule cover this item". Suppression and
+ * restoration both use it, so ending a rule settles exactly what it hid:
+ * same tag, same entity type, same record or series, same keys.
+ */
+function ruleCoversSubject(rule: IgnoreRuleRecord, prepared: PreparedSubject): boolean {
+  const { subject, matchKey, entityId, aliases } = prepared;
+  if (!tagMatches(rule.tag, subject.tag)) {
+    return false;
+  }
+  if (rule.entity_type !== subject.entityType) {
+    if (
+      !(
+        (rule.entity_type === "notification" &&
+          (subject.entityType === "bill" || subject.entityType === "email_source")) ||
+        (rule.entity_type === "email_source" && subject.entityType === "notification")
+      )
+    ) {
+      return false;
     }
   }
-  return undefined;
+  if (rule.match_scope === "record") {
+    if (entityId && rule.entity_id === entityId) {
+      return true;
+    }
+    return (
+      subject.entityType === "reminder" &&
+      subject.seriesId != null &&
+      recordRuleSeriesId(rule) === subject.seriesId
+    );
+  }
+  return keysOverlap(rule.match_key, matchKey, aliases);
+}
+
+export function matchingIgnoreRule(
+  subject: IgnoreSubject,
+  now = new Date(),
+): IgnoreRuleRecord | undefined {
+  const prepared = prepareSubject(subject);
+  return activeRules(now).find((rule) => ruleCoversSubject(rule, prepared));
+}
+
+/**
+ * A record rule on a recurring reminder stands for its whole schedule, so it
+ * keeps matching after the scheduler or a restore writes the next occurrence.
+ * One-time reminders have no series and stay matched by exact id.
+ */
+function recordRuleSeriesId(rule: IgnoreRuleRecord): number | null {
+  if (rule.entity_type !== "reminder" || rule.match_scope !== "record" || !rule.entity_id) {
+    return null;
+  }
+  const target = getReminder(Number(rule.entity_id));
+  if (!target || target.recurrence === "none") {
+    return null;
+  }
+  return target.series_id;
+}
+
+function reminderSeriesId(reminder: ReminderRecord): number | null {
+  return reminder.recurrence === "none" ? null : reminder.series_id;
 }
 
 export function isIgnored(subject: IgnoreSubject, now = new Date()): boolean {
   return matchingIgnoreRule(subject, now) !== undefined;
 }
 
-export function billIsIgnored(bill: BillRecord, now = new Date()): boolean {
+function billSubject(bill: BillRecord): IgnoreSubject {
   const canonical = canonicalBiller(bill.biller);
-  return isIgnored(
-    {
-      entityType: "bill",
-      entityId: bill.id,
-      matchKey: normalizeBillerKey(canonical),
-      tag: "personal",
-      aliases: [bill.biller, canonical, normalizeBillerKey(bill.biller)],
-    },
-    now,
-  );
+  return {
+    entityType: "bill",
+    entityId: bill.id,
+    matchKey: normalizeBillerKey(canonical),
+    tag: "personal",
+    aliases: [bill.biller, canonical, normalizeBillerKey(bill.biller)],
+  };
+}
+
+function taskSubject(task: TaskRecord): IgnoreSubject {
+  return {
+    entityType: "task",
+    entityId: task.id,
+    matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
+    tag: task.tag,
+    aliases: [task.text],
+  };
+}
+
+function reminderSubject(reminder: ReminderRecord): IgnoreSubject {
+  return {
+    entityType: "reminder",
+    entityId: reminder.id,
+    matchKey: reminder.text,
+    tag: reminder.tag,
+    seriesId: reminderSeriesId(reminder),
+  };
+}
+
+export function billIsIgnored(bill: BillRecord, now = new Date()): boolean {
+  return isIgnored(billSubject(bill), now);
 }
 
 export function taskIsIgnored(task: TaskRecord, now = new Date()): boolean {
-  return isIgnored(
-    {
-      entityType: "task",
-      entityId: task.id,
-      matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
-      tag: task.tag,
-      aliases: [task.text],
-    },
-    now,
-  );
+  return isIgnored(taskSubject(task), now);
 }
 
 export function reminderIsIgnored(reminder: ReminderRecord, now = new Date()): boolean {
-  if (
-    isIgnored(
-      {
-        entityType: "reminder",
-        entityId: reminder.id,
-        matchKey: reminder.text,
-        tag: reminder.tag,
-      },
-      now,
-    )
-  ) {
+  if (isIgnored(reminderSubject(reminder), now)) {
     return true;
   }
   if (reminder.related_bill_id) {
@@ -376,12 +448,7 @@ export function applyIgnore(input: IgnoreApplyInput): IgnoreApplyResult {
   if (!keyIsSpecific(matchKey)) {
     throw new Error("Ignore target is too broad. Name the bill, task, reminder or source.");
   }
-  const existing = getActiveIgnoreRuleByKey(
-    input.entityType,
-    matchKey,
-    input.matchScope,
-    input.tag,
-  );
+  const existing = activeRuleFor(input, matchKey);
   if (existing) {
     recordIgnoreRuleEvent(
       existing.id,
@@ -407,12 +474,7 @@ export function applyIgnore(input: IgnoreApplyInput): IgnoreApplyResult {
     reason: input.reason ?? null,
   });
   if (!rule) {
-    const raced = getActiveIgnoreRuleByKey(
-      input.entityType,
-      matchKey,
-      input.matchScope,
-      input.tag,
-    );
+    const raced = activeRuleFor(input, matchKey);
     if (raced) {
       recordIgnoreRuleEvent(
         raced.id,
@@ -427,115 +489,333 @@ export function applyIgnore(input: IgnoreApplyInput): IgnoreApplyResult {
   }
   recordIgnoreRuleEvent(rule.id, "created", input.authRef, input.instruction, null);
   invalidateIgnoreCache();
-  suppressMatchingReminders(rule);
   return { kind: "created", rule, duplicate: false };
 }
 
-function suppressMatchingReminders(rule: IgnoreRuleRecord): void {
-  if (rule.entity_type === "bill") {
-    for (const bill of getBills()) {
-      if (bill.status !== "upcoming") {
-        continue;
-      }
-      if (billIsIgnored(bill)) {
-        cancelPendingRemindersForBill(bill.id);
-      }
+function activeRuleFor(
+  input: Pick<IgnoreApplyInput, "entityType" | "matchScope" | "tag" | "entityId">,
+  matchKey: string,
+): IgnoreRuleRecord | undefined {
+  if (input.matchScope === "record" && input.entityId) {
+    const exact = getActiveIgnoreRuleByRecord(
+      input.entityType,
+      String(input.entityId),
+      input.matchScope,
+      input.tag,
+    );
+    if (exact || input.entityType !== "reminder") {
+      return exact;
     }
-    return;
-  }
-  if (rule.entity_type === "task") {
-    for (const task of getTasks()) {
-      if (task.status !== "open") {
-        continue;
-      }
-      if (taskIsIgnored(task)) {
-        cancelPendingRemindersForTask(task.id);
-      }
+    const target = getReminder(Number(input.entityId));
+    const seriesId = target ? reminderSeriesId(target) : null;
+    if (seriesId == null) {
+      return undefined;
     }
-    return;
+    return listActiveIgnoreRules().find(
+      (rule) =>
+        rule.entity_type === "reminder" &&
+        rule.match_scope === "record" &&
+        rule.tag === input.tag &&
+        recordRuleSeriesId(rule) === seriesId,
+    );
   }
-  if (rule.entity_type === "reminder" && rule.entity_id) {
-    const reminder = getReminder(Number(rule.entity_id));
-    if (reminder && reminder.status === "pending") {
-      transitionReminderStatus(reminder.id, "pending", "cancelled");
-    }
-  }
+  return getActiveIgnoreRuleByKey(
+    input.entityType,
+    matchKey,
+    input.matchScope,
+    input.tag,
+  );
 }
 
 export function resumeIgnore(
   ruleId: number,
   authRef: string,
   instruction = "",
+  now = new Date(),
 ): IgnoreRuleRecord | undefined {
   const rule = getIgnoreRule(ruleId);
   if (!rule || rule.status !== "active") {
     return undefined;
   }
-  const at = nowIso();
+  const at = nowIso(now);
   if (!markIgnoreRuleResumed(ruleId, at)) {
     return undefined;
   }
   recordIgnoreRuleEvent(ruleId, "resumed", authRef, instruction || null, null);
   invalidateIgnoreCache();
-  skipPastRemindersForResumed(rule);
-  return getIgnoreRule(ruleId);
+  const resumed = getIgnoreRule(ruleId);
+  if (resumed) {
+    restoreAfterIgnore(resumed, now);
+  }
+  return resumed;
 }
 
-function skipPastRemindersForResumed(rule: IgnoreRuleRecord): void {
-  const now = Date.now();
-  for (const reminder of getReminders()) {
-    if (reminder.status !== "pending") {
-      continue;
-    }
-    if (new Date(reminder.remind_at).getTime() > now) {
-      continue;
-    }
-    const matches =
-      (rule.entity_type === "reminder" &&
-        (String(reminder.id) === rule.entity_id ||
-          keysOverlap(rule.match_key, normalizeIgnoreKey(reminder.text), [
-            reminder.text,
-          ]))) ||
-      (rule.entity_type === "bill" &&
-        reminder.related_bill_id !== null &&
-        billMatchesRule(getBill(reminder.related_bill_id), rule)) ||
-      (rule.entity_type === "task" &&
-        reminder.related_task_id !== null &&
-        taskMatchesRule(getTask(reminder.related_task_id), rule));
-    if (matches) {
-      transitionReminderStatus(reminder.id, "pending", "cancelled");
-    }
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Resume and temporary expiry share this. It runs after the rule is marked
+ * ended, so every check below sees only the rules still active.
+ *
+ * Restoring never makes anything deliverable by itself. It cancels missed
+ * occurrences and writes the next one in the same series; the scheduler then
+ * checks every active rule again before sending (processDue, deliverReminder).
+ * A rule that still covers the reminder, its series, task, bill or text keeps
+ * the new occurrence suppressed.
+ */
+export function restoreAfterIgnore(rule: IgnoreRuleRecord, now = new Date()): void {
+  if (
+    rule.entity_type === "bill" &&
+    rule.match_scope === "record" &&
+    rule.entity_id
+  ) {
+    // Resume lifts the registry rule. The bill's own state changes only when
+    // provenance shows the old card Ignore made it; a skip or duplicate wins.
+    restoreIgnoreOwnedBill(Number(rule.entity_id));
+  }
+  if (rule.entity_type === "bill") {
+    restoreBillReminders(rule, now);
+    return;
+  }
+  if (rule.entity_type === "task") {
+    restoreTaskReminders(rule, now);
+    return;
+  }
+  if (rule.entity_type === "reminder") {
+    restoreReminderRules(rule, now);
   }
 }
 
-function billMatchesRule(
-  bill: BillRecord | undefined,
-  rule: IgnoreRuleRecord,
-): boolean {
-  if (!bill) {
-    return false;
-  }
-  if (rule.entity_id && String(bill.id) === rule.entity_id) {
-    return true;
-  }
-  return keysOverlap(
-    rule.match_key,
-    normalizeBillerKey(canonicalBiller(bill.biller)),
-    [bill.biller],
+/** Restore only what the rule suppressed: the same predicate, tag included. */
+function billMatchesRule(bill: BillRecord, rule: IgnoreRuleRecord): boolean {
+  return ruleCoversSubject(rule, prepareSubject(billSubject(bill)));
+}
+
+function taskMatchesRule(task: TaskRecord, rule: IgnoreRuleRecord): boolean {
+  return ruleCoversSubject(rule, prepareSubject(taskSubject(task)));
+}
+
+function addDaysYmd(ymd: string, days: number): string {
+  const date = new Date(`${ymd}T12:00:00+05:30`);
+  date.setDate(date.getDate() + days);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function nineAmKolkataIso(dateYmd: string): string {
+  return new Date(`${dateYmd}T09:00:00+05:30`).toISOString();
+}
+
+function billReminderText(bill: BillRecord): string {
+  const amount =
+    bill.amount === null ? "amount unknown" : `${bill.currency} ${bill.amount}`;
+  return (
+    `Bill due: ${bill.biller} for ${amount}. ` +
+    `Due on ${bill.due_date}. Tap Done when paid.`
   );
 }
 
-function taskMatchesRule(
-  task: TaskRecord | undefined,
-  rule: IgnoreRuleRecord,
-): boolean {
-  if (!task) {
-    return false;
+function sameInstant(left: string, right: string): boolean {
+  return new Date(left).getTime() === new Date(right).getTime();
+}
+
+function explicitlyStopped(reminder: ReminderRecord): boolean {
+  return (
+    reminder.status === "cancelled" &&
+    (reminder.status_reason === "user" || reminder.status_reason === "completion")
+  );
+}
+
+function restoreBillReminders(rule: IgnoreRuleRecord, now: Date): void {
+  for (const bill of getBills()) {
+    if (bill.status !== "upcoming" || !billMatchesRule(bill, rule)) {
+      continue;
+    }
+    const linked = () =>
+      getReminders().filter((reminder) => reminder.related_bill_id === bill.id);
+    for (const offset of [-3, -1, 0]) {
+      const slot = nineAmKolkataIso(addDaysYmd(bill.due_date, offset));
+      const at = new Date(slot).getTime();
+      const same = linked().filter((reminder) => sameInstant(reminder.remind_at, slot));
+      if (at <= now.getTime()) {
+        for (const reminder of same) {
+          if (reminder.status === "pending") {
+            transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore");
+          }
+        }
+        continue;
+      }
+      if (same.some((reminder) => reminder.status === "pending")) {
+        continue;
+      }
+      if (same.some((reminder) => explicitlyStopped(reminder))) {
+        continue;
+      }
+      createReminder(billReminderText(bill), "personal", slot, "none", {
+        relatedBillId: bill.id,
+      });
+    }
+    for (const reminder of linked()) {
+      if (
+        reminder.status === "pending" &&
+        new Date(reminder.remind_at).getTime() <= now.getTime()
+      ) {
+        transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore");
+      }
+    }
   }
-  if (rule.entity_id && String(task.id) === rule.entity_id) {
-    return true;
+}
+
+function restoreTaskReminders(rule: IgnoreRuleRecord, now: Date): void {
+  for (const task of getTasks()) {
+    if (task.status !== "open" || !taskMatchesRule(task, rule)) {
+      continue;
+    }
+    settleMatchedReminders(
+      getReminders().filter((reminder) => reminder.related_task_id === task.id),
+      now,
+    );
   }
-  return keysOverlap(rule.match_key, normalizeIgnoreKey(task.text), [task.text]);
+}
+
+/** Same match a reminder rule used while it was active, including linked rows. */
+function ruleSuppressesReminder(rule: IgnoreRuleRecord, reminder: ReminderRecord): boolean {
+  return (
+    rule.entity_type === "reminder" &&
+    ruleCoversSubject(rule, prepareSubject(reminderSubject(reminder)))
+  );
+}
+
+function restoreReminderRules(rule: IgnoreRuleRecord, now: Date): void {
+  settleMatchedReminders(
+    getReminders().filter((reminder) => ruleSuppressesReminder(rule, reminder)),
+    now,
+  );
+}
+
+function seriesKey(reminder: ReminderRecord): string {
+  return reminder.series_id == null ? `row:${reminder.id}` : `series:${reminder.series_id}`;
+}
+
+function settleMatchedReminders(reminders: readonly ReminderRecord[], now: Date): void {
+  const groups = new Map<string, ReminderRecord[]>();
+  for (const reminder of reminders) {
+    const key = reminder.recurrence === "none" ? `row:${reminder.id}` : seriesKey(reminder);
+    const group = groups.get(key) ?? [];
+    group.push(reminder);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    if (group[0]?.recurrence === "none") {
+      settleOneShot(getReminder(group[0]!.id) ?? group[0]!, now);
+    } else {
+      settleSeries(group, now);
+    }
+  }
+}
+
+function settleOneShot(reminder: ReminderRecord, now: Date): void {
+  const at = new Date(reminder.remind_at).getTime();
+  if (reminder.status === "pending" && at <= now.getTime()) {
+    transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore");
+  }
+}
+
+function nextFutureAt(
+  remindAt: string,
+  recurrence: ReminderRecurrence,
+  now: Date,
+): string | undefined {
+  if (recurrence === "none") {
+    return undefined;
+  }
+  let candidate = new Date(remindAt);
+  const increment = recurrence === "weekly" ? 7 * ONE_DAY_MS : ONE_DAY_MS;
+  for (let step = 0; step < 4000; step += 1) {
+    candidate = new Date(candidate.getTime() + increment);
+    if (candidate.getTime() <= now.getTime()) {
+      continue;
+    }
+    if (recurrence === "weekdays") {
+      const day = kolkataWeekday(candidate);
+      if (day === 0 || day === 6) {
+        continue;
+      }
+    }
+    return candidate.toISOString();
+  }
+  return undefined;
+}
+
+function settleSeries(group: readonly ReminderRecord[], now: Date): void {
+  const fresh = group
+    .map((reminder) => getReminder(reminder.id))
+    .filter((reminder): reminder is ReminderRecord => reminder !== undefined);
+  if (fresh.length === 0) {
+    return;
+  }
+  const stopped = fresh.some((reminder) => explicitlyStopped(reminder));
+  const pending = fresh.filter((reminder) => reminder.status === "pending");
+  const future = pending
+    .filter((reminder) => new Date(reminder.remind_at).getTime() > now.getTime())
+    .sort(
+      (left, right) =>
+        new Date(left.remind_at).getTime() - new Date(right.remind_at).getTime() ||
+        left.id - right.id,
+    );
+  const keepId = future[0]?.id;
+  let settledPast = false;
+  for (const reminder of pending) {
+    if (reminder.id === keepId) {
+      continue;
+    }
+    if (transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore")) {
+      settledPast = true;
+    }
+  }
+  if (keepId !== undefined || stopped) {
+    return;
+  }
+  const ignoreOwned =
+    settledPast || fresh.some((reminder) => reminder.status_reason === "ignore");
+  if (!ignoreOwned) {
+    return;
+  }
+  const basis = [...fresh].sort(
+    (left, right) =>
+      new Date(right.remind_at).getTime() - new Date(left.remind_at).getTime() ||
+      right.id - left.id,
+  )[0];
+  if (!basis || basis.recurrence === "none" || basis.series_id == null) {
+    return;
+  }
+  const nextAt = nextFutureAt(basis.remind_at, basis.recurrence, now);
+  if (!nextAt) {
+    return;
+  }
+  const already = getReminders().some(
+    (reminder) =>
+      reminder.status === "pending" &&
+      reminder.series_id === basis.series_id &&
+      sameInstant(reminder.remind_at, nextAt),
+  );
+  if (already) {
+    return;
+  }
+  createReminder(basis.text, basis.tag, nextAt, basis.recurrence, {
+    relatedTaskId: basis.related_task_id,
+    relatedBillId: basis.related_bill_id,
+    seriesId: basis.series_id,
+  });
 }
 
 export function resumeIgnoreByQuery(

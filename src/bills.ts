@@ -440,7 +440,7 @@ export async function handleBillDuplicateCallback(
   }
   // Mark as duplicate: cancel this bill's reminders and set status 'ignored'.
   cancelPendingRemindersForBill(bill.id);
-  if (transitionBillStatus(bill.id, ["upcoming", "paid"], "ignored")) {
+  if (transitionBillStatus(bill.id, ["upcoming", "paid"], "ignored", "duplicate")) {
     console.log(`Bill ${bill.id}: status -> ignored (marked as duplicate)`);
   }
   await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
@@ -743,15 +743,6 @@ export async function handleBillCallback(
       instruction: "telegram:bill-ignore",
       authRef: `telegram:callback:${billId}`,
     });
-    if (transitionBillStatus(billId, "upcoming", "ignored")) {
-      console.log(`Bill ${billId}: status -> ignored`);
-    }
-    const cancelled = cancelPendingRemindersForBill(billId);
-    if (cancelled > 0) {
-      console.log(
-        `Bill ${billId}: cancelled ${cancelled} pending reminder(s)`,
-      );
-    }
     await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
     return;
   }
