@@ -32,6 +32,7 @@ import type { AgentTaskResult } from "./types.js";
 import { newTurnMeter, recordLateWorkflow, recordTurn, type TurnMeter, type TurnWorkflow } from "../metrics.js";
 import { toAgentResult } from "./protocol.js";
 import { parseRef } from "./refs.js";
+import { formatPendingAction, getPendingAction } from "../action_context.js";
 
 /**
  * Aadi as orchestrator. It decides who handles a turn, hands work to the
@@ -647,6 +648,14 @@ const escalateTool: MetaTool = {
   }),
 };
 
+function actionContext(chatId: number | undefined): string {
+  if (chatId === undefined) {
+    return "";
+  }
+  const pending = getPendingAction(chatId);
+  return pending ? formatPendingAction(pending) : "";
+}
+
 function pausedContext(chatId: number | undefined): string {
   if (chatId === undefined) {
     return "";
@@ -692,6 +701,7 @@ export async function runOwnerTurn(modelText: string, options: OwnerTurnOptions)
   let reply = "";
   let failure: unknown;
   try {
+    const pending = actionContext(chatId);
     if (route.kind === "specialist") {
       // The specialist reasons with its own model setting, the same as in a goal.
       reply = await runAgent(modelText, {
@@ -699,21 +709,23 @@ export async function runOwnerTurn(modelText: string, options: OwnerTurnOptions)
         agentId: route.agentId,
         modelAgent: route.agentId,
         metaTools: [escalateTool],
+        extraContext: [agentOptions.extraContext, pending].filter(Boolean).join("\n\n"),
         report,
       });
     } else {
       const full = config.agentRouting === "full" && agentOptions.sendConfirmation !== undefined;
       const waiting = full ? pausedContext(chatId) : "";
+      const extra = [waiting, pending, agentOptions.extraContext].filter(Boolean).join("\n\n");
       reply = await runAgent(modelText, {
         ...agentOptions,
         modelAgent: "aadi",
+        extraContext: extra,
         metaTools: full
           ? [
               delegateTool(chatId, postCard, meter, turnRef),
               ...(waiting ? [continueTool(chatId, postCard), cancelTool(chatId)] : []),
             ]
           : [],
-        extraContext: waiting,
         report,
       });
     }

@@ -6,6 +6,7 @@ import {
   ownerMayChangeIgnore,
   resolveIgnoreTarget,
 } from "../ignore.js";
+import { resolveReferentPhrase, type ReferentEntity } from "../referents.js";
 import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
@@ -56,8 +57,20 @@ export function handler(input: unknown, turn: ToolTurn): string {
     return "Ignore preferences can only be changed from Vishnu's own chat or voice message.";
   }
   const ownWords = turn.userText?.trim() ?? "";
-  if (ownWords && !looksLikeIgnoreInstruction(ownWords)) {
+  const chatId = turn.confirmation?.chatId;
+  const referents = resolveReferentPhrase(ownWords, chatId);
+  const referentEntities =
+    referents.kind === "collection" || referents.kind === "indexes"
+      ? referents.entities
+      : referents.kind === "singular"
+        ? [referents.entity]
+        : [];
+  const fromReferents = referentEntities.length > 0;
+  if (ownWords && !looksLikeIgnoreInstruction(ownWords) && !fromReferents) {
     return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
+  }
+  if (fromReferents && (looksLikeIgnoreInstruction(ownWords) || looksLikeReferentIgnore(ownWords))) {
+    return applyReferentIgnores(referentEntities, ownWords, turn);
   }
   const values = input as {
     query?: unknown;
@@ -105,4 +118,47 @@ function authRefFor(turn: ToolTurn): string {
     return "owner_chat";
   }
   return `owner_chat:${confirmation.chatId}:${confirmation.messageId}`;
+}
+
+function looksLikeReferentIgnore(text: string): boolean {
+  return /^(?:all(?:\s+of)?\s+(?:them|those|these|three|six)|\d+|them|those|it|that|this)\.?$/i.test(
+    text.trim(),
+  );
+}
+
+function applyReferentIgnores(
+  entities: readonly ReferentEntity[],
+  instruction: string,
+  turn: ToolTurn,
+): string {
+  const lines: string[] = [];
+  for (const entity of entities) {
+    const entityType =
+      entity.type === "event"
+        ? "calendar_event"
+        : entity.type === "contact"
+          ? undefined
+          : entity.type;
+    if (!entityType) {
+      continue;
+    }
+    const result = applyIgnore({
+      entityType,
+      matchKey: `${entity.matchKey ?? entity.label} ${entity.id}`,
+      matchScope: "record",
+      tag: entity.tag === "work" ? "work" : "personal",
+      entityId: entity.id,
+      instruction: instruction || entity.label,
+      authRef: authRefFor(turn),
+    });
+    console.log(
+      `Ignore rule ${result.rule.id}: ${result.duplicate ? "duplicate" : "created"} ` +
+        `${result.rule.entity_type}/${result.rule.match_key}`,
+    );
+    lines.push(confirmationForIgnore(result, entity.label));
+  }
+  if (lines.length === 0) {
+    return "Which item or source should I ignore? Name the bill, task, reminder or sender.";
+  }
+  return lines.join("\n");
 }

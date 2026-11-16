@@ -45,7 +45,11 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     if (!turn.confirmation) {
       return "Not added: only Vishnu's own message can add a calendar attendee.";
     }
-    const resolved = await resolveCommandAttendee(attendeeEmail, turn.userText ?? "");
+    const resolved = await resolveCommandAttendee(
+      attendeeEmail,
+      turn.userText ?? "",
+      turn.confirmation.chatId,
+    );
     if ("refused" in resolved) {
       return resolved.refused;
     }

@@ -281,6 +281,7 @@ createMemory({ content: "Dev's email is dev@elsewhere.example.", category: "pers
 
 const forget = () => {
   db.prepare("DELETE FROM contact_choices").run();
+  db.prepare("DELETE FROM canonical_contacts").run();
   db.prepare("UPDATE contact_questions SET status = 'dropped' WHERE status = 'open'").run();
 };
 const emailsOf = (contact: Contact) => contact.emails.join(",");

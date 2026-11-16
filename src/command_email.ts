@@ -9,8 +9,18 @@ import {
   notAnEventCommand,
   notASendCommand,
 } from "./command_logic.js";
-import { resolveRecipient } from "./command_recipients.js";
+import {
+  authorizationWords,
+  clearPendingAction,
+  getPendingAction,
+  pendingResolvedEmails,
+  savePendingAction,
+  type ResolvedAttendee,
+} from "./action_context.js";
+import { rememberContactChoice, resolveContact } from "./contacts.js";
+import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { writeCommandEmail } from "./command_writer.js";
+import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
 import {
   closeCommandChoice,
@@ -96,6 +106,26 @@ export function commandApi(): Api {
 }
 
 const api = commandApi;
+
+function mailboxFromContact(contact: {
+  name: string;
+  emails: string[];
+}): ParsedMailbox {
+  return { email: contact.emails[0]!.toLowerCase(), name: contact.name };
+}
+
+function matchFromContact(resolution: Awaited<ReturnType<typeof resolveContact>>): RecipientMatch {
+  if (resolution.kind === "one") {
+    return { kind: "one", mailbox: mailboxFromContact(resolution.contact) };
+  }
+  if (resolution.kind === "many") {
+    return {
+      kind: "many",
+      options: resolution.options.map(mailboxFromContact),
+    };
+  }
+  return { kind: "none" };
+}
 
 function stringList(value: unknown): string[] {
   const items = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
@@ -438,7 +468,36 @@ async function finishRequest(
   return { text: result.text };
 }
 
-/** Fills in each recipient it can. Stops at the first one it can't, and asks. */
+async function resolveNamedRecipient(input: {
+  gmail: gmail_v1.Gmail;
+  query: string;
+  selfAddresses: ReadonlySet<string>;
+  threadMailboxes?: readonly ParsedMailbox[];
+}): Promise<RecipientMatch> {
+  const threadMatch = await resolveRecipient(input);
+  if (threadMatch.kind === "one") {
+    return threadMatch;
+  }
+  // A typed address is already decided (including "that's me, don't send").
+  if (addressIn(input.query)) {
+    return threadMatch;
+  }
+  const fromIndex = matchFromContact(await resolveContact(input.query));
+  // Gmail already found several different addresses: don't collapse them to one
+  // canonical person.
+  if (threadMatch.kind === "many") {
+    return fromIndex.kind === "many" ? fromIndex : threadMatch;
+  }
+  if (fromIndex.kind === "one") {
+    return fromIndex;
+  }
+  if (fromIndex.kind === "many") {
+    return fromIndex;
+  }
+  return threadMatch;
+}
+
+/** Fills in each recipient it can. Collects genuine ambiguities and asks once. */
 async function resolveAndContinue(
   request: CommandRequest,
   base: string,
@@ -454,11 +513,15 @@ async function resolveAndContinue(
       .then((thread) => thread?.mailboxes)
       .catch(() => undefined);
   }
+  const missing: string[] = [];
+  const ambiguous: Array<{ slot: RecipientSlot; options: ParsedMailbox[] }> = [];
+  const resolved: string[] = [];
   for (const slot of [...request.to, ...request.cc]) {
     if (slot.mailbox) {
+      resolved.push(slot.mailbox.name || slot.query);
       continue;
     }
-    const match = await resolveRecipient({
+    const match = await resolveNamedRecipient({
       gmail,
       query: slot.query,
       selfAddresses,
@@ -466,13 +529,18 @@ async function resolveAndContinue(
     });
     if (match.kind === "one") {
       slot.mailbox = match.mailbox;
+      rememberContactChoice(slot.query, {
+        name: match.mailbox.name,
+        emails: [match.mailbox.email],
+        company: undefined,
+        sources: ["gmail"],
+      });
+      resolved.push(match.mailbox.name || slot.query);
       continue;
     }
     if (match.kind === "none") {
-      return {
-        text: `${notDone(request)}: I found no address for "${slot.query}", so nothing went out.`,
-        hint: "Ask Vishnu for the address.",
-      };
+      missing.push(slot.query);
+      continue;
     }
     if (match.options.length > MAX_BUTTONS) {
       return {
@@ -481,11 +549,24 @@ async function resolveAndContinue(
       };
     }
     slot.options = match.options;
+    ambiguous.push({ slot, options: match.options });
+  }
+  if (ambiguous.length > 0) {
+    const first = ambiguous[0]!;
     const choiceId = createCommandChoice(JSON.stringify(request), now.toISOString());
+    const extra =
+      ambiguous.length > 1
+        ? `\nI also need to know which ${ambiguous
+            .slice(1)
+            .map((item) => item.slot.query)
+            .join(", ")} you mean.`
+        : "";
+    const found =
+      resolved.length > 0 ? `I resolved ${resolved.join(", ")}. ` : "";
     const choiceCard = {
-      text: `Which ${slot.query}? Nothing has gone out.`,
-      caption: `Which ${slot.query}? Nothing has gone out.`,
-      keyboard: choiceKeyboard(choiceId, match.options),
+      text: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
+      caption: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
+      keyboard: choiceKeyboard(choiceId, first.options),
     };
     if (!holdForVoiceNote(choiceCard)) {
       await api().sendMessage(config.ownerTelegramId, choiceCard.text, {
@@ -493,21 +574,30 @@ async function resolveAndContinue(
       });
     }
     return {
-      text: `${notDone(request)} yet: "${slot.query}" matches ${match.options.length} addresses and I've asked with buttons.`,
+      text: `${notDone(request)} yet: ${found}"${first.slot.query}" matches ${first.options.length} people and I've asked with buttons.${extra}`,
       hint: "Tell him to tap one, and don't pick one yourself.",
       shown: true,
+    };
+  }
+  if (missing.length > 0) {
+    return {
+      text: `${notDone(request)}: I found no address for ${missing.map((name) => `"${name}"`).join(", ")}, so nothing went out.`,
+      hint: "Ask Vishnu for the address.",
     };
   }
   return finishRequest(request, base, confirmation, now);
 }
 
 /** Who he named, checked against his own words, or why it can't be used. An address
- *  Aadi already offered him counts, because he's answering that question. */
+ *  Aadi already offered him counts, because he's answering that question. A
+ *  previously resolved attendee on this workflow also counts, even if the email
+ *  is not repeated in the latest message. */
 function recipientSlots(
   queries: readonly string[],
   ownWords: string,
   now: Date,
   refusal: string,
+  chatId?: number,
 ): RecipientSlot[] | string {
   const open = listOpenCommandChoices(new Date(now.getTime() - CHOICE_TTL_MS).toISOString());
   const offeredIn = (address: string) =>
@@ -518,13 +608,20 @@ function recipientSlots(
       );
     });
   const answered = new Set<number>();
+  const prior = pendingResolvedEmails(chatId);
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
     const address = addressIn(query);
     const offers = address ? offeredIn(address) : [];
+    const remembered = prior.get(query.trim().toLowerCase()) ?? (address ? prior.get(address) : undefined);
     if (address && offers.length > 0) {
       offers.forEach((choice) => answered.add(choice.id));
       slots.push({ query, mailbox: { email: address, name: "" } });
+    } else if (remembered?.resolved) {
+      slots.push({
+        query,
+        mailbox: { email: remembered.email, name: remembered.name },
+      });
     } else if (namedInOwnWords(query, ownWords)) {
       slots.push({ query });
     } else {
@@ -611,7 +708,13 @@ export async function sendEmailFromTool(
   if (!instruction) {
     return "Not sent: I don't know what it should say. Ask him.";
   }
-  const slots = recipientSlots([...toQueries, ...ccQueries], ownWords, now, when ? "Not scheduled" : "Not sent");
+  const slots = recipientSlots(
+    [...toQueries, ...ccQueries],
+    authorizationWords(confirmation.chatId, ownWords),
+    now,
+    when ? "Not scheduled" : "Not sent",
+    confirmation.chatId,
+  );
   if (typeof slots === "string") {
     return slots;
   }
@@ -654,7 +757,11 @@ export async function bookMeetingFromTool(
     return "Not booked: only Vishnu's own message can book a meeting.";
   }
   const ownWords = turn.userText?.trim() ?? "";
-  const notCommand = notAnEventCommand(ownWords);
+  const pending = getPendingAction(confirmation.chatId, now);
+  const continuing =
+    pending?.action === "create_meeting" &&
+    (looksLikeTimeFill(ownWords) || (pending.meeting?.attendees.length ?? 0) > 0);
+  const notCommand = continuing ? undefined : notAnEventCommand(ownWords);
   if (notCommand) {
     return `Not booked: ${notCommand}. Use the right tool, or ask him if he wants it booked now.`;
   }
@@ -665,18 +772,53 @@ export async function bookMeetingFromTool(
     end_time?: unknown;
     duration_minutes?: unknown;
   };
-  const queries = stringList(values.attendees);
+  const authWords = authorizationWords(confirmation.chatId, ownWords);
+  let queries = stringList(values.attendees);
+  if (queries.length === 0 && pending?.meeting?.attendees.length) {
+    queries = pending.meeting.attendees.map((item) => item.query);
+  }
   if (queries.length === 0) {
     return "Not booked: he didn't name anyone. For a calendar-only event use create_event.";
   }
-  const slots = recipientSlots(queries, ownWords, now, "Not booked");
+  const slots = recipientSlots(queries, authWords, now, "Not booked", confirmation.chatId);
   if (typeof slots === "string") {
     return slots;
   }
-  const duration = typeof values.duration_minutes === "number" ? values.duration_minutes : undefined;
+  const duration =
+    typeof values.duration_minutes === "number"
+      ? values.duration_minutes
+      : pending?.meeting?.durationMinutes;
   const startTime = typeof values.start_time === "string" ? values.start_time : "";
+  const title =
+    typeof values.title === "string"
+      ? values.title
+      : pending?.meeting?.title;
   if (!startTime.trim()) {
-    return freeSlotsText(duration, now);
+    const resolved = await resolveAttendeesForPending(slots, now);
+    if (typeof resolved === "string") {
+      return resolved;
+    }
+    savePendingAction(confirmation.chatId, {
+      action: "create_meeting",
+      ownerWords: authWords,
+      confirmChat: confirmation.chatId,
+      confirmMessage: confirmation.messageId,
+      updatedAt: now.toISOString(),
+      meeting: {
+        title,
+        calendar: "work",
+        attendees: resolved,
+        durationMinutes: duration,
+        waiting: resolved.every((item) => item.resolved) ? "time" : "attendees",
+        resolutionAttempts: {},
+      },
+    });
+    const found = resolved
+      .filter((item) => item.resolved)
+      .map((item) => `${item.name} at ${item.email}`)
+      .join(", ");
+    const prefix = found ? `I found ${found}. ` : "";
+    return `${prefix}${await freeSlotsText(duration, now)}`;
   }
   const times = parseCommandTimes({
     startTime,
@@ -693,21 +835,100 @@ export async function bookMeetingFromTool(
     cc: [],
     threadId: null,
     instruction: "",
-    ownWords,
+    ownWords: authWords,
     account: "work",
     meeting: {
-      title: typeof values.title === "string" ? values.title : undefined,
+      title,
       startIso: times.startIso,
       endIso: times.endIso,
     },
   };
-  return asToolResult(
+  const result = asToolResult(
     await resolveAndContinue(
       request,
       `meeting:${confirmation.chatId}:${confirmation.messageId}`,
       confirmation,
       now,
     ),
+  );
+  if (!result.startsWith("Not booked")) {
+    clearPendingAction(confirmation.chatId);
+  }
+  return result;
+}
+
+async function resolveAttendeesForPending(
+  slots: RecipientSlot[],
+  now: Date,
+): Promise<ResolvedAttendee[] | string> {
+  const selfAddresses = await loadFollowupSelfAddresses();
+  const gmail = gmailClient(await getGoogleAccount("work"));
+  const attendees: ResolvedAttendee[] = [];
+  const missing: string[] = [];
+  const ambiguous: string[] = [];
+  for (const slot of slots) {
+    if (slot.mailbox) {
+      attendees.push({
+        query: slot.query,
+        name: slot.mailbox.name,
+        email: slot.mailbox.email,
+        resolved: true,
+      });
+      continue;
+    }
+    const match = await resolveNamedRecipient({
+      gmail,
+      query: slot.query,
+      selfAddresses,
+    });
+    if (match.kind === "one") {
+      rememberContactChoice(slot.query, {
+        name: match.mailbox.name,
+        emails: [match.mailbox.email],
+        sources: ["gmail"],
+      });
+      attendees.push({
+        query: slot.query,
+        name: match.mailbox.name,
+        email: match.mailbox.email,
+        resolved: true,
+      });
+      continue;
+    }
+    if (match.kind === "many") {
+      ambiguous.push(
+        `"${slot.query}" (${match.options.map((item) => item.email).join(", ")})`,
+      );
+      attendees.push({ query: slot.query, name: slot.query, email: "", resolved: false });
+      continue;
+    }
+    missing.push(slot.query);
+    attendees.push({ query: slot.query, name: slot.query, email: "", resolved: false });
+  }
+  if (ambiguous.length > 0) {
+    const found = attendees
+      .filter((item) => item.resolved)
+      .map((item) => item.name)
+      .join(", ");
+    const prefix = found ? `I resolved ${found}. ` : "";
+    return `${prefix}I found more than one person for ${ambiguous.join("; ")}. Which unique identity should I use?`;
+  }
+  if (missing.length > 0 && attendees.every((item) => !item.resolved)) {
+    return `Not booked: I found no address for ${missing.map((name) => `"${name}"`).join(", ")}.`;
+  }
+  return attendees;
+}
+
+export async function bookPendingMeetingAt(
+  chatId: number,
+  startIso: string,
+  confirmation: { chatId: number; messageId: number },
+  now = new Date(),
+): Promise<string> {
+  return bookMeetingFromTool(
+    { attendees: [], start_time: startIso },
+    { confirmation, userText: startIso },
+    now,
   );
 }
 
@@ -716,14 +937,20 @@ export async function bookMeetingFromTool(
 export async function resolveCommandAttendee(
   query: string,
   ownWords: string,
+  chatId?: number,
 ): Promise<{ email: string } | { refused: string }> {
-  if (!namedInOwnWords(query, ownWords)) {
+  const authWords = authorizationWords(chatId, ownWords);
+  const remembered = pendingResolvedEmails(chatId).get(query.trim().toLowerCase());
+  if (remembered?.resolved) {
+    return { email: remembered.email };
+  }
+  if (!namedInOwnWords(query, authWords)) {
     return {
       refused: `Not added: "${query}" isn't a name or address in Vishnu's own message. Pass the name as he said it, or ask him.`,
     };
   }
   const gmail = gmailClient(await getGoogleAccount("work"));
-  const match = await resolveRecipient({
+  const match = await resolveNamedRecipient({
     gmail,
     query,
     selfAddresses: await loadFollowupSelfAddresses(),
