@@ -10,6 +10,7 @@ import {
   looksLikeCommandTurn,
   mailboxMatches,
   mentionsSendDate,
+  isAutomatedAddress,
   namedInOwnWords,
   nameTokens,
   notAnEventCommand,
@@ -476,6 +477,11 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   assert(newsletter.includes("no address"), "a newsletter isn't a contact");
   const robot = await sendEmailFromTool({ to: ["Priya"], instruction: "x" }, turn("send Priya a note"));
   assert(robot.includes("no address"), "a no-reply address isn't a contact");
+  assert(isAutomatedAddress("no-reply@acme.example"), "prefix no-reply is automated");
+  assert(isAutomatedAddress("comments-noreply@docs.google.com"), "Docs comments are automated");
+  assert(isAutomatedAddress("drive-shares-noreply@google.com"), "Drive share mail is automated");
+  assert(isAutomatedAddress("calendar-notification@google.com"), "Calendar notification mail is automated");
+  assert(!isAutomatedAddress("nithish@epicode.in"), "a real work address is not automated");
   const self = await sendEmailFromTool({ to: [ME], instruction: "x" }, turn(`send ${ME} a note`));
   assert(self.startsWith("Not sent"), "not himself");
   assert(sends.length === count, "none of them sent");
