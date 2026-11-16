@@ -8,8 +8,10 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "grammy";
-import { handleBillCallback } from "../src/bills.ts";
+import type { Api } from "grammy";
+import { handleBillCallback, handleBillDuplicateCallback } from "../src/bills.ts";
 import {
+  backfillLegacyBillIgnoreProvenance,
   cancelPendingRemindersForBill,
   cancelPendingRemindersForTask,
   createBill,
@@ -17,8 +19,11 @@ import {
   createTask,
   db,
   getBill,
+  getBills,
+  getDueReminders,
   getReminder,
   getReminders,
+  insertIgnoreRule,
   listActiveIgnoreRules,
   listIgnoreRuleEvents,
   markTaskDone,
@@ -28,9 +33,11 @@ import {
 import {
   applyIgnore,
   billIsIgnored,
+  matchingIgnoreRule,
   reminderIsIgnored,
   resumeIgnore,
 } from "../src/ignore.ts";
+import { registerReminderScheduler } from "../src/reminders.ts";
 import { handler as cancelReminder } from "../src/tools/cancel_reminder.ts";
 import { handler as ignoreBill } from "../src/tools/ignore_bill.ts";
 import { handler as ignoreItem } from "../src/tools/ignore_item.ts";
@@ -678,6 +685,348 @@ function addDays(ymd: string, days: number): string {
       .length,
     0,
   );
+}
+
+const cardCtx = {
+  answerCallbackQuery: async () => undefined,
+  reply: async () => undefined,
+  editMessageReplyMarkup: async () => undefined,
+} as unknown as Context;
+
+function cardRuleFor(billId: number) {
+  const rule = listActiveIgnoreRules().find(
+    (row) => row.entity_type === "bill" && row.entity_id === String(billId),
+  );
+  assert.ok(rule, `card rule for bill ${billId}`);
+  return rule!;
+}
+
+function remindersOf(billId: number): number {
+  return getReminders().filter((row) => row.related_bill_id === billId).length;
+}
+
+// Codex 1A. A cycle skip after a card Ignore survives Resume.
+{
+  const bill = createBill("Skipcheck Fibre", 999, "INR", "2026-12-12", "p2-1a")!;
+  await handleBillCallback(cardCtx, "ignore", bill.id);
+  const rule = cardRuleFor(bill.id);
+  assert.equal(getBill(bill.id)!.status, "upcoming", "card Ignore is registry-only");
+  assert.match(
+    ignoreBill({ query: "Skipcheck Fibre", skip_cycle: true }, owner("Skip this cycle")),
+    /Skipped Skipcheck Fibre for this month/,
+  );
+  assert.equal(getBill(bill.id)!.status, "ignored");
+  assert.equal(getBill(bill.id)!.status_reason, "skip_cycle");
+  const before = remindersOf(bill.id);
+  resumeIgnore(rule.id, "telegram:resume", "resume fibre", new Date("2026-12-01T00:00:00.000Z"));
+  assert.equal(getBill(bill.id)!.status, "ignored", "Resume does not undo the skip");
+  assert.equal(getBill(bill.id)!.status_reason, "skip_cycle");
+  assert.equal(remindersOf(bill.id), before, "no reminders rebuilt for a skipped cycle");
+  const listed = JSON.parse(listBills({ filter: "all" })) as Array<{ id: number; status: string }>;
+  assert.equal(listed.find((row) => row.id === bill.id)?.status, "ignored", "reports keep the skip");
+  const next = getBills().find(
+    (row) => row.biller === "Skipcheck Fibre" && row.due_date === "2027-01-12",
+  );
+  assert.equal(next?.status, "upcoming", "the next cycle is untouched");
+  assert.equal(billIsIgnored(next!), false, "the record rule never covered the next cycle");
+}
+
+// Codex 1B. Duplicate removal and payment after a card Ignore survive Resume.
+{
+  const original = createBill("Dupecheck Cloud", 300, "INR", "2026-12-14", "p2-1b")!;
+  const dupe = createBill(
+    "Dupecheck Cloud",
+    300,
+    "INR",
+    "2026-12-15",
+    "p2-1b-2",
+    null,
+    original.id,
+  )!;
+  await handleBillCallback(cardCtx, "ignore", dupe.id);
+  const rule = cardRuleFor(dupe.id);
+  await handleBillDuplicateCallback(cardCtx, "remove", dupe.id);
+  assert.equal(getBill(dupe.id)!.status, "ignored");
+  assert.equal(getBill(dupe.id)!.status_reason, "duplicate");
+  resumeIgnore(rule.id, "telegram:resume", "resume dupe");
+  assert.equal(getBill(dupe.id)!.status, "ignored", "Resume does not undo duplicate removal");
+  assert.equal(getBill(dupe.id)!.status_reason, "duplicate");
+  assert.equal(getBill(original.id)!.status, "upcoming");
+
+  const paid = createBill("Paidcheck Hosting", 120, "INR", "2026-12-16", "p2-1b-3")!;
+  await handleBillCallback(cardCtx, "ignore", paid.id);
+  const paidRule = cardRuleFor(paid.id);
+  assert.equal(transitionBillStatus(paid.id, "upcoming", "paid"), true);
+  assert.equal(getBill(paid.id)!.status_reason, "paid");
+  resumeIgnore(paidRule.id, "telegram:resume", "resume paid");
+  assert.equal(getBill(paid.id)!.status, "paid", "Resume does not unpay a bill");
+}
+
+// Codex 1C. Historical rows: restore only what the old card Ignore provably did.
+{
+  const legacyIgnore = (billId: number) => {
+    // What the old card did after creating its rule: flip the status, no reason column.
+    db.prepare(`UPDATE bills SET status = 'ignored', status_reason = NULL WHERE id = ?`).run(
+      billId,
+    );
+  };
+  const now = new Date("2026-12-01T00:00:00.000Z");
+
+  // Attributable: card rule is the only record rule; no duplicate flag; no next cycle row.
+  const owned = createBill("Legacycard Broadband", 700, "INR", "2026-12-20", "p2-1c-1")!;
+  billReminders(owned.id, "2026-12-20");
+  await handleBillCallback(cardCtx, "ignore", owned.id);
+  legacyIgnore(owned.id);
+  db.prepare(
+    `UPDATE reminders SET status = 'cancelled', status_reason = NULL WHERE related_bill_id = ?`,
+  ).run(owned.id);
+  const ownedRule = cardRuleFor(owned.id);
+
+  // Ambiguous: the bill was skipped (next cycle row exists) and its reason was never recorded.
+  const skipped = createBill("Legacyskip Mobile", 499, "INR", "2026-11-28", "p2-1c-2")!;
+  await handleBillCallback(cardCtx, "ignore", skipped.id);
+  ignoreBill({ query: "Legacyskip Mobile", skip_cycle: true }, owner("Skip this cycle"));
+  db.prepare(`UPDATE bills SET status_reason = NULL WHERE id = ?`).run(skipped.id);
+  const skippedRule = cardRuleFor(skipped.id);
+
+  // Ambiguous: removed as a duplicate, reason never recorded.
+  const keep = createBill("Legacydupe Storage", 50, "INR", "2026-12-21", "p2-1c-3")!;
+  const removed = createBill(
+    "Legacydupe Storage",
+    50,
+    "INR",
+    "2026-12-22",
+    "p2-1c-4",
+    null,
+    keep.id,
+  )!;
+  await handleBillCallback(cardCtx, "ignore", removed.id);
+  legacyIgnore(removed.id);
+  const removedRule = cardRuleFor(removed.id);
+
+  // Ambiguous: an earlier record rule on the same bill came first.
+  const twice = createBill("Legacytwice Gym", 1500, "INR", "2026-12-23", "p2-1c-5")!;
+  const earlier = insertIgnoreRule({
+    tag: "personal",
+    entityType: "bill",
+    entityId: String(twice.id),
+    matchKey: "legacytwice gym",
+    matchScope: "record",
+    duration: "permanent",
+    instruction: "Ignore that gym invoice",
+    authRef: "owner_chat:test",
+  })!;
+  db.prepare(`UPDATE ignore_rules SET status = 'resumed' WHERE id = ?`).run(earlier.id);
+  await handleBillCallback(cardCtx, "ignore", twice.id);
+  legacyIgnore(twice.id);
+  const twiceRule = cardRuleFor(twice.id);
+
+  // Ambiguous: ignored with a record rule that the card did not create.
+  const chat = createBill("Legacychat Insurance", 2000, "INR", "2026-12-24", "p2-1c-6")!;
+  const chatRule = applyIgnore({
+    entityType: "bill",
+    matchKey: "legacychat insurance",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(chat.id),
+    instruction: "Ignore that insurance invoice",
+    authRef: "owner_chat:test",
+  }).rule;
+  legacyIgnore(chat.id);
+
+  assert.equal(backfillLegacyBillIgnoreProvenance(), 1, "only the provable row is marked");
+  assert.equal(backfillLegacyBillIgnoreProvenance(), 0, "backfill is idempotent");
+  assert.equal(getBill(owned.id)!.status_reason, "ignore");
+  for (const bill of [skipped, removed, twice, chat]) {
+    assert.equal(getBill(bill.id)!.status_reason, null, `bill ${bill.id} stays ambiguous`);
+  }
+
+  resumeIgnore(ownedRule.id, "telegram:resume", "resume broadband", now);
+  assert.equal(getBill(owned.id)!.status, "upcoming", "provable legacy Ignore is undone");
+  assert.equal(getBill(owned.id)!.status_reason, null);
+  assert.equal(
+    getReminders().filter(
+      (row) =>
+        row.related_bill_id === owned.id &&
+        row.status === "pending" &&
+        new Date(row.remind_at).getTime() > now.getTime(),
+    ).length,
+    3,
+    "future slots come back once",
+  );
+
+  for (const [bill, rule] of [
+    [skipped, skippedRule],
+    [removed, removedRule],
+    [twice, twiceRule],
+    [chat, chatRule],
+  ] as const) {
+    const before = remindersOf(bill.id);
+    resumeIgnore(rule.id, "telegram:resume", "resume ambiguous", now);
+    assert.equal(getBill(bill.id)!.status, "ignored", `bill ${bill.id} is not restored`);
+    assert.equal(remindersOf(bill.id), before);
+  }
+}
+
+// Codex 2A/2B. A record Ignore follows the series when another rule's Resume advances it.
+{
+  const DAY = 24 * 60 * 60 * 1000;
+  const real = Date.now();
+  const firstAt = new Date(real - 3 * DAY - 60 * 60 * 1000);
+  const resumeTaskAt = new Date(real - 2 * 60 * 60 * 1000);
+  const task = createTask("Water the balcony plants", "personal", null);
+  const seed = createReminder(
+    "Water the balcony plants",
+    "personal",
+    firstAt.toISOString(),
+    "daily",
+    { relatedTaskId: task.id },
+  );
+  assert.ok(seed.series_id);
+  const recordRule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "water the balcony plants",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(seed.id),
+    instruction: "Ignore the balcony plants reminder",
+    authRef: "owner_chat:test",
+  }).rule;
+  const taskRule = applyIgnore({
+    entityType: "task",
+    matchKey: "water the balcony plants",
+    matchScope: "source",
+    tag: "personal",
+    entityId: String(task.id),
+    instruction: "Ignore the balcony plants task",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(getReminder(seed.id)!.status, "pending", "stale while both rules are active");
+
+  resumeIgnore(taskRule.id, "owner_chat:test", "resume the task only", resumeTaskAt);
+  const afterTask = getReminders().filter((row) => row.series_id === seed.series_id);
+  const pending = afterTask.filter((row) => row.status === "pending");
+  assert.equal(getReminder(seed.id)!.status, "cancelled");
+  assert.equal(getReminder(seed.id)!.status_reason, "ignore");
+  assert.equal(pending.length, 1, JSON.stringify(afterTask));
+  const next = pending[0]!;
+  assert.notEqual(next.id, seed.id, "the next occurrence is a new row");
+  assert.equal(next.series_id, seed.series_id);
+  assert.ok(new Date(next.remind_at).getTime() > resumeTaskAt.getTime());
+  assert.ok(new Date(next.remind_at).getTime() <= real, "and it is already due");
+  assert.equal(matchingIgnoreRule(
+    { entityType: "reminder", entityId: next.id, matchKey: next.text, tag: next.tag, seriesId: next.series_id },
+  )?.id, recordRule.id);
+  assert.equal(reminderIsIgnored(next), true, "the remaining record rule still suppresses it");
+  assert.equal(
+    getDueReminders(new Date().toISOString())
+      .filter((row) => !reminderIsIgnored(row))
+      .some((row) => row.series_id === seed.series_id),
+    false,
+  );
+
+  const sent: string[] = [];
+  const api = {
+    sendMessage: async (_chat: number, text: string) => {
+      sent.push(text);
+      return {};
+    },
+  } as unknown as Api;
+  const interval = await registerReminderScheduler(api);
+  clearInterval(interval);
+  assert.equal(
+    sent.filter((text) => text.includes("Water the balcony plants")).length,
+    0,
+    "no notification while the record rule is active",
+  );
+  assert.equal(getReminder(next.id)!.status, "pending");
+
+  // 2B. Resume the record rule: exactly one valid future occurrence, deliverable.
+  const resumeRecordAt = new Date();
+  resumeIgnore(recordRule.id, "owner_chat:test", "resume the reminder", resumeRecordAt);
+  const series = getReminders().filter((row) => row.series_id === seed.series_id);
+  const live = series.filter((row) => row.status === "pending");
+  assert.equal(live.length, 1, JSON.stringify(series));
+  assert.ok(new Date(live[0]!.remind_at).getTime() > resumeRecordAt.getTime());
+  assert.equal(getReminder(next.id)!.status, "cancelled", "the missed occurrence does not burst");
+  assert.ok(series.every((row) => row.status !== "sent"));
+  assert.equal(reminderIsIgnored(live[0]!), false, "normal delivery eligibility is back");
+  const dueAt = new Date(new Date(live[0]!.remind_at).getTime() + 1000).toISOString();
+  assert.equal(
+    getDueReminders(dueAt).filter(
+      (row) => row.series_id === seed.series_id && !reminderIsIgnored(row),
+    ).length,
+    1,
+  );
+}
+
+// Codex 2C. Same text, different series: a record Ignore covers only its own series.
+{
+  const now = new Date("2026-11-16T16:00:00.000Z");
+  const a = createReminder("Check the inverter", "personal", "2026-11-17T03:30:00.000Z", "daily");
+  const b = createReminder("Check the inverter", "personal", "2026-11-17T14:30:00.000Z", "daily");
+  assert.notEqual(a.series_id, b.series_id);
+  const rule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "check the inverter",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(a.id),
+    instruction: "Ignore the morning inverter check",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(reminderIsIgnored(a, now), true);
+  assert.equal(reminderIsIgnored(b, now), false);
+  // Each series moves on the way deliverReminder moves it: sent, then a new row.
+  const advance = (row: typeof a, at: string) => {
+    assert.equal(transitionReminderStatus(row.id, "pending", "sent"), true);
+    return createReminder(row.text, row.tag, at, row.recurrence, { seriesId: row.series_id });
+  };
+  const aNext = advance(a, "2026-11-18T03:30:00.000Z");
+  const bNext = advance(b, "2026-11-18T14:30:00.000Z");
+  assert.notEqual(aNext.id, a.id);
+  assert.equal(reminderIsIgnored(aNext, now), true, "the rule follows series A");
+  assert.equal(reminderIsIgnored(bNext, now), false, "series B is untouched");
+  const again = applyIgnore({
+    entityType: "reminder",
+    matchKey: "check the inverter",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(aNext.id),
+    instruction: "Ignore the inverter check",
+    authRef: "owner_chat:test",
+  });
+  assert.equal(again.kind, "duplicate", "a later occurrence of series A is the same rule");
+  assert.equal(again.rule.id, rule.id);
+  const bRows = () =>
+    getReminders()
+      .filter((row) => row.series_id === b.series_id)
+      .map((row) => `${row.id}:${row.status}:${row.remind_at}`);
+  const bBefore = bRows();
+  resumeIgnore(rule.id, "owner_chat:test", "resume morning", now);
+  assert.deepEqual(bRows(), bBefore, "resuming A does not touch B's rows");
+  assert.equal(getReminder(aNext.id)!.status, "pending");
+  assert.equal(reminderIsIgnored(aNext, now), false);
+}
+
+// Codex 2D. A one-time reminder record Ignore stays on that exact id.
+{
+  const now = new Date("2026-11-16T16:00:00.000Z");
+  const first = createReminder("Collect the courier", "personal", "2026-11-20T05:00:00.000Z", "none");
+  const second = createReminder("Collect the courier", "personal", "2026-11-21T05:00:00.000Z", "none");
+  assert.equal(first.series_id, null);
+  assert.equal(second.series_id, null);
+  applyIgnore({
+    entityType: "reminder",
+    matchKey: "collect the courier",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(first.id),
+    instruction: "Ignore the courier reminder",
+    authRef: "owner_chat:test",
+  });
+  assert.equal(reminderIsIgnored(first, now), true);
+  assert.equal(reminderIsIgnored(second, now), false, "exact id, not text");
 }
 
 {

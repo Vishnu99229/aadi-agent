@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { addOneMonthYmd } from "./bill_cycle.js";
 import { assertTestSeam } from "./test_seam.js";
 
 export type MessageRole = "user" | "assistant" | "tool";
@@ -1003,6 +1004,75 @@ if (!tableHasColumn("bills", "suspected_duplicate_of")) {
 // it, which is fine - dedupe only runs on the trailing 7 days.
 if (!tableHasColumn("bills", "source_text")) {
   db.exec(`ALTER TABLE bills ADD COLUMN source_text TEXT`);
+}
+// Why a bill left `upcoming`. Resuming an ignore may only undo `ignore`.
+// The backfill runs once, in the same transaction that adds the column.
+if (!tableHasColumn("bills", "status_reason")) {
+  db.transaction(() => {
+    db.exec(`ALTER TABLE bills ADD COLUMN status_reason TEXT`);
+    backfillLegacyBillIgnoreProvenance();
+  })();
+}
+
+/**
+ * Before this column, three paths set a bill to `ignored`: the bill-card
+ * Ignore button, duplicate removal and skip-this-cycle. The card only acted
+ * on `upcoming` bills. Duplicate removal always leaves `suspected_duplicate_of`
+ * set. A cycle skip always leaves a row for the same biller on the next
+ * cycle's due date (it creates one, or one already existed). So an ignored
+ * row with neither, whose first record rule is the active rule its own card
+ * created, was changed by that card. Anything else stays NULL and Resume
+ * never resets it.
+ */
+export function backfillLegacyBillIgnoreProvenance(): number {
+  const candidates = db
+    .prepare(
+      `SELECT b.id, b.biller, b.due_date, b.thread_id
+         FROM bills b
+         JOIN ignore_rules r
+           ON r.entity_type = 'bill'
+          AND r.match_scope = 'record'
+          AND r.entity_id = CAST(b.id AS TEXT)
+          AND r.status = 'active'
+          AND r.instruction = 'telegram:bill-ignore'
+          AND r.auth_ref = 'telegram:callback:' || b.id
+        WHERE b.status = 'ignored'
+          AND b.status_reason IS NULL
+          AND b.suspected_duplicate_of IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM ignore_rules earlier
+             WHERE earlier.entity_type = 'bill'
+               AND earlier.match_scope = 'record'
+               AND earlier.entity_id = r.entity_id
+               AND earlier.id < r.id
+          )`,
+    )
+    .all() as Array<{ id: number; biller: string; due_date: string; thread_id: string }>;
+  const nextCycle = db.prepare(
+    `SELECT 1 FROM bills
+      WHERE id != ?
+        AND due_date = ?
+        AND (LOWER(biller) = LOWER(?) OR thread_id = ?)
+      LIMIT 1`,
+  );
+  const mark = db.prepare(
+    `UPDATE bills SET status_reason = 'ignore'
+      WHERE id = ? AND status = 'ignored' AND status_reason IS NULL`,
+  );
+  let marked = 0;
+  for (const bill of candidates) {
+    let nextDue: string;
+    try {
+      nextDue = addOneMonthYmd(bill.due_date);
+    } catch {
+      continue;
+    }
+    if (nextCycle.get(bill.id, nextDue, bill.biller, bill.thread_id)) {
+      continue;
+    }
+    marked += mark.run(bill.id).changes;
+  }
+  return marked;
 }
 
 if (!tableHasColumn("accounts", "relationship")) {
@@ -2092,6 +2162,8 @@ export function expireOldPendingAttachmentAlerts(hours: number): number {
 }
 
 export type BillStatus = "upcoming" | "paid" | "ignored";
+/** Why a bill left `upcoming`. Only `ignore` (legacy card Ignore) is undone by Resume. */
+export type BillStatusReason = "ignore" | "skip_cycle" | "duplicate" | "paid" | "other";
 
 export interface BillRecord {
   id: number;
@@ -2104,6 +2176,7 @@ export interface BillRecord {
   created_at: string;
   suspected_duplicate_of: number | null;
   source_text: string | null;
+  status_reason: BillStatusReason | null;
 }
 
 export type ImportantDateType = "birthday" | "anniversary" | "other";
@@ -2120,7 +2193,7 @@ export interface ImportantDateRecord {
 }
 
 const BILL_COLUMNS = `id, biller, amount, currency, due_date, thread_id,
-  status, created_at, suspected_duplicate_of, source_text`;
+  status, created_at, suspected_duplicate_of, source_text, status_reason`;
 
 export function createBill(
   biller: string,
@@ -2256,14 +2329,30 @@ export function transitionBillStatus(
   id: number,
   from: BillStatus | BillStatus[],
   to: BillStatus,
+  reason?: BillStatusReason,
 ): boolean {
   const statuses = Array.isArray(from) ? from : [from];
   const placeholders = statuses.map(() => "?").join(", ");
+  const nextReason =
+    to === "upcoming" ? null : (reason ?? (to === "paid" ? "paid" : "other"));
   const result = db
     .prepare(
-      `UPDATE bills SET status = ? WHERE id = ? AND status IN (${placeholders})`,
+      `UPDATE bills SET status = ?, status_reason = ?
+        WHERE id = ? AND status IN (${placeholders})`,
     )
-    .run(to, id, ...statuses);
+    .run(to, nextReason, id, ...statuses);
+  return result.changes === 1;
+}
+
+/** Undo only a status change the Ignore feature itself made. A later skip,
+ *  duplicate removal or payment carries its own reason and is left alone. */
+export function restoreIgnoreOwnedBill(id: number): boolean {
+  const result = db
+    .prepare(
+      `UPDATE bills SET status = 'upcoming', status_reason = NULL
+        WHERE id = ? AND status = 'ignored' AND status_reason = 'ignore'`,
+    )
+    .run(id);
   return result.changes === 1;
 }
 

@@ -22,7 +22,7 @@ import {
   listActiveIgnoreRules,
   markIgnoreRuleResumed,
   recordIgnoreRuleEvent,
-  transitionBillStatus,
+  restoreIgnoreOwnedBill,
   transitionReminderStatus,
   type BillRecord,
   type IgnoreDuration,
@@ -47,6 +47,8 @@ export type IgnoreSubject = {
   relatedBillId?: number | null;
   relatedTaskId?: number | null;
   fromHeader?: string;
+  /** Recurring reminders only: the stable schedule id. */
+  seriesId?: number | null;
 };
 
 export type IgnoreApplyInput = {
@@ -176,6 +178,9 @@ function tagMatches(ruleTag: IgnoreTag, subjectTag?: ItemTag): boolean {
 
 function activeRules(now = new Date()): IgnoreRuleRecord[] {
   const expired = expireDueIgnoreRules(nowIso(now));
+  if (expired.length > 0) {
+    invalidateIgnoreCache();
+  }
   for (const rule of expired) {
     restoreAfterIgnore(rule, now);
   }
@@ -230,6 +235,13 @@ export function matchingIgnoreRule(
       if (entityId && rule.entity_id === entityId) {
         return rule;
       }
+      if (
+        subject.entityType === "reminder" &&
+        subject.seriesId != null &&
+        recordRuleSeriesId(rule) === subject.seriesId
+      ) {
+        return rule;
+      }
       continue;
     }
     if (keysOverlap(rule.match_key, matchKey, aliases)) {
@@ -237,6 +249,26 @@ export function matchingIgnoreRule(
     }
   }
   return undefined;
+}
+
+/**
+ * A record rule on a recurring reminder stands for its whole schedule, so it
+ * keeps matching after the scheduler or a restore writes the next occurrence.
+ * One-time reminders have no series and stay matched by exact id.
+ */
+function recordRuleSeriesId(rule: IgnoreRuleRecord): number | null {
+  if (rule.entity_type !== "reminder" || rule.match_scope !== "record" || !rule.entity_id) {
+    return null;
+  }
+  const target = getReminder(Number(rule.entity_id));
+  if (!target || target.recurrence === "none") {
+    return null;
+  }
+  return target.series_id;
+}
+
+function reminderSeriesId(reminder: ReminderRecord): number | null {
+  return reminder.recurrence === "none" ? null : reminder.series_id;
 }
 
 export function isIgnored(subject: IgnoreSubject, now = new Date()): boolean {
@@ -278,6 +310,7 @@ export function reminderIsIgnored(reminder: ReminderRecord, now = new Date()): b
         entityId: reminder.id,
         matchKey: reminder.text,
         tag: reminder.tag,
+        seriesId: reminderSeriesId(reminder),
       },
       now,
     )
@@ -435,11 +468,26 @@ function activeRuleFor(
   matchKey: string,
 ): IgnoreRuleRecord | undefined {
   if (input.matchScope === "record" && input.entityId) {
-    return getActiveIgnoreRuleByRecord(
+    const exact = getActiveIgnoreRuleByRecord(
       input.entityType,
       String(input.entityId),
       input.matchScope,
       input.tag,
+    );
+    if (exact || input.entityType !== "reminder") {
+      return exact;
+    }
+    const target = getReminder(Number(input.entityId));
+    const seriesId = target ? reminderSeriesId(target) : null;
+    if (seriesId == null) {
+      return undefined;
+    }
+    return listActiveIgnoreRules().find(
+      (rule) =>
+        rule.entity_type === "reminder" &&
+        rule.match_scope === "record" &&
+        rule.tag === input.tag &&
+        recordRuleSeriesId(rule) === seriesId,
     );
   }
   return getActiveIgnoreRuleByKey(
@@ -475,17 +523,25 @@ export function resumeIgnore(
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Resume and temporary expiry share this. Suppression ends; schedules continue. */
+/**
+ * Resume and temporary expiry share this. It runs after the rule is marked
+ * ended, so every check below sees only the rules still active.
+ *
+ * Restoring never makes anything deliverable by itself. It cancels missed
+ * occurrences and writes the next one in the same series; the scheduler then
+ * checks every active rule again before sending (processDue, deliverReminder).
+ * A rule that still covers the reminder, its series, task, bill or text keeps
+ * the new occurrence suppressed.
+ */
 export function restoreAfterIgnore(rule: IgnoreRuleRecord, now = new Date()): void {
   if (
     rule.entity_type === "bill" &&
     rule.match_scope === "record" &&
     rule.entity_id
   ) {
-    const bill = getBill(Number(rule.entity_id));
-    if (bill?.status === "ignored") {
-      transitionBillStatus(bill.id, "ignored", "upcoming");
-    }
+    // Resume lifts the registry rule. The bill's own state changes only when
+    // provenance shows the old card Ignore made it; a skip or duplicate wins.
+    restoreIgnoreOwnedBill(Number(rule.entity_id));
   }
   if (rule.entity_type === "bill") {
     restoreBillReminders(rule, now);
@@ -635,26 +691,20 @@ function ruleSuppressesReminder(rule: IgnoreRuleRecord, reminder: ReminderRecord
     return false;
   }
   if (rule.match_scope === "record") {
-    return rule.entity_id != null && rule.entity_id === String(reminder.id);
+    if (rule.entity_id != null && rule.entity_id === String(reminder.id)) {
+      return true;
+    }
+    const seriesId = reminderSeriesId(reminder);
+    return seriesId != null && recordRuleSeriesId(rule) === seriesId;
   }
   return keysOverlap(rule.match_key, normalizeIgnoreKey(reminder.text), [reminder.text]);
 }
 
 function restoreReminderRules(rule: IgnoreRuleRecord, now: Date): void {
-  const matched = getReminders().filter((reminder) => ruleSuppressesReminder(rule, reminder));
-  if (rule.match_scope === "record" && rule.entity_id) {
-    const seed = getReminder(Number(rule.entity_id));
-    if (!seed) {
-      return;
-    }
-    const series =
-      seed.series_id == null
-        ? [seed]
-        : getReminders().filter((reminder) => reminder.series_id === seed.series_id);
-    settleMatchedReminders(series, now);
-    return;
-  }
-  settleMatchedReminders(matched, now);
+  settleMatchedReminders(
+    getReminders().filter((reminder) => ruleSuppressesReminder(rule, reminder)),
+    now,
+  );
 }
 
 function seriesKey(reminder: ReminderRecord): string {

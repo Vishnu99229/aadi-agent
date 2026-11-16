@@ -440,7 +440,7 @@ export async function handleBillDuplicateCallback(
   }
   // Mark as duplicate: cancel this bill's reminders and set status 'ignored'.
   cancelPendingRemindersForBill(bill.id);
-  if (transitionBillStatus(bill.id, ["upcoming", "paid"], "ignored")) {
+  if (transitionBillStatus(bill.id, ["upcoming", "paid"], "ignored", "duplicate")) {
     console.log(`Bill ${bill.id}: status -> ignored (marked as duplicate)`);
   }
   await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
