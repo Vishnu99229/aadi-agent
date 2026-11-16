@@ -2,7 +2,8 @@
 export type SettingPhrase =
   | { kind: "voice"; on: boolean }
   | { kind: "keyboard"; on: boolean }
-  | { kind: "panel" };
+  | { kind: "panel" }
+  | { kind: "ignored" };
 
 const VOICE = "(?:the\\s+)?(?:voice|spoken)\\s+(?:repl(?:ies|y)|answers?|responses?)";
 
@@ -29,6 +30,13 @@ export function parseSettingPhrase(text: string): SettingPhrase | undefined {
   }
   if (/^(?:please\s+)?(?:show|open)\s+(?:me\s+)?(?:my\s+|the\s+)?settings$/i.test(clean)) {
     return { kind: "panel" };
+  }
+  if (
+    /^(?:please\s+)?(?:show|list|open)\s+(?:me\s+)?(?:my\s+|the\s+)?ignored(?:\s+items)?$/i.test(
+      clean,
+    )
+  ) {
+    return { kind: "ignored" };
   }
   return undefined;
 }

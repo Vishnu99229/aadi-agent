@@ -1,5 +1,6 @@
 import type { LlmTool } from "../llm.js";
 import { getBills, type BillStatus } from "../db.js";
+import { billIsIgnored } from "../ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 
@@ -21,7 +22,12 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
           "paid_this_month",
           "ignored",
         ],
-        description: "Which bills to list. Default all.",
+        description: "Which bills to list. Default all. upcoming and overdue omit ignored sources.",
+      },
+      include_ignored: {
+        type: "boolean",
+        description:
+          "Include bills from ignored sources in upcoming/overdue/all. Default false.",
       },
     },
     required: [],
@@ -38,8 +44,9 @@ function todayYmd(): string {
 }
 
 export function handler(input: unknown): string {
-  const values = input as { filter?: unknown };
+  const values = input as { filter?: unknown; include_ignored?: unknown };
   const filter = values.filter ?? "all";
+  const includeIgnored = values.include_ignored === true;
   if (
     filter !== "all" &&
     filter !== "upcoming" &&
@@ -55,6 +62,13 @@ export function handler(input: unknown): string {
   const today = todayYmd();
   const month = today.slice(0, 7);
   const bills = getBills().filter((bill) => {
+    const suppressed = billIsIgnored(bill);
+    if (filter === "ignored") {
+      return bill.status === "ignored" || suppressed;
+    }
+    if (!includeIgnored && suppressed && bill.status !== "paid") {
+      return false;
+    }
     if (filter === "all") {
       return true;
     }
@@ -66,9 +80,6 @@ export function handler(input: unknown): string {
     }
     if (filter === "paid") {
       return bill.status === "paid";
-    }
-    if (filter === "ignored") {
-      return bill.status === "ignored";
     }
     return bill.status === "paid" && bill.created_at.startsWith(month);
   });

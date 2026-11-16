@@ -30,6 +30,7 @@ import {
 } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
+import { taskIsIgnored } from "./ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -461,10 +462,12 @@ async function processCandidate(
     if (api) await sendPromiseDuplicateAlert(api, task, existing);
     console.log(`Promise ${task.id}: suspected duplicate of ${existing.id}`);
   }
-  const reminders = scheduleRemindersForPromise(
-    task,
-    recipientLabel(candidate.recipient),
-  );
+  const reminders = taskIsIgnored(task)
+    ? 0
+    : scheduleRemindersForPromise(
+        task,
+        recipientLabel(candidate.recipient),
+      );
   console.log(
     `Promise ${task.id}: tracked (deadline=${task.deadline ?? "none"}, ` +
       `reminders=${reminders}, account=${account.id})`,

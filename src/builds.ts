@@ -22,6 +22,7 @@ import {
   wrapBuildPrompt,
 } from "./build_logic.js";
 import { config } from "./config.js";
+import { buildNotificationIsIgnored } from "./ignore.js";
 import {
   archiveCloudAgent,
   createCloudAgent,
@@ -122,6 +123,18 @@ export function setBuildsTestApi(api: Api | undefined): void {
 
 function ownerApi(): Api {
   return testApi ?? new Api(config.telegramBotToken);
+}
+
+async function notifyBuild(
+  text: string,
+  buildId: number,
+  extra?: { reply_markup?: InlineKeyboard },
+): Promise<void> {
+  if (buildNotificationIsIgnored(text, buildId)) {
+    console.log(`Build ${buildId}: notice suppressed by ignore rule`);
+    return;
+  }
+  await ownerApi().sendMessage(config.ownerTelegramId, text, extra);
 }
 
 /**
@@ -365,10 +378,7 @@ async function finishCursorRun(build: BuildRecord): Promise<void> {
     const error = oneLineError(run.result);
     updateBuild(build.id, { status: "failed", error });
     console.log(`Build ${build.id}: status -> failed`);
-    await ownerApi().sendMessage(
-      config.ownerTelegramId,
-      `Build #${build.id} failed: ${error}`,
-    );
+    await notifyBuild(`Build #${build.id} failed: ${error}`, build.id);
     return;
   }
 
@@ -438,9 +448,9 @@ async function processChecks(build: BuildRecord): Promise<void> {
       status: "failed",
       error: "The agent finished without a pull request.",
     });
-    await ownerApi().sendMessage(
-      config.ownerTelegramId,
+    await notifyBuild(
       `Build #${build.id} failed: The agent finished without a pull request.`,
+      build.id,
     );
     return;
   }
@@ -488,7 +498,7 @@ async function processChecks(build: BuildRecord): Promise<void> {
   }
   if (checks.state === "failed") {
     const text = failedChecksText(checks.reason ?? "CI failed");
-    await ownerApi().sendMessage(config.ownerTelegramId, text, {
+    await notifyBuild(text, build.id, {
       reply_markup: failedCheckKeyboard(build.id),
     });
     updateBuild(build.id, { status: "failed", error: text });

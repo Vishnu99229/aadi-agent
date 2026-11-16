@@ -4,6 +4,7 @@ import {
   type ItemTag,
   type TaskStatus,
 } from "../db.js";
+import { taskIsIgnored } from "../ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 
@@ -30,6 +31,11 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         description:
           "Optional Asia/Kolkata calendar date formatted YYYY-MM-DD.",
       },
+      include_ignored: {
+        type: "boolean",
+        description:
+          "Include tasks Vishnu asked to ignore. Default false. Use true only when he asked about an ignored item.",
+      },
     },
     required: [],
   },
@@ -55,6 +61,7 @@ export function handler(input: unknown): string {
     tag?: unknown;
     status?: unknown;
     due_date?: unknown;
+    include_ignored?: unknown;
   };
   if (
     values.tag !== undefined &&
@@ -87,13 +94,15 @@ export function handler(input: unknown): string {
     throw new Error("due_date must be formatted YYYY-MM-DD.");
   }
 
+  const includeIgnored = values.include_ignored === true;
   const tasks = getTasks().filter(
     (task) =>
       (!tag || task.tag === tag) &&
       (!status || task.status === status) &&
       (!values.due_date ||
         (task.due_at !== null &&
-          dateInKolkata(task.due_at) === values.due_date)),
+          dateInKolkata(task.due_at) === values.due_date)) &&
+      (includeIgnored || !taskIsIgnored(task)),
   );
 
   if (tasks.length === 0) {
@@ -103,7 +112,9 @@ export function handler(input: unknown): string {
   return tasks
     .map(
       (task) =>
-        `#${task.id} [${task.status}] (${task.tag}) ${task.text}${
+        `#${task.id} [${task.status}] (${task.tag})${
+          includeIgnored && taskIsIgnored(task) ? " [ignored]" : ""
+        } ${task.text}${
           task.due_at ? ` — due ${task.due_at}` : ""
         }`,
     )

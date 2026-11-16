@@ -361,6 +361,51 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_builds_status_updated
     ON builds (status, updated_at);
+
+  CREATE TABLE IF NOT EXISTS ignore_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL DEFAULT 'owner',
+    tag TEXT NOT NULL CHECK (tag IN ('work', 'personal', 'both')),
+    entity_type TEXT NOT NULL CHECK (entity_type IN (
+      'bill', 'task', 'reminder', 'date', 'email_source',
+      'account', 'notification', 'build', 'calendar_event'
+    )),
+    entity_id TEXT,
+    match_key TEXT NOT NULL,
+    match_scope TEXT NOT NULL CHECK (match_scope IN ('record', 'source', 'category')),
+    duration TEXT NOT NULL CHECK (duration IN ('permanent', 'temporary')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT,
+    instruction TEXT NOT NULL,
+    auth_ref TEXT NOT NULL,
+    reason TEXT,
+    resumed_at TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+      CHECK (status IN ('active', 'resumed', 'expired'))
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_key
+    ON ignore_rules (entity_type, match_key, match_scope, tag)
+    WHERE status = 'active';
+  CREATE INDEX IF NOT EXISTS idx_ignore_rules_lookup
+    ON ignore_rules (status, entity_type, match_key);
+  CREATE INDEX IF NOT EXISTS idx_ignore_rules_expiry
+    ON ignore_rules (status, expires_at);
+
+  CREATE TABLE IF NOT EXISTS ignore_rule_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN (
+      'created', 'resumed', 'expired', 'duplicate'
+    )),
+    at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    auth_ref TEXT NOT NULL,
+    instruction TEXT,
+    detail TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_ignore_rule_events_rule
+    ON ignore_rule_events (rule_id, at);
 `);
 
 const buildsSchema =
@@ -4927,4 +4972,217 @@ export function retryScheduledSend(id: number, retryAt: string): number {
     "UPDATE scheduled_sends SET status = 'scheduled', retry_at = ?, write_failures = write_failures + 1 WHERE id = ?",
   ).run(retryAt, id);
   return getScheduledSend(id)?.write_failures ?? 0;
+}
+
+export type IgnoreEntityType =
+  | "bill"
+  | "task"
+  | "reminder"
+  | "date"
+  | "email_source"
+  | "account"
+  | "notification"
+  | "build"
+  | "calendar_event";
+
+export type IgnoreMatchScope = "record" | "source" | "category";
+export type IgnoreDuration = "permanent" | "temporary";
+export type IgnoreRuleStatus = "active" | "resumed" | "expired";
+export type IgnoreTag = ItemTag | "both";
+
+export interface IgnoreRuleRecord {
+  id: number;
+  owner_id: string;
+  tag: IgnoreTag;
+  entity_type: IgnoreEntityType;
+  entity_id: string | null;
+  match_key: string;
+  match_scope: IgnoreMatchScope;
+  duration: IgnoreDuration;
+  created_at: string;
+  expires_at: string | null;
+  instruction: string;
+  auth_ref: string;
+  reason: string | null;
+  resumed_at: string | null;
+  status: IgnoreRuleStatus;
+}
+
+export interface IgnoreRuleEventRecord {
+  id: number;
+  rule_id: number;
+  action: "created" | "resumed" | "expired" | "duplicate";
+  at: string;
+  auth_ref: string;
+  instruction: string | null;
+  detail: string | null;
+}
+
+const IGNORE_RULE_COLUMNS = `id, owner_id, tag, entity_type, entity_id, match_key,
+  match_scope, duration, created_at, expires_at, instruction, auth_ref, reason,
+  resumed_at, status`;
+
+export interface CreateIgnoreRuleInput {
+  ownerId?: string;
+  tag: IgnoreTag;
+  entityType: IgnoreEntityType;
+  entityId?: string | null;
+  matchKey: string;
+  matchScope: IgnoreMatchScope;
+  duration: IgnoreDuration;
+  expiresAt?: string | null;
+  instruction: string;
+  authRef: string;
+  reason?: string | null;
+}
+
+export function insertIgnoreRule(
+  input: CreateIgnoreRuleInput,
+): IgnoreRuleRecord | undefined {
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO ignore_rules (
+           owner_id, tag, entity_type, entity_id, match_key, match_scope,
+           duration, expires_at, instruction, auth_ref, reason
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.ownerId ?? "owner",
+        input.tag,
+        input.entityType,
+        input.entityId ?? null,
+        input.matchKey,
+        input.matchScope,
+        input.duration,
+        input.expiresAt ?? null,
+        input.instruction,
+        input.authRef,
+        input.reason ?? null,
+      );
+    return getIgnoreRule(Number(result.lastInsertRowid));
+  } catch {
+    return undefined;
+  }
+}
+
+export function getIgnoreRule(id: number): IgnoreRuleRecord | undefined {
+  return db
+    .prepare(`SELECT ${IGNORE_RULE_COLUMNS} FROM ignore_rules WHERE id = ?`)
+    .get(id) as IgnoreRuleRecord | undefined;
+}
+
+export function getActiveIgnoreRuleByKey(
+  entityType: IgnoreEntityType,
+  matchKey: string,
+  matchScope: IgnoreMatchScope,
+  tag: IgnoreTag,
+): IgnoreRuleRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${IGNORE_RULE_COLUMNS}
+         FROM ignore_rules
+        WHERE status = 'active'
+          AND entity_type = ?
+          AND match_key = ?
+          AND match_scope = ?
+          AND tag = ?`,
+    )
+    .get(entityType, matchKey, matchScope, tag) as IgnoreRuleRecord | undefined;
+}
+
+export function listActiveIgnoreRules(): IgnoreRuleRecord[] {
+  return db
+    .prepare(
+      `SELECT ${IGNORE_RULE_COLUMNS}
+         FROM ignore_rules
+        WHERE status = 'active'
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all() as IgnoreRuleRecord[];
+}
+
+export function listIgnoreRulesByStatus(
+  status: IgnoreRuleStatus,
+): IgnoreRuleRecord[] {
+  return db
+    .prepare(
+      `SELECT ${IGNORE_RULE_COLUMNS}
+         FROM ignore_rules
+        WHERE status = ?
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all(status) as IgnoreRuleRecord[];
+}
+
+export function recordIgnoreRuleEvent(
+  ruleId: number,
+  action: IgnoreRuleEventRecord["action"],
+  authRef: string,
+  instruction?: string | null,
+  detail?: string | null,
+): void {
+  db.prepare(
+    `INSERT INTO ignore_rule_events (rule_id, action, auth_ref, instruction, detail)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(ruleId, action, authRef, instruction ?? null, detail ?? null);
+}
+
+export function listIgnoreRuleEvents(ruleId: number): IgnoreRuleEventRecord[] {
+  return db
+    .prepare(
+      `SELECT id, rule_id, action, at, auth_ref, instruction, detail
+         FROM ignore_rule_events
+        WHERE rule_id = ?
+        ORDER BY at ASC, id ASC`,
+    )
+    .all(ruleId) as IgnoreRuleEventRecord[];
+}
+
+export function markIgnoreRuleResumed(
+  id: number,
+  resumedAt: string,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE ignore_rules
+          SET status = 'resumed', resumed_at = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(resumedAt, id);
+  return result.changes === 1;
+}
+
+export function markIgnoreRuleExpired(
+  id: number,
+  expiredAt: string,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE ignore_rules
+          SET status = 'expired', resumed_at = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(expiredAt, id);
+  return result.changes === 1;
+}
+
+export function expireDueIgnoreRules(nowIso: string): number {
+  const due = db
+    .prepare(
+      `SELECT id FROM ignore_rules
+        WHERE status = 'active'
+          AND duration = 'temporary'
+          AND expires_at IS NOT NULL
+          AND expires_at <= ?`,
+    )
+    .all(nowIso) as Array<{ id: number }>;
+  let count = 0;
+  for (const row of due) {
+    if (markIgnoreRuleExpired(row.id, nowIso)) {
+      recordIgnoreRuleEvent(row.id, "expired", "scheduler", null, nowIso);
+      count += 1;
+    }
+  }
+  return count;
 }

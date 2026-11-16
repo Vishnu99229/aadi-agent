@@ -2,6 +2,7 @@ import { InlineKeyboard, type Api, type Context } from "grammy";
 import { everyMs, type IntervalJob } from "./scheduler.js";
 import { google } from "googleapis";
 import { config } from "./config.js";
+import { calendarEventIsIgnored } from "./ignore.js";
 import {
   clearMeetingRebrief,
   deleteSetting,
@@ -172,6 +173,10 @@ async function sendBriefAtThreshold(
   const startKey = new Date(startIso).toISOString();
   const endKey = new Date(endIso).toISOString();
   const title = event.summary?.trim() || "(Untitled event)";
+  if (calendarEventIsIgnored(title, "work")) {
+    console.log(`Pre-meeting brief skipped: event=${event.id} reason=ignored`);
+    return undefined;
+  }
 
   const built = buildBriefForEvent(event, account, self, {
     minutesUntil: thresholdMinutes,

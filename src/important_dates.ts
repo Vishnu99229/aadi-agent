@@ -8,6 +8,7 @@ import {
   getImportantDates,
   type ImportantDateRecord,
 } from "./db.js";
+import { dateIsIgnored } from "./ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const REMINDER_HOUR = 9;
@@ -76,8 +77,9 @@ export function importantDatesForBrief(
   for (let offset = 0; offset < window; offset += 1) {
     targetDays.add(addDaysYmd(todayYmd, offset).slice(5));
   }
-  return getImportantDates().filter((record) =>
-    targetDays.has(record.month_day),
+  return getImportantDates().filter(
+    (record) =>
+      targetDays.has(record.month_day) && !dateIsIgnored(record),
   );
 }
 
@@ -112,6 +114,9 @@ export async function runImportantDateReminders(api: Api): Promise<void> {
   const threeDays = addDaysMonthDay(monthDay, 3, year);
 
   for (const record of getImportantDates()) {
+    if (dateIsIgnored(record)) {
+      continue;
+    }
     if (
       (record.type === "birthday" || record.type === "anniversary") &&
       matchesReminderDay(record, threeDays)

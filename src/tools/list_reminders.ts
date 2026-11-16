@@ -4,6 +4,7 @@ import {
   type ItemTag,
   type ReminderStatus,
 } from "../db.js";
+import { reminderIsIgnored } from "../ignore.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -23,13 +24,22 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         enum: ["pending", "sent", "cancelled"],
         description: "Optional reminder status filter.",
       },
+      include_ignored: {
+        type: "boolean",
+        description:
+          "Include reminders Vishnu asked to ignore. Default false.",
+      },
     },
     required: [],
   },
 };
 
 export function handler(input: unknown): string {
-  const values = input as { tag?: unknown; status?: unknown };
+  const values = input as {
+    tag?: unknown;
+    status?: unknown;
+    include_ignored?: unknown;
+  };
   if (
     values.tag !== undefined &&
     values.tag !== "work" &&
@@ -58,10 +68,12 @@ export function handler(input: unknown): string {
       ? (values.status as ReminderStatus)
       : undefined;
 
+  const includeIgnored = values.include_ignored === true;
   const reminders = getReminders().filter(
     (reminder) =>
       (!tag || reminder.tag === tag) &&
-      (!status || reminder.status === status),
+      (!status || reminder.status === status) &&
+      (includeIgnored || !reminderIsIgnored(reminder)),
   );
 
   if (reminders.length === 0) {

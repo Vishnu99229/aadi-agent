@@ -1,3 +1,4 @@
+import { reminderIsIgnored } from "./ignore.js";
 import { runWithPriority } from "./governor.js";
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import { config } from "./config.js";
@@ -134,7 +135,9 @@ async function processDue(
   processingDueReminders = true;
 
   try {
-    const reminders = getDueReminders(new Date().toISOString());
+    const reminders = getDueReminders(new Date().toISOString()).filter(
+      (reminder) => !reminderIsIgnored(reminder),
+    );
     for (const reminder of reminders) {
       try {
         await deliverReminder(api, reminder, missedAtStartup.has(reminder.id));

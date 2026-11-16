@@ -23,7 +23,14 @@ export const salesAgent: SpecialistDefinition = {
     { name: "add_sales_fact", effect: "write", retry: "never" },
     { name: "remove_sales_fact", effect: "write", retry: "never" },
   ],
-  sharedTools: ["get_current_time", "react_to_message", "resolve_contact"],
+  sharedTools: [
+    "get_current_time",
+    "react_to_message",
+    "resolve_contact",
+    "list_ignored",
+    "ignore_item",
+    "resume_item",
+  ],
   routing: {
     patterns: [/\b(?:accounts?|deals?|pipeline|prospects?|sales\s+facts?|crm|where\s+are\s+we\s+with)\b/i],
     commandKinds: ["sales_fact_add", "sales_fact_remove", "account"],
@@ -66,10 +73,11 @@ export const salesAgent: SpecialistDefinition = {
       },
       handler: async (input) => {
         const { decodedAccounts } = await import("../../accounts.js");
+        const { accountIsIgnored } = await import("../../ignore.js");
         const quietDays = typeof input.quiet_days === "number" && input.quiet_days > 0 ? input.quiet_days : 5;
         const now = Date.now();
         const quiet = decodedAccounts()
-          .filter((account) => account.waiting_on === "them")
+          .filter((account) => account.waiting_on === "them" && !accountIsIgnored(account))
           .map((account) => {
             const last = account.last_activity_at ? Date.parse(account.last_activity_at) : Number.NaN;
             const silentDays = Number.isNaN(last) ? undefined : Math.floor((now - last) / DAY_MS);

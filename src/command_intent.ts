@@ -21,7 +21,10 @@ export type CommandKind =
   | "date"
   | "account"
   | "memory"
-  | "qa_bank";
+  | "qa_bank"
+  | "ignore"
+  | "resume"
+  | "ignore_list";
 
 interface CommandFamily {
   /** Tools that carry the command out. */
@@ -131,10 +134,29 @@ const FAMILIES: Record<CommandKind, CommandFamily> = {
     notRun: "your task list wasn't changed",
   },
   bill: {
-    action: ["mark_bill_paid", "ignore_bill"],
+    action: ["mark_bill_paid", "ignore_bill", "ignore_item"],
     lookup: ["list_bills"],
-    retry: "For a bill, call list_bills and then mark_bill_paid, or ignore_bill, now.",
+    retry: "For a bill, call list_bills and then mark_bill_paid, ignore_bill, or ignore_item now.",
     notRun: "no bill was marked paid or skipped",
+  },
+  ignore: {
+    action: ["ignore_item", "ignore_bill"],
+    lookup: ["list_ignored", "list_tasks", "list_bills", "list_reminders"],
+    retry: "To ignore something, call ignore_item now with what he named.",
+    notRun: "nothing was ignored",
+  },
+  resume: {
+    action: ["resume_item"],
+    lookup: ["list_ignored"],
+    retry: "To resume tracking, call resume_item now with what he named.",
+    notRun: "nothing was resumed",
+  },
+  ignore_list: {
+    action: ["list_ignored"],
+    lookup: [],
+    force: "list_ignored",
+    retry: "To show ignored items, call list_ignored now.",
+    notRun: "ignored items were not listed",
   },
   date_add: {
     action: ["add_date"],
@@ -280,7 +302,30 @@ const ADD_TASK = [
 ];
 const CHANGE_TASK = [
   /\b(?:mark|tick|check off)\b[^.?!\n]{0,50}?\b(?:as\s+)?(?:done|complete|completed|finished)\b/i,
-  /\b(?:complete|finish|close|delete|remove|drop|dismiss|ignore)\s+(?:the\s+|my\s+|that\s+|this\s+)?(?:[\p{L}\p{N}'-]+\s+){0,3}?tasks?\b/iu,
+  /\b(?:complete|finish|close|delete|remove|drop|dismiss)\s+(?:the\s+|my\s+|that\s+|this\s+)?(?:[\p{L}\p{N}'-]+\s+){0,3}?tasks?\b/iu,
+];
+const IGNORE = [
+  /\bignore\b/i,
+  /\bstop bothering me\b/i,
+  /\bdon'?t\s+(?:remind|ping|bother|track)\b/i,
+  /\bdo not\s+(?:remind|ping|bother|track)\b/i,
+  /\bi don'?t want to see\b/i,
+  /\bforget about this\b/i,
+  /\bstop tracking\b/i,
+  /\bstop reminding me\b/i,
+];
+const RESUME = [
+  /\b(?:start|resume)\s+track(?:ing)?\b/i,
+  /\bstart reminding me\b/i,
+  /\btrack\b[^.?\n]{0,40}\bagain\b/i,
+  /\bundo the ignore\b/i,
+  /\bstop ignoring\b/i,
+  /\bresume\b[^.?\n]{0,40}\b(?:bill|task|reminder|alert|item)/i,
+  /\bresume all ignored\b/i,
+];
+const LIST_IGNORED = [
+  /\bwhat have i asked you to ignore\b/i,
+  /\b(?:show|list|open)\b[^.?\n]{0,20}\bignored(?:\s+items)?\b/i,
 ];
 const BILL = [
   /\bmark\b[^.?!\n]{0,50}?\bpaid\b/i,
@@ -320,6 +365,9 @@ const SPECIFIC: readonly CommandKind[] = [
   "account",
   "memory",
   "qa_bank",
+  "ignore",
+  "resume",
+  "ignore_list",
 ];
 
 /** The explicit commands in his own words, in English. Other languages stay the
@@ -401,6 +449,16 @@ export function commandIntents(ownWords: string): CommandKind[] {
   }
   if (plain && QA_BANK.test(text)) {
     found.add("qa_bank");
+  }
+  if (any(LIST_IGNORED)) {
+    found.add("ignore_list");
+  }
+  if (any(RESUME) && !notAnInstruction(text, { negationAllowed: true })) {
+    found.add("resume");
+  }
+  if (any(IGNORE) && !notAnInstruction(text, { negationAllowed: true })) {
+    found.add("ignore");
+    found.delete("task");
   }
   if (SPECIFIC.some((kind) => found.has(kind))) {
     found.delete("calendar");

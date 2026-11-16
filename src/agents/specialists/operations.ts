@@ -34,12 +34,28 @@ export const operationsAgent: SpecialistDefinition = {
     { name: "mark_bill_paid", effect: "write", retry: "never" },
     { name: "ignore_bill", effect: "write", retry: "never" },
   ],
-  sharedTools: ["get_current_time", "react_to_message"],
+  sharedTools: [
+    "get_current_time",
+    "react_to_message",
+    "list_ignored",
+    "ignore_item",
+    "resume_item",
+  ],
   routing: {
     patterns: [
-      /\b(?:remind(?:er|ers)?|tasks?|to-?dos?|bills?|renewals?|birthdays?|anniversar(?:y|ies)|subscriptions?|promise[ds]?)\b/i,
+      /\b(?:remind(?:er|ers)?|tasks?|to-?dos?|bills?|renewals?|birthdays?|anniversar(?:y|ies)|subscriptions?|promise[ds]?|ignored items)\b/i,
     ],
-    commandKinds: ["reminder", "task_add", "task", "bill", "date_add", "date"],
+    commandKinds: [
+      "reminder",
+      "task_add",
+      "task",
+      "bill",
+      "date_add",
+      "date",
+      "ignore",
+      "resume",
+      "ignore_list",
+    ],
   },
   capabilities: [
     {
@@ -85,6 +101,7 @@ export const operationsAgent: SpecialistDefinition = {
           });
         }
         const { trackPayableBill } = await import("../../bills.js");
+        const { billIsIgnored } = await import("../../ignore.js");
         const tracked = trackPayableBill({
           biller,
           amount,
@@ -100,13 +117,17 @@ export const operationsAgent: SpecialistDefinition = {
           remindAt = soonest;
         }
         const offset = new Date(remindAt.getTime() + 330 * 60_000).toISOString().slice(0, 19);
-        const reminder = await ctx.runTool("set_reminder", {
-          text: `Pay ${biller}${amount === null ? "" : ` (${currency} ${amount})`}, due ${dueDate}`,
-          tag,
-          remind_at: `${offset}+05:30`,
-        });
+        const ignored =
+          tracked.action !== "skipped" && billIsIgnored(tracked.bill);
+        const reminder = ignored
+          ? "That biller is ignored, so no reminder was set."
+          : await ctx.runTool("set_reminder", {
+              text: `Pay ${biller}${amount === null ? "" : ` (${currency} ${amount})`}, due ${dueDate}`,
+              tag,
+              remind_at: `${offset}+05:30`,
+            });
         return {
-          text: `${biller} bill ${tracked.action === "skipped" ? "was already handled" : `is tracked (${tracked.action})`}, due ${dueDate}. ${reminder}${late ? " It is due in under " + daysBefore + " days, so the reminder is set for now." : ""}`,
+          text: `${biller} bill ${tracked.action === "skipped" ? "was already handled" : `is tracked (${tracked.action})`}, due ${dueDate}. ${reminder}${!ignored && late ? " It is due in under " + daysBefore + " days, so the reminder is set for now." : ""}`,
           output: {
             biller,
             due_date: dueDate,

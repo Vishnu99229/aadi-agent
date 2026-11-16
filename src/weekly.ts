@@ -4,6 +4,7 @@ import { config } from "./config.js";
 import { getTasks } from "./db.js";
 import { billsForBrief } from "./bills.js";
 import { importantDatesForBrief } from "./important_dates.js";
+import { taskIsIgnored } from "./ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -36,7 +37,10 @@ export function buildWeeklyReview(now = new Date()): string {
       task.created_at >= weekStart,
   );
   const openPersonal = getTasks().filter(
-    (task) => task.status === "open" && task.tag === "personal",
+    (task) =>
+      task.status === "open" &&
+      task.tag === "personal" &&
+      !taskIsIgnored(task),
   );
   const { upcoming, overdue } = billsForBrief(today);
   const dates = importantDatesForBrief(today);

@@ -363,7 +363,7 @@ passed.push("C: a missing due date pauses the task (input-required); it can be d
 // =====================================================================
 const build = getAgent("build")!;
 assert(
-  build.manifest.tools.join(",") === "get_build,list_recent_builds,get_build_checks,get_repo_state,prepare_build,get_current_time",
+  build.manifest.tools.join(",") === "get_build,list_recent_builds,get_build_checks,get_repo_state,prepare_build,get_current_time,list_ignored,ignore_item,resume_item",
   `the Build Agent's model tools read builds, CI and the repo, and prepare a card (${build.manifest.tools.join(",")})`,
 );
 const buildCapabilities = build.getCapabilities().map((item) => item.name);

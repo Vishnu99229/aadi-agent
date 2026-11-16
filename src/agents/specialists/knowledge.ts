@@ -35,7 +35,14 @@ export const knowledgeAgent: SpecialistDefinition = {
     { name: "update_memory", effect: "write", retry: "never" },
     { name: "forget_memory", effect: "write", retry: "never" },
   ],
-  sharedTools: ["get_current_time", "react_to_message", "search_emails"],
+  sharedTools: [
+    "get_current_time",
+    "react_to_message",
+    "search_emails",
+    "list_ignored",
+    "ignore_item",
+    "resume_item",
+  ],
   routing: {
     patterns: [
       /\b(?:documents?|docs?|pdfs?|drive|sheets?|spreadsheets?|rfps?|questionnaires?|q\s*&\s*a|memor(?:y|ies)|attachments?|uploads?|uploaded|files?|scans?|scanned|photos?|screenshots?|call\s+notes|meeting\s+notes|search\s+the\s+web|google\s+it)\b/i,

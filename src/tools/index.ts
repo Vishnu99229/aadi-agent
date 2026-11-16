@@ -22,6 +22,9 @@ import * as deleteCalendarEvent from "./delete_calendar_event.js";
 import * as deleteTask from "./delete_task.js";
 import * as forgetMemory from "./forget_memory.js";
 import * as ignoreBill from "./ignore_bill.js";
+import * as ignoreItem from "./ignore_item.js";
+import * as listIgnored from "./list_ignored.js";
+import * as resumeItem from "./resume_item.js";
 import * as draftMom from "./draft_mom.js";
 import * as draftNewEmail from "./draft_new_email.js";
 import * as draftReply from "./draft_reply.js";
@@ -114,6 +117,7 @@ const modules = {
   draft_reply: draftReply,
   get_current_time: getCurrentTime,
   ignore_bill: ignoreBill,
+  ignore_item: ignoreItem,
   latest_release: latestRelease,
   learn_qa_bank: learnQa,
   list_accounts: listAccounts,
@@ -123,6 +127,7 @@ const modules = {
   resolve_contact: resolveContact,
   list_documents: listDocuments,
   list_events: listEvents,
+  list_ignored: listIgnored,
   list_upcoming_dates: listUpcomingDates,
   list_reminders: listReminders,
   list_sales_facts: listSalesFacts,
@@ -142,6 +147,7 @@ const modules = {
   remove_date: removeDate,
   read_email: readEmail,
   remember,
+  resume_item: resumeItem,
   read_sheet: readSheet,
   search_drive: searchDrive,
   search_history: searchHistory,
@@ -179,12 +185,14 @@ export const TOOL_ORDER = [
   "draft_reply",
   "get_current_time",
   "ignore_bill",
+  "ignore_item",
   "learn_qa_bank",
   "list_accounts",
   "list_attachments",
   "list_bills",
   "list_dates",
   "list_events",
+  "list_ignored",
   "list_upcoming_dates",
   "list_reminders",
   "list_tasks",
@@ -201,6 +209,7 @@ export const TOOL_ORDER = [
   "remove_date",
   "read_email",
   "remember",
+  "resume_item",
   "read_sheet",
   "search_drive",
   "search_emails",
@@ -281,6 +290,7 @@ export const FORWARDED_TOOLS = [
   "list_bills",
   "list_dates",
   "list_events",
+  "list_ignored",
   "list_upcoming_dates",
   "list_reminders",
   "list_tasks",
