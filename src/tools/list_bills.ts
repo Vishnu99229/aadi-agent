@@ -1,6 +1,6 @@
 import type { LlmTool } from "../llm.js";
 import { getBills, type BillStatus } from "../db.js";
-import { billIsIgnored } from "../ignore.js";
+import { billIsIgnored, refreshIgnoreRules } from "../ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 
@@ -61,8 +61,11 @@ export function handler(input: unknown): string {
   }
   const today = todayYmd();
   const month = today.slice(0, 7);
+  // Expire and restore before the snapshot; restoring can change bill rows.
+  const now = new Date();
+  refreshIgnoreRules(now);
   const bills = getBills().filter((bill) => {
-    const suppressed = billIsIgnored(bill);
+    const suppressed = billIsIgnored(bill, now);
     if (filter === "ignored") {
       return bill.status === "ignored" || suppressed;
     }

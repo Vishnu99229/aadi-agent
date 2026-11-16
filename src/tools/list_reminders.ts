@@ -4,7 +4,7 @@ import {
   type ItemTag,
   type ReminderStatus,
 } from "../db.js";
-import { reminderIsIgnored } from "../ignore.js";
+import { refreshIgnoreRules, reminderIsIgnored } from "../ignore.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -69,11 +69,15 @@ export function handler(input: unknown): string {
       : undefined;
 
   const includeIgnored = values.include_ignored === true;
+  // Expire and restore first: restoring rewrites reminder rows, so the
+  // snapshot below must be taken after it. One instant keeps it stable.
+  const now = new Date();
+  refreshIgnoreRules(now);
   const reminders = getReminders().filter(
     (reminder) =>
       (!tag || reminder.tag === tag) &&
       (!status || reminder.status === status) &&
-      (includeIgnored || !reminderIsIgnored(reminder)),
+      (includeIgnored || !reminderIsIgnored(reminder, now)),
   );
 
   if (reminders.length === 0) {

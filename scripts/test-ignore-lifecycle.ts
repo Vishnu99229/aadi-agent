@@ -42,6 +42,7 @@ import { handler as cancelReminder } from "../src/tools/cancel_reminder.ts";
 import { handler as ignoreBill } from "../src/tools/ignore_bill.ts";
 import { handler as ignoreItem } from "../src/tools/ignore_item.ts";
 import { handler as listBills } from "../src/tools/list_bills.ts";
+import { handler as listReminders } from "../src/tools/list_reminders.ts";
 
 if (process.env.AADI_DB_PATH !== ":memory:") {
   throw new Error("test-ignore-lifecycle.ts must run with AADI_DB_PATH=:memory:");
@@ -1027,6 +1028,44 @@ function remindersOf(billId: number): number {
   });
   assert.equal(reminderIsIgnored(first, now), true);
   assert.equal(reminderIsIgnored(second, now), false, "exact id, not text");
+}
+
+// Codex 3. list_reminders expires rules before it reads rows, not halfway through.
+{
+  const DAY = 24 * 60 * 60 * 1000;
+  const real = Date.now();
+  const seed = createReminder(
+    "Feed the fish",
+    "personal",
+    new Date(real - 3 * DAY - 60 * 60 * 1000).toISOString(),
+    "daily",
+  );
+  const rule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "feed the fish",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(seed.id),
+    duration: "temporary",
+    expiresAt: new Date(real - 60 * 1000).toISOString(),
+    instruction: "Ignore feeding the fish for a bit",
+    authRef: "owner_chat:test",
+  }).rule;
+  // Expired by the clock, not yet processed: no scheduler tick has run since.
+  assert.equal(rule.status, "active");
+  const listed = listReminders({ status: "pending" })
+    .split("\n")
+    .filter((line) => line.includes("Feed the fish"));
+  assert.equal(getReminder(seed.id)!.status, "cancelled", "the missed occurrence was settled");
+  const live = getReminders().filter(
+    (row) => row.series_id === seed.series_id && row.status === "pending",
+  );
+  assert.equal(live.length, 1);
+  assert.deepEqual(
+    listed.map((line) => /^#(\d+) \[pending\]/.exec(line)?.[1]),
+    [String(live[0]!.id)],
+    `list shows the new occurrence, not the cancelled one: ${JSON.stringify(listed)}`,
+  );
 }
 
 {

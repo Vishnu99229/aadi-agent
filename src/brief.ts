@@ -14,7 +14,7 @@ import {
 import { importantDatesForBrief } from "./important_dates.js";
 import { memoriesForBrief } from "./memory.js";
 import { formatMemoryLine } from "./memory_logic.js";
-import { reminderIsIgnored, taskIsIgnored } from "./ignore.js";
+import { refreshIgnoreRules, reminderIsIgnored, taskIsIgnored } from "./ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -35,6 +35,8 @@ function dateInKolkata(date: Date): string {
 }
 
 function localBriefData(now: Date): string {
+  // Restoring an expired ignore rewrites reminder rows; do it before reading them.
+  refreshIgnoreRules(now);
   const today = dateInKolkata(now);
   const grouped = {
     work: {
@@ -53,7 +55,7 @@ function localBriefData(now: Date): string {
   } satisfies Record<ItemTag, Record<string, object[]>>;
 
   for (const task of getTasks()) {
-    if (task.status !== "open" || task.due_at === null || taskIsIgnored(task)) {
+    if (task.status !== "open" || task.due_at === null || taskIsIgnored(task, now)) {
       continue;
     }
     const dueDate = dateInKolkata(new Date(task.due_at));
@@ -68,7 +70,7 @@ function localBriefData(now: Date): string {
   for (const reminder of getReminders()) {
     if (
       reminder.status !== "cancelled" &&
-      !reminderIsIgnored(reminder) &&
+      !reminderIsIgnored(reminder, now) &&
       dateInKolkata(new Date(reminder.remind_at)) === today
     ) {
       grouped[reminder.tag].todays_reminders.push({
