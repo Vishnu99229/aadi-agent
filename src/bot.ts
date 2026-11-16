@@ -74,6 +74,10 @@ import {
 import { handlePromiseDuplicateCallback } from "./promises.js";
 import { handleModelCallback, sendModelPanel } from "./model_panel.js";
 import { handleAgentModelCallback, sendAgentModelsPanel } from "./agent_model_panel.js";
+import {
+  handleIgnorePanelCallback,
+  sendIgnoredItemsPanel,
+} from "./ignore_panel.js";
 import { formatAgentsReport } from "./metrics.js";
 import { runWithPriority } from "./governor.js";
 import { noteOwnerMessage, noteRetryTap } from "./feedback.js";
@@ -586,6 +590,8 @@ function settingsKeyboard(): InlineKeyboard {
     .row()
     .text("Advanced models", "settings:model")
     .row()
+    .text("Ignored items", "settings:ignored")
+    .row()
     .text(`Voice replies: ${voiceRepliesEnabled() ? "on" : "off"}`, "settings:voice")
     .row()
     .text(`Keyboard: ${replyKeyboardOn() ? "shown" : "hidden"}`, "settings:keyboard");
@@ -771,10 +777,14 @@ bot.command("settings", async (ctx) => {
     await setReplyKeyboard(ctx, value === "on" || value === "show");
     return;
   }
+  if (topic === "ignored" || topic === "ignore") {
+    await sendIgnoredItemsPanel(ctx);
+    return;
+  }
   await sendSettingsPanel(ctx);
 });
 
-bot.callbackQuery(/^settings:(agents|model|voice|keyboard)$/, async (ctx) => {
+bot.callbackQuery(/^settings:(agents|model|voice|keyboard|ignored)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCallbackQuery().catch(() => undefined);
   if (action === "agents") {
@@ -783,6 +793,10 @@ bot.callbackQuery(/^settings:(agents|model|voice|keyboard)$/, async (ctx) => {
   }
   if (action === "model") {
     await sendModelPanel(ctx);
+    return;
+  }
+  if (action === "ignored") {
+    await sendIgnoredItemsPanel(ctx);
     return;
   }
   if (action === "voice") {
@@ -988,6 +1002,22 @@ bot.callbackQuery(/^document:(tasks|skip):(\d+)$/, async (ctx) => {
   const operation = ctx.match[1] as "tasks" | "skip";
   const documentId = Number(ctx.match[2]);
   await handleDocumentCallback(ctx, operation, documentId);
+});
+
+bot.callbackQuery(/^ign:/, async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  if (data === "ign:back") {
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    try {
+      await ctx.editMessageText(settingsCaption(), {
+        reply_markup: settingsKeyboard(),
+      });
+    } catch {
+      await sendSettingsPanel(ctx);
+    }
+    return;
+  }
+  await handleIgnorePanelCallback(ctx, data);
 });
 
 bot.callbackQuery(/^bill:(paid|remind|ignore):(\d+)$/, async (ctx) => {
@@ -1356,6 +1386,8 @@ Call update_draft exactly once with the draft ID above and the complete revised 
       await setVoiceReplies(ctx, setting.on);
     } else if (setting.kind === "keyboard") {
       await setReplyKeyboard(ctx, setting.on);
+    } else if (setting.kind === "ignored") {
+      await sendIgnoredItemsPanel(ctx);
     } else {
       await sendSettingsPanel(ctx);
     }

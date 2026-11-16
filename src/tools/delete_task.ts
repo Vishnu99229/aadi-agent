@@ -5,7 +5,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "delete_task",
   description:
-    "Dismiss a task so it stops appearing in list_tasks. Pass either its numeric id or a text fragment (case-insensitive) that matches the task text/tag. Use this when Vishnu says to ignore, delete, drop or remove a task.",
+    "Delete or dismiss a task so it stops appearing in list_tasks. Pass either its numeric id or a text fragment. Use this when Vishnu says to delete, drop or remove a task. Do not use this for ignore — call ignore_item instead so the task stays stored.",
   inputSchema: {
     type: "object",
     properties: {
@@ -83,6 +83,6 @@ export function handler(input: unknown): string {
     throw new Error(`Task ${task.id} could not be dismissed.`);
   }
 
-  console.log(`Task ${task.id}: status -> done (deleted/ignored)`);
+  console.log(`Task ${task.id}: status -> done (deleted)`);
   return JSON.stringify({ id: task.id, tag: task.tag, status: "done" });
 }

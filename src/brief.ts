@@ -14,6 +14,7 @@ import {
 import { importantDatesForBrief } from "./important_dates.js";
 import { memoriesForBrief } from "./memory.js";
 import { formatMemoryLine } from "./memory_logic.js";
+import { reminderIsIgnored, taskIsIgnored } from "./ignore.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -52,7 +53,7 @@ function localBriefData(now: Date): string {
   } satisfies Record<ItemTag, Record<string, object[]>>;
 
   for (const task of getTasks()) {
-    if (task.status !== "open" || task.due_at === null) {
+    if (task.status !== "open" || task.due_at === null || taskIsIgnored(task)) {
       continue;
     }
     const dueDate = dateInKolkata(new Date(task.due_at));
@@ -67,6 +68,7 @@ function localBriefData(now: Date): string {
   for (const reminder of getReminders()) {
     if (
       reminder.status !== "cancelled" &&
+      !reminderIsIgnored(reminder) &&
       dateInKolkata(new Date(reminder.remind_at)) === today
     ) {
       grouped[reminder.tag].todays_reminders.push({

@@ -22,6 +22,7 @@ import { completeBackground } from "./llm.js";
 import { stripSensitive } from "./sensitive.js";
 import { extractBillDeterministic } from "./bill_extract.js";
 import { billersMatch, canonicalBiller } from "./bill_aliases.js";
+import { applyIgnore, billIsIgnored, emailSourceIsIgnored } from "./ignore.js";
 import {
   classifyBillMail,
   paymentStatusFyiLine,
@@ -488,6 +489,18 @@ export async function runBillScan(api: Api): Promise<void> {
     }
     if (kind === "actionable_status") {
       skippedStatus += 1;
+      if (
+        emailSourceIsIgnored({
+          fromHeader: candidate.fromHeader,
+          subject: candidate.subject,
+          tag: "personal",
+        })
+      ) {
+        console.log(
+          `Bill scan: skip=ignored_status message=${candidate.messageId}`,
+        );
+        continue;
+      }
       actionableFyi += 1;
       console.log(
         `Bill scan: skip=payment_status_actionable message=${candidate.messageId}`,
@@ -520,22 +533,17 @@ export async function runBillScan(api: Api): Promise<void> {
     if (result.action === "skipped") {
       continue;
     }
-    if (result.action === "created") {
-      console.log(`Bill ${result.bill.id}: status -> upcoming (deterministic)`);
-      scheduleBillReminders(result.bill);
-      await notifyNewBill(api, result.bill);
-      tracked += 1;
-      continue;
-    }
-    if (result.action === "updated") {
-      console.log(
-        `Bill ${result.bill.id}: merged amount=${result.bill.amount} (deterministic)`,
+    if (result.action === "created" || result.action === "updated") {
+      const surfaced = await surfaceTrackedBill(
+        api,
+        result.bill,
+        result.action,
+        item.candidate.fromHeader,
+        item.candidate.subject,
       );
-      await api.sendMessage(
-        config.ownerTelegramId,
-        `Bill updated\n\n${formatBillLine(result.bill)}`,
-      );
-      tracked += 1;
+      if (surfaced) {
+        tracked += 1;
+      }
       continue;
     }
     console.log(`Bill ${result.bill.id}: kept existing (deterministic)`);
@@ -572,6 +580,18 @@ export async function runBillScan(api: Api): Promise<void> {
       }
       if (kind === "actionable_status") {
         skippedStatus += 1;
+        if (
+          emailSourceIsIgnored({
+            fromHeader: candidate.fromHeader,
+            subject: candidate.subject,
+            tag: "personal",
+          })
+        ) {
+          console.log(
+            `Bill scan: skip=ignored_status message=${candidate.messageId}`,
+          );
+          continue;
+        }
         actionableFyi += 1;
         console.log(
           `Bill scan: skip=payment_status_actionable message=${candidate.messageId}`,
@@ -598,22 +618,17 @@ export async function runBillScan(api: Api): Promise<void> {
       if (result.action === "skipped") {
         continue;
       }
-      if (result.action === "created") {
-        console.log(`Bill ${result.bill.id}: status -> upcoming (llm)`);
-        scheduleBillReminders(result.bill);
-        await notifyNewBill(api, result.bill);
-        tracked += 1;
-        continue;
-      }
-      if (result.action === "updated") {
-        console.log(
-          `Bill ${result.bill.id}: merged amount=${result.bill.amount} (llm)`,
+      if (result.action === "created" || result.action === "updated") {
+        const surfaced = await surfaceTrackedBill(
+          api,
+          result.bill,
+          result.action,
+          candidate.fromHeader,
+          candidate.subject,
         );
-        await api.sendMessage(
-          config.ownerTelegramId,
-          `Bill updated\n\n${formatBillLine(result.bill)}`,
-        );
-        tracked += 1;
+        if (surfaced) {
+          tracked += 1;
+        }
         continue;
       }
       console.log(`Bill ${result.bill.id}: kept existing (llm)`);
@@ -623,6 +638,38 @@ export async function runBillScan(api: Api): Promise<void> {
   console.log(
     `Bill scan complete: candidates=${candidates.length}, tracked=${tracked}, skipped_status=${skippedStatus}, actionable_fyi=${actionableFyi}`,
   );
+}
+
+async function surfaceTrackedBill(
+  api: Api,
+  bill: BillRecord,
+  action: "created" | "updated",
+  fromHeader?: string,
+  subject?: string,
+): Promise<boolean> {
+  if (
+    billIsIgnored(bill) ||
+    emailSourceIsIgnored({
+      fromHeader,
+      subject,
+      tag: "personal",
+    })
+  ) {
+    console.log(`Bill ${bill.id}: suppressed by ignore rule (${action})`);
+    return false;
+  }
+  if (action === "created") {
+    console.log(`Bill ${bill.id}: status -> upcoming`);
+    scheduleBillReminders(bill);
+    await notifyNewBill(api, bill);
+    return true;
+  }
+  console.log(`Bill ${bill.id}: merged amount=${bill.amount}`);
+  await api.sendMessage(
+    config.ownerTelegramId,
+    `Bill updated\n\n${formatBillLine(bill)}`,
+  );
+  return true;
 }
 
 function formatAmountForReminder(bill: BillRecord): string {
@@ -635,7 +682,10 @@ function formatAmountForReminder(bill: BillRecord): string {
  *  3 days before the due date, 1 day before, and on the due date itself.
  *  Any slot in the past is skipped. Each reminder is linked to the bill so
  *  "Done" marks the bill paid and cancels its siblings. */
-function scheduleBillReminders(bill: BillRecord): number {
+export function scheduleBillReminders(bill: BillRecord): number {
+  if (billIsIgnored(bill)) {
+    return 0;
+  }
   const now = Date.now();
   const text =
     `Bill due: ${bill.biller} for ${formatAmountForReminder(bill)}. ` +
@@ -684,6 +734,15 @@ export async function handleBillCallback(
   }
 
   if (operation === "ignore") {
+    applyIgnore({
+      entityType: "bill",
+      matchKey: bill.biller,
+      matchScope: "record",
+      tag: "personal",
+      entityId: String(bill.id),
+      instruction: "telegram:bill-ignore",
+      authRef: `telegram:callback:${billId}`,
+    });
     if (transitionBillStatus(billId, "upcoming", "ignored")) {
       console.log(`Bill ${billId}: status -> ignored`);
     }
@@ -723,7 +782,7 @@ export function billsForBrief(todayYmd: string): {
   const upcoming: BillRecord[] = [];
   const overdue: BillRecord[] = [];
   for (const bill of getBills()) {
-    if (bill.status !== "upcoming") {
+    if (bill.status !== "upcoming" || billIsIgnored(bill)) {
       continue;
     }
     if (bill.due_date < todayYmd) {

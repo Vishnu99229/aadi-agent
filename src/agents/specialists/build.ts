@@ -24,7 +24,7 @@ export const buildAgent: SpecialistDefinition = {
     { name: "get_repo_state", effect: "read", retry: "safe" },
     { name: "prepare_build", effect: "draft", retry: "never" },
   ],
-  sharedTools: ["get_current_time"],
+  sharedTools: ["get_current_time", "list_ignored", "ignore_item", "resume_item"],
   routing: {
     patterns: [
       /\b(?:deploy(?:s|ed|ing|ment)?|codebase|builds?|pull\s+requests?|cursor|repo(?:sitory)?|merge[sd]?\s+(?:the\s+)?(?:pr|pull)|ci\s+(?:run|check|fail\w*)|(?:failing|failed)\s+(?:tests?|checks?))\b/i,

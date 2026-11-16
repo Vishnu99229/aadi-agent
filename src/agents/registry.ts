@@ -42,6 +42,9 @@ const CORE_TOOLS: Record<string, { effect: CapabilityEffect; retry: RetryPolicy 
   react_to_message: { effect: "write", retry: "never" },
   // Who Vishnu means by a name: the same lookup for every agent that works with people.
   resolve_contact: { effect: "read", retry: "safe" },
+  list_ignored: { effect: "read", retry: "safe" },
+  ignore_item: { effect: "write", retry: "never" },
+  resume_item: { effect: "write", retry: "never" },
 };
 
 for (const [name, detail] of Object.entries(CORE_TOOLS)) {

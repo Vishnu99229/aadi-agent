@@ -82,7 +82,15 @@ export const emailAgent: SpecialistDefinition = {
     { name: "send_email", effect: "external", retry: "never" },
     { name: "cancel_scheduled_send", effect: "external", retry: "never" },
   ],
-  sharedTools: ["get_current_time", "react_to_message", "search_notes", "resolve_contact"],
+  sharedTools: [
+    "get_current_time",
+    "react_to_message",
+    "search_notes",
+    "resolve_contact",
+    "list_ignored",
+    "ignore_item",
+    "resume_item",
+  ],
   routing: {
     patterns: [
       /\b(?:e-?mails?|inbox|gmail|mails?|mailbox|drafts?|repl(?:y|ied|ies)|follow[\s-]?ups?|sequences?|outbox|unread)\b/i,
