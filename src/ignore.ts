@@ -182,7 +182,7 @@ function activeRules(now = new Date()): IgnoreRuleRecord[] {
     invalidateIgnoreCache();
   }
   for (const rule of expired) {
-    restoreAfterIgnore(rule, now);
+    restoreAfterIgnore(rule, expiryBoundary(rule, now));
   }
   const stamp = Date.now();
   if (expired.length === 0 && cachedActive && stamp - cachedAt < CACHE_MS) {
@@ -191,6 +191,20 @@ function activeRules(now = new Date()): IgnoreRuleRecord[] {
   cachedActive = listActiveIgnoreRules();
   cachedAt = stamp;
   return cachedActive;
+}
+
+/**
+ * An expired rule stopped hiding things at expires_at, not when we noticed.
+ * Settle against that instant: occurrences due before it were suppressed and
+ * are dropped; anything due after it was never hidden, so it stays pending
+ * and the scheduler delivers it (as "missed while offline" after a restart).
+ */
+function expiryBoundary(rule: IgnoreRuleRecord, now: Date): Date {
+  const at = rule.expires_at ? new Date(rule.expires_at) : now;
+  if (Number.isNaN(at.getTime()) || at.getTime() > now.getTime()) {
+    return now;
+  }
+  return at;
 }
 
 /** Expire temporary rules and restore what they were suppressing. */

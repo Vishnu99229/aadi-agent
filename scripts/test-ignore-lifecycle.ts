@@ -1140,6 +1140,92 @@ function remindersOf(billId: number): number {
   assert.equal(remindersOf(bill.id), before, "no slots rebuilt for a bill the rule never hid");
 }
 
+// Codex 5. Expiry settles at expires_at: what fell due afterwards is delivered.
+{
+  // Midnight IST expiry, processed at 10am IST.
+  const expiresAt = "2026-11-21T18:30:00.000Z";
+  const processedAt = new Date("2026-11-22T04:30:00.000Z");
+  const during = createReminder("Pharmacy pickup", "personal", "2026-11-21T10:00:00.000Z", "none");
+  const after = createReminder("Pharmacy refill", "personal", "2026-11-22T03:30:00.000Z", "none");
+  applyIgnore({
+    entityType: "reminder",
+    matchKey: "pharmacy",
+    matchScope: "source",
+    tag: "personal",
+    duration: "temporary",
+    expiresAt,
+    instruction: "Ignore pharmacy reminders until midnight",
+    authRef: "owner_chat:test",
+  });
+  const daily = createReminder("Log the meter reading", "personal", "2026-11-19T03:30:00.000Z", "daily");
+  applyIgnore({
+    entityType: "reminder",
+    matchKey: "log the meter reading",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(daily.id),
+    duration: "temporary",
+    expiresAt,
+    instruction: "Ignore the meter reading until midnight",
+    authRef: "owner_chat:test",
+  });
+  refreshIgnoreRules(processedAt);
+  assert.equal(getReminder(during.id)!.status, "cancelled", "due while ignored: dropped");
+  assert.equal(getReminder(after.id)!.status, "pending", "due after expiry: still delivered");
+  const meter = getReminders().filter(
+    (row) => row.series_id === daily.series_id && row.status === "pending",
+  );
+  assert.equal(getReminder(daily.id)!.status, "cancelled");
+  assert.deepEqual(
+    meter.map((row) => row.remind_at),
+    ["2026-11-22T03:30:00.000Z"],
+    "the 9am occurrence after expiry is kept, not skipped to tomorrow",
+  );
+}
+
+// Codex 5b. The restart path: expired while offline, delivered as missed.
+{
+  const HOUR = 60 * 60 * 1000;
+  const real = Date.now();
+  const hidden = createReminder(
+    "Call the plumber about the tap",
+    "personal",
+    new Date(real - 3 * HOUR).toISOString(),
+    "none",
+  );
+  const visible = createReminder(
+    "Call the plumber to confirm",
+    "personal",
+    new Date(real - 1 * HOUR).toISOString(),
+    "none",
+  );
+  applyIgnore({
+    entityType: "reminder",
+    matchKey: "call the plumber",
+    matchScope: "source",
+    tag: "personal",
+    duration: "temporary",
+    expiresAt: new Date(real - 2 * HOUR).toISOString(),
+    instruction: "Ignore the plumber for a bit",
+    authRef: "owner_chat:test",
+  });
+  const sent: string[] = [];
+  const api = {
+    sendMessage: async (_chat: number, text: string) => {
+      sent.push(text);
+      return {};
+    },
+  } as unknown as Api;
+  const interval = await registerReminderScheduler(api);
+  clearInterval(interval);
+  const plumber = sent.filter((text) => text.includes("Call the plumber"));
+  assert.equal(plumber.length, 1, JSON.stringify(plumber));
+  assert.match(plumber[0]!, /missed while offline/);
+  assert.match(plumber[0]!, /to confirm/);
+  assert.equal(getReminder(visible.id)!.status, "sent");
+  assert.equal(getReminder(hidden.id)!.status, "cancelled", "the one due while ignored stays dropped");
+}
+
 {
   const dir = mkdtempSync(join(tmpdir(), "aadi-ignore-migrate-"));
   const path = join(dir, "old.db");
