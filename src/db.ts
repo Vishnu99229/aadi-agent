@@ -93,6 +93,60 @@ function tableHasColumn(table: string, column: string): boolean {
   return rows.some((row) => row.name === column);
 }
 
+/** Record rules are unique by entity id. Source and category rules stay unique
+ *  by normalized key. Safe to run on every open: it only drops the old index. */
+function migrateIgnoreRuleIndexes(): void {
+  const table = db
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ignore_rules'`,
+    )
+    .get() as { name: string } | undefined;
+  if (!table) {
+    return;
+  }
+  const duplicates = db
+    .prepare(
+      `SELECT entity_type, entity_id, tag, MIN(id) AS keep_id
+         FROM ignore_rules
+        WHERE status = 'active'
+          AND match_scope = 'record'
+          AND entity_id IS NOT NULL
+        GROUP BY entity_type, entity_id, tag
+       HAVING COUNT(*) > 1`,
+    )
+    .all() as Array<{
+    entity_type: string;
+    entity_id: string;
+    tag: string;
+    keep_id: number;
+  }>;
+  const retiredAt = new Date().toISOString();
+  for (const row of duplicates) {
+    db.prepare(
+      `UPDATE ignore_rules
+          SET status = 'resumed', resumed_at = ?
+        WHERE status = 'active'
+          AND match_scope = 'record'
+          AND entity_type = ?
+          AND entity_id = ?
+          AND tag = ?
+          AND id != ?`,
+    ).run(retiredAt, row.entity_type, row.entity_id, row.tag, row.keep_id);
+  }
+  db.exec(`
+    DROP INDEX IF EXISTS idx_ignore_rules_active_key;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_record
+      ON ignore_rules (entity_type, entity_id, match_scope, tag)
+      WHERE status = 'active' AND match_scope = 'record' AND entity_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_record_key
+      ON ignore_rules (entity_type, match_key, match_scope, tag)
+      WHERE status = 'active' AND match_scope = 'record' AND entity_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_source
+      ON ignore_rules (entity_type, match_key, match_scope, tag)
+      WHERE status = 'active' AND match_scope IN ('source', 'category');
+  `);
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -384,9 +438,6 @@ db.exec(`
       CHECK (status IN ('active', 'resumed', 'expired'))
   );
 
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_ignore_rules_active_key
-    ON ignore_rules (entity_type, match_key, match_scope, tag)
-    WHERE status = 'active';
   CREATE INDEX IF NOT EXISTS idx_ignore_rules_lookup
     ON ignore_rules (status, entity_type, match_key);
   CREATE INDEX IF NOT EXISTS idx_ignore_rules_expiry
@@ -438,6 +489,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_canonical_contacts_name
     ON canonical_contacts (name_key);
 `);
+
+migrateIgnoreRuleIndexes();
 
 const buildsSchema =
   (
@@ -5267,6 +5320,25 @@ export function getActiveIgnoreRuleByKey(
     .get(entityType, matchKey, matchScope, tag) as IgnoreRuleRecord | undefined;
 }
 
+export function getActiveIgnoreRuleByRecord(
+  entityType: IgnoreEntityType,
+  entityId: string,
+  matchScope: IgnoreMatchScope,
+  tag: IgnoreTag,
+): IgnoreRuleRecord | undefined {
+  return db
+    .prepare(
+      `SELECT ${IGNORE_RULE_COLUMNS}
+         FROM ignore_rules
+        WHERE status = 'active'
+          AND entity_type = ?
+          AND entity_id = ?
+          AND match_scope = ?
+          AND tag = ?`,
+    )
+    .get(entityType, entityId, matchScope, tag) as IgnoreRuleRecord | undefined;
+}
+
 export function listActiveIgnoreRules(): IgnoreRuleRecord[] {
   return db
     .prepare(
@@ -5343,7 +5415,7 @@ export function markIgnoreRuleExpired(
   return result.changes === 1;
 }
 
-export function expireDueIgnoreRules(nowIso: string): number {
+export function expireDueIgnoreRules(nowIso: string): IgnoreRuleRecord[] {
   const due = db
     .prepare(
       `SELECT id FROM ignore_rules
@@ -5353,12 +5425,15 @@ export function expireDueIgnoreRules(nowIso: string): number {
           AND expires_at <= ?`,
     )
     .all(nowIso) as Array<{ id: number }>;
-  let count = 0;
+  const expired: IgnoreRuleRecord[] = [];
   for (const row of due) {
     if (markIgnoreRuleExpired(row.id, nowIso)) {
       recordIgnoreRuleEvent(row.id, "expired", "scheduler", null, nowIso);
-      count += 1;
+      const rule = getIgnoreRule(row.id);
+      if (rule) {
+        expired.push(rule);
+      }
     }
   }
-  return count;
+  return expired;
 }

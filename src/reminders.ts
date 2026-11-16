@@ -1,4 +1,4 @@
-import { reminderIsIgnored } from "./ignore.js";
+import { refreshIgnoreRules, reminderIsIgnored } from "./ignore.js";
 import { runWithPriority } from "./governor.js";
 import { InlineKeyboard, type Api, type Context } from "grammy";
 import { config } from "./config.js";
@@ -95,6 +95,10 @@ async function deliverReminder(
   reminder: ReminderRecord,
   missedWhileOffline: boolean,
 ): Promise<void> {
+  const current = getReminder(reminder.id);
+  if (!current || current.status !== "pending" || reminderIsIgnored(current)) {
+    return;
+  }
   const heading = missedWhileOffline
     ? "⏰ Reminder (missed while offline)"
     : "⏰ Reminder";
@@ -135,7 +139,9 @@ async function processDue(
   processingDueReminders = true;
 
   try {
-    const reminders = getDueReminders(new Date().toISOString()).filter(
+    const now = new Date();
+    refreshIgnoreRules(now);
+    const reminders = getDueReminders(now.toISOString()).filter(
       (reminder) => !reminderIsIgnored(reminder),
     );
     for (const reminder of reminders) {
@@ -157,7 +163,9 @@ async function processDue(
 export async function registerReminderScheduler(
   api: Api,
 ): Promise<NodeJS.Timeout> {
-  for (const reminder of getDueReminders(new Date().toISOString())) {
+  const started = new Date();
+  refreshIgnoreRules(started);
+  for (const reminder of getDueReminders(started.toISOString())) {
     missedAtStartup.add(reminder.id);
   }
   await runWithPriority("urgent", () => processDue(api));
