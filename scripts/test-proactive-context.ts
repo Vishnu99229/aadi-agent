@@ -154,6 +154,10 @@ setOwnerMeetingTestHooks({
 {
   assert.equal(parseOwnerTime("3:50 pm today", NOW), START);
   assert.equal(parseOwnerTime("today at 3:50 pm", NOW), START);
+  assert.equal(parseOwnerTime("tomorrow at 3:50 pm", NOW), "2026-11-17T15:50:00+05:30");
+  assert.equal(parseOwnerTime("Friday at 3:50 pm", NOW), "2026-11-20T15:50:00+05:30");
+  assert.equal(parseOwnerTime("Show my 3 open tasks", NOW), undefined);
+  assert.equal(parseOwnerTime("Don't book it at 3:50 pm", NOW), undefined);
 }
 
 {
@@ -212,6 +216,8 @@ setOwnerMeetingTestHooks({
 }
 
 {
+  assert.equal(continuePendingAction(CHAT, "Show my 3 open tasks", NOW).kind, "none");
+  assert.equal(continuePendingAction(CHAT, "Don't book it at 3:50 pm", NOW).kind, "none");
   const continuation = continuePendingAction(CHAT, "3:50 pm today", NOW);
   assert.equal(continuation.kind, "meeting_time");
   const second =
@@ -266,6 +272,31 @@ setOwnerMeetingTestHooks({
     bills.some((bill) => rule.entity_id === String(bill.id)),
   );
   assert.equal(rules.length, bills.length, `expected ${bills.length} bill rules, got ${rules.length}`);
+  assert.ok(rules.every((rule) => rule.duration === "permanent"));
+}
+
+{
+  const tempBills = [
+    createBill("TempOne", 1, "INR", "2026-10-07", "tmp1")!,
+    createBill("TempTwo", 1, "INR", "2026-10-08", "tmp2")!,
+  ];
+  recordPresentedEntities(
+    CHAT,
+    tempBills.map((bill) => ({
+      type: "bill" as const,
+      id: String(bill.id),
+      label: bill.biller,
+      matchKey: bill.biller,
+      tag: "personal",
+    })),
+  );
+  const result = ignoreItem({ query: "all of them" }, owner("Ignore all of them until tomorrow."));
+  assert.match(result, /until 2026-11-17|until tomorrow|stop tracking/i, result);
+  const rules = listActiveIgnoreRules().filter((rule) =>
+    tempBills.some((bill) => rule.entity_id === String(bill.id)),
+  );
+  assert.equal(rules.length, 2);
+  assert.ok(rules.every((rule) => rule.duration === "temporary" && rule.expires_at));
 }
 
 {

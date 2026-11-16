@@ -10,6 +10,9 @@ const WEEKDAYS: Record<string, number> = {
   saturday: 6,
 };
 
+const CLOCK = "(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)?";
+const WEEKDAY_NAMES = Object.keys(WEEKDAYS).join("|");
+
 function pad(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -47,29 +50,43 @@ function isoFor(ymd: string, hour: number, minute: number): string {
   return `${ymd}T${pad(hour)}:${pad(minute)}:00+05:30`;
 }
 
+function isoFromClock(
+  now: Date,
+  dayWord: string | undefined,
+  hourToken: string,
+  minuteToken: string | undefined,
+  meridian: string | undefined,
+): string {
+  const { hour, minute } = hourFromClock(
+    Number(hourToken),
+    minuteToken ? Number(minuteToken) : 0,
+    meridian,
+  );
+  let ymd = formatIstDate(now);
+  if (dayWord?.toLowerCase() === "tomorrow") {
+    ymd = addDaysYmd(ymd, 1);
+  }
+  return isoFor(ymd, hour, minute);
+}
+
 /**
  * Turns a short time phrase in Vishnu's own words into an Asia/Kolkata ISO
- * timestamp. Returns undefined when the message is not a time fill.
+ * timestamp. Returns undefined unless the whole message is a time fill.
  */
 export function parseOwnerTime(text: string, now = new Date()): string | undefined {
-  const clean = text.trim();
+  const clean = text.trim().replace(/[.!?]+$/, "");
   if (!clean) {
     return undefined;
   }
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(clean) && Number.isFinite(Date.parse(clean))) {
-    return new Date(clean).toISOString() === new Date(clean).toISOString() ? clean : undefined;
+    return clean;
   }
-  const clock =
-    /(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s+(today|tomorrow))?/i.exec(clean) ??
-    /(today|tomorrow)\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(clean);
-  if (!clock) {
-    const weekday = new RegExp(
-      `\\b(${Object.keys(WEEKDAYS).join("|")})\\b(?:\\s+at)?\\s+(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)?`,
-      "i",
-    ).exec(clean);
-    if (!weekday) {
-      return undefined;
-    }
+  const dayFirst = new RegExp(`^(today|tomorrow)\\s+(?:at\\s+)?${CLOCK}$`, "i").exec(clean);
+  if (dayFirst) {
+    return isoFromClock(now, dayFirst[1], dayFirst[2]!, dayFirst[3], dayFirst[4]);
+  }
+  const weekday = new RegExp(`^(${WEEKDAY_NAMES})\\s+(?:at\\s+)?${CLOCK}$`, "i").exec(clean);
+  if (weekday) {
     const today = formatIstDate(now);
     const current = weekdayIndex(now);
     const target = WEEKDAYS[weekday[1]!.toLowerCase()]!;
@@ -84,25 +101,11 @@ export function parseOwnerTime(text: string, now = new Date()): string | undefin
     );
     return isoFor(addDaysYmd(today, delta), hour, minute);
   }
-
-  const todayFirst = /^(today|tomorrow)\b/i.test(clock[1] ?? "");
-  const dayWord = (todayFirst ? clock[1] : clock[4])?.toLowerCase();
-  const hourToken = todayFirst ? clock[2] : clock[1];
-  const minuteToken = todayFirst ? clock[3] : clock[2];
-  const meridian = todayFirst ? clock[4] : clock[3];
-  if (!hourToken) {
+  const timeThenDay = new RegExp(`^(?:at\\s+)?${CLOCK}(?:\\s+(today|tomorrow))?$`, "i").exec(clean);
+  if (!timeThenDay) {
     return undefined;
   }
-  const { hour, minute } = hourFromClock(
-    Number(hourToken),
-    minuteToken ? Number(minuteToken) : 0,
-    meridian,
-  );
-  let ymd = formatIstDate(now);
-  if (dayWord === "tomorrow") {
-    ymd = addDaysYmd(ymd, 1);
-  }
-  return isoFor(ymd, hour, minute);
+  return isoFromClock(now, timeThenDay[4], timeThenDay[1]!, timeThenDay[2], timeThenDay[3]);
 }
 
 export function looksLikeTimeFill(text: string): boolean {

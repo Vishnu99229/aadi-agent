@@ -4,6 +4,7 @@ import {
   confirmationForIgnore,
   looksLikeIgnoreInstruction,
   ownerMayChangeIgnore,
+  parseIgnoreDuration,
   resolveIgnoreTarget,
 } from "../ignore.js";
 import { resolveReferentPhrase, type ReferentEntity } from "../referents.js";
@@ -69,15 +70,23 @@ export function handler(input: unknown, turn: ToolTurn): string {
   if (ownWords && !looksLikeIgnoreInstruction(ownWords) && !fromReferents) {
     return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
   }
-  if (fromReferents && (looksLikeIgnoreInstruction(ownWords) || looksLikeReferentIgnore(ownWords))) {
-    return applyReferentIgnores(referentEntities, ownWords, turn);
-  }
   const values = input as {
     query?: unknown;
     entity_type?: unknown;
     expires_at?: unknown;
     tag?: unknown;
   };
+  if (fromReferents && (looksLikeIgnoreInstruction(ownWords) || looksLikeReferentIgnore(ownWords))) {
+    const fromTool =
+      typeof values.expires_at === "string" && values.expires_at.trim()
+        ? values.expires_at.trim()
+        : undefined;
+    const parsed = parseIgnoreDuration(ownWords);
+    return applyReferentIgnores(referentEntities, ownWords, turn, {
+      duration: fromTool ? "temporary" : parsed.duration,
+      expiresAt: fromTool ?? parsed.expiresAt,
+    });
+  }
   if (typeof values.query !== "string" || !values.query.trim()) {
     throw new Error("query must be a non-empty string.");
   }
@@ -130,6 +139,7 @@ function applyReferentIgnores(
   entities: readonly ReferentEntity[],
   instruction: string,
   turn: ToolTurn,
+  duration: { duration: "permanent" | "temporary"; expiresAt: string | null },
 ): string {
   const lines: string[] = [];
   for (const entity of entities) {
@@ -148,6 +158,8 @@ function applyReferentIgnores(
       matchScope: "record",
       tag: entity.tag === "work" ? "work" : "personal",
       entityId: entity.id,
+      duration: duration.duration,
+      expiresAt: duration.expiresAt,
       instruction: instruction || entity.label,
       authRef: authRefFor(turn),
     });

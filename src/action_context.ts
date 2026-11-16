@@ -163,12 +163,15 @@ export function continuePendingAction(
   if (!pending || pending.action !== "create_meeting" || !pending.meeting) {
     return { kind: "none" };
   }
+  if (/\b(?:don'?t|do not|never)\b/i.test(clean)) {
+    return { kind: "none" };
+  }
   if (NEW_REQUEST.test(clean) && !looksLikeTimeFill(clean) && !looksLikeIgnoreInstruction(clean)) {
     return { kind: "none" };
   }
   if (pending.meeting.waiting === "time") {
     const startIso = parseOwnerTime(clean, now);
-    if (startIso) {
+    if (startIso && looksLikeTimeFill(clean)) {
       return { kind: "meeting_time", startIso, pending };
     }
   }
