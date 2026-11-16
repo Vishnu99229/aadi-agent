@@ -435,8 +435,14 @@ const wait = async (read: () => string | undefined, what: string): Promise<strin
 try {
   const first = run("build-start");
   const startedId = await wait(() => /STARTED (\d+)/.exec(first.out())?.[1], `the first process: ${first.out().slice(-300)}`);
+  const exited = new Promise<void>((resolve) => {
+    first.child.once("exit", () => resolve());
+    if (first.child.exitCode !== null || first.child.signalCode !== null) {
+      resolve();
+    }
+  });
   first.child.kill("SIGKILL");
-  await new Promise((resolve) => first.child.once("exit", resolve));
+  await exited;
   const second = run("build-status");
   const after = JSON.parse(await wait(() => /RESULT (.+)/.exec(second.out())?.[1], `the second process: ${second.out().slice(-300)}`)) as {
     state: string;

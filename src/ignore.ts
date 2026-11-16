@@ -570,6 +570,13 @@ function sameInstant(left: string, right: string): boolean {
   return new Date(left).getTime() === new Date(right).getTime();
 }
 
+function explicitlyStopped(reminder: ReminderRecord): boolean {
+  return (
+    reminder.status === "cancelled" &&
+    (reminder.status_reason === "user" || reminder.status_reason === "completion")
+  );
+}
+
 function restoreBillReminders(rule: IgnoreRuleRecord, now: Date): void {
   for (const bill of getBills()) {
     if (bill.status !== "upcoming" || !billMatchesRule(bill, rule)) {
@@ -584,7 +591,7 @@ function restoreBillReminders(rule: IgnoreRuleRecord, now: Date): void {
       if (at <= now.getTime()) {
         for (const reminder of same) {
           if (reminder.status === "pending") {
-            transitionReminderStatus(reminder.id, "pending", "cancelled");
+            transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore");
           }
         }
         continue;
@@ -592,9 +599,7 @@ function restoreBillReminders(rule: IgnoreRuleRecord, now: Date): void {
       if (same.some((reminder) => reminder.status === "pending")) {
         continue;
       }
-      const cancelled = same.find((reminder) => reminder.status === "cancelled");
-      if (cancelled) {
-        transitionReminderStatus(cancelled.id, "cancelled", "pending");
+      if (same.some((reminder) => explicitlyStopped(reminder))) {
         continue;
       }
       createReminder(billReminderText(bill), "personal", slot, "none", {
@@ -606,7 +611,7 @@ function restoreBillReminders(rule: IgnoreRuleRecord, now: Date): void {
         reminder.status === "pending" &&
         new Date(reminder.remind_at).getTime() <= now.getTime()
       ) {
-        transitionReminderStatus(reminder.id, "pending", "cancelled");
+        transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore");
       }
     }
   }
@@ -617,87 +622,66 @@ function restoreTaskReminders(rule: IgnoreRuleRecord, now: Date): void {
     if (task.status !== "open" || !taskMatchesRule(task, rule)) {
       continue;
     }
-    const linked = getReminders().filter(
-      (reminder) => reminder.related_task_id === task.id,
+    settleMatchedReminders(
+      getReminders().filter((reminder) => reminder.related_task_id === task.id),
+      now,
     );
-    const once = linked.filter((reminder) => reminder.recurrence === "none");
-    for (const reminder of once) {
-      settleOneShot(reminder, now);
-    }
-    const groups = groupReminders(
-      linked.filter((reminder) => reminder.recurrence !== "none"),
-    );
-    for (const group of groups) {
-      settleSeries(group, now, task.id);
-    }
   }
 }
 
+/** Same match a reminder rule used while it was active, including linked rows. */
+function ruleSuppressesReminder(rule: IgnoreRuleRecord, reminder: ReminderRecord): boolean {
+  if (rule.entity_type !== "reminder" || !tagMatches(rule.tag, reminder.tag)) {
+    return false;
+  }
+  if (rule.match_scope === "record") {
+    return rule.entity_id != null && rule.entity_id === String(reminder.id);
+  }
+  return keysOverlap(rule.match_key, normalizeIgnoreKey(reminder.text), [reminder.text]);
+}
+
 function restoreReminderRules(rule: IgnoreRuleRecord, now: Date): void {
-  const all = getReminders().filter(
-    (reminder) => reminder.related_bill_id === null && reminder.related_task_id === null,
-  );
+  const matched = getReminders().filter((reminder) => ruleSuppressesReminder(rule, reminder));
   if (rule.match_scope === "record" && rule.entity_id) {
     const seed = getReminder(Number(rule.entity_id));
     if (!seed) {
       return;
     }
-    if (seed.recurrence === "none") {
-      settleOneShot(getReminder(seed.id) ?? seed, now);
-      return;
-    }
-    const series = all.filter(
-      (reminder) =>
-        reminder.text === seed.text &&
-        reminder.tag === seed.tag &&
-        reminder.recurrence === seed.recurrence,
-    );
-    settleSeries(series, now);
+    const series =
+      seed.series_id == null
+        ? [seed]
+        : getReminders().filter((reminder) => reminder.series_id === seed.series_id);
+    settleMatchedReminders(series, now);
     return;
   }
-  const matched = all.filter((reminder) =>
-    keysOverlap(rule.match_key, normalizeIgnoreKey(reminder.text), [reminder.text]),
-  );
-  for (const group of groupReminders(matched)) {
+  settleMatchedReminders(matched, now);
+}
+
+function seriesKey(reminder: ReminderRecord): string {
+  return reminder.series_id == null ? `row:${reminder.id}` : `series:${reminder.series_id}`;
+}
+
+function settleMatchedReminders(reminders: readonly ReminderRecord[], now: Date): void {
+  const groups = new Map<string, ReminderRecord[]>();
+  for (const reminder of reminders) {
+    const key = reminder.recurrence === "none" ? `row:${reminder.id}` : seriesKey(reminder);
+    const group = groups.get(key) ?? [];
+    group.push(reminder);
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
     if (group[0]?.recurrence === "none") {
-      for (const reminder of group) {
-        settleOneShot(getReminder(reminder.id) ?? reminder, now);
-      }
+      settleOneShot(getReminder(group[0]!.id) ?? group[0]!, now);
     } else {
       settleSeries(group, now);
     }
   }
 }
 
-function groupReminders(reminders: readonly ReminderRecord[]): ReminderRecord[][] {
-  const groups = new Map<string, ReminderRecord[]>();
-  for (const reminder of reminders) {
-    const key = `${reminder.recurrence}\n${reminder.tag}\n${reminder.text}`;
-    const group = groups.get(key) ?? [];
-    group.push(reminder);
-    groups.set(key, group);
-  }
-  return [...groups.values()];
-}
-
 function settleOneShot(reminder: ReminderRecord, now: Date): void {
   const at = new Date(reminder.remind_at).getTime();
   if (reminder.status === "pending" && at <= now.getTime()) {
-    transitionReminderStatus(reminder.id, "pending", "cancelled");
-    return;
-  }
-  if (reminder.status === "cancelled" && at > now.getTime()) {
-    const twin = getReminders().some(
-      (other) =>
-        other.id !== reminder.id &&
-        other.status === "pending" &&
-        other.text === reminder.text &&
-        other.tag === reminder.tag &&
-        sameInstant(other.remind_at, reminder.remind_at),
-    );
-    if (!twin) {
-      transitionReminderStatus(reminder.id, "cancelled", "pending");
-    }
+    transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore");
   }
 }
 
@@ -727,17 +711,14 @@ function nextFutureAt(
   return undefined;
 }
 
-function settleSeries(
-  group: readonly ReminderRecord[],
-  now: Date,
-  taskId?: number,
-): void {
+function settleSeries(group: readonly ReminderRecord[], now: Date): void {
   const fresh = group
     .map((reminder) => getReminder(reminder.id))
     .filter((reminder): reminder is ReminderRecord => reminder !== undefined);
   if (fresh.length === 0) {
     return;
   }
+  const stopped = fresh.some((reminder) => explicitlyStopped(reminder));
   const pending = fresh.filter((reminder) => reminder.status === "pending");
   const future = pending
     .filter((reminder) => new Date(reminder.remind_at).getTime() > now.getTime())
@@ -747,12 +728,21 @@ function settleSeries(
         left.id - right.id,
     );
   const keepId = future[0]?.id;
+  let settledPast = false;
   for (const reminder of pending) {
-    if (reminder.id !== keepId) {
-      transitionReminderStatus(reminder.id, "pending", "cancelled");
+    if (reminder.id === keepId) {
+      continue;
+    }
+    if (transitionReminderStatus(reminder.id, "pending", "cancelled", "ignore")) {
+      settledPast = true;
     }
   }
-  if (keepId !== undefined) {
+  if (keepId !== undefined || stopped) {
+    return;
+  }
+  const ignoreOwned =
+    settledPast || fresh.some((reminder) => reminder.status_reason === "ignore");
+  if (!ignoreOwned) {
     return;
   }
   const basis = [...fresh].sort(
@@ -760,7 +750,7 @@ function settleSeries(
       new Date(right.remind_at).getTime() - new Date(left.remind_at).getTime() ||
       right.id - left.id,
   )[0];
-  if (!basis || basis.recurrence === "none") {
+  if (!basis || basis.recurrence === "none" || basis.series_id == null) {
     return;
   }
   const nextAt = nextFutureAt(basis.remind_at, basis.recurrence, now);
@@ -770,21 +760,17 @@ function settleSeries(
   const already = getReminders().some(
     (reminder) =>
       reminder.status === "pending" &&
-      reminder.text === basis.text &&
-      reminder.tag === basis.tag &&
-      reminder.recurrence === basis.recurrence &&
+      reminder.series_id === basis.series_id &&
       sameInstant(reminder.remind_at, nextAt),
   );
   if (already) {
     return;
   }
-  createReminder(
-    basis.text,
-    basis.tag,
-    nextAt,
-    basis.recurrence,
-    taskId === undefined ? null : { relatedTaskId: taskId },
-  );
+  createReminder(basis.text, basis.tag, nextAt, basis.recurrence, {
+    relatedTaskId: basis.related_task_id,
+    relatedBillId: basis.related_bill_id,
+    seriesId: basis.series_id,
+  });
 }
 
 export function resumeIgnoreByQuery(

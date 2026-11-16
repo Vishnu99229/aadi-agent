@@ -65,6 +65,8 @@ export interface TaskRecord {
 
 export type ReminderRecurrence = "none" | "daily" | "weekly" | "weekdays";
 export type ReminderStatus = "pending" | "sent" | "cancelled";
+/** Why a reminder left `pending`. `ignore` is the only reason restore may undo. */
+export type ReminderStatusReason = "user" | "completion" | "ignore" | "other";
 
 export interface ReminderRecord {
   id: number;
@@ -76,6 +78,9 @@ export interface ReminderRecord {
   created_at: string;
   related_task_id: number | null;
   related_bill_id: number | null;
+  /** Stable id shared by every occurrence of one recurring schedule. */
+  series_id: number | null;
+  status_reason: ReminderStatusReason | null;
 }
 
 export const DB_PATH = process.env.AADI_DB_PATH?.trim() || "./aadi.db";
@@ -949,6 +954,19 @@ if (!tableHasColumn("reminders", "related_task_id")) {
 if (!tableHasColumn("reminders", "related_bill_id")) {
   db.exec(`ALTER TABLE reminders ADD COLUMN related_bill_id INTEGER`);
 }
+if (!tableHasColumn("reminders", "series_id")) {
+  db.exec(`ALTER TABLE reminders ADD COLUMN series_id INTEGER`);
+}
+if (!tableHasColumn("reminders", "status_reason")) {
+  db.exec(`ALTER TABLE reminders ADD COLUMN status_reason TEXT`);
+}
+// Each existing recurring row is its own series. Never merge on text.
+db.exec(
+  `UPDATE reminders
+      SET series_id = id
+    WHERE series_id IS NULL
+      AND recurrence != 'none'`,
+);
 
 // Autonomy / rules engine: when a draft passes auto_send_approved, the
 // pending action's auto_send_at carries the scheduled send instant.
@@ -1636,11 +1654,12 @@ export function markTaskDone(id: number): boolean {
 }
 
 const REMINDER_COLUMNS = `id, text, tag, remind_at, recurrence, status,
-  created_at, related_task_id, related_bill_id`;
+  created_at, related_task_id, related_bill_id, series_id, status_reason`;
 
 export interface ReminderLinks {
   relatedTaskId?: number | null;
   relatedBillId?: number | null;
+  seriesId?: number | null;
 }
 
 export function createReminder(
@@ -1659,15 +1678,22 @@ export function createReminder(
         : null;
   const billId =
     links && typeof links === "object" ? (links.relatedBillId ?? null) : null;
+  const seriesId =
+    links && typeof links === "object" ? (links.seriesId ?? null) : null;
   const result = db
     .prepare(
       `INSERT INTO reminders (
-         text, tag, remind_at, recurrence, related_task_id, related_bill_id
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
+         text, tag, remind_at, recurrence, related_task_id, related_bill_id, series_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(text, tag, remindAt, recurrence, taskId, billId);
-
-  return getReminder(Number(result.lastInsertRowid))!;
+    .run(text, tag, remindAt, recurrence, taskId, billId, seriesId);
+  const id = Number(result.lastInsertRowid);
+  if (recurrence !== "none" && seriesId == null) {
+    db.prepare(
+      `UPDATE reminders SET series_id = id WHERE id = ? AND series_id IS NULL`,
+    ).run(id);
+  }
+  return getReminder(id)!;
 }
 
 export function getReminder(id: number): ReminderRecord | undefined {
@@ -1707,7 +1733,7 @@ export function cancelPendingRemindersForTask(taskId: number): number {
   const result = db
     .prepare(
       `UPDATE reminders
-       SET status = 'cancelled'
+       SET status = 'cancelled', status_reason = 'completion'
        WHERE related_task_id = ? AND status = 'pending'`,
     )
     .run(taskId);
@@ -1720,7 +1746,7 @@ export function cancelPendingRemindersForBill(billId: number): number {
   const result = db
     .prepare(
       `UPDATE reminders
-       SET status = 'cancelled'
+       SET status = 'cancelled', status_reason = 'completion'
        WHERE related_bill_id = ? AND status = 'pending'`,
     )
     .run(billId);
@@ -1731,14 +1757,40 @@ export function transitionReminderStatus(
   id: number,
   from: ReminderStatus,
   to: ReminderStatus,
+  reason?: ReminderStatusReason | null,
 ): boolean {
-  const result = db
-    .prepare(
-      `UPDATE reminders
-       SET status = ?
-       WHERE id = ? AND status = ?`,
-    )
-    .run(to, id, from);
+  if (to === "pending" && from === "cancelled") {
+    const current = db
+      .prepare(`SELECT status_reason FROM reminders WHERE id = ?`)
+      .get(id) as { status_reason: string | null } | undefined;
+    if (current?.status_reason !== "ignore") {
+      return false;
+    }
+  }
+  const result =
+    to === "cancelled"
+      ? db
+          .prepare(
+            `UPDATE reminders
+                SET status = ?, status_reason = ?
+              WHERE id = ? AND status = ?`,
+          )
+          .run(to, reason ?? "other", id, from)
+      : to === "pending"
+        ? db
+            .prepare(
+              `UPDATE reminders
+                  SET status = ?, status_reason = NULL
+                WHERE id = ? AND status = ?`,
+            )
+            .run(to, id, from)
+        : db
+            .prepare(
+              `UPDATE reminders
+                  SET status = ?
+                WHERE id = ? AND status = ?`,
+            )
+            .run(to, id, from);
 
   return result.changes === 1;
 }

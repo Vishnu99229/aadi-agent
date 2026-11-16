@@ -125,6 +125,7 @@ async function deliverReminder(
       reminder.tag,
       nextAt,
       reminder.recurrence,
+      { seriesId: reminder.series_id },
     );
     console.log(`Reminder ${next.id}: recurring occurrence -> pending`);
   }

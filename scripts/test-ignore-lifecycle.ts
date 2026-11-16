@@ -10,14 +10,18 @@ import { join } from "node:path";
 import type { Context } from "grammy";
 import { handleBillCallback } from "../src/bills.ts";
 import {
+  cancelPendingRemindersForBill,
+  cancelPendingRemindersForTask,
   createBill,
   createReminder,
   createTask,
+  db,
   getBill,
   getReminder,
   getReminders,
   listActiveIgnoreRules,
   listIgnoreRuleEvents,
+  markTaskDone,
   transitionBillStatus,
   transitionReminderStatus,
 } from "../src/db.ts";
@@ -27,6 +31,7 @@ import {
   reminderIsIgnored,
   resumeIgnore,
 } from "../src/ignore.ts";
+import { handler as cancelReminder } from "../src/tools/cancel_reminder.ts";
 import { handler as ignoreBill } from "../src/tools/ignore_bill.ts";
 import { handler as ignoreItem } from "../src/tools/ignore_item.ts";
 import { handler as listBills } from "../src/tools/list_bills.ts";
@@ -227,9 +232,11 @@ function addDays(ymd: string, days: number): string {
     authRef: "owner_chat:test",
   }).rule;
   resumeIgnore(brokenRule.id, "owner_chat:test", "resume stretch", now);
-  const stretch = getReminders().filter((row) => row.text === "Stretch" && row.status === "pending");
-  assert.equal(stretch.length, 1, "a cancelled recurrence chain is rebuilt once");
-  assert.ok(new Date(stretch[0]!.remind_at).getTime() > now.getTime());
+  assert.equal(
+    getReminders().filter((row) => row.text === "Stretch" && row.status === "pending").length,
+    0,
+    "a cancellation without ignore provenance is not revived",
+  );
 }
 
 // D. The bill-card Ignore button is registry-only.
@@ -403,7 +410,7 @@ function addDays(ymd: string, days: number): string {
   const future = createReminder("tax future", "personal", slot("2026-11-30"), "none", {
     relatedTaskId: task.id,
   });
-  transitionReminderStatus(future.id, "pending", "cancelled");
+  transitionReminderStatus(future.id, "pending", "cancelled", "user");
   const rule = applyIgnore({
     entityType: "task",
     matchKey: "file the tax papers",
@@ -415,7 +422,8 @@ function addDays(ymd: string, days: number): string {
   }).rule;
   resumeIgnore(rule.id, "owner_chat:test", "resume tax", new Date("2026-11-16T12:00:00.000Z"));
   assert.equal(getReminder(past.id)!.status, "cancelled");
-  assert.equal(getReminder(future.id)!.status, "pending");
+  assert.equal(getReminder(future.id)!.status, "cancelled");
+  assert.equal(getReminder(future.id)!.status_reason, "user");
 }
 
 {
@@ -424,6 +432,252 @@ function addDays(ymd: string, days: number): string {
     { iteration: 1, calledTools: [] },
   );
   assert.match(refused, /own chat or voice/i);
+}
+
+// Two daily schedules with the same words stay separate series.
+{
+  const now = new Date("2026-11-16T16:00:00.000Z");
+  const morning = createReminder(
+    "Take medication",
+    "personal",
+    "2026-11-13T03:30:00.000Z",
+    "daily",
+  );
+  const evening = createReminder(
+    "Take medication",
+    "personal",
+    "2026-11-13T14:30:00.000Z",
+    "daily",
+  );
+  assert.ok(morning.series_id && evening.series_id);
+  assert.notEqual(morning.series_id, evening.series_id);
+  const rule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "take medication",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(morning.id),
+    instruction: "Ignore the morning medication",
+    authRef: "owner_chat:test",
+  }).rule;
+  resumeIgnore(rule.id, "owner_chat:test", "resume morning medication", now);
+  const morningRows = getReminders().filter((row) => row.series_id === morning.series_id);
+  const eveningRows = getReminders().filter((row) => row.series_id === evening.series_id);
+  assert.equal(
+    morningRows.filter((row) => row.status === "pending").length,
+    1,
+  );
+  assert.equal(eveningRows.length, 1);
+  assert.equal(eveningRows[0]!.id, evening.id);
+  assert.equal(eveningRows[0]!.status, "pending");
+  assert.equal(eveningRows[0]!.remind_at, evening.remind_at);
+  const morningNext = morningRows.find((row) => row.status === "pending")!;
+  assert.equal(morningNext.series_id, morning.series_id);
+  assert.ok(new Date(morningNext.remind_at).getTime() > now.getTime());
+  assert.notEqual(morningNext.remind_at, evening.remind_at);
+}
+
+// An explicit cancel survives both resume and expiry.
+{
+  const now = new Date("2026-11-20T04:00:00.000Z");
+  const kept = createReminder("Water the plants", "personal", "2026-11-25T03:30:00.000Z", "daily");
+  const rule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "water the plants",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(kept.id),
+    instruction: "Ignore watering",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(JSON.parse(cancelReminder({ id: kept.id })).status, "cancelled");
+  resumeIgnore(rule.id, "owner_chat:test", "resume watering", now);
+  assert.equal(getReminder(kept.id)!.status, "cancelled");
+  assert.equal(getReminder(kept.id)!.status_reason, "user");
+  assert.equal(
+    getReminders().filter((row) => row.series_id === kept.series_id && row.status === "pending").length,
+    0,
+  );
+
+  const expiring = createReminder(
+    "Water the herbs",
+    "personal",
+    "2026-11-25T03:30:00.000Z",
+    "daily",
+  );
+  applyIgnore({
+    entityType: "reminder",
+    matchKey: "water the herbs",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(expiring.id),
+    duration: "temporary",
+    expiresAt: "2026-11-18T00:00:00.000Z",
+    instruction: "Ignore herbs for a few days",
+    authRef: "owner_chat:test",
+  });
+  cancelReminder({ id: expiring.id });
+  assert.equal(
+    reminderIsIgnored(getReminder(expiring.id)!, new Date("2026-11-19T00:00:00.000Z")),
+    false,
+  );
+  assert.equal(getReminder(expiring.id)!.status, "cancelled");
+  assert.equal(getReminder(expiring.id)!.status_reason, "user");
+  assert.equal(
+    getReminders().some((row) => row.series_id === expiring.series_id && row.status === "pending"),
+    false,
+  );
+}
+
+// A user-cancelled bill slot stays cancelled. Paying the bill blocks a rebuild.
+{
+  const bill = createBill("Lifecycle Rent", 1000, "INR", "2026-12-10", "life-rent")!;
+  billReminders(bill.id, "2026-12-10");
+  const slots = getReminders().filter((row) => row.related_bill_id === bill.id);
+  const dropped = slots[0]!;
+  const rule = applyIgnore({
+    entityType: "bill",
+    matchKey: "lifecycle rent",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(bill.id),
+    instruction: "Ignore rent",
+    authRef: "owner_chat:test",
+  }).rule;
+  cancelReminder({ id: dropped.id });
+  const now = new Date("2026-11-16T12:00:00.000Z");
+  resumeIgnore(rule.id, "owner_chat:test", "resume rent", now);
+  assert.equal(getReminder(dropped.id)!.status, "cancelled");
+  assert.equal(getReminder(dropped.id)!.status_reason, "user");
+  const pendingSlots = getReminders().filter(
+    (row) => row.related_bill_id === bill.id && row.status === "pending",
+  );
+  assert.equal(pendingSlots.length, 2);
+  assert.ok(pendingSlots.every((row) => row.remind_at !== dropped.remind_at));
+
+  const paid = createBill("Lifecycle Paid", 10, "INR", "2026-12-12", "life-paid")!;
+  billReminders(paid.id, "2026-12-12");
+  const paidRule = applyIgnore({
+    entityType: "bill",
+    matchKey: "lifecycle paid",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(paid.id),
+    instruction: "Ignore paid bill",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(transitionBillStatus(paid.id, "upcoming", "paid"), true);
+  cancelPendingRemindersForBill(paid.id);
+  resumeIgnore(paidRule.id, "owner_chat:test", "resume paid bill", now);
+  assert.ok(
+    getReminders()
+      .filter((row) => row.related_bill_id === paid.id)
+      .every((row) => row.status === "cancelled" && row.status_reason === "completion"),
+  );
+}
+
+// Completing a task while it is ignored does not bring its reminders back.
+{
+  const task = createTask("Send the receipt", "personal", "2026-12-01T09:00:00.000Z");
+  const reminder = createReminder("Send the receipt", "personal", slot("2026-11-30"), "none", {
+    relatedTaskId: task.id,
+  });
+  const rule = applyIgnore({
+    entityType: "task",
+    matchKey: "send the receipt",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(task.id),
+    instruction: "Ignore the receipt task",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(markTaskDone(task.id), true);
+  cancelPendingRemindersForTask(task.id);
+  resumeIgnore(rule.id, "owner_chat:test", "resume receipt", new Date("2026-11-16T12:00:00.000Z"));
+  assert.equal(getReminder(reminder.id)!.status, "cancelled");
+  assert.equal(getReminder(reminder.id)!.status_reason, "completion");
+}
+
+// A reminder-source rule also settles linked reminders that its text suppressed.
+{
+  const now = new Date("2026-11-16T16:00:00.000Z");
+  const task = createTask("Walk the dog", "personal", null);
+  const linked = createReminder(
+    "Walk the dog",
+    "personal",
+    "2026-11-14T03:30:00.000Z",
+    "daily",
+    { relatedTaskId: task.id },
+  );
+  const rule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "walk the dog",
+    matchScope: "source",
+    tag: "personal",
+    instruction: "Ignore walk the dog reminders",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(reminderIsIgnored(getReminder(linked.id)!, new Date("2026-11-15T04:00:00.000Z")), true);
+  resumeIgnore(rule.id, "owner_chat:test", "resume the dog walk", now);
+  assert.equal(getReminder(linked.id)!.status, "cancelled");
+  assert.equal(getReminder(linked.id)!.status_reason, "ignore");
+  const next = getReminders().filter(
+    (row) => row.series_id === linked.series_id && row.status === "pending",
+  );
+  assert.equal(next.length, 1);
+  assert.equal(next[0]!.related_task_id, task.id);
+  assert.ok(new Date(next[0]!.remind_at).getTime() > now.getTime());
+
+  const bill = createBill("Lifecycle Milk", 60, "INR", "2026-12-05", "life-milk")!;
+  const billReminder = createReminder(
+    "Milk delivery",
+    "personal",
+    "2026-11-14T03:30:00.000Z",
+    "none",
+    { relatedBillId: bill.id },
+  );
+  const milkRule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "milk delivery",
+    matchScope: "source",
+    tag: "personal",
+    duration: "temporary",
+    expiresAt: "2026-11-16T12:00:00.000Z",
+    instruction: "Ignore milk delivery reminders",
+    authRef: "owner_chat:test",
+  }).rule;
+  assert.equal(milkRule.duration, "temporary");
+  assert.equal(reminderIsIgnored(getReminder(billReminder.id)!, now), false);
+  assert.equal(getReminder(billReminder.id)!.status, "cancelled");
+  assert.notEqual(getReminder(billReminder.id)!.status, "pending");
+}
+
+// Unknown historical cancellations are not treated as ignore-owned.
+{
+  const historical = createReminder(
+    "Call the clinic",
+    "personal",
+    "2026-11-13T03:30:00.000Z",
+    "daily",
+  );
+  db.prepare(
+    `UPDATE reminders SET status = 'cancelled', status_reason = NULL WHERE id = ?`,
+  ).run(historical.id);
+  const rule = applyIgnore({
+    entityType: "reminder",
+    matchKey: "call the clinic",
+    matchScope: "record",
+    tag: "personal",
+    entityId: String(historical.id),
+    instruction: "Ignore the clinic call",
+    authRef: "owner_chat:test",
+  }).rule;
+  resumeIgnore(rule.id, "owner_chat:test", "resume clinic", new Date("2026-11-16T16:00:00.000Z"));
+  assert.equal(
+    getReminders().filter((row) => row.series_id === historical.series_id && row.status === "pending")
+      .length,
+    0,
+  );
 }
 
 {
