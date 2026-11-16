@@ -15,6 +15,7 @@ import { CORE_OWNER } from "./types.js";
 import { cacheBypassed, cacheGet, cachePut, invalidateOwner, isCacheable } from "./cache.js";
 import { CACHE_POLICIES, ownerWantsFresh, VOLATILE } from "./cache_policy.js";
 import { contactQuestionAsked, contactQuestionMark } from "../contact_questions.js";
+import { notePresentedFromTool } from "../referents.js";
 import { acquire } from "../governor.js";
 
 /**
@@ -339,6 +340,9 @@ async function runCall(
       throw error;
     }
     outcome = { content: intercepted !== undefined ? intercepted : await tool.handler(input, turn) };
+    if (!outcome.isError) {
+      notePresentedFromTool(call.name, outcome.content, turn.confirmation?.chatId ?? ctx.chatId);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     outcome = { content: `Tool failed: ${message}`, isError: true };

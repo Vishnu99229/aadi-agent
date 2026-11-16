@@ -714,6 +714,13 @@ export function parseIgnoreDuration(
   if (/\b(?:just )?for today\b|\btoday only\b/i.test(text)) {
     return { duration: "temporary", expiresAt: endOfKolkataDay(now) };
   }
+  if (/\buntil tomorrow\b/i.test(text)) {
+    const startOfToday = new Date(`${kolkataYmd(now)}T00:00:00+05:30`);
+    return {
+      duration: "temporary",
+      expiresAt: new Date(startOfToday.getTime() + 86_400_000).toISOString(),
+    };
+  }
   const untilDay = /\buntil\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.exec(
     text,
   );

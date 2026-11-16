@@ -8,13 +8,22 @@ import {
   companyNamed,
   contactsFrom,
   nameKey,
+  namesFuzzyEqual,
+  preferOrganization,
   resolutionFrom,
   sightingMatches,
   type Contact,
   type ContactResolution,
   type Sighting,
 } from "./contact_logic.js";
-import { getContactChoice, listSequenceProspects, saveContactChoice, searchMemories } from "./db.js";
+import {
+  getContactChoice,
+  listCanonicalContacts,
+  listSequenceProspects,
+  saveContactChoice,
+  searchMemories,
+  upsertCanonicalContact,
+} from "./db.js";
 import { messageHeader } from "./gmail_attachments.js";
 import {
   getGoogleAccount,
@@ -293,12 +302,172 @@ export function chosenContact(query: string): Contact | undefined {
   }
 }
 
+function contactFromCanonical(row: {
+  display_name: string;
+  emails_json: string;
+  company: string | null;
+  sources_json: string;
+}): Contact | undefined {
+  try {
+    const emails = JSON.parse(row.emails_json) as string[];
+    if (!Array.isArray(emails) || emails.length === 0) {
+      return undefined;
+    }
+    const sources = JSON.parse(row.sources_json) as Contact["sources"];
+    return {
+      name: row.display_name,
+      emails: emails.map((email) => email.toLowerCase()),
+      company: row.company ?? undefined,
+      sources: Array.isArray(sources) ? sources : ["known"],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function aliasesOf(row: { aliases_json: string; display_name: string; name_key: string }): string[] {
+  try {
+    const parsed = JSON.parse(row.aliases_json) as string[];
+    return [
+      row.name_key,
+      nameKey(row.display_name),
+      ...(Array.isArray(parsed) ? parsed : []),
+    ].filter(Boolean);
+  } catch {
+    return [row.name_key, nameKey(row.display_name)];
+  }
+}
+
+function queryFitsCanonical(query: string, row: {
+  aliases_json: string;
+  display_name: string;
+  name_key: string;
+  emails_json: string;
+  company: string | null;
+  sources_json: string;
+}): boolean {
+  const aliases = aliasesOf(row);
+  const tokens = nameTokens(query);
+  const first = tokens[0] ?? "";
+  if (tokens.length === 0) {
+    return false;
+  }
+  const nameOk =
+    aliases.includes(nameKey(query)) ||
+    aliases.includes(first) ||
+    aliases.some((alias) => namesFuzzyEqual(first, nameTokens(alias)[0] ?? alias));
+  if (!nameOk) {
+    return false;
+  }
+  const extra = tokens.slice(1);
+  if (extra.length === 0) {
+    return true;
+  }
+  const contact = contactFromCanonical(row);
+  const haystack = nameTokens(
+    `${contact?.name ?? row.display_name} ${contact?.company ?? row.company ?? ""} ${(contact?.emails ?? []).join(" ").replaceAll("@", " ").replaceAll(".", " ")} ${aliases.join(" ")}`,
+  );
+  return extra.every((token) => haystack.includes(token));
+}
+
+function canonicalSightings(query: string): Sighting[] {
+  const sightings: Sighting[] = [];
+  for (const row of listCanonicalContacts()) {
+    if (!queryFitsCanonical(query, row)) {
+      continue;
+    }
+    const contact = contactFromCanonical(row);
+    if (!contact) {
+      continue;
+    }
+    for (const email of contact.emails) {
+      sightings.push({
+        name: contact.name,
+        email,
+        source: "known",
+      });
+    }
+  }
+  return sightings;
+}
+
+function matchCanonical(query: string): ContactResolution | undefined {
+  const tokens = nameTokens(query);
+  if (tokens.length === 0) {
+    return undefined;
+  }
+  const matches: Contact[] = [];
+  for (const row of listCanonicalContacts()) {
+    if (!queryFitsCanonical(query, row)) {
+      continue;
+    }
+    const contact = contactFromCanonical(row);
+    if (contact) {
+      matches.push(contact);
+    }
+  }
+  const narrowed = preferOrganization(matches, query);
+  if (narrowed.length === 1) {
+    return { kind: "one", contact: narrowed[0]! };
+  }
+  if (narrowed.length > 1) {
+    return { kind: "many", options: narrowed };
+  }
+  return undefined;
+}
+
+function rememberCanonical(query: string, contact: Contact, confirmed: boolean): void {
+  const key = nameKey(contact.name) || nameKey(query);
+  if (!key || contact.emails.length === 0) {
+    return;
+  }
+  const aliases = [...new Set([nameKey(query), nameTokens(query)[0] ?? "", nameKey(contact.name)].filter(Boolean))];
+  upsertCanonicalContact({
+    nameKey: key,
+    displayName: contact.name || query.trim(),
+    emailsJson: JSON.stringify(contact.emails),
+    company: contact.company ?? null,
+    aliasesJson: JSON.stringify(aliases),
+    sourcesJson: JSON.stringify(contact.sources),
+    confirmed,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
 /** Records his own answer to "which one?". Called only for his reply or his tap. */
 export function rememberContactChoice(query: string, contact: Contact): void {
   const key = nameKey(query);
   if (key) {
     saveContactChoice(key, JSON.stringify(contact), new Date().toISOString());
   }
+  rememberCanonical(query, contact, true);
+}
+
+function uniqueFuzzyCorrection(query: string): string | undefined {
+  const tokens = nameTokens(query);
+  const first = tokens[0];
+  if (!first) {
+    return undefined;
+  }
+  const candidates = new Map<string, string>();
+  for (const row of listCanonicalContacts()) {
+    const displayFirst = nameTokens(row.display_name)[0];
+    if (displayFirst && namesFuzzyEqual(first, displayFirst)) {
+      candidates.set(nameKey(row.display_name), row.display_name);
+    }
+  }
+  for (const prospect of listSequenceProspects()) {
+    const displayFirst = nameTokens(prospect.name)[0];
+    if (displayFirst && namesFuzzyEqual(first, displayFirst)) {
+      candidates.set(nameKey(prospect.name), prospect.name);
+    }
+  }
+  if (candidates.size !== 1) {
+    return undefined;
+  }
+  const corrected = [...candidates.values()][0]!;
+  const rest = tokens.slice(1).join(" ");
+  return rest ? `${corrected} ${rest}` : corrected;
 }
 
 /**
@@ -306,7 +475,10 @@ export function rememberContactChoice(query: string, contact: Contact): void {
  * is matched on first name or full name, whatever the capitals and spacing.
  * Exactly one match is "one"; more than one is "many", for Vishnu to choose.
  */
-export async function resolveContact(query: string): Promise<ContactResolution> {
+export async function resolveContact(
+  query: string,
+  options: { skipFuzzy?: boolean } = {},
+): Promise<ContactResolution> {
   const accounts = decodedAccounts();
   const typed = addressIn(query);
   if (typed) {
@@ -323,20 +495,40 @@ export async function resolveContact(query: string): Promise<ContactResolution> 
   if (chosen) {
     return { kind: "one", contact: chosen };
   }
+  const canonical = matchCanonical(query);
   const company = companyNamed(tokens, accounts);
   if (company) {
     return { kind: "none", company };
   }
   const startedAt = Date.now();
   const fromGoogle = await googleSightings(tokens, accounts);
-  const sightings = [...knownSightings(tokens), ...fromGoogle].filter(
-    (sighting) => !isSelf(sighting.email),
-  );
+  const sightings = [
+    ...canonicalSightings(query),
+    ...knownSightings(tokens),
+    ...fromGoogle,
+  ].filter((sighting) => !isSelf(sighting.email));
   const people = accountPeopleMatching(tokens, accounts);
-  const resolution = resolutionFrom(contactsFrom(sightings, tokens, accounts, people));
+  const contacts = preferOrganization(
+    contactsFrom(sightings, tokens, accounts, people),
+    query,
+  );
+  let resolution = resolutionFrom(contacts);
+  if (resolution.kind === "none" && canonical?.kind === "one") {
+    resolution = canonical;
+  }
   console.log(
     `contacts: lookup kind=${resolution.kind} matches=${resolution.kind === "many" ? resolution.options.length : resolution.kind === "one" ? 1 : 0} ms=${Date.now() - startedAt}`,
   );
+  if (resolution.kind === "one") {
+    rememberCanonical(query, resolution.contact, false);
+    return resolution;
+  }
+  if (resolution.kind === "none" && !options.skipFuzzy) {
+    const corrected = uniqueFuzzyCorrection(query);
+    if (corrected && corrected.toLowerCase() !== query.trim().toLowerCase()) {
+      return resolveContact(corrected, { skipFuzzy: true });
+    }
+  }
   if (resolution.kind === "none" && people.length > 0) {
     return { kind: "none", knownAs: `${people[0]!.name} (${people[0]!.account.name})` };
   }

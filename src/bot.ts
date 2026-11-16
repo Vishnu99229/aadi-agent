@@ -15,7 +15,8 @@ import {
 } from "./contact_questions.js";
 import { runCapability, runOwnerTurn, tryDirectAnswer } from "./agents/orchestrator.js";
 import { parseSettingPhrase } from "./settings_logic.js";
-import { handleCommandSendCallback } from "./command_email.js";
+import { continuePendingAction } from "./action_context.js";
+import { bookPendingMeetingAt, handleCommandSendCallback } from "./command_email.js";
 import { looksLikeCommandTurn } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
 import { FORWARDED_TOOLS } from "./tools/index.js";
@@ -66,6 +67,7 @@ import {
 } from "./db.js";
 import { formatCostReport } from "./usage.js";
 import { handler as listBills } from "./tools/list_bills.js";
+import { handler as ignoreItem } from "./tools/ignore_item.js";
 import { handler as listTasks } from "./tools/list_tasks.js";
 import {
   handleBillCallback,
@@ -1283,6 +1285,37 @@ async function handleUserText(
     const answer = await whileTyping(ctx, () => answerContactQuestion(chatId, userText));
     if (answer.kind !== "none") {
       await continueAfterContactAnswer(ctx, userId, answer, { voiceReply: options.voiceReply });
+      return;
+    }
+  }
+
+  if (
+    ctx.chat &&
+    options.forwarded !== true &&
+    options.contactNote === undefined &&
+    !isForwardedMessage(ctx.message) &&
+    ctx.message
+  ) {
+    const continuation = continuePendingAction(ctx.chat.id, userText);
+    if (continuation.kind === "meeting_time") {
+      const confirmation = { chatId: ctx.chat.id, messageId: ctx.message.message_id };
+      const booked = await whileTyping(ctx, () =>
+        bookPendingMeetingAt(ctx.chat!.id, continuation.startIso, confirmation),
+      );
+      await ctx.reply(booked);
+      return;
+    }
+    if (continuation.kind === "ignore") {
+      const reply = ignoreItem(
+        { query: userText },
+        {
+          iteration: 1,
+          calledTools: [],
+          confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
+          userText,
+        },
+      );
+      await ctx.reply(reply);
       return;
     }
   }

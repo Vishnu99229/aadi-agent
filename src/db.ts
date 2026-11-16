@@ -406,6 +406,37 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_ignore_rule_events_rule
     ON ignore_rule_events (rule_id, at);
+
+  CREATE TABLE IF NOT EXISTS pending_action_contexts (
+    chat_id INTEGER PRIMARY KEY,
+    action TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    owner_words TEXT NOT NULL,
+    confirm_chat INTEGER NOT NULL,
+    confirm_message INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS presented_referents (
+    chat_id INTEGER PRIMARY KEY,
+    entities_json TEXT NOT NULL,
+    pending_kind TEXT,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS canonical_contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    emails_json TEXT NOT NULL,
+    company TEXT,
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    sources_json TEXT NOT NULL DEFAULT '[]',
+    confirmed INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_canonical_contacts_name
+    ON canonical_contacts (name_key);
 `);
 
 const buildsSchema =
@@ -4812,6 +4843,151 @@ export function getContactChoice(nameKey: string, sinceIso: string): string | un
     .prepare("SELECT contact FROM contact_choices WHERE name_key = ? AND chosen_at >= ?")
     .get(nameKey, sinceIso) as { contact: string } | undefined;
   return row?.contact;
+}
+
+export interface PendingActionRow {
+  chat_id: number;
+  action: string;
+  state_json: string;
+  owner_words: string;
+  confirm_chat: number;
+  confirm_message: number;
+  updated_at: string;
+}
+
+export function upsertPendingActionContext(input: {
+  chatId: number;
+  action: string;
+  stateJson: string;
+  ownerWords: string;
+  confirmChat: number;
+  confirmMessage: number;
+  updatedAt: string;
+}): void {
+  db.prepare(
+    `INSERT INTO pending_action_contexts (
+       chat_id, action, state_json, owner_words, confirm_chat, confirm_message, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       action = excluded.action,
+       state_json = excluded.state_json,
+       owner_words = excluded.owner_words,
+       confirm_chat = excluded.confirm_chat,
+       confirm_message = excluded.confirm_message,
+       updated_at = excluded.updated_at`,
+  ).run(
+    input.chatId,
+    input.action,
+    input.stateJson,
+    input.ownerWords,
+    input.confirmChat,
+    input.confirmMessage,
+    input.updatedAt,
+  );
+}
+
+export function getPendingActionContext(chatId: number): PendingActionRow | undefined {
+  return db
+    .prepare("SELECT * FROM pending_action_contexts WHERE chat_id = ?")
+    .get(chatId) as PendingActionRow | undefined;
+}
+
+export function deletePendingActionContext(chatId: number): void {
+  db.prepare("DELETE FROM pending_action_contexts WHERE chat_id = ?").run(chatId);
+}
+
+export interface PresentedReferentRow {
+  chat_id: number;
+  entities_json: string;
+  pending_kind: string | null;
+  updated_at: string;
+}
+
+export function upsertPresentedReferents(input: {
+  chatId: number;
+  entitiesJson: string;
+  pendingKind?: string | null;
+  updatedAt: string;
+}): void {
+  db.prepare(
+    `INSERT INTO presented_referents (chat_id, entities_json, pending_kind, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       entities_json = excluded.entities_json,
+       pending_kind = excluded.pending_kind,
+       updated_at = excluded.updated_at`,
+  ).run(input.chatId, input.entitiesJson, input.pendingKind ?? null, input.updatedAt);
+}
+
+export function getPresentedReferents(chatId: number): PresentedReferentRow | undefined {
+  return db
+    .prepare("SELECT * FROM presented_referents WHERE chat_id = ?")
+    .get(chatId) as PresentedReferentRow | undefined;
+}
+
+export interface CanonicalContactRow {
+  id: number;
+  name_key: string;
+  display_name: string;
+  emails_json: string;
+  company: string | null;
+  aliases_json: string;
+  sources_json: string;
+  confirmed: number;
+  updated_at: string;
+}
+
+export function listCanonicalContacts(): CanonicalContactRow[] {
+  return db
+    .prepare("SELECT * FROM canonical_contacts ORDER BY confirmed DESC, updated_at DESC")
+    .all() as CanonicalContactRow[];
+}
+
+export function upsertCanonicalContact(input: {
+  nameKey: string;
+  displayName: string;
+  emailsJson: string;
+  company?: string | null;
+  aliasesJson: string;
+  sourcesJson: string;
+  confirmed: boolean;
+  updatedAt: string;
+}): void {
+  const existing = db
+    .prepare("SELECT id, confirmed, aliases_json FROM canonical_contacts WHERE name_key = ?")
+    .get(input.nameKey) as { id: number; confirmed: number; aliases_json: string } | undefined;
+  if (existing) {
+    db.prepare(
+      `UPDATE canonical_contacts
+       SET display_name = ?, emails_json = ?, company = COALESCE(?, company),
+           aliases_json = ?, sources_json = ?, confirmed = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(
+      input.displayName,
+      input.emailsJson,
+      input.company ?? null,
+      input.aliasesJson,
+      input.sourcesJson,
+      input.confirmed || existing.confirmed ? 1 : 0,
+      input.updatedAt,
+      existing.id,
+    );
+    return;
+  }
+  db.prepare(
+    `INSERT INTO canonical_contacts (
+       name_key, display_name, emails_json, company, aliases_json, sources_json, confirmed, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.nameKey,
+    input.displayName,
+    input.emailsJson,
+    input.company ?? null,
+    input.aliasesJson,
+    input.sourcesJson,
+    input.confirmed ? 1 : 0,
+    input.updatedAt,
+  );
 }
 
 /** Everyone a follow-up sequence was proposed or run for: name, address and company. */

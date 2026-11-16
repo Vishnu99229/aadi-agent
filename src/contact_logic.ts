@@ -161,17 +161,111 @@ export function accountPeopleMatching(
   return found;
 }
 
-/** Two addresses are one person only when the full name is the same and they
- *  can't be at two different companies. Anything less stays two people. */
-function samePerson(contact: Contact, name: string, email: string): boolean {
-  const words = nameTokens(name);
-  if (words.length < 2 || words.join(" ") !== nameTokens(contact.name).join(" ")) {
+function firstName(name: string): string {
+  return nameTokens(name)[0] ?? "";
+}
+
+function lastNames(name: string): string[] {
+  return nameTokens(name).slice(1);
+}
+
+/** Levenshtein distance, capped so ordinary typos stay cheap to score. */
+export function editDistance(left: string, right: string, max = 2): number {
+  if (left === right) {
+    return 0;
+  }
+  if (Math.abs(left.length - right.length) > max) {
+    return max + 1;
+  }
+  const rows = left.length + 1;
+  const cols = right.length + 1;
+  const prev = new Array<number>(cols);
+  const next = new Array<number>(cols);
+  for (let j = 0; j < cols; j += 1) {
+    prev[j] = j;
+  }
+  for (let i = 1; i < rows; i += 1) {
+    next[0] = i;
+    let rowMin = next[0]!;
+    for (let j = 1; j < cols; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      next[j] = Math.min(prev[j]! + 1, next[j - 1]! + 1, prev[j - 1]! + cost);
+      if (next[j]! < rowMin) {
+        rowMin = next[j]!;
+      }
+    }
+    if (rowMin > max) {
+      return max + 1;
+    }
+    for (let j = 0; j < cols; j += 1) {
+      prev[j] = next[j]!;
+    }
+  }
+  return prev[right.length]!;
+}
+
+export function namesFuzzyEqual(left: string, right: string): boolean {
+  if (!left || !right) {
     return false;
   }
+  if (left === right) {
+    return true;
+  }
+  const longest = Math.max(left.length, right.length);
+  const max = longest <= 4 ? 1 : 2;
+  return editDistance(left, right, max) <= max;
+}
+
+/** Two addresses are one person when the full name matches, or when the first
+ *  names match, they share a company, and neither last name contradicts the other. */
+function samePerson(contact: Contact, name: string, email: string): boolean {
   const companies = new Set(
     [...contact.emails, email].filter((item) => !isConsumerAddress(item)).map(domainOf),
   );
-  return companies.size <= 1;
+  if (companies.size > 1) {
+    return false;
+  }
+  const known = nameTokens(contact.name);
+  const incoming = nameTokens(name);
+  if (known.length >= 2 && incoming.length >= 2 && known.join(" ") === incoming.join(" ")) {
+    return true;
+  }
+  const knownFirst = firstName(contact.name) || firstName(localPart(contact.emails[0] ?? ""));
+  const incomingFirst = firstName(name) || firstName(localPart(email));
+  if (!knownFirst || !incomingFirst || !namesFuzzyEqual(knownFirst, incomingFirst)) {
+    return false;
+  }
+  if (companies.size === 0) {
+    return known.length >= 2 && incoming.length >= 2 && known.join(" ") === incoming.join(" ");
+  }
+  const knownLast = lastNames(contact.name);
+  const incomingLast = lastNames(name);
+  // Same first name at one company is not enough: "Ravi Kumar" and "Ravi K"
+  // at the same domain are two people until a last name actually agrees.
+  if (knownLast.length === 0 || incomingLast.length === 0) {
+    return false;
+  }
+  return knownLast.every((word) => incomingLast.includes(word)) ||
+    incomingLast.every((word) => knownLast.includes(word));
+}
+
+/** Prefer people whose company or domain matches an organization word he used. */
+export function preferOrganization(
+  contacts: readonly Contact[],
+  query: string,
+): Contact[] {
+  const tokens = nameTokens(query);
+  if (tokens.length < 2 || contacts.length <= 1) {
+    return [...contacts];
+  }
+  const extra = tokens.slice(1);
+  const matching = contacts.filter((contact) => {
+    const company = nameTokens(
+      `${contact.company ?? ""} ${contact.emails.map((email) => email.replaceAll("@", " ").replaceAll(".", " ")).join(" ")}`,
+    );
+    return extra.some((word) => company.includes(word));
+  });
+  return matching.length > 0 && matching.length < contacts.length ? matching : [...contacts];
 }
 
 /**
