@@ -162,6 +162,22 @@ db.exec(`
     tool_name TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS calendar_event_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    account_id TEXT NOT NULL CHECK (account_id IN ('work', 'personal')),
+    title TEXT NOT NULL,
+    start_iso TEXT NOT NULL,
+    attendees_json TEXT NOT NULL DEFAULT '[]',
+    focused INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    UNIQUE (chat_id, account_id, event_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_calendar_event_refs_chat
+    ON calendar_event_refs (chat_id, focused DESC, updated_at DESC);
+
   CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL CHECK (type IN ('send_draft', 'create_event')),
@@ -1129,6 +1145,46 @@ try {
   );
 }
 
+let messagesFtsReady = false;
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      content,
+      content='messages',
+      content_rowid='id',
+      tokenize='porter'
+    );
+    CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+      INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF content ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+      INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+  `);
+  messagesFtsReady = true;
+  const rebuilt = db
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get("messages_fts_rebuilt_v1") as { value: string } | undefined;
+  if (rebuilt?.value !== "1") {
+    db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild');`);
+    db.prepare(
+      `INSERT INTO settings (key, value) VALUES ('messages_fts_rebuilt_v1', '1')
+       ON CONFLICT(key) DO UPDATE SET value = '1'`,
+    ).run();
+    console.log("messages FTS index rebuilt");
+  }
+} catch (error) {
+  messagesFtsReady = false;
+  const errorType = error instanceof Error ? error.name : "UnknownError";
+  console.error(`Message FTS5 unavailable (${errorType}); search will scan a bounded slice.`);
+}
+
 let memoriesFtsReady = false;
 try {
   db.exec(`
@@ -1309,6 +1365,184 @@ export function getRecentMessages(limit = 10): StoredMessage[] {
     .all(safeLimit) as StoredMessage[];
 
   return rows.reverse();
+}
+
+export interface MessageHit {
+  id: number;
+  content: string;
+  created_at: string;
+}
+
+function messageSearchForms(tokens: readonly string[]): string[] {
+  const forms = new Set<string>();
+  for (const token of tokens) {
+    const word = token.toLowerCase();
+    if (word.length < 3) {
+      continue;
+    }
+    forms.add(word);
+    if (word.length >= 6 && forms.size < 12) {
+      for (let index = 0; index < word.length && forms.size < 12; index += 1) {
+        if (word[index] === "h" || word[index] === "i") {
+          const variant = `${word.slice(0, index)}${word[index] === "i" ? "y" : ""}${word.slice(index + 1)}`;
+          if (variant.length >= 3) {
+            forms.add(variant);
+          }
+        }
+      }
+    }
+  }
+  return [...forms].slice(0, 12);
+}
+
+/**
+ * Candidate chat lines for one lookup. FTS5 supplies a small set; the caller ranks it.
+ * Without FTS, only the latest 200 non-tool rows are read, then whole words are kept.
+ */
+export function searchRelevantMessages(tokens: readonly string[], limit = 24): MessageHit[] {
+  const safeLimit = Math.max(1, Math.min(24, Math.floor(limit)));
+  const forms = messageSearchForms(tokens);
+  if (forms.length === 0) {
+    return [];
+  }
+  if (messagesFtsReady) {
+    const match = forms.map((form) => `"${form.replace(/"/g, "")}"`).join(" OR ");
+    try {
+      return db
+        .prepare(
+          `SELECT m.id, m.content, m.created_at
+           FROM messages m
+           JOIN messages_fts f ON f.rowid = m.id
+           WHERE messages_fts MATCH ? AND m.role != 'tool'
+           ORDER BY bm25(messages_fts), m.id DESC
+           LIMIT ?`,
+        )
+        .all(match, safeLimit) as MessageHit[];
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Message FTS query failed (${errorType}); scanning a bounded slice.`);
+    }
+  }
+  const rows = db
+    .prepare(
+      `SELECT id, content, created_at
+       FROM messages
+       WHERE role != 'tool'
+       ORDER BY id DESC
+       LIMIT 200`,
+    )
+    .all() as MessageHit[];
+  return rows
+    .filter((row) =>
+      forms.some((form) => new RegExp(`(?<![\\p{L}\\p{N}])${form}(?![\\p{L}\\p{N}])`, "iu").test(row.content)),
+    )
+    .slice(0, safeLimit);
+}
+
+export interface CalendarEventRefRecord {
+  chatId: number;
+  eventId: string;
+  accountId: "work" | "personal";
+  title: string;
+  startIso: string;
+  attendees: Array<{ name: string; email: string }>;
+  focused: boolean;
+  updatedAt: string;
+}
+
+const CALENDAR_REF_LIMIT = 20;
+
+export function upsertCalendarEventRef(input: {
+  chatId: number;
+  eventId: string;
+  accountId: "work" | "personal";
+  title: string;
+  startIso: string;
+  attendees: Array<{ name: string; email: string }>;
+  focused?: boolean;
+  updatedAt: string;
+}): void {
+  const attendees = input.attendees.slice(0, 30);
+  const focused = input.focused ? 1 : 0;
+  db.transaction(() => {
+    if (focused) {
+      db.prepare(`UPDATE calendar_event_refs SET focused = 0 WHERE chat_id = ?`).run(input.chatId);
+    }
+    db.prepare(
+      `INSERT INTO calendar_event_refs
+        (chat_id, event_id, account_id, title, start_iso, attendees_json, focused, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(chat_id, account_id, event_id) DO UPDATE SET
+         title = excluded.title,
+         start_iso = excluded.start_iso,
+         attendees_json = excluded.attendees_json,
+         focused = CASE WHEN excluded.focused = 1 THEN 1 ELSE calendar_event_refs.focused END,
+         updated_at = excluded.updated_at`,
+    ).run(
+      input.chatId,
+      input.eventId,
+      input.accountId,
+      input.title,
+      input.startIso,
+      JSON.stringify(attendees),
+      focused,
+      input.updatedAt,
+    );
+    db.prepare(
+      `DELETE FROM calendar_event_refs
+       WHERE chat_id = ?
+         AND id NOT IN (
+           SELECT id FROM calendar_event_refs
+           WHERE chat_id = ?
+           ORDER BY focused DESC, updated_at DESC
+           LIMIT ?
+         )`,
+    ).run(input.chatId, input.chatId, CALENDAR_REF_LIMIT);
+  })();
+}
+
+export function listCalendarEventRefs(chatId: number): CalendarEventRefRecord[] {
+  const rows = db
+    .prepare(
+      `SELECT event_id, account_id, title, start_iso, attendees_json, focused, updated_at
+       FROM calendar_event_refs
+       WHERE chat_id = ?
+       ORDER BY focused DESC, updated_at DESC
+       LIMIT ?`,
+    )
+    .all(chatId, CALENDAR_REF_LIMIT) as Array<{
+    event_id: string;
+    account_id: "work" | "personal";
+    title: string;
+    start_iso: string;
+    attendees_json: string;
+    focused: number;
+    updated_at: string;
+  }>;
+  return rows.map((row) => {
+    let attendees: Array<{ name: string; email: string }> = [];
+    try {
+      const parsed = JSON.parse(row.attendees_json) as Array<{ name?: string; email?: string }>;
+      attendees = parsed
+        .map((person) => ({
+          name: person.name ?? "",
+          email: (person.email ?? "").toLowerCase(),
+        }))
+        .filter((person) => person.email);
+    } catch {
+      attendees = [];
+    }
+    return {
+      chatId,
+      eventId: row.event_id,
+      accountId: row.account_id,
+      title: row.title,
+      startIso: row.start_iso,
+      attendees,
+      focused: row.focused === 1,
+      updatedAt: row.updated_at,
+    };
+  });
 }
 
 export const CONVERSATION_SUMMARY_KEY = "conversation_summary";

@@ -5,6 +5,7 @@ import {
   asksForAttachment,
   isAutomatedAddress,
   mentionsSendDate,
+  nameTokens,
   namedInOwnWords,
   notAnEventCommand,
   notASendCommand,
@@ -13,7 +14,10 @@ import {
   authorizationWords,
   clearPendingAction,
   getPendingAction,
+  holdEmailToolTurn,
+  matchOwnerSupplied,
   pendingResolvedEmails,
+  rememberBookedMeeting,
   savePendingAction,
   type ResolvedAttendee,
 } from "./action_context.js";
@@ -465,6 +469,18 @@ async function finishRequest(
     attendees,
     now,
   });
+  if (result.booked && result.eventId && confirmation) {
+    rememberBookedMeeting(confirmation.chatId, {
+      eventId: result.eventId,
+      accountId: "work",
+      title: request.meeting!.title ?? request.to[0]?.query ?? "Meeting",
+      startIso: request.meeting!.startIso,
+      attendees: attendees.map((person) => ({
+        name: person.name || person.email,
+        email: person.email.toLowerCase(),
+      })),
+    }, now);
+  }
   return { text: result.text };
 }
 
@@ -588,6 +604,29 @@ async function resolveAndContinue(
   return finishRequest(request, base, confirmation, now);
 }
 
+function ownerNamed(
+  query: string,
+  ownWords: string,
+  contact: { email: string; name: string },
+): boolean {
+  if (/^(?:him|her|them|it)$/i.test(query.trim())) {
+    return true;
+  }
+  if (/\b(?:this|that|the|same)\s+(?:email(?:\s+id)?|address)\b|\bemail i\b|\baddress i\b/i.test(query)) {
+    return true;
+  }
+  const said = (token: string) =>
+    new RegExp(`(?<![\\p{L}\\p{N}])${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "iu").test(ownWords);
+  const typed = addressIn(query);
+  if (typed && ownWords.toLowerCase().includes(typed)) {
+    return true;
+  }
+  const spoken = nameTokens(query).filter((token) => token.length >= 3);
+  const known = nameTokens(contact.name).filter((token) => token.length >= 3);
+  const first = known[0];
+  return (spoken.length > 0 && spoken.every(said)) || (first !== undefined && said(first));
+}
+
 /** Who he named, checked against his own words, or why it can't be used. An address
  *  Aadi already offered him counts, because he's answering that question. A
  *  previously resolved attendee on this workflow also counts, even if the email
@@ -608,12 +647,16 @@ function recipientSlots(
       );
     });
   const answered = new Set<number>();
-  const prior = pendingResolvedEmails(chatId);
+  const prior = pendingResolvedEmails(chatId, now);
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
     const address = addressIn(query);
     const offers = address ? offeredIn(address) : [];
     const remembered = prior.get(query.trim().toLowerCase()) ?? (address ? prior.get(address) : undefined);
+    const supplied = matchOwnerSupplied(chatId, query, now);
+    if (supplied.kind === "many") {
+      return `${refusal}: "${query}" matches more than one address Vishnu typed (${supplied.contacts.map((item) => item.email).join(", ")}). Ask which one.`;
+    }
     if (address && offers.length > 0) {
       offers.forEach((choice) => answered.add(choice.id));
       slots.push({ query, mailbox: { email: address, name: "" } });
@@ -621,6 +664,11 @@ function recipientSlots(
       slots.push({
         query,
         mailbox: { email: remembered.email, name: remembered.name },
+      });
+    } else if (supplied.kind === "one" && ownerNamed(query, ownWords, supplied.contact)) {
+      slots.push({
+        query,
+        mailbox: { email: supplied.contact.email, name: supplied.contact.name },
       });
     } else if (namedInOwnWords(query, ownWords)) {
       slots.push({ query });
@@ -674,6 +722,10 @@ export async function sendEmailFromTool(
     return "Not sent: only Vishnu's own message can send an email.";
   }
   const ownWords = turn.userText?.trim() ?? "";
+  const held = holdEmailToolTurn(confirmation.chatId, ownWords, now);
+  if (held) {
+    return held;
+  }
   const notCommand = notASendCommand(ownWords);
   if (notCommand) {
     return `Not sent: ${notCommand}. Use the right tool, or ask him if he wants it sent now.`;
@@ -710,7 +762,7 @@ export async function sendEmailFromTool(
   }
   const slots = recipientSlots(
     [...toQueries, ...ccQueries],
-    authorizationWords(confirmation.chatId, ownWords),
+    authorizationWords(confirmation.chatId, ownWords, now),
     now,
     when ? "Not scheduled" : "Not sent",
     confirmation.chatId,
@@ -772,7 +824,7 @@ export async function bookMeetingFromTool(
     end_time?: unknown;
     duration_minutes?: unknown;
   };
-  const authWords = authorizationWords(confirmation.chatId, ownWords);
+  const authWords = authorizationWords(confirmation.chatId, ownWords, now);
   let queries = stringList(values.attendees);
   if (queries.length === 0 && pending?.meeting?.attendees.length) {
     queries = pending.meeting.attendees.map((item) => item.query);

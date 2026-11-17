@@ -15,7 +15,10 @@ import {
 } from "./contact_questions.js";
 import { runCapability, runOwnerTurn, tryDirectAnswer } from "./agents/orchestrator.js";
 import { parseSettingPhrase } from "./settings_logic.js";
-import { continuePendingAction } from "./action_context.js";
+import { applyOwnerContextTurn, continuePendingAction, savePendingAction } from "./action_context.js";
+import { attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
+import { publishReadyDraft } from "./context_draft.js";
+import { stageExternalContext } from "./context_lookup.js";
 import { bookPendingMeetingAt, handleCommandSendCallback } from "./command_email.js";
 import { looksLikeCommandTurn } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
@@ -1296,6 +1299,69 @@ async function handleUserText(
     !isForwardedMessage(ctx.message) &&
     ctx.message
   ) {
+    await stageExternalContext(userText);
+    const noted = await noteCalendarReference({ chatId: ctx.chat.id, text: userText });
+    if (noted) {
+      await ctx.reply(noted);
+      return;
+    }
+    const revised = await reviseReferencedMeeting({
+      chatId: ctx.chat.id,
+      text: userText,
+      confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
+    });
+    if (revised) {
+      await ctx.reply(revised);
+      return;
+    }
+    const reused = await attendeesForNewMeeting(userText);
+    if (reused.kind === "many") {
+      await ctx.reply(reused.question);
+      return;
+    }
+    if (reused.kind === "one") {
+      savePendingAction(ctx.chat.id, {
+        action: "create_meeting",
+        status: "open",
+        ownerWords: userText,
+        confirmChat: ctx.chat.id,
+        confirmMessage: ctx.message.message_id,
+        updatedAt: new Date().toISOString(),
+        meeting: {
+          title: reused.title,
+          calendar: reused.accountId,
+          waiting: "time",
+          resolutionAttempts: {},
+          attendees: reused.attendees.map((person) => ({
+            query: person.name,
+            name: person.name,
+            email: person.email,
+            resolved: true,
+          })),
+        },
+      });
+      await ctx.reply(
+        `I found ${reused.title} on the ${reused.accountId} calendar, with ${reused.attendees.map((person) => person.email).join(", ")}. What time should the new meeting be?`,
+      );
+      return;
+    }
+    const contextTurn = applyOwnerContextTurn(
+      ctx.chat.id,
+      userText,
+      ctx.message.message_id,
+    );
+    if (contextTurn.publishDraft) {
+      const posted = await publishReadyDraft(ctx.chat.id);
+      if (posted.posted) {
+        return;
+      }
+      await ctx.reply("I couldn't create that draft.");
+      return;
+    }
+    if (contextTurn.handled && contextTurn.text) {
+      await ctx.reply(contextTurn.text);
+      return;
+    }
     const continuation = continuePendingAction(ctx.chat.id, userText);
     if (continuation.kind === "meeting_time") {
       const confirmation = { chatId: ctx.chat.id, messageId: ctx.message.message_id };

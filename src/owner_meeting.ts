@@ -543,7 +543,7 @@ export async function createCommandEvent(input: {
   /** The addresses resolved from what he named. */
   resolved: ReadonlySet<string>;
 }): Promise<
-  | { ok: true; hangoutLink?: string; clash: string[] }
+  | { ok: true; eventId?: string; hangoutLink?: string; clash: string[] }
   | { ok: false; text: string }
 > {
   try {
@@ -582,7 +582,7 @@ export async function createCommandEvent(input: {
   }
   recordCommandSendSent(input.key, created.id ?? "unknown");
   console.log("Command event: provider=calendar status=created");
-  return { ok: true, hangoutLink: created.hangoutLink, clash };
+  return { ok: true, eventId: created.id, hangoutLink: created.hangoutLink, clash };
 }
 
 /** Calendar only: nobody is invited or emailed. */
@@ -644,7 +644,7 @@ export async function bookResolvedMeeting(input: {
   endIso: string;
   attendees: ParsedMailbox[];
   now: Date;
-}): Promise<{ text: string; booked: boolean }> {
+}): Promise<{ text: string; booked: boolean; eventId?: string }> {
   if (new Date(input.startIso).getTime() < input.now.getTime() - PAST_GRACE_MS) {
     return { text: "Not booked: that time has already passed.", booked: false };
   }
@@ -670,5 +670,6 @@ export async function bookResolvedMeeting(input: {
       ...result.clash,
     ].join("\n"),
     booked: true,
+    eventId: result.eventId,
   };
 }
