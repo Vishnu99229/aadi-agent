@@ -190,15 +190,21 @@ function eventDay(start: string): string {
 }
 
 function personMatches(name: string, attendee: { name: string; email: string }): boolean {
-  const token = name.trim().toLowerCase();
-  if (!token) {
+  const query = name.trim().toLowerCase();
+  if (!query) {
     return false;
   }
+  if (query.includes("@")) {
+    return attendee.email.toLowerCase() === query;
+  }
+  const queryWords = query.split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 3);
   const words = `${attendee.name} ${attendee.email.split("@")[0] ?? ""}`
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter((word) => word.length >= 3);
-  return words.some((word) => word === token || (token.length >= 6 && word.length >= 6 && namesFuzzyEqual(word, token)));
+  return queryWords.length > 0 && queryWords.every((token) =>
+    words.some((word) => word === token || (token.length >= 6 && word.length >= 6 && namesFuzzyEqual(word, token))),
+  );
 }
 
 function contentTokens(text: string): string[] {
@@ -632,12 +638,16 @@ async function currentAttendees(
           calendarId: "primary",
           eventId: ref.eventId,
         })).data.attendees;
+    const known = new Map(ref.attendees.map((person) => [person.email.toLowerCase(), person.name]));
     const guests = (listed ?? [])
-      .map((person) => ({
-        email: (person.email ?? "").trim().toLowerCase(),
-        name: (person.displayName || person.email || "").trim(),
-        resource: NOT_A_PERSON.test(person.email ?? ""),
-      }))
+      .map((person) => {
+        const email = (person.email ?? "").trim().toLowerCase();
+        return {
+          email,
+          name: (person.displayName || known.get(email) || person.email || "").trim(),
+          resource: NOT_A_PERSON.test(person.email ?? ""),
+        };
+      })
       .filter((person) => person.email);
     return [...new Map(guests.map((person) => [person.email, person])).values()];
   } catch (error) {

@@ -380,8 +380,14 @@ function correctionOfEmail(text: string, email: PendingEmailState | undefined): 
   if (!email) {
     return false;
   }
-  if (/\b(?:cancel(?:\s+that|\s+it|\s+the\s+email)?|don'?t send|do not send|never send)\b/i.test(text)) {
+  if (/\b(?:don'?t send|do not send|never send)\b/i.test(text)) {
     return true;
+  }
+  if (/\bcancel\b/i.test(text)) {
+    if (/\b(?:meeting|reminder|task|bill|event)\b/i.test(text)) {
+      return false;
+    }
+    return /\b(?:email|e-mail|mail|draft|it|that)\b/i.test(text);
   }
   if (/^(?:not|no)\b/i.test(text.trim()) && /\b(?:context|explain|tell you)\b/i.test(text)) {
     return true;
