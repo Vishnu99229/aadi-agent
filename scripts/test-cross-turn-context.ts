@@ -31,6 +31,7 @@ import { setApprovalsTestHooks, handleApprovalCallback, retireOwnerDraft } from 
 import { setRouteModelCompleteForTests } from "../src/llm.ts";
 import { resetAgentModelSettings, setAgentModelSetting } from "../src/models/agent_models.ts";
 import { attendeesForNewMeeting, resetOwnerCalendarTestHooks, reviseReferencedMeeting, setOwnerCalendarTestHooks } from "../src/owner_calendar.ts";
+import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { rememberBookedMeeting } from "../src/action_context.ts";
 import { setGoogleAccountForTests } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
@@ -667,6 +668,14 @@ const say = (text: string, now = NOW) =>
   assert.match(byEmail ?? "", /^Updated /);
   assert.equal(current.some((person) => person.email === "nithish@epicode.in"), false);
   assert.equal(patches, 4);
+  const addedTyped = await reviseReferencedMeeting({
+    chatId: chat,
+    text: "Add fresh.person@example.com to that meeting.",
+    confirmation: { chatId: chat, messageId: 8 },
+    now: NOW,
+  });
+  assert.match(addedTyped ?? "", /fresh\.person@example\.com/);
+  assert.equal(patches, 5);
   assert.equal(await reviseReferencedMeeting({
     chatId: chat,
     text: "add a task to buy milk",
@@ -699,6 +708,26 @@ const say = (text: string, now = NOW) =>
   assert.equal(await retireOwnerDraft(cancelled.retireDraftId!), "retired");
   assert.equal(getPendingActionForDraft(posted.draftId!), undefined);
   assert.match(cards.at(-1)!.text, /Discarded/);
+}
+
+{
+  const chat = 33;
+  applyOwnerContextTurn(chat, "Draft an email to alice@example.com about the proposal.", 1, NOW);
+  const created = await draftNewEmail(
+    { to: "alice@example.com", subject: "Proposal", body: "Here is the proposal." },
+    {
+      iteration: 1,
+      calledTools: [],
+      confirmation: { chatId: chat, messageId: 1 },
+      userText: "Draft an email to alice@example.com about the proposal.",
+    },
+  );
+  const draftId = /draft_id:\s*(\S+)/.exec(created)?.[1];
+  assert.ok(draftId);
+  assert.equal(getPendingAction(chat, NOW)?.email?.draftId, draftId);
+  const cancelled = applyOwnerContextTurn(chat, "Cancel that email.", 2, NOW);
+  assert.equal(cancelled.retireDraftId, draftId);
+  assert.equal(await retireOwnerDraft(cancelled.retireDraftId!), "retired");
 }
 
 console.log("cross-turn context checks passed.");

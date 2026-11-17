@@ -192,6 +192,46 @@ export function rememberBookedMeeting(
 }
 
 /** Point "that meeting" at an older event without dropping an open draft. */
+/** Remember a Gmail draft the Email Agent just created, so a later cancel can drop its Send card. */
+export function linkPublishedDraft(input: {
+  chatId: number;
+  draftId: string;
+  to: string;
+  subject: string;
+  account: "work" | "personal";
+}): void {
+  const pending = getPendingAction(input.chatId);
+  const addresses = [...input.to.matchAll(EMAIL_RE)].map((match) => match[0].toLowerCase());
+  const to = addresses.map((email) => ({
+    query: email,
+    name: email.split("@")[0]?.replace(/[._]+/g, " ").trim() || email,
+    email,
+    resolved: true,
+  }));
+  savePendingAction(input.chatId, {
+    action: pending?.action === "send_email" ? "send_email" : "draft_email",
+    status: "open",
+    ownerWords: pending?.ownerWords ?? "",
+    confirmChat: pending?.confirmChat ?? input.chatId,
+    confirmMessage: pending?.confirmMessage ?? 0,
+    ownerSupplied: pending?.ownerSupplied,
+    meeting: pending?.meeting,
+    updatedAt: new Date().toISOString(),
+    email: {
+      to: to.length > 0 ? to : pending?.email?.to ?? [],
+      cc: pending?.email?.cc ?? [],
+      notes: pending?.email?.notes ?? [],
+      subject: input.subject,
+      purpose: pending?.email?.purpose ?? input.subject,
+      account: input.account,
+      waiting: "confirm",
+      draftId: input.draftId,
+      sendAt: pending?.email?.sendAt,
+      scheduledSendId: pending?.email?.scheduledSendId,
+    },
+  });
+}
+
 export function focusBookedMeeting(
   chatId: number,
   booked: NonNullable<PendingAction["bookedMeeting"]>,

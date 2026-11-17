@@ -12,6 +12,7 @@ import { parseAddressList } from "../mail_helpers.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor, signaturePlainText } from "../google/mail.js";
 import { notASendCommand } from "../command_logic.js";
+import { linkPublishedDraft } from "../action_context.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 
@@ -140,6 +141,15 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     googleAccount: account.id,
     ...(signature ? { signature } : {}),
   });
+  if (turn.confirmation) {
+    linkPublishedDraft({
+      chatId: turn.confirmation.chatId,
+      draftId,
+      to: toHeader,
+      subject,
+      account: account.id,
+    });
+  }
 
   return `Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`;
 }

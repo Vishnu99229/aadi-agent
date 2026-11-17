@@ -1,5 +1,6 @@
 import { google, type calendar_v3 } from "googleapis";
 import { focusBookedMeeting, getPendingAction, matchOwnerSupplied } from "./action_context.js";
+import { rememberContactChoice } from "./contacts.js";
 import { nameTokens } from "./command_logic.js";
 import { namesFuzzyEqual } from "./contact_logic.js";
 import { listCalendarEventRefs, type CalendarEventRefRecord } from "./db.js";
@@ -561,6 +562,13 @@ export async function reviseReferencedMeeting(input: {
     return `Not changed: I couldn't read the current guest list for ${booked.title}.`;
   }
   const resolveNew = (name: string): { email: string; name: string } | string => {
+    const typed = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.exec(name);
+    if (typed) {
+      const email = typed[0].toLowerCase();
+      const local = email.split("@")[0]?.replace(/[._]+/g, " ").trim() || email;
+      rememberContactChoice(local, { name: local, emails: [email], sources: ["known"] });
+      return { email, name: local };
+    }
     const found = matchOwnerSupplied(input.chatId, name, now);
     if (found.kind === "one") {
       return { email: found.contact.email, name: found.contact.name };
