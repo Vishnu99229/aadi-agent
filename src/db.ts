@@ -5478,6 +5478,18 @@ export function createScheduledSend(input: {
   })();
 }
 
+export function appendScheduledSendInstruction(id: number, note: string): void {
+  const row = getScheduledSend(id);
+  if (!row || (row.status !== "scheduled" && row.status !== "held")) {
+    return;
+  }
+  const request = JSON.parse(row.request) as { instruction?: string };
+  request.instruction = `${request.instruction ?? ""}\n${note}`.trim();
+  db.prepare(
+    "UPDATE scheduled_sends SET request = ? WHERE id = ? AND status IN ('scheduled', 'held')",
+  ).run(JSON.stringify(request), id);
+}
+
 export function getScheduledSend(id: number): ScheduledSendRecord | undefined {
   return db.prepare("SELECT * FROM scheduled_sends WHERE id = ?").get(id) as
     | ScheduledSendRecord

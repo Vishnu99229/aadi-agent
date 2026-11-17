@@ -8,6 +8,7 @@ import {
   getScheduledSend,
   listCanonicalContacts,
   markTaskDone,
+  appendScheduledSendInstruction,
   transitionScheduledSend,
   upsertCalendarEventRef,
   upsertPendingActionContext,
@@ -781,6 +782,9 @@ export function applyOwnerContextTurn(
     emails.length === 0
   ) {
     const notes = [...next.email.notes, clean, ...(contextNote ? [contextNote] : [])];
+    if (next.email.scheduledSendId) {
+      appendScheduledSendInstruction(next.email.scheduledSendId, clean);
+    }
     next = {
       ...next,
       email: {

@@ -27,12 +27,20 @@ If the facts do not mention a previous discussion, do not say there was one.
 Do not add a sign-off. Match the situation: follow-up, proposal, or a first note.
 No filler such as "I hope this email finds you well" or "just following up" when the facts already say what to ask.`;
 
+/** Keep the start of the facts and the latest instruction. A long draft must not push the correction off the end. */
+function boundedFacts(facts: string): string {
+  if (facts.length <= 1800) {
+    return facts;
+  }
+  return `${facts.slice(0, 1100)}\n…\n${facts.slice(-600)}`;
+}
+
 /** One email-agent call. Exported so tests can see which model was asked. */
 export async function composeWithEmailAgent(facts: string): Promise<{ subject: string; body: string; modelKey?: string }> {
   const resolved = resolveAgentModel("email", { needs: { tools: false } });
   const result: CompleteResult = await complete({
     system: { cacheable: WRITER_SYSTEM },
-    messages: [{ role: "user", content: facts.slice(0, 1800) }],
+    messages: [{ role: "user", content: boundedFacts(facts) }],
     tools: [],
     jsonSchema: DRAFT_SCHEMA,
     maxTokens: 500,
