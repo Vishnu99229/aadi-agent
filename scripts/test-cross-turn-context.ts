@@ -22,11 +22,12 @@ import {
   createMemory,
   createScheduledSend,
   createTask,
+  getPendingActionForDraft,
   getScheduledSend,
   listOpenScheduledSends,
   saveMessage,
 } from "../src/db.ts";
-import { setApprovalsTestHooks, handleApprovalCallback } from "../src/approvals.ts";
+import { setApprovalsTestHooks, handleApprovalCallback, retireOwnerDraft } from "../src/approvals.ts";
 import { setRouteModelCompleteForTests } from "../src/llm.ts";
 import { resetAgentModelSettings, setAgentModelSetting } from "../src/models/agent_models.ts";
 import { attendeesForNewMeeting, resetOwnerCalendarTestHooks, reviseReferencedMeeting, setOwnerCalendarTestHooks } from "../src/owner_calendar.ts";
@@ -332,9 +333,14 @@ const say = (text: string, now = NOW) =>
   assert.match(draft?.email?.notes.join(" ") ?? "", /voice agent requirements/);
   assert.equal(listOpenScheduledSends().filter((row) => row.confirm_chat === other).length, 0);
 
+  const beforeSwap = draftCount;
   applyOwnerContextTurn(other, "other.person@example.com", 5, NOW);
   const swapped = applyOwnerContextTurn(other, "Not that one, the other contact.", 6, NOW);
   assert.match(swapped.text ?? "", /other\.person@example\.com/);
+  assert.equal(swapped.publishDraft, true);
+  assert.equal((await publishReadyDraft(other, NOW)).posted, true);
+  assert.equal(draftCount, beforeSwap, "switching recipients updates the same draft");
+  assert.match(cards.at(-1)!.text, /other\.person@example\.com/i);
   assert.equal(getPendingAction(other, NOW)?.email?.to[0]?.email, "other.person@example.com");
   assert.match(getPendingAction(other, NOW)?.email?.notes.join(" ") ?? "", /BotCompose/);
 }
@@ -652,7 +658,34 @@ const say = (text: string, now = NOW) =>
   assert.equal(current.some((person) => person.email === "tripthi.anchan@epicode.in"), false);
   assert.equal(current.filter((person) => person.email === "hardik@pinnacle.example").length, 1);
   assert.equal(patches, 3);
+  assert.equal(await reviseReferencedMeeting({
+    chatId: chat,
+    text: "add a task to buy milk",
+    confirmation: { chatId: chat, messageId: 5 },
+    now: NOW,
+  }), undefined);
+  assert.equal(await reviseReferencedMeeting({
+    chatId: chat,
+    text: "remove the shopping task",
+    confirmation: { chatId: chat, messageId: 6 },
+    now: NOW,
+  }), undefined);
   resetOwnerCalendarTestHooks();
+}
+
+{
+  const chat = 31;
+  applyOwnerContextTurn(chat, "Draft an email to Sameer.", 1, NOW);
+  applyOwnerContextTurn(chat, "sameer@example.com", 2, NOW);
+  const ready = applyOwnerContextTurn(chat, "It's about the dialer.", 3, NOW);
+  assert.equal(ready.publishDraft, true);
+  const posted = await publishReadyDraft(chat, NOW);
+  assert.ok(posted.draftId);
+  const cancelled = applyOwnerContextTurn(chat, "Cancel that email.", 4, NOW);
+  assert.equal(cancelled.retireDraftId, posted.draftId);
+  assert.equal(await retireOwnerDraft(cancelled.retireDraftId!), "retired");
+  assert.equal(getPendingActionForDraft(posted.draftId!), undefined);
+  assert.match(cards.at(-1)!.text, /Discarded/);
 }
 
 console.log("cross-turn context checks passed.");

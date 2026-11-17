@@ -47,6 +47,7 @@ import {
 import {
   consumeDraftEdit,
   handleApprovalCallback,
+  retireOwnerDraft,
   sendPendingDraftByText,
   type SendConfirmation,
 } from "./approvals.js";
@@ -1350,9 +1351,21 @@ async function handleUserText(
       userText,
       ctx.message.message_id,
     );
+    if (contextTurn.retireDraftId) {
+      const retired = await retireOwnerDraft(contextTurn.retireDraftId);
+      if (retired === "delete_failed") {
+        await ctx.reply(
+          "Cancelled that email. The Send button is off. I could not delete the Gmail draft, so check the mailbox.",
+        );
+        return;
+      }
+    }
     if (contextTurn.publishDraft) {
       const posted = await publishReadyDraft(ctx.chat.id);
       if (posted.posted) {
+        if (contextTurn.text) {
+          await ctx.reply(contextTurn.text);
+        }
         return;
       }
       await ctx.reply("I couldn't create that draft.");

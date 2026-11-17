@@ -121,6 +121,25 @@ function parseAttendeeEdit(text: string): AttendeeEdit | undefined {
   return undefined;
 }
 
+/** Bare "add/remove NAME" is a meeting edit only while a meeting is in play. */
+function isMeetingAttendeeEdit(text: string, edit: AttendeeEdit, chatId: number, now: Date): boolean {
+  if (/\b(?:task|reminder|bill|memory|shopping)\b/i.test(text)) {
+    return false;
+  }
+  if (/\b(?:meeting|calendar|attendee|invite|invitation)\b/i.test(text)) {
+    return true;
+  }
+  const name = (edit.op === "replace" ? edit.from : edit.name).trim();
+  if (/^(?:a|an|the|my|our)\b/i.test(name) || name.split(/\s+/).length > 3) {
+    return false;
+  }
+  const pending = getPendingAction(chatId, now);
+  if (pending?.status === "open" && pending.meeting) {
+    return true;
+  }
+  return refsFromStore(chatId).length > 0;
+}
+
 function referencePhrase(text: string, edit: AttendeeEdit | undefined): string {
   if (!edit) {
     return text;
@@ -510,7 +529,7 @@ export async function reviseReferencedMeeting(input: {
   now?: Date;
 }): Promise<string | undefined> {
   const edit = parseAttendeeEdit(input.text);
-  if (!edit) {
+  if (!edit || !isMeetingAttendeeEdit(input.text, edit, input.chatId, input.now ?? new Date())) {
     return undefined;
   }
   const now = input.now ?? new Date();

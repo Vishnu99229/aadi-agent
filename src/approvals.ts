@@ -924,6 +924,25 @@ async function markCardDiscarded(action: PendingAction): Promise<void> {
   }
 }
 
+/** Drops a draft the owner cancelled in chat, including its Send card. */
+export async function retireOwnerDraft(
+  draftId: string,
+): Promise<"retired" | "missing" | "delete_failed"> {
+  const action = getPendingActionForDraft(draftId);
+  if (!action?.draft_id) {
+    return "missing";
+  }
+  const outcome = await performDraftDiscard(action);
+  if (outcome.ok) {
+    await markCardDiscarded(action);
+    return "retired";
+  }
+  if (outcome.reason === "delete_failed" && transitionPendingAction(action.id, "pending", "discarded")) {
+    await markCardDiscarded(action);
+  }
+  return "delete_failed";
+}
+
 export async function discardPendingDraftByText(
   confirmation: SendConfirmation,
   draftId: string,

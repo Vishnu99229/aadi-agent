@@ -475,6 +475,8 @@ export interface OwnerTurnResult {
   text?: string;
   /** The draft is complete. The caller posts one Gmail approval card and does not repeat the body. */
   publishDraft?: boolean;
+  /** A published Gmail draft whose Send card must be discarded with this turn. */
+  retireDraftId?: string;
 }
 
 /**
@@ -536,21 +538,36 @@ export function applyOwnerContextTurn(
 
   if (correctionOfEmail(clean, next.email) && next.email && next.status !== "cancelled") {
     cancelLinkedSend(next.email);
+    const retireDraftId = next.email.draftId;
     next = {
       ...next,
       status: "cancelled",
       action: next.action === "note" ? "draft_email" : next.action,
-      email: { ...next.email, waiting: "purpose", scheduledSendId: undefined, purpose: undefined, subject: undefined },
+      email: {
+        ...next.email,
+        waiting: "purpose",
+        scheduledSendId: undefined,
+        purpose: undefined,
+        subject: undefined,
+        draftId: undefined,
+      },
     };
     savePendingAction(chatId, next, now);
     return {
       handled: true,
       text: "Cancelled that email. It will not be sent. Tell me the context when you're ready.",
+      retireDraftId,
     };
   }
 
   const remove = /^(?:remove|drop)\s+(.+)$/i.exec(clean);
-  if (remove && next.action === "create_meeting" && next.status === "open" && next.meeting) {
+  if (
+    remove &&
+    next.action === "create_meeting" &&
+    next.status === "open" &&
+    next.meeting &&
+    !/\b(?:task|reminder|bill|memory|shopping)\b/i.test(clean)
+  ) {
     const token = remove[1]!.trim().toLowerCase();
     next = {
       ...next,
@@ -570,17 +587,18 @@ export function applyOwnerContextTurn(
 
   if (/\b(?:the other one|not that one)\b/i.test(clean) && supplied.length === 2 && next.email?.to[0]) {
     const other = supplied.find((item) => item.email !== next.email!.to[0]!.email);
-    if (other) {
-      next = {
-        ...next,
-        status: "open",
-        email: {
-          ...next.email,
-          to: [{ query: other.name, name: other.name, email: other.email, resolved: true }],
-        },
+    if (other && next.email) {
+      const email = {
+        ...next.email,
+        to: [{ query: other.name, name: other.name, email: other.email, resolved: true }],
       };
+      next = { ...next, status: "open", email };
       savePendingAction(chatId, next, now);
-      return { handled: true, text: `Using ${other.email} instead. Nothing has been sent.` };
+      return {
+        handled: true,
+        text: `Using ${other.email} instead. Nothing has been sent.`,
+        publishDraft: Boolean(email.draftId),
+      };
     }
   }
 
