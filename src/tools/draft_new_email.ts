@@ -147,6 +147,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       draftId,
       to: toHeader,
       subject,
+      body: values.body,
       account: account.id,
     });
   }

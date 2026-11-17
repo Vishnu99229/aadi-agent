@@ -142,13 +142,17 @@ function isMeetingAttendeeEdit(text: string, edit: AttendeeEdit, chatId: number,
 }
 
 function referencePhrase(text: string, edit: AttendeeEdit | undefined): string {
+  const withoutNotice = text
+    .replace(/\b(?:quietly|without notifying|no notifications?)\b/gi, " ")
+    .replace(/\b(?:don'?t|do not)\s+(?:notify|email|e-mail|tell)(?:\s+\w+){0,3}\b/gi, " ")
+    .replace(/\b(?:let them know|notify them|tell them|send (?:the )?(?:invitation|update))\b/gi, " ");
   if (!edit) {
-    return text;
+    return withoutNotice;
   }
   if (edit.op === "replace") {
-    return text.replace(edit.from, " ").replace(edit.to, " ");
+    return withoutNotice.replace(edit.from, " ").replace(edit.to, " ");
   }
-  return text.replace(edit.name, " ");
+  return withoutNotice.replace(edit.name, " ");
 }
 
 function istWeekday(now: Date): number {

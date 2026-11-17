@@ -676,6 +676,15 @@ const say = (text: string, now = NOW) =>
   });
   assert.match(addedTyped ?? "", /fresh\.person@example\.com/);
   assert.equal(patches, 5);
+  const quiet = await reviseReferencedMeeting({
+    chatId: chat,
+    text: "Remove Hardik from that meeting quietly.",
+    confirmation: { chatId: chat, messageId: 9 },
+    now: NOW,
+  });
+  assert.match(quiet ?? "", /^Updated /);
+  assert.match(quiet ?? "", /sendUpdates=none/);
+  assert.equal(current.some((person) => person.email === "hardik@pinnacle.example"), false);
   assert.equal(await reviseReferencedMeeting({
     chatId: chat,
     text: "add a task to buy milk",
@@ -725,6 +734,7 @@ const say = (text: string, now = NOW) =>
   const draftId = /draft_id:\s*(\S+)/.exec(created)?.[1];
   assert.ok(draftId);
   assert.equal(getPendingAction(chat, NOW)?.email?.draftId, draftId);
+  assert.match(getPendingAction(chat, NOW)?.email?.notes.join("\n") ?? "", /Here is the proposal/);
   const cancelled = applyOwnerContextTurn(chat, "Cancel that email.", 2, NOW);
   assert.equal(cancelled.retireDraftId, draftId);
   assert.equal(await retireOwnerDraft(cancelled.retireDraftId!), "retired");

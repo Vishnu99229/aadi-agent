@@ -83,6 +83,9 @@ export async function publishReadyDraft(
     const body = written.body;
     if (email.draftId) {
       await updateDraft({ draft_id: email.draftId, to, body });
+      const notes = email.notes.filter((note) => !note.startsWith("Current draft:"));
+      notes.push(`Current draft:\n${body}`);
+      savePendingAction(chatId, { ...pending, email: { ...email, notes } }, now);
       return { posted: true, draftId: email.draftId };
     }
     const subject = written.subject || email.subject || subjectFrom(email.purpose);

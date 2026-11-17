@@ -1,4 +1,4 @@
-import { addressIn, nameTokens } from "./command_logic.js";
+import { addressIn, nameTokens, notASendCommand } from "./command_logic.js";
 import { namesFuzzyEqual } from "./contact_logic.js";
 import { rememberContactChoice } from "./contacts.js";
 import { retrieveRelevantContext } from "./context_lookup.js";
@@ -198,10 +198,11 @@ export function linkPublishedDraft(input: {
   draftId: string;
   to: string;
   subject: string;
+  body?: string;
   account: "work" | "personal";
 }): void {
   const pending = getPendingAction(input.chatId);
-  const addresses = [...input.to.matchAll(EMAIL_RE)].map((match) => match[0].toLowerCase());
+  const addresses = [...input.to.matchAll(new RegExp(EMAIL_RE.source, "gi"))].map((match) => match[0].toLowerCase());
   const to = addresses.map((email) => ({
     query: email,
     name: email.split("@")[0]?.replace(/[._]+/g, " ").trim() || email,
@@ -220,15 +221,46 @@ export function linkPublishedDraft(input: {
     email: {
       to: to.length > 0 ? to : pending?.email?.to ?? [],
       cc: pending?.email?.cc ?? [],
-      notes: pending?.email?.notes ?? [],
+      notes: [
+        ...(pending?.email?.notes ?? []).filter((note) => !note.startsWith("Current draft:")),
+        ...(input.body ? [`Current draft:\n${input.body}`] : []),
+      ],
       subject: input.subject,
       purpose: pending?.email?.purpose ?? input.subject,
       account: input.account,
       waiting: "confirm",
-      draftId: input.draftId,
+      draftId: input.draftId || pending?.email?.draftId,
       sendAt: pending?.email?.sendAt,
       scheduledSendId: pending?.email?.scheduledSendId,
     },
+  });
+}
+
+/** So "cancel that email" can stop a send that was scheduled from this chat. */
+export function rememberScheduledSend(input: {
+  chatId: number;
+  scheduledSendId: number;
+  sendAt: string;
+  to: string;
+  subject: string;
+  account: "work" | "personal";
+}): void {
+  linkPublishedDraft({
+    chatId: input.chatId,
+    draftId: getPendingAction(input.chatId)?.email?.draftId ?? "",
+    to: input.to,
+    subject: input.subject,
+    account: input.account,
+  });
+  const pending = getPendingAction(input.chatId);
+  if (!pending?.email) {
+    return;
+  }
+  savePendingAction(input.chatId, {
+    ...pending,
+    action: "send_email",
+    status: "open",
+    email: { ...pending.email, scheduledSendId: input.scheduledSendId, sendAt: input.sendAt, draftId: pending.email.draftId || undefined },
   });
 }
 
@@ -794,6 +826,9 @@ export function holdEmailToolTurn(
     return "Not sent: that email was cancelled. Nothing from it will go out. Say send when you want a new one.";
   }
   if (pending?.status === "open" && pending.email && !messageAuthorizesExternalSend(ownWords)) {
+    if (notASendCommand(ownWords) === undefined && /\b(?:send|e-?mail|mail|reply|schedule)\b/i.test(ownWords)) {
+      return undefined;
+    }
     const stillAuthorized =
       pending.action === "send_email" &&
       messageAuthorizesExternalSend(pending.ownerWords) &&

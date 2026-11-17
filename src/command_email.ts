@@ -18,6 +18,7 @@ import {
   matchOwnerSupplied,
   pendingResolvedEmails,
   rememberBookedMeeting,
+  rememberScheduledSend,
   savePendingAction,
   type ResolvedAttendee,
 } from "./action_context.js";
@@ -429,6 +430,14 @@ async function scheduleRequest(
     return { text: "Not scheduled again: this command was already handled." };
   }
   console.log(`Scheduled send ${row.id}: status -> scheduled`);
+  rememberScheduledSend({
+    chatId: confirmation.chatId,
+    scheduledSendId: row.id,
+    sendAt: request.sendAt!,
+    to: formatMailboxList(to),
+    subject: shownSubject,
+    account: request.account === "personal" ? "personal" : "work",
+  });
   const scheduledCard = {
     text: `Scheduled: ${itemText}`,
     caption: `Scheduled: ${itemText}`,
