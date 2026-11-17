@@ -756,6 +756,21 @@ const say = (text: string, now = NOW) =>
     { iteration: 1, calledTools: [], confirmation: { chatId: chat, messageId: 5 }, userText: "Change the To line to bob@example.com" },
   );
   assert.equal(getPendingAction(chat, NOW)?.email?.to[0]?.email, "bob@example.com");
+  const second = await draftNewEmail(
+    { to: "carol@example.com", subject: "Other", body: "Other note." },
+    { iteration: 1, calledTools: [], confirmation: { chatId: chat, messageId: 6 }, userText: "Draft another email." },
+  );
+  const secondId = /draft_id:\s*(\S+)/.exec(second)?.[1];
+  assert.equal(getPendingAction(chat, NOW)?.email?.draftId, secondId);
+  await updateDraftTool(
+    { draft_id: posted.draftId, to: "dave@example.com" },
+    { iteration: 1, calledTools: [], confirmation: { chatId: chat, messageId: 7 }, userText: "Change the older draft." },
+  );
+  assert.equal(getPendingAction(chat, NOW)?.email?.draftId, secondId);
+  assert.equal(getPendingAction(chat, NOW)?.email?.to[0]?.email, "carol@example.com");
+  const another = applyOwnerContextTurn(chat, "Draft an email to bob@example.com about the invoice.", 8, NOW);
+  assert.notEqual(another.publishDraft, true);
+  assert.equal(getPendingAction(chat, NOW)?.email?.draftId, undefined);
 }
 
 console.log("cross-turn context checks passed.");

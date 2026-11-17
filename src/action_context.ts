@@ -252,6 +252,9 @@ export function syncDraftRecipient(input: {
     email,
     resolved: true,
   }));
+  if (pending?.email?.draftId && pending.email.draftId !== input.draftId) {
+    return;
+  }
   if (!pending?.email) {
     linkPublishedDraft(input);
     return;
@@ -717,7 +720,7 @@ export function applyOwnerContextTurn(
 
   const openEmail = next.status === "open" && (next.action === "draft_email" || next.action === "send_email");
   const freshDraft = /\bdraft\b/i.test(clean) && /\b(?:email|e-mail|mail)\b/i.test(clean);
-  if (freshDraft && !openEmail) {
+  if (freshDraft) {
     const named = clean.replace(/^.*\bto\s+/i, "").replace(/[.?!].*$/, "").trim();
     next = {
       ...next,
