@@ -286,22 +286,34 @@ export function rememberScheduledSend(input: {
   subject: string;
   account: "work" | "personal";
 }): void {
+  const pending = getPendingAction(input.chatId);
+  const scheduled = [...input.to.matchAll(new RegExp(EMAIL_RE.source, "gi"))].map((match) => match[0].toLowerCase());
+  const sameDraft = (pending?.email?.to ?? []).some((person) => scheduled.includes(person.email));
   linkPublishedDraft({
     chatId: input.chatId,
-    draftId: getPendingAction(input.chatId)?.email?.draftId ?? "",
+    draftId: sameDraft ? pending?.email?.draftId ?? "" : "",
     to: input.to,
     subject: input.subject,
+    body: sameDraft ? undefined : "",
     account: input.account,
   });
-  const pending = getPendingAction(input.chatId);
-  if (!pending?.email) {
+  const linked = getPendingAction(input.chatId);
+  if (!linked?.email) {
     return;
   }
+  const notes = sameDraft ? linked.email.notes : [];
   savePendingAction(input.chatId, {
-    ...pending,
+    ...linked,
     action: "send_email",
     status: "open",
-    email: { ...pending.email, scheduledSendId: input.scheduledSendId, sendAt: input.sendAt, draftId: pending.email.draftId || undefined },
+    email: {
+      ...linked.email,
+      notes,
+      purpose: sameDraft ? linked.email.purpose : input.subject,
+      scheduledSendId: input.scheduledSendId,
+      sendAt: input.sendAt,
+      draftId: sameDraft ? linked.email.draftId || undefined : undefined,
+    },
   });
 }
 
