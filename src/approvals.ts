@@ -1183,6 +1183,10 @@ export async function handleApprovalCallback(
   }
 }
 
+export function hasPendingDraftEdit(userId: number): boolean {
+  return editingActionByUser.has(userId);
+}
+
 export async function consumeDraftEdit(
   userId: number,
 ): Promise<DraftEditContext | undefined> {

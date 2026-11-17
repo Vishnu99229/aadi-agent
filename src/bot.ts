@@ -46,6 +46,7 @@ import {
 } from "./chat_backend.js";
 import {
   consumeDraftEdit,
+  hasPendingDraftEdit,
   handleApprovalCallback,
   retireOwnerDraft,
   sendPendingDraftByText,
@@ -1360,7 +1361,7 @@ async function handleUserText(
         return;
       }
     }
-    if (contextTurn.publishDraft) {
+    if (contextTurn.publishDraft && !hasPendingDraftEdit(userId)) {
       const posted = await publishReadyDraft(ctx.chat.id);
       if (posted.posted) {
         if (contextTurn.text) {
