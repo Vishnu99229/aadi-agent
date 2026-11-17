@@ -139,12 +139,13 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   });
 
   const draftId = result.data.id ?? values.draft_id;
-  if (turn?.confirmation && values.to !== undefined) {
+  if (turn?.confirmation && (values.to !== undefined || typeof values.body === "string")) {
     syncDraftRecipient({
       chatId: turn.confirmation.chatId,
       draftId,
       to: safeHeader(to),
       subject: safeHeader(subject),
+      body: typeof values.body === "string" ? body : undefined,
       account: account.id,
     });
   }

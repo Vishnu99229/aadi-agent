@@ -242,6 +242,7 @@ export function syncDraftRecipient(input: {
   draftId: string;
   to: string;
   subject: string;
+  body?: string;
   account: "work" | "personal";
 }): void {
   const pending = getPendingAction(input.chatId);
@@ -259,12 +260,16 @@ export function syncDraftRecipient(input: {
     linkPublishedDraft(input);
     return;
   }
+  const notes = input.body
+    ? [...pending.email.notes.filter((note) => !note.startsWith("Current draft:")), `Current draft:\n${input.body}`]
+    : pending.email.notes;
   savePendingAction(input.chatId, {
     ...pending,
     email: {
       ...pending.email,
       to: to.length > 0 ? to : pending.email.to,
       subject: input.subject || pending.email.subject,
+      notes,
       draftId: pending.email.draftId || input.draftId,
       account: input.account,
     },
@@ -684,21 +689,21 @@ export function applyOwnerContextTurn(
     next.meeting &&
     !/\b(?:task|reminder|bill|memory|shopping)\b/i.test(clean)
   ) {
-    const token = remove[1]!.trim().toLowerCase();
-    next = {
-      ...next,
-      meeting: {
-        ...next.meeting,
-        attendees: next.meeting.attendees.filter(
-          (item) => !item.name.toLowerCase().includes(token) && !item.query.toLowerCase().includes(token),
-        ),
-      },
-    };
-    savePendingAction(chatId, next, now);
-    return {
-      handled: true,
-      text: `Removed ${remove[1]!.trim()} from the pending meeting. The other attendees stay.`,
-    };
+    const name = remove[1]!.replace(/\s+from\s+.*$/i, "").trim();
+    const token = name.toLowerCase();
+    const words = token.includes("@") ? [token] : token.split(/\s+/).filter((word) => word.length >= 3);
+    const attendees = next.meeting.attendees.filter((item) => {
+      const hay = `${item.name} ${item.query} ${item.email}`.toLowerCase();
+      return words.length === 0 || !words.every((word) => hay.includes(word));
+    });
+    if (attendees.length !== next.meeting.attendees.length) {
+      next = { ...next, meeting: { ...next.meeting, attendees } };
+      savePendingAction(chatId, next, now);
+      return {
+        handled: true,
+        text: `Removed ${name} from the pending meeting. The other attendees stay.`,
+      };
+    }
   }
 
   if (/\b(?:the other one|not that one)\b/i.test(clean) && supplied.length === 2 && next.email?.to[0]) {
@@ -708,11 +713,17 @@ export function applyOwnerContextTurn(
         ...next.email,
         to: [{ query: other.name, name: other.name, email: other.email, resolved: true }],
       };
+      const hadSchedule = Boolean(email.scheduledSendId);
+      if (hadSchedule) {
+        cancelLinkedSend(email);
+        email.scheduledSendId = undefined;
+        email.sendAt = undefined;
+      }
       next = { ...next, status: "open", email };
       savePendingAction(chatId, next, now);
       return {
         handled: true,
-        text: `Using ${other.email} instead. Nothing has been sent.`,
+        text: `Using ${other.email} instead. Nothing has been sent.${hadSchedule ? " The scheduled send was cancelled so it will not go to the previous address." : ""}`,
         publishDraft: Boolean(email.draftId),
       };
     }
