@@ -236,6 +236,38 @@ export function linkPublishedDraft(input: {
   });
 }
 
+/** Keep the chat's draft pointed at the address a later update_draft wrote. */
+export function syncDraftRecipient(input: {
+  chatId: number;
+  draftId: string;
+  to: string;
+  subject: string;
+  account: "work" | "personal";
+}): void {
+  const pending = getPendingAction(input.chatId);
+  const addresses = [...input.to.matchAll(new RegExp(EMAIL_RE.source, "gi"))].map((match) => match[0].toLowerCase());
+  const to = addresses.map((email) => ({
+    query: email,
+    name: email.split("@")[0]?.replace(/[._]+/g, " ").trim() || email,
+    email,
+    resolved: true,
+  }));
+  if (!pending?.email) {
+    linkPublishedDraft(input);
+    return;
+  }
+  savePendingAction(input.chatId, {
+    ...pending,
+    email: {
+      ...pending.email,
+      to: to.length > 0 ? to : pending.email.to,
+      subject: input.subject || pending.email.subject,
+      draftId: pending.email.draftId || input.draftId,
+      account: input.account,
+    },
+  });
+}
+
 /** So "cancel that email" can stop a send that was scheduled from this chat. */
 export function rememberScheduledSend(input: {
   chatId: number;
@@ -443,6 +475,9 @@ export function messageAuthorizesExternalSend(text: string): boolean {
 
 function looksLikeEmailContext(text: string): boolean {
   if (/^(?:what|who|when|where|why|how|show|list|find|search)\b/i.test(text.trim())) {
+    return false;
+  }
+  if (/\b(?:add|remove|delete|set|create|schedule|book|cancel)\b/i.test(text) && /\b(?:task|reminder|bill|meeting|calendar)\b/i.test(text)) {
     return false;
   }
   return /\b(?:about|regarding|mention|wants?|needs?|requirement|context|subject|shorter|longer)\b/i.test(text);

@@ -32,6 +32,7 @@ import { setRouteModelCompleteForTests } from "../src/llm.ts";
 import { resetAgentModelSettings, setAgentModelSetting } from "../src/models/agent_models.ts";
 import { attendeesForNewMeeting, resetOwnerCalendarTestHooks, reviseReferencedMeeting, setOwnerCalendarTestHooks } from "../src/owner_calendar.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
+import { handler as updateDraftTool } from "../src/tools/update_draft.ts";
 import { rememberBookedMeeting } from "../src/action_context.ts";
 import { setGoogleAccountForTests } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
@@ -738,6 +739,23 @@ const say = (text: string, now = NOW) =>
   const cancelled = applyOwnerContextTurn(chat, "Cancel that email.", 2, NOW);
   assert.equal(cancelled.retireDraftId, draftId);
   assert.equal(await retireOwnerDraft(cancelled.retireDraftId!), "retired");
+}
+
+{
+  const chat = 34;
+  applyOwnerContextTurn(chat, "Draft an email to Sameer.", 1, NOW);
+  applyOwnerContextTurn(chat, "sameer@example.com", 2, NOW);
+  const ready = applyOwnerContextTurn(chat, "It's about the dialer.", 3, NOW);
+  assert.equal(ready.publishDraft, true);
+  const posted = await publishReadyDraft(chat, NOW);
+  const task = applyOwnerContextTurn(chat, "Add a task about reviewing the proposal.", 4, NOW);
+  assert.notEqual(task.publishDraft, true);
+  assert.doesNotMatch(getPendingAction(chat, NOW)?.email?.notes.join(" ") ?? "", /reviewing the proposal/);
+  await updateDraftTool(
+    { draft_id: posted.draftId, to: "bob@example.com" },
+    { iteration: 1, calledTools: [], confirmation: { chatId: chat, messageId: 5 }, userText: "Change the To line to bob@example.com" },
+  );
+  assert.equal(getPendingAction(chat, NOW)?.email?.to[0]?.email, "bob@example.com");
 }
 
 console.log("cross-turn context checks passed.");

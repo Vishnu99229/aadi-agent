@@ -1,4 +1,5 @@
 import type { LlmTool } from "../llm.js";
+import { syncDraftRecipient } from "../action_context.js";
 import { queueDraftApproval } from "../approvals.js";
 import { getPendingActionForDraft } from "../db.js";
 import {
@@ -11,6 +12,7 @@ import {
   stripSignature,
 } from "../google/mail.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
+import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -54,7 +56,7 @@ function safeHeader(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }
 
-export async function handler(input: unknown): Promise<string> {
+export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
   const values = input as {
     draft_id?: unknown;
     body?: unknown;
@@ -137,6 +139,15 @@ export async function handler(input: unknown): Promise<string> {
   });
 
   const draftId = result.data.id ?? values.draft_id;
+  if (turn?.confirmation && values.to !== undefined) {
+    syncDraftRecipient({
+      chatId: turn.confirmation.chatId,
+      draftId,
+      to: safeHeader(to),
+      subject: safeHeader(subject),
+      account: account.id,
+    });
+  }
   await queueDraftApproval({
     draftId,
     threadId,
