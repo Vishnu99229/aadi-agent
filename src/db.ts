@@ -5714,6 +5714,22 @@ export function draftDeliveryBlocksDiscard(draftId: string, account: string): "i
   return undefined;
 }
 
+/** The mailbox a draft was scheduled from, including after that send has finished. */
+export function accountBoundToDraft(draftId: string): "work" | "personal" | undefined {
+  const row = db
+    .prepare(
+      `SELECT json_extract(request, '$.account') AS account
+       FROM scheduled_sends
+       WHERE json_valid(request)
+         AND json_extract(request, '$.draftId') = ?
+         AND status IN ('scheduled', 'held', 'sending', 'sent', 'failed')
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get(draftId) as { account: unknown } | undefined;
+  return row?.account === "work" || row?.account === "personal" ? row.account : undefined;
+}
+
 export function getScheduledSend(id: number): ScheduledSendRecord | undefined {
   return db.prepare("SELECT * FROM scheduled_sends WHERE id = ?").get(id) as
     | ScheduledSendRecord

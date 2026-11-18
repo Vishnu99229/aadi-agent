@@ -9,7 +9,7 @@ import {
   type ScheduleSync,
 } from "../action_context.js";
 import { queueDraftApproval } from "../approvals.js";
-import { getPendingActionForDraft } from "../db.js";
+import { accountBoundToDraft, getPendingActionForDraft } from "../db.js";
 import {
   buildMimeMessage,
   gmailClient,
@@ -106,14 +106,19 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     throw new Error("Pass body, to, cc, subject, or a combination.");
   }
 
-  const pending = getPendingActionForDraft(values.draft_id.trim());
-  const { account, draft: existing } = await resolveGmailDraft(
-    values.draft_id.trim(),
-    pending?.google_account,
-  );
+  const draftId = values.draft_id.trim();
+  const pending = getPendingActionForDraft(draftId);
+  const hintedAccount = pending?.google_account ?? accountBoundToDraft(draftId);
   // The email this draft was scheduled as may already be going out, or gone. Its history
-  // stays as sent: say so before changing anything.
-  const locked = lockedScheduleForDraft(values.draft_id.trim(), account.id);
+  // stays as sent: say so before reading or changing the draft.
+  if (hintedAccount) {
+    const locked = lockedScheduleForDraft(draftId, hintedAccount);
+    if (locked) {
+      return tooLateText(locked);
+    }
+  }
+  const { account, draft: existing } = await resolveGmailDraft(draftId, hintedAccount);
+  const locked = lockedScheduleForDraft(draftId, account.id);
   if (locked) {
     return tooLateText(locked);
   }
@@ -182,7 +187,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     },
   });
 
-  const draftId = result.data.id ?? values.draft_id;
+  const savedDraftId = result.data.id ?? values.draft_id;
   const draftThread = leavesThread ? result.data.message?.threadId ?? threadId : threadId;
   const conversationNote = leavesThread
     ? "New subject: this will go out as a new conversation, not as a reply in the original thread."
@@ -203,13 +208,13 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
       body: typeof values.body === "string" ? body : undefined,
     };
     sync = turn?.confirmation
-      ? syncDraftRecipient({ chatId: turn.confirmation.chatId, draftId, ...fields, account: account.id })
-      : syncBoundSchedules(draftId, account.id, draftChange(fields));
+      ? syncDraftRecipient({ chatId: turn.confirmation.chatId, draftId: savedDraftId, ...fields, account: account.id })
+      : syncBoundSchedules(savedDraftId, account.id, draftChange(fields));
   }
   const scheduleNote =
     sync.kind === "synced" ? "The scheduled email was updated to match this draft." : scheduleSyncNotice(sync);
   await queueDraftApproval({
-    draftId,
+    draftId: savedDraftId,
     threadId: draftThread,
     to: safeHeader(to),
     cc: cc ? safeHeader(cc) : undefined,
@@ -224,7 +229,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   });
 
   return JSON.stringify({
-    draft_id: draftId,
+    draft_id: savedDraftId,
     account: account.id,
     tag: account.tag,
     to: safeHeader(to),
