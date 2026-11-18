@@ -1,5 +1,5 @@
 import { google, type calendar_v3 } from "googleapis";
-import { focusBookedMeeting, getPendingAction, matchOwnerSupplied } from "./action_context.js";
+import { explicitEmailField, focusBookedMeeting, getPendingAction, matchOwnerSupplied } from "./action_context.js";
 import { rememberContactChoice } from "./contacts.js";
 import { nameTokens } from "./command_logic.js";
 import { namesFuzzyEqual } from "./contact_logic.js";
@@ -147,8 +147,25 @@ function parseAttendeeEdit(text: string): AttendeeEdit | undefined {
   return undefined;
 }
 
+/** An add/remove while both an email draft and a meeting are open, with no word that picks one. */
+function ambiguousSharedReference(text: string, chatId: number, now: Date): boolean {
+  if (!parseAttendeeEdit(text) || explicitEmailField(text)) {
+    return false;
+  }
+  if (/\b(?:meeting|calendar|attendee|invite|invitation|task|reminder|bill|memory|shopping)\b/i.test(text)) {
+    return false;
+  }
+  const pending = getPendingAction(chatId, now);
+  const emailOpen = pending?.status === "open" && Boolean(pending.email?.draftId);
+  const meetingOpen = Boolean(pending?.status === "open" && pending.meeting) || refsFromStore(chatId).some((ref) => ref.focused);
+  return emailOpen && meetingOpen;
+}
+
 /** Bare "add/remove NAME" is a meeting edit only while a meeting is in play. */
 function isMeetingAttendeeEdit(text: string, edit: AttendeeEdit, chatId: number, now: Date): boolean {
+  if (explicitEmailField(text)) {
+    return false;
+  }
   if (/\b(?:task|reminder|bill|memory|shopping)\b/i.test(text)) {
     return false;
   }
@@ -683,11 +700,17 @@ export async function reviseReferencedMeeting(input: {
   confirmation: { chatId: number; messageId: number } | undefined;
   now?: Date;
 }): Promise<string | undefined> {
-  const edit = parseAttendeeEdit(input.text);
-  if (!edit || !isMeetingAttendeeEdit(input.text, edit, input.chatId, input.now ?? new Date())) {
+  const now = input.now ?? new Date();
+  if (explicitEmailField(input.text)) {
     return undefined;
   }
-  const now = input.now ?? new Date();
+  if (ambiguousSharedReference(input.text, input.chatId, now)) {
+    return "Do you mean the email draft or the meeting?";
+  }
+  const edit = parseAttendeeEdit(input.text);
+  if (!edit || !isMeetingAttendeeEdit(input.text, edit, input.chatId, now)) {
+    return undefined;
+  }
   const pending = getPendingAction(input.chatId, now);
   const cues = meetingCues(referencePhrase(input.text, edit), now);
   if (pending?.status === "open" && pending.meeting && cues.tokens.length === 0 && !namesADay(cues)) {

@@ -2,12 +2,17 @@ import { Api, InlineKeyboard, type Context } from "grammy";
 import { google, type gmail_v1 } from "googleapis";
 import { config } from "./config.js";
 import {
+  cancelOpenDraftSchedules,
+  claimDraftDelivery,
   createPendingAction,
   createPendingEventAction,
+  draftDeliveryBlocksDiscard,
   getExpiredPendingActions,
   getPendingAction,
   getPendingActionForDraft,
   listDraftsShownBefore,
+  markTaskDone,
+  recordScheduledSendSent,
   setPendingActionDraftMeta,
   setPendingActionTelegramMessage,
   transitionPendingAction,
@@ -469,9 +474,18 @@ async function currentPendingAction(
 
 type SendOutcome =
   | { ok: true }
-  | { ok: false; reason: "send_failed" | "status_update_failed" };
+  | { ok: false; reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" };
 
-function sendFailureText(reason: "send_failed" | "status_update_failed"): string {
+function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"]): string {
+  if (reason === "already_sent") {
+    return "That email was already delivered. I didn't send it again.";
+  }
+  if (reason === "in_progress") {
+    return "That email is already being sent. I didn't send it again.";
+  }
+  if (reason === "unconfirmed") {
+    return "Gmail didn't confirm an earlier send, so I won't try again. Check your Sent mail.";
+  }
   return reason === "send_failed"
     ? "Sending failed. The draft is still pending; please try again."
     : "The draft was sent, but its approval status could not be updated.";
@@ -482,6 +496,14 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
   if (!draftId) {
     return { ok: false, reason: "send_failed" };
   }
+  const claim = claimDraftDelivery(draftId, action.google_account, new Date().toISOString());
+  if (claim.state === "already_sent" || claim.state === "unconfirmed" || claim.state === "in_progress") {
+    if (claim.state === "already_sent") {
+      transitionPendingAction(action.id, "pending", "sent");
+    }
+    console.log(`Approval action ${action.id}: send blocked reason=${claim.state}`);
+    return { ok: false, reason: claim.state };
+  }
   let sentMessageId: string | undefined;
   try {
     const gmail = await gmailFor(action.google_account);
@@ -491,8 +513,17 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
     });
     sentMessageId = sent.data.id ?? undefined;
   } catch {
+    if (claim.state === "claimed") {
+      console.log(`Approval action ${action.id}: send unconfirmed; schedule ${claim.id} stays claimed`);
+      return { ok: false, reason: "unconfirmed" };
+    }
     console.log(`Approval action ${action.id}: send failed; status -> pending`);
     return { ok: false, reason: "send_failed" };
+  }
+  if (claim.state === "claimed") {
+    recordScheduledSendSent(claim.id, sentMessageId ?? null);
+    markTaskDone(claim.taskId);
+    console.log(`Scheduled send ${claim.id}: status -> sent reason=manual_draft`);
   }
   if (sentMessageId && afterDraftSend) {
     try {
@@ -526,6 +557,11 @@ export async function sendCreatedDraftNow(params: {
   } catch {
     return { ok: false, reason: "not_approved" };
   }
+  const claim = claimDraftDelivery(params.draftId, params.googleAccount, new Date().toISOString());
+  if (claim.state === "already_sent" || claim.state === "in_progress" || claim.state === "unconfirmed") {
+    console.log(`Draft ${params.draftId}: immediate send blocked reason=${claim.state}`);
+    return { ok: false, reason: "send_failed" };
+  }
   let sentMessageId: string | undefined;
   try {
     const gmail = await gmailFor(params.googleAccount);
@@ -537,6 +573,10 @@ export async function sendCreatedDraftNow(params: {
   } catch {
     console.log(`Draft ${params.draftId}: immediate send failed`);
     return { ok: false, reason: "send_failed" };
+  }
+  if (claim.state === "claimed") {
+    recordScheduledSendSent(claim.id, sentMessageId ?? null);
+    markTaskDone(claim.taskId);
   }
   if (sentMessageId && afterDraftSend) {
     try {
@@ -645,6 +685,9 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   });
   const outcome = await performDraftSend(action);
   if (!outcome.ok) {
+    if (outcome.reason === "already_sent") {
+      await showStatus(ctx, "Sent").catch(() => undefined);
+    }
     await ctx.answerCallbackQuery({ text: sendFailureText(outcome.reason), show_alert: true });
     return;
   }
@@ -904,13 +947,21 @@ export async function sendPendingDraftByText(
 
 type DiscardOutcome =
   | { ok: true }
-  | { ok: false; reason: "no_draft" | "delete_failed" | "status_update_failed" };
+  | { ok: false; reason: "no_draft" | "delete_failed" | "status_update_failed" | "in_progress" | "already_sent" };
 
 async function performDraftDiscard(action: PendingAction): Promise<DiscardOutcome> {
   const draftId = action.draft_id;
   if (!draftId) {
     return { ok: false, reason: "no_draft" };
   }
+  const blocked = draftDeliveryBlocksDiscard(draftId, action.google_account);
+  if (blocked) {
+    if (blocked === "already_sent") {
+      transitionPendingAction(action.id, "pending", "sent");
+    }
+    return { ok: false, reason: blocked };
+  }
+  cancelOpenDraftSchedules(draftId, action.google_account);
   try {
     const gmail = await gmailFor(action.google_account);
     await gmail.users.drafts.delete({
@@ -1068,11 +1119,16 @@ async function discardDraft(
       });
       return;
     }
+    const text =
+      outcome.reason === "delete_failed"
+        ? "Discarding failed. The draft is still pending; please try again."
+        : outcome.reason === "in_progress"
+          ? "That email is already being sent, so I didn't discard it."
+          : outcome.reason === "already_sent"
+            ? "That email was already delivered, so I didn't discard it."
+            : "The draft was discarded, but its approval status could not be updated.";
     await ctx.answerCallbackQuery({
-      text:
-        outcome.reason === "delete_failed"
-          ? "Discarding failed. The draft is still pending; please try again."
-          : "The draft was discarded, but its approval status could not be updated.",
+      text,
       show_alert: true,
     });
     return;
@@ -1203,6 +1259,29 @@ export async function handleApprovalCallback(
     }
   } finally {
     activeActions.delete(action.id);
+  }
+}
+
+/** The scheduled worker delivered this draft's email. The Send card can no longer send it. */
+export async function retireDraftApproval(draftId: string, account: GoogleAccountId): Promise<void> {
+  const action = getPendingActionForDraft(draftId);
+  if (!action || action.google_account !== account) {
+    return;
+  }
+  if (action.telegram_message_id) {
+    try {
+      await telegram.editMessageText(
+        config.ownerTelegramId,
+        action.telegram_message_id,
+        "Draft approval\n\nStatus: Sent",
+        { reply_markup: new InlineKeyboard() },
+      );
+    } catch {
+      console.log(`Approval action ${action.id}: scheduled-send preview update failed`);
+    }
+  }
+  if (transitionPendingAction(action.id, "pending", "sent")) {
+    console.log(`Approval action ${action.id}: status -> sent reason=scheduled_delivery`);
   }
 }
 

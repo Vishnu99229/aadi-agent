@@ -757,6 +757,22 @@ function looksLikeEmailContext(text: string): boolean {
   return /\b(?:about|regarding|mention|wants?|needs?|requirement|context|subject|shorter|longer|wording|reword|rephrase|formal|tone)\b/i.test(text);
 }
 
+/** "Add bob@example.com to Cc" names an email field. A meeting word keeps it a meeting edit. */
+export function explicitEmailField(text: string): { field: "to" | "cc" | "bcc"; person: string } | undefined {
+  if (/\b(?:meeting|calendar|attendee|invite|invitation)\b/i.test(text)) {
+    return undefined;
+  }
+  const match = /^(?:please\s+)?add\s+(.+?)\s+to\s+(?:the\s+)?(cc|bcc|to)(?:\s+(?:line|field|list))?(?:\s+of\s+(?:the\s+)?(?:draft|e-?mail|mail))?\.?$/i.exec(text.trim());
+  if (!match?.[1] || !match[2]) {
+    return undefined;
+  }
+  const field = match[2].toLowerCase();
+  if (field !== "to" && field !== "cc" && field !== "bcc") {
+    return undefined;
+  }
+  return { person: match[1].trim(), field };
+}
+
 function recipientInstead(text: string): string | undefined {
   const match =
     /^(?:actually,?\s+)?(?:please\s+)?(?:send|e-?mail)\s+it\s+to\s+(.+?)\s+instead\.?$/i.exec(text.trim())
@@ -926,6 +942,8 @@ export interface OwnerTurnResult {
   subjectUpdate?: string;
   /** Change the open draft's To line without rewriting the message. */
   redirectDraft?: { draftId: string; to: string };
+  /** Add someone to To or Cc. The caller updates that draft and nothing else. */
+  fieldDraft?: { draftId: string; to?: string; cc?: string };
   /** Rewrite the open draft from this instruction, replacing superseded facts. */
   reviseEmail?: string;
 }
@@ -1091,6 +1109,52 @@ export function applyOwnerContextTurn(
   }
 
   const openEmail = next.status === "open" && (next.action === "draft_email" || next.action === "send_email");
+  const fieldEdit = explicitEmailField(clean);
+  const openDraftId = next.email?.draftId;
+  if (fieldEdit && openEmail && next.email && openDraftId) {
+    const locked = lockedScheduleFor(next.email);
+    if (locked) {
+      return { handled: true, text: tooLateText(locked) };
+    }
+    if (fieldEdit.field === "bcc") {
+      return {
+        handled: true,
+        text: "That's the email, not a meeting. I can't set Bcc on this draft; tell me if they should be on Cc.",
+      };
+    }
+    const typed = emails.find((item) => fieldEdit.person.toLowerCase().includes(item));
+    const found = typed
+      ? { kind: "one" as const, contact: { email: typed, name: typed.split("@")[0]?.replace(/[._]+/g, " ") ?? typed, messageId, at: now.toISOString() } }
+      : matchOwnerSupplied(chatId, fieldEdit.person, now);
+    if (found.kind === "many") {
+      return { handled: true, text: `Which ${fieldEdit.person}? ${found.contacts.map((item) => item.email).join(", ")}` };
+    }
+    if (found.kind === "none") {
+      return { handled: true, text: `I don't have a confirmed address for ${fieldEdit.person}. Tell me which address to add.` };
+    }
+    const person = found.contact;
+    const email = next.email;
+    const line = fieldEdit.field === "cc" ? email.cc : email.to;
+    if (line.some((item) => item.email.toLowerCase() === person.email)) {
+      return { handled: true, text: `${person.email} is already on ${fieldEdit.field === "cc" ? "Cc" : "To"}.` };
+    }
+    const added = { query: person.name, name: person.name, email: person.email, resolved: true as const };
+    const nextLine = [...line, added];
+    const header = nextLine.map((item) => item.email).join(", ");
+    next = {
+      ...next,
+      email: fieldEdit.field === "cc" ? { ...email, cc: nextLine } : { ...email, to: nextLine },
+    };
+    savePendingAction(chatId, next, now);
+    return {
+      handled: true,
+      text: `Added ${person.email} to ${fieldEdit.field === "cc" ? "Cc" : "To"}. The rest of the draft stays.`,
+      fieldDraft: {
+        draftId: openDraftId,
+        ...(fieldEdit.field === "cc" ? { cc: header } : { to: header }),
+      },
+    };
+  }
   const redirectName = recipientInstead(clean);
   if (openEmail && next.email && (redirectName || next.email.pendingRedirect)) {
     const asked = redirectName ?? next.email.pendingRedirect ?? "";

@@ -31,6 +31,7 @@ import { loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { getGoogleAccount } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
+import { retireDraftApproval } from "./approvals.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { allowOwnerChatCancelScheduledSend } from "./security/send_approval.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -193,6 +194,9 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
   if (outcome.result === "sent") {
     recordScheduledSendSent(row.id, outcome.messageId ?? null);
     markTaskDone(row.task_id);
+    if (request.draftId) {
+      await retireDraftApproval(request.draftId, request.account);
+    }
     console.log(`Scheduled send ${row.id}: status -> sent`);
     return;
   }

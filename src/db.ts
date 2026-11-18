@@ -1808,6 +1808,13 @@ export function transitionPendingAction(
   return result.changes === 1;
 }
 
+/** Puts a finished approval back to pending. Tests use it to prove a stale Send
+ *  button still cannot deliver an email that already went out. */
+export function reopenPendingActionForTests(id: number): void {
+  assertTestSeam("reopenPendingActionForTests");
+  db.prepare("UPDATE pending_actions SET status = 'pending' WHERE id = ?").run(id);
+}
+
 export function setPendingActionDraftMeta(
   id: number,
   meta: { toHeader: string; ccHeader: string; subject: string },
@@ -5616,6 +5623,95 @@ export function listScheduledSendsForDraft(draftId: string, account: string): Sc
        ORDER BY id DESC`,
     )
     .all(draftId, account) as ScheduledSendRecord[];
+}
+
+export type DraftDeliveryClaim =
+  | { state: "none" }
+  | { state: "claimed"; id: number; taskId: number }
+  | { state: "already_sent"; id: number; itemText: string }
+  | { state: "in_progress"; id: number; itemText: string }
+  | { state: "unconfirmed"; id: number; itemText: string };
+
+/** Scheduled rows for this draft in this mailbox, including attempts that already left the queue. */
+function draftDeliveryRows(draftId: string, account: string): ScheduledSendRecord[] {
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_sends
+       WHERE json_valid(request)
+         AND json_extract(request, '$.draftId') = ?
+         AND json_extract(request, '$.account') = ?
+         AND status IN ('scheduled', 'held', 'sending', 'sent', 'failed')
+       ORDER BY id DESC`,
+    )
+    .all(draftId, account) as ScheduledSendRecord[];
+}
+
+/**
+ * One claim for every way this draft can go out. The manual Send button and the
+ * scheduled worker both take it before Gmail, so only one of them proceeds.
+ * A sent, in-flight, or unconfirmed attempt blocks another try.
+ */
+export function claimDraftDelivery(draftId: string, account: string, nowIso: string): DraftDeliveryClaim {
+  const classify = (depth: number): DraftDeliveryClaim => {
+    if (depth > 3) {
+      return { state: "in_progress", id: 0, itemText: "That email is already being sent." };
+    }
+    const rows = draftDeliveryRows(draftId, account);
+    const sending = rows.find((row) => row.status === "sending");
+    if (sending) {
+      return { state: "in_progress", id: sending.id, itemText: sending.item_text };
+    }
+    const open = rows.find((row) => row.status === "scheduled" || row.status === "held");
+    if (open) {
+      const claimed =
+        db
+          .prepare(
+            `UPDATE scheduled_sends SET status = 'sending', claimed_at = ?
+             WHERE id = ? AND status IN ('scheduled', 'held')`,
+          )
+          .run(nowIso, open.id).changes === 1;
+      if (claimed) {
+        return { state: "claimed", id: open.id, taskId: open.task_id };
+      }
+      return classify(depth + 1);
+    }
+    const sent = rows.find((row) => row.status === "sent");
+    if (sent) {
+      return { state: "already_sent", id: sent.id, itemText: sent.item_text };
+    }
+    const failed = rows.find((row) => row.status === "failed");
+    if (failed) {
+      return { state: "unconfirmed", id: failed.id, itemText: failed.item_text };
+    }
+    return { state: "none" };
+  };
+  return db.transaction(() => classify(0))();
+}
+
+/** Drops queued deliveries for this draft. An attempt already underway is left alone. */
+export function cancelOpenDraftSchedules(draftId: string, account: string): number {
+  let cancelled = 0;
+  for (const row of draftDeliveryRows(draftId, account)) {
+    if (row.status !== "scheduled" && row.status !== "held") {
+      continue;
+    }
+    if (transitionScheduledSend(row.id, ["scheduled", "held"], "cancelled")) {
+      markTaskDone(row.task_id);
+      cancelled += 1;
+    }
+  }
+  return cancelled;
+}
+
+export function draftDeliveryBlocksDiscard(draftId: string, account: string): "in_progress" | "already_sent" | undefined {
+  const rows = draftDeliveryRows(draftId, account);
+  if (rows.some((row) => row.status === "sending")) {
+    return "in_progress";
+  }
+  if (rows.some((row) => row.status === "sent")) {
+    return "already_sent";
+  }
+  return undefined;
 }
 
 export function getScheduledSend(id: number): ScheduledSendRecord | undefined {

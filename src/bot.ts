@@ -1453,6 +1453,26 @@ async function handleUserText(
       ctx.message.message_id,
     );
     historyNote = contextTurn.historyNote;
+    if (contextTurn.fieldDraft) {
+      const result = await updateDraft(
+        {
+          draft_id: contextTurn.fieldDraft.draftId,
+          ...(contextTurn.fieldDraft.to !== undefined ? { to: contextTurn.fieldDraft.to } : {}),
+          ...(contextTurn.fieldDraft.cc !== undefined ? { cc: contextTurn.fieldDraft.cc } : {}),
+        },
+        {
+          iteration: 1,
+          calledTools: [],
+          confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
+          userText,
+        },
+      );
+      const reply = [contextTurn.text, draftUpdateNotice(result)].filter(Boolean).join("\n");
+      if (reply) {
+        await ctx.reply(reply);
+      }
+      return;
+    }
     if (contextTurn.redirectDraft) {
       const result = await updateDraft(
         { draft_id: contextTurn.redirectDraft.draftId, to: contextTurn.redirectDraft.to },
