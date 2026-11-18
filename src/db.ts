@@ -5675,7 +5675,11 @@ export function claimDraftDelivery(
         db
           .prepare(
             `UPDATE scheduled_sends SET status = 'sending', claimed_at = ?
-             WHERE id = ? AND status IN ('scheduled', 'held')`,
+             WHERE id = ? AND status IN ('scheduled', 'held')
+               AND EXISTS (
+                 SELECT 1 FROM tasks
+                 WHERE tasks.id = scheduled_sends.task_id AND tasks.status = 'open'
+               )`,
           )
           .run(nowIso, open.id).changes === 1;
       if (claimed) {
@@ -5686,6 +5690,10 @@ export function claimDraftDelivery(
           }
         }
         return { state: "claimed", id: open.id, taskId: open.task_id };
+      }
+      const current = getScheduledSend(open.id);
+      if (current && (current.status === "scheduled" || current.status === "held")) {
+        return { state: "none" };
       }
       return classify(depth + 1);
     }

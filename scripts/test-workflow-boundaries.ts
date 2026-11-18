@@ -23,6 +23,7 @@ import {
   claimDraftDelivery,
   createScheduledSend,
   getScheduledSend,
+  markTaskDone,
   reopenPendingActionForTests,
   saveMessage,
   transitionScheduledSend,
@@ -588,6 +589,22 @@ assert.equal(getScheduledSend(firstCopy.id)?.status, "sent");
 assert.equal(getScheduledSend(secondCopy.id)?.status, "cancelled");
 await fireScheduledSend(getScheduledSend(secondCopy.id)!, new Date());
 assert.equal(messageSends.length, messagesBeforeTwice + 1);
+
+const closed = await draft("alice@example.com", "Closed", "Do not send after the task is closed.");
+const closedSchedule = schedule({
+  draftId: closed.id,
+  account: "work",
+  to: "alice@example.com",
+  subject: "Closed",
+  body: "Do not send after the task is closed.",
+  key: "task-closed",
+  remember: false,
+});
+assert.equal(markTaskDone(closedSchedule.task_id), true);
+const messagesBeforeClosed = messageSends.length;
+await fireScheduledSend(closedSchedule, new Date());
+assert.equal(messageSends.length, messagesBeforeClosed);
+assert.equal(getScheduledSend(closedSchedule.id)?.status, "scheduled");
 
 saveMessage("user", "Hardik said Pinnacle wants the proposal on Friday.");
 const history = retrieveRelevantContext("remember the discussion with Hardik about Pinnacle");
