@@ -45,6 +45,11 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         type: "string",
         description: "With send_on on a new email, a short subject. It shows on his task list and is the email's subject.",
       },
+      draft_id: {
+        type: "string",
+        description:
+          "With send_on, when he is scheduling an existing Gmail draft (\"send this draft on Monday\"): that draft's draft_id. It must be the draft he means, in the same mailbox, addressed to the people in to and cc. The scheduled email then goes out as the draft reads, and later edits to that draft carry over. Omit it for a separate email, even to the same person.",
+      },
       attachment_requested: {
         type: "boolean",
         description: "True when he asked to attach or send a file, such as a deck or PDF.",

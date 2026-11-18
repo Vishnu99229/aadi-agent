@@ -40,7 +40,14 @@ import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
-import { gmailClient, signatureHtmlFor } from "./google/mail.js";
+import {
+  gmailClient,
+  messageHeader as draftHeader,
+  plainTextBody,
+  resolveGmailDraft,
+  signatureHtmlFor,
+  stripSignature,
+} from "./google/mail.js";
 import { isSelfEmail } from "./mom_logic.js";
 import { bookResolvedMeeting, freeSlotsText, parseCommandTimes } from "./owner_meeting.js";
 import {
@@ -93,6 +100,9 @@ export interface CommandRequest {
   /** Present on a scheduled email. */
   sendAt?: string;
   subject?: string;
+  /** A scheduled email made from this Gmail draft, named explicitly and checked against
+   *  its mailbox and people. The only link between a draft and a schedule. */
+  draftId?: string;
 }
 
 let telegram: Api | undefined;
@@ -392,6 +402,49 @@ export function scheduledWhen(iso: string): string {
 
 /** Saved, with a visible task, once every recipient is settled. The email itself is
  *  written when it goes out, so it reflects whatever has changed by then. */
+function addressSet(items: readonly { email: string }[]): string {
+  return [...new Set(items.map((item) => item.email.toLowerCase()))].sort().join(",");
+}
+
+/**
+ * The draft he named for this schedule, checked: it is in the mailbox the email will go
+ * from, and it is addressed to exactly the people his own words resolved to. Its wording
+ * as it stands now, including any edits made before scheduling, becomes the scheduled copy.
+ */
+async function draftForSchedule(
+  request: CommandRequest,
+): Promise<{ subject: string; body: string; threadId: string | null } | string> {
+  const draftId = request.draftId!;
+  let found: Awaited<ReturnType<typeof resolveGmailDraft>>;
+  try {
+    found = await resolveGmailDraft(draftId, request.account);
+  } catch {
+    return `Not scheduled: I couldn't find that draft in your ${request.account} mailbox, so nothing was scheduled.`;
+  }
+  if (found.account.id !== request.account) {
+    return `Not scheduled: that draft is in a different mailbox, so nothing was scheduled.`;
+  }
+  const message = found.draft.message;
+  const headers = message?.payload?.headers;
+  const draftTo = parseAddressList(draftHeader(headers, "To"));
+  const draftCc = parseAddressList(draftHeader(headers, "Cc"));
+  const to = request.to.map((slot) => slot.mailbox!);
+  const cc = request.cc.map((slot) => slot.mailbox!);
+  if (addressSet(draftTo) !== addressSet(to) || addressSet(draftCc) !== addressSet(cc)) {
+    const shown = [formatMailboxList(draftTo), draftCc.length ? `Cc ${formatMailboxList(draftCc)}` : ""].filter(Boolean).join(", ");
+    return `Not scheduled: that draft is addressed to ${shown || "nobody"}, not ${formatMailboxList([...to, ...cc])}, so nothing was scheduled.`;
+  }
+  const body = stripSignature(plainTextBody(message?.payload ?? {}).trim()).body.trim();
+  if (!body) {
+    return "Not scheduled: that draft is empty, so nothing was scheduled.";
+  }
+  const replyThread = draftHeader(headers, "In-Reply-To") ? message?.threadId ?? null : null;
+  if (replyThread && request.threadId && replyThread !== request.threadId) {
+    return "Not scheduled: that draft replies on a different thread, so nothing was scheduled.";
+  }
+  return { subject: draftHeader(headers, "Subject").trim(), body, threadId: request.threadId ?? replyThread };
+}
+
 async function scheduleRequest(
   request: CommandRequest,
   base: string,
@@ -401,6 +454,15 @@ async function scheduleRequest(
     return { text: "Not scheduled: only Vishnu's own message can do that." };
   }
   const to = request.to.map((slot) => slot.mailbox!);
+  let draft: { subject: string; body: string } | undefined;
+  if (request.draftId) {
+    const checked = await draftForSchedule(request);
+    if (typeof checked === "string") {
+      return { text: checked, hint: "Tell Vishnu as it is. Nothing was scheduled." };
+    }
+    draft = checked;
+    request = { ...request, threadId: checked.threadId, subject: checked.subject || request.subject };
+  }
   let subject = request.subject?.trim() ?? "";
   if (request.threadId) {
     const gmail = gmailClient(await getGoogleAccount(request.account));
@@ -428,7 +490,11 @@ async function scheduleRequest(
     sendAt: request.sendAt!,
     itemText,
     tag: request.account === "personal" ? "personal" : "work",
-    request: JSON.stringify({ ...request, subject }),
+    request: JSON.stringify({
+      ...request,
+      subject,
+      ...(draft ? { finalSubject: subject, finalBody: draft.body } : {}),
+    }),
     confirmChat: confirmation.chatId,
     confirmMessage: confirmation.messageId,
   });
@@ -443,6 +509,8 @@ async function scheduleRequest(
     to: formatMailboxList(to),
     subject: shownSubject,
     account: request.account === "personal" ? "personal" : "work",
+    draftId: request.draftId,
+    body: draft?.body,
   });
   const scheduledCard = {
     text: `Scheduled: ${itemText}`,
@@ -756,6 +824,7 @@ export async function sendEmailFromTool(
     send_on?: unknown;
     send_time?: unknown;
     subject?: unknown;
+    draft_id?: unknown;
   };
   if (values.attachment_requested === true || asksForAttachment(ownWords)) {
     return "Not sent: he asked for a file and I can't attach one here, so nothing went out. Ask him whether to send it without the file or draft it so he can add it.";
@@ -798,6 +867,10 @@ export async function sendEmailFromTool(
     ...(when ? { sendAt: when } : {}),
     ...(typeof values.subject === "string" && values.subject.trim()
       ? { subject: values.subject.trim() }
+      : {}),
+    // Only a scheduled email is made from a draft. It is checked when it is scheduled.
+    ...(when && typeof values.draft_id === "string" && values.draft_id.trim()
+      ? { draftId: values.draft_id.trim() }
       : {}),
   };
   return asToolResult(

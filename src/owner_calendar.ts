@@ -66,10 +66,27 @@ function isMeetingBooking(phrase: string): boolean {
   return /\b(?:book|schedule|another meeting|new meeting|meet with)\b/i.test(phrase);
 }
 
-function reuseRequest(
-  phrase: string,
-  now: Date,
-): { title: string; date?: string; accountId?: GoogleAccountId; span?: { pastDays: number; futureDays: number } } | undefined {
+interface ReuseRequest {
+  title: string;
+  date?: string;
+  /** Every IST day the meeting may be on, when he named a day. */
+  days?: string[];
+  accountId?: GoogleAccountId;
+  span?: { pastDays: number; futureDays: number };
+  /** "the Friday demo" read with Friday as part of the title, if nothing is on a Friday. */
+  weekdayTitle?: string;
+}
+
+function reuseTitle(phrase: string): string {
+  const titled = /\b(?:from|at)\s+(?:the\s+)?([^?.]+)/i.exec(phrase);
+  return (titled?.[1] ?? "")
+    .replace(/\bon the\b.*$/i, "")
+    .replace(/\b(meeting|discussion|people)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function reuseRequest(phrase: string, now: Date): ReuseRequest | undefined {
   if (!/\b(?:same people|everyone from)\b/i.test(phrase)) {
     return undefined;
   }
@@ -78,17 +95,14 @@ function reuseRequest(
     : /\bwork calendar\b/i.test(phrase)
       ? "work"
       : undefined;
-  const date = /\byesterday\b/i.test(phrase) ? addIstDays(istYmd(now), -1) : undefined;
-  const span = !date && /\blast week\b/i.test(phrase) ? { pastDays: 14, futureDays: 0 } : undefined;
-  const titled =
-    /(?:from|at)\s+(?:the\s+|yesterday(?:'s)?\s+|last week(?:'s)?\s+)?([^?.]+)/i.exec(phrase) ??
-    /yesterday(?:'s)?\s+([^?.]+)/i.exec(phrase);
-  const title = (titled?.[1] ?? "")
-    .replace(/\bon the\b.*$/i, "")
-    .replace(/\b(meeting|discussion|people)\b/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return title ? { title, date, accountId, span } : undefined;
+  // The day comes out of the phrase first, so "last Monday's Acme" searches for Acme on that Monday.
+  const mention = dateMention(phrase, now);
+  const days = mention.days;
+  const date = days?.length === 1 ? days[0] : undefined;
+  const span = mention.lastWeek ? { pastDays: 14, futureDays: 0 } : undefined;
+  const title = reuseTitle(mention.rest);
+  const weekdayTitle = mention.bareWeekday ? reuseTitle(phrase.replace(/\blast week(?:'s|\u2019s)?/i, " ")) : undefined;
+  return title ? { title, date, days, accountId, span, weekdayTitle } : undefined;
 }
 
 type AttendeeEdit =
@@ -111,6 +125,9 @@ const CAL_STOP = new Set([
   "meeting", "that", "this", "the", "from", "with", "last", "week", "tomorrow",
   "yesterday", "today", "remove", "drop", "add", "replace", "people", "same",
   "calendar", "onto", "into", "about", "remember", "find", "which",
+  // Words of the question, never of a title: "which meeting did I have last Thursday?"
+  "did", "had", "have", "has", "was", "were", "what", "who", "when", "where", "there",
+  "and", "for", "our", "your", "you", "are", "next",
 ]);
 const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
@@ -168,30 +185,98 @@ function istWeekday(now: Date): number {
   return WEEKDAYS.indexOf(name);
 }
 
-function mentionedDay(text: string, now: Date): string | "last-week" | undefined {
-  if (/\blast week\b/i.test(text)) {
-    return "last-week";
-  }
-  if (/\btomorrow\b/i.test(text)) {
-    return addIstDays(istYmd(now), 1);
-  }
-  if (/\byesterday\b/i.test(text)) {
-    return addIstDays(istYmd(now), -1);
-  }
-  if (/\btoday\b/i.test(text)) {
-    return istYmd(now);
-  }
-  const named = /\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.exec(text);
-  if (!named) {
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const MONTH_WORD = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+const WEEKDAY_WORD = "(monday|tuesday|wednesday|thursday|friday|saturday|sunday)";
+const POSSESSIVE = "(?:'s|\u2019s)?";
+
+/** A day or days he named, with that phrase taken out of the words left to match. */
+interface DateMention {
+  /** IST days the meeting may be on. Two for a bare weekday: the last one and the next. */
+  days?: string[];
+  lastWeek?: boolean;
+  /** A bare weekday, which could also be part of a title such as "Friday demo". */
+  bareWeekday?: string;
+  rest: string;
+}
+
+function validYmd(year: number, month: number, day: number): string | undefined {
+  const at = new Date(Date.UTC(year, month - 1, day));
+  if (at.getUTCFullYear() !== year || at.getUTCMonth() !== month - 1 || at.getUTCDate() !== day) {
     return undefined;
   }
-  const target = WEEKDAYS.indexOf(named[1]!.toLowerCase());
-  const today = istWeekday(now);
-  let delta = (today - target + 7) % 7;
-  if (delta === 0) {
-    delta = 7;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+/** "17 Nov" with no year: the one nearest today, so a reference in January to "28 Dec" is last year's. */
+function nearestYmd(month: number, day: number, today: string): string | undefined {
+  const year = Number(today.slice(0, 4));
+  const options = [year - 1, year, year + 1]
+    .map((candidate) => validYmd(candidate, month, day))
+    .filter((value): value is string => Boolean(value));
+  const distance = (ymd: string) => Math.abs(Date.parse(`${ymd}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`));
+  return options.sort((left, right) => distance(left) - distance(right))[0];
+}
+
+/**
+ * Turns the day he named into actual IST dates: today, yesterday, tomorrow, last week,
+ * last/next/this Monday, a bare weekday, 2026-11-17, 17 Nov, Nov 17th. The phrase is
+ * removed from the text, so a weekday or a month is never searched for as a title word.
+ */
+function dateMention(text: string, now: Date): DateMention {
+  const today = istYmd(now);
+  const cut = (pattern: RegExp): string => text.replace(pattern, " ").replace(/\s+/g, " ").trim();
+  const lastWeek = new RegExp(`\\blast week${POSSESSIVE}(?![\\p{L}])`, "iu");
+  if (lastWeek.test(text)) {
+    return { lastWeek: true, rest: cut(lastWeek) };
   }
-  return addIstDays(istYmd(now), -delta);
+  for (const [word, offset] of [["today", 0], ["yesterday", -1], ["tomorrow", 1]] as const) {
+    const pattern = new RegExp(`\\b${word}${POSSESSIVE}(?![\\p{L}])`, "iu");
+    if (pattern.test(text)) {
+      return { days: [addIstDays(today, offset)], rest: cut(pattern) };
+    }
+  }
+  const iso = /\b(\d{4})-(\d{2})-(\d{2})\b/;
+  const isoHit = iso.exec(text);
+  const isoDay = isoHit ? validYmd(Number(isoHit[1]), Number(isoHit[2]), Number(isoHit[3])) : undefined;
+  if (isoDay) {
+    return { days: [isoDay], rest: cut(iso) };
+  }
+  const dayFirst = new RegExp(`\\b(?:on\\s+)?(?:the\\s+)?(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH_WORD}(?:,?\\s+(\\d{4}))?${POSSESSIVE}(?![\\p{L}])`, "iu");
+  const monthFirst = new RegExp(`\\b(?:on\\s+)?${MONTH_WORD}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{4}))?${POSSESSIVE}(?![\\p{L}\\d])`, "iu");
+  for (const [pattern, dayAt, monthAt] of [[dayFirst, 1, 2], [monthFirst, 2, 1]] as const) {
+    const hit = pattern.exec(text);
+    if (!hit) {
+      continue;
+    }
+    const month = MONTHS.indexOf(hit[monthAt]!.slice(0, 3).toLowerCase()) + 1;
+    const day = Number(hit[dayAt]);
+    const ymd = hit[3] ? validYmd(Number(hit[3]), month, day) : nearestYmd(month, day, today);
+    if (ymd) {
+      return { days: [ymd], rest: cut(pattern) };
+    }
+  }
+  const weekday = istWeekday(now);
+  const qualified = new RegExp(`\\b(last|next|this|on)\\s+${WEEKDAY_WORD}${POSSESSIVE}(?![\\p{L}])`, "iu");
+  const bare = new RegExp(`\\b${WEEKDAY_WORD}${POSSESSIVE}(?![\\p{L}])`, "iu");
+  const hit = qualified.exec(text);
+  const named = hit ? hit[2]! : bare.exec(text)?.[1];
+  if (!named) {
+    return { rest: text };
+  }
+  const target = WEEKDAYS.indexOf(named.toLowerCase());
+  const back = (weekday - target + 7) % 7;
+  const ahead = (target - weekday + 7) % 7;
+  const which = hit?.[1]?.toLowerCase();
+  if (which === "last") {
+    return { days: [addIstDays(today, -(back || 7))], rest: cut(qualified) };
+  }
+  if (which === "next") {
+    return { days: [addIstDays(today, ahead || 7)], rest: cut(qualified) };
+  }
+  // "Monday", "on Monday", "this Monday": today if it is that day, else the last one and the next one.
+  const days = back === 0 ? [today] : [addIstDays(today, -back), addIstDays(today, ahead)];
+  return { days, bareWeekday: named.toLowerCase(), rest: cut(hit ? qualified : bare) };
 }
 
 function eventDay(start: string): string {
@@ -233,7 +318,12 @@ function contentTokens(text: string): string[] {
 
 interface MeetingCues {
   accountId?: GoogleAccountId;
-  day?: string | "last-week";
+  /** The IST days he named, already parsed. Absent when he named none. */
+  days?: string[];
+  lastWeek?: boolean;
+  /** A bare weekday that may instead be a title word, tried only if no meeting is on those days. */
+  bareWeekday?: string;
+  /** Title and attendee words, with the date phrase removed. */
   tokens: string[];
 }
 
@@ -243,7 +333,25 @@ function meetingCues(text: string, now: Date): MeetingCues {
     : /\bwork calendar\b/i.test(text)
       ? "work"
       : undefined;
-  return { accountId, day: mentionedDay(text, now), tokens: contentTokens(text) };
+  const mention = dateMention(text, now);
+  return {
+    accountId,
+    days: mention.days,
+    lastWeek: mention.lastWeek,
+    bareWeekday: mention.bareWeekday,
+    tokens: contentTokens(mention.rest),
+  };
+}
+
+function namesADay(cues: MeetingCues): boolean {
+  return Boolean(cues.days?.length || cues.lastWeek);
+}
+
+/** "the Friday demo": no meeting on a Friday, so Friday was part of the title. */
+function weekdayAsTitle(cues: MeetingCues): MeetingCues | undefined {
+  return cues.bareWeekday
+    ? { accountId: cues.accountId, tokens: [...cues.tokens, cues.bareWeekday] }
+    : undefined;
 }
 
 function tokenIn(words: readonly string[], token: string): boolean {
@@ -256,11 +364,11 @@ function scoreMeeting(ref: MeetingRef, cues: MeetingCues, now: Date, hint?: stri
   }
   const day = eventDay(ref.startIso);
   const today = istYmd(now);
-  if (cues.day === "last-week") {
+  if (cues.lastWeek) {
     if (!day || day < addIstDays(today, -14) || day > today) {
       return 0;
     }
-  } else if (cues.day && day !== cues.day) {
+  } else if (cues.days && !cues.days.includes(day)) {
     return 0;
   }
   const titleWords = nameTokens(ref.title);
@@ -276,9 +384,9 @@ function scoreMeeting(ref: MeetingRef, cues: MeetingCues, now: Date, hint?: stri
   if (cues.tokens.length > 0 && !matched) {
     return 0;
   }
-  if (cues.day && cues.day !== "last-week") {
+  if (cues.days) {
     score += 14;
-  } else if (cues.day === "last-week") {
+  } else if (cues.lastWeek) {
     score += 6;
   }
   if (hint && ref.attendees.some((person) => personMatches(hint, person))) {
@@ -413,14 +521,14 @@ async function resolveMeetingReference(input: {
   const phrase = referencePhrase(input.text, input.edit);
   const cues = meetingCues(phrase, input.now);
   const hint = input.edit?.op === "add" ? undefined : input.edit?.op === "replace" ? input.edit.from : input.edit?.name;
-  let pool = refsFromStore(input.chatId);
-  const pronoun = cues.tokens.length === 0 && !cues.day;
+  const stored = refsFromStore(input.chatId);
+  const pronoun = cues.tokens.length === 0 && !namesADay(cues);
   if (pronoun) {
-    const focused = pool.filter((ref) => ref.focused && (!cues.accountId || ref.accountId === cues.accountId));
+    const focused = stored.filter((ref) => ref.focused && (!cues.accountId || ref.accountId === cues.accountId));
     if (focused.length === 1) {
       return { kind: "one", ref: focused[0]! };
     }
-    const available = pool.filter((ref) => !cues.accountId || ref.accountId === cues.accountId);
+    const available = stored.filter((ref) => !cues.accountId || ref.accountId === cues.accountId);
     if (available.length === 1) {
       return { kind: "one", ref: available[0]! };
     }
@@ -432,31 +540,49 @@ async function resolveMeetingReference(input: {
     }
     return { kind: "none" };
   }
-  const live = await searchLiveMeetings({
-    tokens: cues.tokens,
-    accountId: cues.accountId,
-    date: cues.day && cues.day !== "last-week" ? cues.day : undefined,
-    now: input.now,
-  });
-  const seen = new Set(pool.map((ref) => `${ref.accountId}:${ref.eventId}`));
+  const found = await pickFromCalendar(stored, cues, input.now, hint);
+  if (found.kind !== "none") {
+    return found;
+  }
+  const asTitle = weekdayAsTitle(cues);
+  return asTitle ? pickFromCalendar(stored, asTitle, input.now, hint) : found;
+}
+
+/** Remembered and live meetings scored against the cues. Asks only when the best ones tie. */
+async function pickFromCalendar(
+  stored: MeetingRef[],
+  cues: MeetingCues,
+  now: Date,
+  hint: string | undefined,
+): Promise<{ kind: "none" } | { kind: "many"; question: string } | { kind: "one"; ref: MeetingRef }> {
+  const live: MeetingRef[] = [];
+  for (const date of cues.days?.length ? cues.days : [undefined]) {
+    live.push(...(await searchLiveMeetings({ tokens: cues.tokens, accountId: cues.accountId, date, now })));
+  }
+  const seen = new Set(stored.map((ref) => `${ref.accountId}:${ref.eventId}`));
   const liveById = new Map(live.map((ref) => [`${ref.accountId}:${ref.eventId}`, ref]));
-  pool = pool.map((ref) => {
+  let pool = stored.map((ref) => {
     const fresh = liveById.get(`${ref.accountId}:${ref.eventId}`);
     if (!fresh || fresh.attendees.length === 0) {
       return ref;
     }
     return { ...ref, title: fresh.title, startIso: fresh.startIso, attendees: fresh.attendees };
   });
-  pool = [...pool, ...live.filter((ref) => !seen.has(`${ref.accountId}:${ref.eventId}`))];
-  const choice = pickMeeting(pool.map((ref) => ({ ref, score: scoreMeeting(ref, cues, input.now, hint) })));
+  const added = new Set<string>();
+  for (const ref of live) {
+    const key = `${ref.accountId}:${ref.eventId}`;
+    if (!seen.has(key) && !added.has(key)) {
+      added.add(key);
+      pool = [...pool, ref];
+    }
+  }
+  const scored = pool.map((ref) => ({ ref, score: scoreMeeting(ref, cues, now, hint) }));
+  const choice = pickMeeting(scored);
   if (!choice) {
     return { kind: "none" };
   }
   if (choice === "many") {
-    const viable = pool
-      .map((ref) => ({ ref, score: scoreMeeting(ref, cues, input.now, hint) }))
-      .filter((item) => item.score > 0)
-      .sort((left, right) => right.score - left.score);
+    const viable = scored.filter((item) => item.score > 0).sort((left, right) => right.score - left.score);
     const top = viable[0]?.score ?? 0;
     return {
       kind: "many",
@@ -564,7 +690,7 @@ export async function reviseReferencedMeeting(input: {
   const now = input.now ?? new Date();
   const pending = getPendingAction(input.chatId, now);
   const cues = meetingCues(referencePhrase(input.text, edit), now);
-  if (pending?.status === "open" && pending.meeting && cues.tokens.length === 0 && !cues.day) {
+  if (pending?.status === "open" && pending.meeting && cues.tokens.length === 0 && !namesADay(cues)) {
     const focused = refsFromStore(input.chatId).find((ref) => ref.focused);
     if (focused) {
       return `Which meeting? The one still being scheduled, or ${describeMeeting(focused)}?`;
@@ -767,8 +893,14 @@ async function reusedAttendees(phrase: string, now: Date): Promise<ReusedAttende
   if (!request) {
     return { kind: "none" };
   }
-  const matches = (await listMatchingEvents(request.title, request.date, request.accountId, request.span, now))
-    .filter((event) => titleMatches(request.title, event.title));
+  let matches = (await listMatchingEvents(request.title, request.date, request.accountId, request.span, now))
+    .filter((event) => titleMatches(request.title, event.title))
+    .filter((event) => !request.days || request.days.includes(eventDay(event.start)));
+  if (matches.length === 0 && request.weekdayTitle) {
+    const title = request.weekdayTitle;
+    matches = (await listMatchingEvents(title, undefined, request.accountId, undefined, now))
+      .filter((event) => titleMatches(title, event.title));
+  }
   if (matches.length === 0) {
     return { kind: "none" };
   }

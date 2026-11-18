@@ -976,13 +976,32 @@ const say = (text: string, now = NOW) =>
   assert.equal(email?.to[0]?.email, "bob@example.com");
   assert.equal(email?.scheduledSendId, undefined);
   assert.equal(getScheduledSend(scheduled!.id)?.status, "scheduled");
+  // Chat state alone never links a draft to a schedule: Alice's row keeps its subject.
   savePendingAction(chat, {
     ...getPendingAction(chat, NOW)!,
     email: { ...email!, draftId: "draft-bob", scheduledSendId: scheduled!.id, subject: "Invoice" },
   }, NOW);
-  const retitled = applyOwnerContextTurn(chat, "Change the subject to Quarterly report.", 3, NOW);
+  applyOwnerContextTurn(chat, "Change the subject to Quarterly report.", 3, NOW);
+  assert.equal((JSON.parse(getScheduledSend(scheduled!.id)!.request) as { subject?: string }).subject, "Hello");
+  // A row scheduled from Bob's draft in the same mailbox is the same email, and follows it.
+  const bobs = createScheduledSend({
+    key: "bob-schedule",
+    sendAt: "2026-11-18T04:30:00.000Z",
+    itemText: "Send email to Bob",
+    tag: "work",
+    request: JSON.stringify({ instruction: "hello", to: [], subject: "Invoice", draftId: "draft-bob", account: "work" }),
+    confirmChat: chat,
+    confirmMessage: 1,
+  });
+  assert.ok(bobs);
+  savePendingAction(chat, {
+    ...getPendingAction(chat, NOW)!,
+    status: "open",
+    email: { ...getPendingAction(chat, NOW)!.email!, draftId: "draft-bob", scheduledSendId: bobs!.id, subject: "Invoice" },
+  }, NOW);
+  const retitled = applyOwnerContextTurn(chat, "Change the subject to Quarterly report.", 4, NOW);
   assert.equal(retitled.subjectUpdate, "Quarterly report");
-  const stored = JSON.parse(getScheduledSend(scheduled!.id)!.request) as { subject?: string };
+  const stored = JSON.parse(getScheduledSend(bobs!.id)!.request) as { subject?: string };
   assert.equal(stored.subject, "Quarterly report");
 }
 
@@ -1010,7 +1029,13 @@ const say = (text: string, now = NOW) =>
     sendAt: "2026-11-18T04:30:00.000Z",
     itemText: "Send email to Alice",
     tag: "work",
-    request: JSON.stringify({ instruction: "hello", to: [{ mailbox: { email: "alice@example.com" } }], subject: "Hello" }),
+    request: JSON.stringify({
+      instruction: "hello",
+      to: [{ mailbox: { email: "alice@example.com" } }],
+      subject: "Hello",
+      draftId: "draft-alice",
+      account: "work",
+    }),
     confirmChat: chat,
     confirmMessage: 1,
   });
@@ -1049,7 +1074,7 @@ const say = (text: string, now = NOW) =>
     sendAt: "2026-11-18T05:30:00.000Z",
     itemText: "Send email to Bob",
     tag: "work",
-    request: JSON.stringify({ instruction: "hello", subject: "Hello" }),
+    request: JSON.stringify({ instruction: "hello", subject: "Hello", draftId: "draft-alice", account: "work" }),
     confirmChat: chat,
     confirmMessage: 2,
   });

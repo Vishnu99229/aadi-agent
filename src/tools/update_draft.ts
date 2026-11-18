@@ -105,17 +105,17 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     throw new Error("Pass body, to, cc, subject, or a combination.");
   }
 
-  // An email that is already going out can't take this edit. Say so before changing anything.
-  const locked = lockedScheduleForDraft(values.draft_id.trim(), turn?.confirmation?.chatId);
-  if (locked) {
-    return tooLateText(locked);
-  }
-
   const pending = getPendingActionForDraft(values.draft_id.trim());
   const { account, draft: existing } = await resolveGmailDraft(
     values.draft_id.trim(),
     pending?.google_account,
   );
+  // The email this draft was scheduled as may already be going out, or gone. Its history
+  // stays as sent: say so before changing anything.
+  const locked = lockedScheduleForDraft(values.draft_id.trim(), account.id);
+  if (locked) {
+    return tooLateText(locked);
+  }
   const gmail = gmailClient(account);
   const message = existing.message;
   const headers = message?.payload?.headers;
@@ -182,15 +182,14 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     typeof values.subject === "string"
   ) {
     const fields = {
-      draftId,
       to: safeHeader(to),
       cc: values.cc === undefined ? undefined : safeHeader(cc),
       subject: safeHeader(subject),
       body: typeof values.body === "string" ? body : undefined,
     };
     sync = turn?.confirmation
-      ? syncDraftRecipient({ chatId: turn.confirmation.chatId, ...fields, account: account.id })
-      : syncBoundSchedules(draftId, draftChange(fields));
+      ? syncDraftRecipient({ chatId: turn.confirmation.chatId, draftId, ...fields, account: account.id })
+      : syncBoundSchedules(draftId, account.id, draftChange(fields));
   }
   const scheduleNote =
     sync.kind === "synced" ? "The scheduled email was updated to match this draft." : scheduleSyncNotice(sync);

@@ -9,7 +9,6 @@ import {
   listCanonicalContacts,
   listScheduledSendsForDraft,
   markTaskDone,
-  bindScheduledDraft,
   transitionScheduledSend,
   upsertCalendarEventRef,
   upsertPendingActionContext,
@@ -200,42 +199,41 @@ export function rememberBookedMeeting(
   );
 }
 
-/** Point "that meeting" at an older event without dropping an open draft. */
-/** A newly created draft inherits a schedule only when that row already names this draft. */
-function scheduleOwnsDraft(scheduledSendId: number, draftId: string): boolean {
-  const row = getScheduledSend(scheduledSendId);
-  if (!row || (row.status !== "scheduled" && row.status !== "held") || !draftId) {
-    return false;
-  }
+/**
+ * Whether a scheduled row is this email. The only link is the one fixed when it was
+ * scheduled: the same Gmail draft id (or no draft on either side) in the same mailbox.
+ * Shared recipients never link two emails.
+ */
+function rowBelongsTo(row: ScheduledSendRecord, email: { draftId?: string; account: string }): boolean {
   try {
-    const request = JSON.parse(row.request) as { draftId?: string };
-    return request.draftId === draftId;
+    const request = JSON.parse(row.request) as { draftId?: unknown; account?: unknown };
+    const bound = typeof request.draftId === "string" && request.draftId ? request.draftId : undefined;
+    if (bound !== (email.draftId || undefined)) {
+      return false;
+    }
+    return typeof request.account !== "string" || request.account === email.account;
   } catch {
     return false;
   }
 }
 
-/** The open email already points at this schedule, and the row does not name a different draft. */
+function openRow(row: ScheduledSendRecord | undefined): row is ScheduledSendRecord {
+  return Boolean(row && (row.status === "scheduled" || row.status === "held"));
+}
+
+/** A newly created draft inherits a schedule only when that row was scheduled from this draft. */
+function scheduleOwnsDraft(scheduledSendId: number, draftId: string, account: string): boolean {
+  const row = getScheduledSend(scheduledSendId);
+  return Boolean(draftId) && openRow(row) && rowBelongsTo(row, { draftId, account });
+}
+
+/** The open email's schedule, when that row was scheduled as this very email. */
 export function contextScheduleForDraft(email: PendingEmailState): number | undefined {
   if (!email.scheduledSendId) {
     return undefined;
   }
   const row = getScheduledSend(email.scheduledSendId);
-  if (!row || (row.status !== "scheduled" && row.status !== "held")) {
-    return undefined;
-  }
-  try {
-    const request = JSON.parse(row.request) as { draftId?: string };
-    if (request.draftId && request.draftId !== email.draftId) {
-      return undefined;
-    }
-    if (!email.draftId && request.draftId) {
-      return undefined;
-    }
-    return email.scheduledSendId;
-  } catch {
-    return undefined;
-  }
+  return openRow(row) && rowBelongsTo(row, email) ? email.scheduledSendId : undefined;
 }
 
 /** What an approved edit did to the scheduled email it belongs to. */
@@ -258,42 +256,29 @@ function lockedRow(row: ScheduledSendRecord | undefined): LockedSchedule | undef
     : undefined;
 }
 
-function rowNamesOtherDraft(row: ScheduledSendRecord, draftId: string | undefined): boolean {
-  try {
-    const bound = (JSON.parse(row.request) as { draftId?: string }).draftId;
-    return Boolean(bound && bound !== draftId);
-  } catch {
-    return false;
-  }
-}
-
 /** The open email's scheduled send, once it is going out or gone. */
 export function lockedScheduleFor(email: PendingEmailState | undefined): LockedSchedule | undefined {
   if (!email?.scheduledSendId) {
     return undefined;
   }
   const row = getScheduledSend(email.scheduledSendId);
-  return row && !rowNamesOtherDraft(row, email.draftId) ? lockedRow(row) : undefined;
+  return row && rowBelongsTo(row, email) ? lockedRow(row) : undefined;
 }
 
-/** Before a draft edit: the scheduled email this draft belongs to, when it can no longer change. */
-export function lockedScheduleForDraft(draftId: string, chatId?: number): LockedSchedule | undefined {
-  const rows = listScheduledSendsForDraft(draftId);
-  if (rows.some((row) => row.status === "scheduled" || row.status === "held")) {
+/** Before a draft edit: the scheduled email this draft was scheduled as, when it can no
+ *  longer change. Only the binding made at scheduling counts. */
+export function lockedScheduleForDraft(draftId: string, account: string): LockedSchedule | undefined {
+  const rows = listScheduledSendsForDraft(draftId, account);
+  if (rows.some(openRow)) {
     return undefined;
   }
-  const bound = lockedRow(rows[0]);
-  if (bound || chatId === undefined) {
-    return bound;
-  }
-  const email = getPendingAction(chatId)?.email;
-  return email?.draftId === draftId ? lockedScheduleFor(email) : undefined;
+  return lockedRow(rows[0]);
 }
 
 /** The refusal for a correction that arrives after the send was claimed. Nothing changed. */
 export function tooLateText(locked: LockedSchedule): string {
   return locked.sent
-    ? `Too late: that scheduled email already went out with the previous version, so I didn't change anything. (${locked.itemText})`
+    ? `Too late: that scheduled email already went out with the previous version, and a sent email stays as it was sent, so I didn't change anything. (${locked.itemText}) I can draft a new email if you want to follow up.`
     : `Too late: that scheduled email is already being sent with the previous version, so I didn't change anything. (${locked.itemText})`;
 }
 
@@ -344,16 +329,17 @@ function worse(left: ScheduleSync, right: ScheduleSync): ScheduleSync {
   return SYNC_RANK[right.kind] > SYNC_RANK[left.kind] ? right : left;
 }
 
-/** Every open scheduled email this Gmail draft was bound to, whichever chat or button edited it. */
-export function syncBoundSchedules(draftId: string, change: ScheduledCopyChange): ScheduleSync {
-  const rows = listScheduledSendsForDraft(draftId);
-  const open = rows.filter((row) => row.status === "scheduled" || row.status === "held");
+/** Every open scheduled email that was scheduled from this Gmail draft in this mailbox,
+ *  whichever chat or button edited the draft. */
+export function syncBoundSchedules(draftId: string, account: string, change: ScheduledCopyChange): ScheduleSync {
+  const rows = listScheduledSendsForDraft(draftId, account);
+  const open = rows.filter(openRow);
   if (open.length === 0) {
     const locked = lockedRow(rows[0]);
     return locked ? { kind: "too_late", ...locked } : { kind: "none" };
   }
   return open.reduce<ScheduleSync>(
-    (result, row) => worse(result, applyToSchedule(row.id, { ...change, draftId })),
+    (result, row) => worse(result, applyToSchedule(row.id, change)),
     { kind: "none" },
   );
 }
@@ -364,7 +350,6 @@ function peopleIn(header: string): ScheduledPerson[] {
 
 /** The draft's fields as the scheduled worker reads them. */
 export function draftChange(input: {
-  draftId: string;
   to?: string;
   cc?: string;
   subject?: string;
@@ -375,8 +360,60 @@ export function draftChange(input: {
     cc: input.cc === undefined ? undefined : peopleIn(input.cc),
     subject: input.subject,
     body: input.body,
-    draftId: input.draftId,
   };
+}
+
+function attendeesIn(header: string | undefined): ResolvedAttendee[] {
+  return (header ? peopleIn(header) : []).map((person) => ({
+    query: person.email,
+    name: person.name || person.email,
+    email: person.email,
+    resolved: true,
+  }));
+}
+
+/**
+ * Vishnu tapped Edit on this draft's card. From now on the chat's open email is this
+ * draft, whatever was drafted after it, together with the schedule it was scheduled as.
+ */
+export function focusSelectedDraft(
+  chatId: number,
+  input: { draftId: string; to: string; cc?: string; subject: string; body: string; account: "work" | "personal" },
+  now = new Date(),
+): void {
+  const pending = getPendingAction(chatId, now);
+  const same = pending?.email?.draftId === input.draftId && pending.email.account === input.account;
+  const bound = listScheduledSendsForDraft(input.draftId, input.account).find(openRow);
+  const to = attendeesIn(input.to);
+  savePendingAction(
+    chatId,
+    {
+      action: bound ? "send_email" : "draft_email",
+      status: "open",
+      ownerWords: pending?.ownerWords ?? "",
+      confirmChat: pending?.confirmChat ?? chatId,
+      confirmMessage: pending?.confirmMessage ?? 0,
+      ownerSupplied: pending?.ownerSupplied,
+      meeting: pending?.meeting,
+      updatedAt: now.toISOString(),
+      email: {
+        to: to.length > 0 ? to : same ? pending!.email!.to : [],
+        cc: attendeesIn(input.cc),
+        subject: input.subject,
+        purpose: same ? pending!.email!.purpose ?? input.subject : input.subject,
+        notes: [
+          ...(same ? pending!.email!.notes.filter((note) => !note.startsWith("Current draft:")) : []),
+          `Current draft:\n${input.body}`,
+        ],
+        account: input.account,
+        waiting: "confirm",
+        draftId: input.draftId,
+        scheduledSendId: bound?.id,
+        sendAt: bound?.send_at,
+      },
+    },
+    now,
+  );
 }
 
 /** Remember a Gmail draft the Email Agent just created, so a later cancel can drop its Send card. */
@@ -398,7 +435,7 @@ export function linkPublishedDraft(input: {
   }));
   const linkedSchedule =
     pending?.email?.scheduledSendId && input.draftId
-      ? scheduleOwnsDraft(pending.email.scheduledSendId, input.draftId)
+      ? scheduleOwnsDraft(pending.email.scheduledSendId, input.draftId, input.account)
       : false;
   savePendingAction(input.chatId, {
     action: pending?.action === "send_email" ? "send_email" : "draft_email",
@@ -447,11 +484,11 @@ export function syncDraftRecipient(input: {
   const pending = getPendingAction(input.chatId);
   const change = draftChange(input);
   if (pending?.email?.draftId && pending.email.draftId !== input.draftId) {
-    return syncBoundSchedules(input.draftId, change);
+    return syncBoundSchedules(input.draftId, input.account, change);
   }
   if (!pending?.email) {
     linkPublishedDraft(input);
-    return syncBoundSchedules(input.draftId, change);
+    return syncBoundSchedules(input.draftId, input.account, change);
   }
   const to = (change.to ?? []).map((person) => ({
     query: person.email,
@@ -480,7 +517,7 @@ export function syncDraftRecipient(input: {
     }
   }
   savePendingAction(input.chatId, { ...pending, email });
-  return worse(sync, syncBoundSchedules(input.draftId, change));
+  return worse(sync, syncBoundSchedules(input.draftId, input.account, change));
 }
 
 /** So "cancel that email" can stop a send that was scheduled from this chat. */
@@ -491,40 +528,41 @@ export function rememberScheduledSend(input: {
   to: string;
   subject: string;
   account: "work" | "personal";
+  /** The Gmail draft this was scheduled from, already checked against its mailbox and people. */
+  draftId?: string;
+  body?: string;
 }): void {
   const pending = getPendingAction(input.chatId);
-  const scheduled = [...input.to.matchAll(new RegExp(EMAIL_RE.source, "gi"))].map((match) => match[0].toLowerCase());
-  const sameDraft = (pending?.email?.to ?? []).some((person) => scheduled.includes(person.email));
-  linkPublishedDraft({
-    chatId: input.chatId,
-    draftId: sameDraft ? pending?.email?.draftId ?? "" : "",
-    to: input.to,
-    subject: input.subject,
-    body: sameDraft ? undefined : "",
-    account: input.account,
-  });
-  const linked = getPendingAction(input.chatId);
-  if (!linked?.email) {
-    return;
+  const open = pending?.email;
+  // Only the draft he named carries its notes over. Another open draft, even to the same
+  // person, stays a separate email that this schedule can't change or cancel.
+  const sameEmail = Boolean(input.draftId) && open?.draftId === input.draftId && open?.account === input.account;
+  const notes = sameEmail && open ? open.notes.filter((note) => !note.startsWith("Current draft:")) : [];
+  if (input.body) {
+    notes.push(`Current draft:\n${input.body}`);
   }
-  const notes = sameDraft ? linked.email.notes : [];
   savePendingAction(input.chatId, {
-    ...linked,
     action: "send_email",
     status: "open",
+    ownerWords: pending?.ownerWords ?? "",
+    confirmChat: pending?.confirmChat ?? input.chatId,
+    confirmMessage: pending?.confirmMessage ?? 0,
+    ownerSupplied: pending?.ownerSupplied,
+    meeting: pending?.meeting,
+    updatedAt: new Date().toISOString(),
     email: {
-      ...linked.email,
+      to: attendeesIn(input.to),
+      cc: [],
       notes,
-      purpose: sameDraft ? linked.email.purpose : input.subject,
+      subject: input.subject,
+      purpose: sameEmail && open ? open.purpose ?? input.subject : input.subject,
+      account: input.account,
+      waiting: "confirm",
+      draftId: input.draftId,
       scheduledSendId: input.scheduledSendId,
       sendAt: input.sendAt,
-      draftId: sameDraft ? linked.email.draftId || undefined : undefined,
     },
   });
-  const draftId = sameDraft ? linked.email.draftId : undefined;
-  if (draftId) {
-    bindScheduledDraft(input.scheduledSendId, draftId);
-  }
 }
 
 export function focusBookedMeeting(
@@ -750,7 +788,8 @@ function cancelLinkedSend(email: PendingEmailState | undefined): void {
     return;
   }
   const row = getScheduledSend(email.scheduledSendId);
-  if (!row) {
+  // Never another email's schedule, even one to the same person.
+  if (!row || !rowBelongsTo(row, email)) {
     return;
   }
   if (transitionScheduledSend(row.id, ["scheduled", "held"], "cancelled")) {

@@ -5482,46 +5482,6 @@ function editableScheduledStatus(status: ScheduledSendStatus): boolean {
   return status === "scheduled" || status === "held";
 }
 
-/** Applies a change only while the row is still scheduled or held, and only to the exact
- *  version it read. The worker claims that same text, so a copy it prepared from an older
- *  version is refused and prepared again from this one. */
-export function patchScheduledRequest(
-  id: number,
-  patch: (request: Record<string, unknown>) => void,
-): boolean {
-  return db.transaction((): boolean => {
-    const row = getScheduledSend(id);
-    if (!row || !editableScheduledStatus(row.status)) {
-      return false;
-    }
-    let request: Record<string, unknown>;
-    try {
-      request = JSON.parse(row.request) as Record<string, unknown>;
-    } catch {
-      return false;
-    }
-    patch(request);
-    const next = JSON.stringify(request);
-    if (next === row.request) {
-      return true;
-    }
-    return (
-      db
-        .prepare(
-          `UPDATE scheduled_sends SET request = ?
-           WHERE id = ? AND status IN ('scheduled', 'held') AND request = ?`,
-        )
-        .run(next, id, row.request).changes === 1
-    );
-  })();
-}
-
-export function bindScheduledDraft(id: number, draftId: string): boolean {
-  return patchScheduledRequest(id, (request) => {
-    request.draftId = draftId;
-  });
-}
-
 /** A person the scheduled email goes to. The address is the choice he made, so it is
  *  also what the send-time check looks up. */
 export interface ScheduledPerson {
@@ -5553,14 +5513,14 @@ function sameAddressSet(slots: unknown, people: readonly ScheduledPerson[]): boo
   return slotAddresses(slots) === people.map((person) => person.email.toLowerCase()).sort().join(",");
 }
 
-/** Everything the scheduled worker reads from an approved draft edit. */
+/** Everything the scheduled worker reads from an approved draft edit. Which draft a row
+ *  belongs to is fixed when it is scheduled and is never changed here. */
 export interface ScheduledCopyChange {
   to?: readonly ScheduledPerson[];
   cc?: readonly ScheduledPerson[];
   subject?: string;
   /** The finished body. It is sent as it is, with no rewrite at send time. */
   body?: string;
-  draftId?: string;
 }
 
 export type ScheduledCopyResult =
@@ -5568,8 +5528,8 @@ export type ScheduledCopyResult =
   | { ok: false; status: ScheduledSendStatus | "missing" | "unreadable" };
 
 /**
- * One write for every field the worker reads: recipients, subject, the finalized subject
- * and body, and the draft it belongs to. Either all of it lands or none of it does, and
+ * One write for every field the worker reads: recipients, subject, and the finalized
+ * subject and body. Either all of it lands or none of it does, and
  * only while the row can still change. The worker's claim compares the request text, so
  * any change here makes a copy it already prepared stale.
  */
@@ -5607,9 +5567,6 @@ export function writeScheduledCopy(id: number, change: ScheduledCopyChange): Sch
         request.finalSubject = request.subject;
       }
     }
-    if (change.draftId) {
-      request.draftId = change.draftId;
-    }
     let next = JSON.stringify(request);
     if (next === row.request) {
       return { ok: true, changed: false };
@@ -5629,16 +5586,19 @@ export function writeScheduledCopy(id: number, change: ScheduledCopyChange): Sch
   })();
 }
 
-/** Every scheduled email a Gmail draft was bound to and that has not ended without sending. */
-export function listScheduledSendsForDraft(draftId: string): ScheduledSendRecord[] {
+/** Every scheduled email bound, when it was scheduled, to this Gmail draft in this mailbox,
+ *  and that has not ended without sending. A draft id alone never links two mailboxes. */
+export function listScheduledSendsForDraft(draftId: string, account: string): ScheduledSendRecord[] {
   return db
     .prepare(
       `SELECT * FROM scheduled_sends
        WHERE status IN ('scheduled', 'held', 'sending', 'sent')
-         AND json_valid(request) AND json_extract(request, '$.draftId') = ?
+         AND json_valid(request)
+         AND json_extract(request, '$.draftId') = ?
+         AND json_extract(request, '$.account') = ?
        ORDER BY id DESC`,
     )
-    .all(draftId) as ScheduledSendRecord[];
+    .all(draftId, account) as ScheduledSendRecord[];
 }
 
 export function getScheduledSend(id: number): ScheduledSendRecord | undefined {

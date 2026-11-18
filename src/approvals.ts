@@ -86,6 +86,29 @@ export interface DraftEditContext {
   actionId: number;
   draftId: string;
   body: string;
+  to: string;
+  cc: string;
+  subject: string;
+  account: GoogleAccountId;
+}
+
+/** A draft as it stands in Gmail: who it goes to, its subject and plain body. */
+export async function readDraftSnapshot(
+  draftId: string,
+  account: GoogleAccountId,
+): Promise<{ to: string; cc: string; subject: string; body: string }> {
+  const gmail = await gmailFor(account);
+  const draft = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "full" });
+  const payload = draft.data.message?.payload;
+  const headers = payload?.headers ?? [];
+  const header = (name: string) =>
+    headers.find((item) => item.name?.toLowerCase() === name.toLowerCase())?.value?.trim() ?? "";
+  return {
+    to: header("To"),
+    cc: header("Cc"),
+    subject: header("Subject"),
+    body: payload ? stripSignature(plainTextBody(payload).trim()).body : "",
+  };
 }
 
 function keyboard(actionId: number, sendOnly = false, showFull = false): InlineKeyboard {
@@ -1210,19 +1233,12 @@ export async function consumeDraftEdit(
     return undefined;
   }
   const draftId = action.draft_id;
-
-  const gmail = await gmailFor(action.google_account);
-  const draft = await gmail.users.drafts.get({
-    userId: "me",
-    id: draftId,
-    format: "full",
-  });
-  const payload = draft.data.message?.payload;
-
+  const snapshot = await readDraftSnapshot(draftId, action.google_account);
   return {
     actionId: action.id,
     draftId,
-    body: payload ? stripSignature(plainTextBody(payload).trim()).body : "",
+    ...snapshot,
+    account: action.google_account,
   };
 }
 

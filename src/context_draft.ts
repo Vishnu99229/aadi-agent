@@ -185,11 +185,7 @@ export async function reviseLinkedDraft(
   const scheduleId = contextScheduleForDraft(email);
   let sync: ScheduleSync = { kind: "none" };
   if (scheduleId) {
-    sync = applyToSchedule(scheduleId, {
-      subject,
-      body: written.body,
-      ...(email.draftId ? { draftId: email.draftId } : {}),
-    });
+    sync = applyToSchedule(scheduleId, { subject, body: written.body });
     if (sync.kind === "too_late" && !email.draftId) {
       // Nothing else was written, so nothing changed at all.
       return tooLateText(sync);
@@ -252,7 +248,7 @@ export async function publishReadyDraft(
       // The rewritten body is now the scheduled copy too, so the old wording can't go out.
       const scheduleId = contextScheduleForDraft(email);
       const sync: ScheduleSync = scheduleId
-        ? applyToSchedule(scheduleId, { body, draftId: email.draftId })
+        ? applyToSchedule(scheduleId, { body })
         : { kind: "none" };
       const notice = [refused, scheduleSyncNotice(sync)].filter(Boolean).filter((item, index, all) => all.indexOf(item) === index).join(" ");
       const notes = email.notes.filter((note) => !note.startsWith("Current draft:"));

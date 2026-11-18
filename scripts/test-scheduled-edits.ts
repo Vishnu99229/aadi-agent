@@ -2,7 +2,7 @@
 // Fake Gmail, fake Telegram, stub models, an in-memory database. Nothing real is sent.
 import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import { applyOwnerContextTurn, getPendingAction } from "../src/action_context.ts";
+import { applyOwnerContextTurn, focusSelectedDraft, getPendingAction } from "../src/action_context.ts";
 import { setApprovalsTestHooks } from "../src/approvals.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import { reviseLinkedDraft } from "../src/context_draft.ts";
@@ -11,6 +11,8 @@ import {
   getScheduledSend,
   getTask,
   listOpenScheduledSends,
+  listScheduledSendsForDraft,
+  transitionScheduledSend,
   type ScheduledSendRecord,
 } from "../src/db.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
@@ -52,7 +54,10 @@ interface SentMail {
   body: string;
 }
 const sends: SentMail[] = [];
-const drafts = new Map<string, { to: string; cc: string; subject: string; body: string }>();
+type StoredDraft = { to: string; cc: string; subject: string; body: string };
+/** Each mailbox keeps its own drafts, as Gmail does. */
+const mailboxes = { work: new Map<string, StoredDraft>(), personal: new Map<string, StoredDraft>() };
+const drafts = mailboxes.work;
 let draftCounter = 0;
 /** Runs inside Gmail's send call: the worker has already claimed the row. */
 let duringSend: (() => Promise<void>) | undefined;
@@ -70,8 +75,8 @@ function bodyOf(raw: string): string {
   return raw.split(/\r?\n\r?\n/).slice(1).join("\n").trim();
 }
 
-function storeDraft(id: string, raw: string): void {
-  drafts.set(id, {
+function storeDraft(store: Map<string, StoredDraft>, id: string, raw: string): void {
+  store.set(id, {
     to: headerOf(raw, "To"),
     cc: headerOf(raw, "Cc"),
     subject: headerOf(raw, "Subject"),
@@ -85,7 +90,10 @@ const latas = [
   { id: "lata-2", from: "Lata Menon <lata.m@two.example>" },
 ];
 
-const gmail = {
+function mailbox(account: "work" | "personal"): gmail_v1.Gmail {
+  const drafts = mailboxes[account];
+  const prefix = account === "work" ? "draft" : "pdraft";
+  return {
   users: {
     getProfile: async () => ({ data: { emailAddress: ME } }),
     settings: {
@@ -132,8 +140,8 @@ const gmail = {
     drafts: {
       create: async ({ requestBody }: { requestBody: { message: { raw: string } } }) => {
         draftCounter += 1;
-        const id = `draft-${draftCounter}`;
-        storeDraft(id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"));
+        const id = `${prefix}-${draftCounter}`;
+        storeDraft(drafts, id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"));
         return { data: { id, message: { id, threadId: `thread-${id}` } } };
       },
       get: async ({ id }: { id: string }) => {
@@ -161,7 +169,7 @@ const gmail = {
         };
       },
       update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string } } }) => {
-        storeDraft(id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"));
+        storeDraft(drafts, id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"));
         return { data: { id, message: { id, threadId: `thread-${id}` } } };
       },
       delete: async ({ id }: { id: string }) => {
@@ -173,20 +181,24 @@ const gmail = {
       },
     },
   },
-} as unknown as gmail_v1.Gmail;
+  } as unknown as gmail_v1.Gmail;
+}
+const gmail = mailbox("work");
+const personalGmail = mailbox("personal");
 
 /** Runs on the first Google account lookup of a fire, after the worker has read its row. */
 let duringPrepare: (() => void) | undefined;
 const workAccount = { id: "work", tag: "work", label: "work", client: {} } as unknown as LoadedGoogleAccount;
-setGoogleAccountForTests(() => {
+const personalAccount = { id: "personal", tag: "personal", label: "personal", client: {} } as unknown as LoadedGoogleAccount;
+setGoogleAccountForTests((id) => {
   if (duringPrepare) {
     const hook = duringPrepare;
     duringPrepare = undefined;
     hook();
   }
-  return workAccount;
+  return id === "personal" ? personalAccount : workAccount;
 });
-setGmailClientForTests(() => gmail);
+setGmailClientForTests((account) => (account.id === "personal" ? personalGmail : gmail));
 
 const told: string[] = [];
 const telegram = {
@@ -200,7 +212,7 @@ const telegram = {
   },
 } as unknown as Api;
 setCommandEmailTestHooks({ telegram });
-setApprovalsTestHooks({ telegram, gmailFor: () => gmail });
+setApprovalsTestHooks({ telegram, gmailFor: (account) => (account === "personal" ? personalGmail : gmail) });
 
 // ---- models: the Email Agent rewrites, the Command writer writes at send time ----
 setAgentModelSetting("email", { primary: "anthropic:haiku", fallbacks: [] });
@@ -213,7 +225,7 @@ setRouteModelCompleteForTests(async (_spec, params) => emailAgentReply(params));
 const writerCalls: CompleteParams[] = [];
 /** Runs while the Command writer is composing a copy at send time. */
 let duringWrite: (() => void) | undefined;
-setCompleteForTests(async (params: CompleteParams): Promise<CompleteResult> => {
+const standardModel = async (params: CompleteParams): Promise<CompleteResult> => {
   if (params.task === "command_send") {
     writerCalls.push(params);
     if (duringWrite) {
@@ -229,7 +241,8 @@ setCompleteForTests(async (params: CompleteParams): Promise<CompleteResult> => {
     return emailAgentReply(params);
   }
   return modelReply({ text: '{"facts":[]}' });
-});
+};
+setCompleteForTests(standardModel);
 
 // ---- time: two days out, 10:00 in Kolkata ----
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -266,7 +279,7 @@ async function draftThenSchedule(chatId: number, address: string, subject: strin
   assert(draftId, `the draft is created, got ${created}`);
   const words = `send it to ${address} on ${SEND_DAY} at 10am`;
   const scheduled = await sendEmailFromTool(
-    { to: [address], instruction: "send the proposal note", send_on: SEND_DAY, send_time: "10:00", subject },
+    { to: [address], instruction: "send the proposal note", send_on: SEND_DAY, send_time: "10:00", subject, draft_id: draftId },
     turnIn(chatId, words),
   );
   assert(scheduled.startsWith("Scheduled:"), `it is scheduled, got ${scheduled}`);
@@ -516,7 +529,6 @@ async function fire(): Promise<void> {
     turnIn(chat, `email ${address} on ${SEND_DAY} at 10am about the plan`),
   );
   const row = listOpenScheduledSends().sort((left, right) => right.id - left.id)[0]!;
-  const { transitionScheduledSend } = await import("../src/db.ts");
   setCompleteForTests(async (params: CompleteParams): Promise<CompleteResult> => {
     if (params.task === "command_send") {
       transitionScheduledSend(row.id, ["scheduled", "held"], "cancelled");
@@ -534,6 +546,158 @@ async function fire(): Promise<void> {
   assert(!told.slice(toldBefore).some((text) => text.includes("keep trying")), "and he isn't told it will retry");
   await runScheduledSendTick(new Date(FIRE.getTime() + 20 * 60_000));
   assert(sends.length === before, "nothing is sent");
+}
+
+setCompleteForTests(standardModel);
+
+const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id - left.id)[0]!;
+
+// 9. Two emails to the same person in different mailboxes stay independent: editing or
+//    cancelling one never touches the other.
+{
+  const chat = 9;
+  const created = await draftNewEmail(
+    { to: "alice@example.com", subject: "Work plan", body: "Hi Alice,\n\nThe work plan." },
+    turnIn(chat, "Draft an email to alice@example.com about the work plan"),
+  );
+  const workDraft = /draft_id:\s*(\S+)/.exec(created)![1]!;
+  const scheduled = await sendEmailFromTool(
+    { to: ["alice@example.com"], instruction: "Wish her a happy birthday.", send_on: SEND_DAY, send_time: "10:00", subject: "Birthday", account: "personal" },
+    turnIn(chat, `email alice@example.com from my personal account on ${SEND_DAY} at 10am wishing her a happy birthday`),
+  );
+  assert(scheduled.startsWith("Scheduled:"), `the personal email is scheduled, got ${scheduled}`);
+  const personal = newestOpen();
+  const personalRequest = getScheduledSend(personal.id)!.request;
+  assert(!requestOf(personal.id).draftId, "a shared recipient does not bind the work draft");
+  assert(!getPendingAction(chat)?.email?.draftId, "the chat's email is the personal one, with no draft");
+
+  const edited = await updateDraft({ draft_id: workDraft, body: "Hi Alice,\n\nThe revised work plan." }, turnIn(chat, "edit the work plan"));
+  assert(!JSON.parse(edited).schedule, `editing the work draft reports no schedule, got ${edited}`);
+  assert(getScheduledSend(personal.id)!.request === personalRequest, "and the personal email is unchanged");
+
+  // Focused on the work draft, "cancel that email" retires that draft only.
+  const draft = drafts.get(workDraft)!;
+  focusSelectedDraft(chat, { draftId: workDraft, to: draft.to, subject: draft.subject, body: draft.body, account: "work" });
+  const cancelled = say(chat, "cancel that email");
+  assert(cancelled.retireDraftId === workDraft, "the work draft is the one cancelled");
+  assert(getScheduledSend(personal.id)!.status === "scheduled", "the personal email stays scheduled");
+
+  // Account isolation in the lookup itself: the same draft id in two mailboxes.
+  for (const [key, account] of [["iso-work", "work"], ["iso-personal", "personal"]] as const) {
+    createScheduledSend({
+      key,
+      sendAt: atIst(SEND_DAY, "23:00").toISOString(),
+      itemText: `Send email to Iso — ${account}`,
+      tag: account,
+      request: JSON.stringify({ to: [], cc: [], instruction: "x", draftId: "same-id", account }),
+      confirmChat: chat,
+      confirmMessage: 1,
+    });
+  }
+  assert(listScheduledSendsForDraft("same-id", "work").every((row) => row.item_text.endsWith("work")), "a draft id never reaches another mailbox's schedule");
+  assert(listScheduledSendsForDraft("same-id", "personal").length === 1, "each mailbox sees only its own");
+  for (const row of listOpenScheduledSends().filter((item) => item.item_text.startsWith("Send email to Iso"))) {
+    transitionScheduledSend(row.id, ["scheduled"], "cancelled");
+  }
+
+  const before = sends.length;
+  await fire();
+  assert(sends.length === before + 1 && sends.at(-1)!.subject === "Birthday", "the personal email goes out on its own terms");
+}
+
+// 10. A named draft that isn't verified is refused: wrong mailbox, or different people.
+{
+  const chat = 10;
+  const created = await draftNewEmail(
+    { to: "ben@example.com", subject: "Quote", body: "Hi Ben,\n\nThe quote." },
+    turnIn(chat, "Draft an email to ben@example.com with the quote"),
+  );
+  const workDraft = /draft_id:\s*(\S+)/.exec(created)![1]!;
+  const open = listOpenScheduledSends().length;
+  const otherMailbox = await sendEmailFromTool(
+    { to: ["ben@example.com"], instruction: "send the quote", send_on: SEND_DAY, send_time: "10:00", account: "personal", draft_id: workDraft },
+    turnIn(chat, `send it to ben@example.com from my personal account on ${SEND_DAY} at 10am`),
+  );
+  assert(/^Not scheduled: I couldn't find that draft in your personal mailbox/.test(otherMailbox), `a draft from another mailbox is refused, got ${otherMailbox}`);
+  const otherPeople = await sendEmailFromTool(
+    { to: ["cara@example.com"], instruction: "send the quote", send_on: SEND_DAY, send_time: "10:00", draft_id: workDraft },
+    turnIn(chat, `send it to cara@example.com on ${SEND_DAY} at 10am`),
+  );
+  assert(/^Not scheduled: that draft is addressed to .*ben@example\.com/.test(otherPeople), `a draft to other people is refused, got ${otherPeople}`);
+  assert(listOpenScheduledSends().length === open, "neither made a schedule");
+}
+
+// 11. Two drafts to the same person in one mailbox: only the scheduled one follows its edits.
+{
+  const chat = 11;
+  const { draftId: first, row } = await draftThenSchedule(chat, "dan@example.com", "Offer");
+  const second = /draft_id:\s*(\S+)/.exec(
+    await draftNewEmail({ to: "dan@example.com", subject: "Lunch", body: "Hi Dan,\n\nLunch on Friday?" }, turnIn(chat, "Draft an email to dan@example.com about lunch")),
+  )![1]!;
+  const kept = getScheduledSend(row.id)!.request;
+  await updateDraft({ draft_id: second, body: "Hi Dan,\n\nLunch on Saturday?" });
+  assert(getScheduledSend(row.id)!.request === kept, "editing the other draft to Dan leaves the schedule alone");
+  await updateDraft({ draft_id: first, body: "Hi Dan,\n\nThe offer is attached below in text." });
+  assert(requestOf(row.id).finalBody === "Hi Dan,\n\nThe offer is attached below in text.", "editing the scheduled draft reaches it");
+  transitionScheduledSend(row.id, ["scheduled"], "cancelled");
+}
+
+// 12. Edits made before scheduling are what the scheduled email sends.
+{
+  const chat = 12;
+  const created = await draftNewEmail(
+    { to: "esha@example.com", subject: "Draft subject", body: "Hi Esha,\n\nFirst wording." },
+    turnIn(chat, "Draft an email to esha@example.com"),
+  );
+  const draftId = /draft_id:\s*(\S+)/.exec(created)![1]!;
+  await updateDraft({ draft_id: draftId, subject: "Final subject", body: "Hi Esha,\n\nThe wording he settled on." });
+  const scheduled = await sendEmailFromTool(
+    { to: ["esha@example.com"], instruction: "send the draft", send_on: SEND_DAY, send_time: "10:00", draft_id: draftId },
+    turnIn(chat, `send it to esha@example.com on ${SEND_DAY} at 10am`),
+  );
+  assert(scheduled.includes("Final subject"), `the scheduled item shows the draft's subject, got ${scheduled}`);
+  const row = newestOpen();
+  assert(requestOf(row.id).finalBody === "Hi Esha,\n\nThe wording he settled on.", "the copy is the edited draft");
+  assert(getPendingAction(chat)?.email?.draftId === draftId && getPendingAction(chat)?.email?.scheduledSendId === row.id, "the chat's email is that draft and its schedule");
+  const writes = writerCalls.length;
+  const before = sends.length;
+  await fire();
+  const sent = sends.at(-1)!;
+  assert(sends.length === before + 1 && sent.subject === "Final subject" && sent.body.startsWith("Hi Esha,\n\nThe wording he settled on."), `the edits before scheduling go out, got ${sent.subject} / ${sent.body}`);
+  assert(writerCalls.length === writes, "and nothing is rewritten at send time");
+}
+
+// 13. A sent email stays as sent. Edits are refused, and a new draft is independent.
+{
+  const chat = 13;
+  const { draftId, row } = await draftThenSchedule(chat, "farah@example.com", "Agenda");
+  await updateDraft({ draft_id: draftId, body: "Hi Farah,\n\nThe agenda." }, turnIn(chat, "edit"));
+  await fire();
+  const sentRow = getScheduledSend(row.id)!;
+  assert(sentRow.status === "sent", "it went out");
+  const sentCount = sends.length;
+  const draftBefore = JSON.stringify(drafts.get(draftId));
+
+  const late = await updateDraft({ draft_id: draftId, body: "Hi Farah,\n\nA changed agenda." }, turnIn(chat, "change it"));
+  assert(/already went out/.test(late) && /stays as it was sent/.test(late) && /draft a new email/.test(late), `an edit after sending is refused and offers a new draft, got ${late}`);
+  assert(JSON.stringify(drafts.get(draftId)) === draftBefore, "the draft is untouched");
+  const shorter = say(chat, "make it shorter");
+  assert(/already went out/.test(shorter.text ?? ""), "a contextual rewrite is refused too");
+  const after = getScheduledSend(row.id)!;
+  assert(after.request === sentRow.request && after.sent_message_id === sentRow.sent_message_id && after.status === "sent", "the sent record never changes");
+
+  const followUp = /draft_id:\s*(\S+)/.exec(
+    await draftNewEmail({ to: "farah@example.com", subject: "Agenda follow-up", body: "Hi Farah,\n\nOne more item." }, turnIn(chat, "Draft a new email to farah@example.com with one more item")),
+  )![1]!;
+  assert(followUp !== draftId, "a new draft is created");
+  assert(!getPendingAction(chat)?.email?.scheduledSendId, "it is not tied to the sent email");
+  const edited = await updateDraft({ draft_id: followUp, body: "Hi Farah,\n\nOne more item, and a question." }, turnIn(chat, "edit"));
+  assert(edited.startsWith("{") && !JSON.parse(edited).schedule, `the new draft can be edited freely, got ${edited}`);
+  const revised = await reviseLinkedDraft(chat, "mention that the proposal will be shared Friday");
+  assert(revised === "Updated the draft.", `and rewritten, got ${revised}`);
+  assert(getScheduledSend(row.id)!.request === sentRow.request, "the sent record still never changes");
+  await runScheduledSendTick(new Date(FIRE.getTime() + 60_000));
+  assert(sends.length === sentCount, "nothing is resent");
 }
 
 console.log = log;
