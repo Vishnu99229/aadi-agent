@@ -11,6 +11,7 @@ import {
   getPendingAction,
   holdEmailToolTurn,
   linkPublishedDraft,
+  syncDraftRecipient,
   matchOwnerSupplied,
   pendingResolvedEmails,
   savePendingAction,
@@ -876,6 +877,28 @@ const say = (text: string, now = NOW) =>
   const asked = applyOwnerContextTurn(chat, "Remove Alice", 2, NOW);
   assert.match(asked.text ?? "", /Which Alice/);
   assert.equal(getPendingAction(chat, NOW)?.meeting?.attendees.length, 2);
+  savePendingAction(chat, {
+    action: "create_meeting",
+    status: "open",
+    ownerWords: "Book them",
+    confirmChat: chat,
+    confirmMessage: 3,
+    updatedAt: NOW.toISOString(),
+    meeting: {
+      calendar: "work",
+      waiting: "time",
+      resolutionAttempts: {},
+      attendees: [
+        { query: "Alice", name: "Alice", email: "", resolved: false },
+        { query: "Bob", name: "Bob", email: "", resolved: false },
+        { query: "Carol", name: "Carol", email: "carol@example.com", resolved: true },
+      ],
+    },
+  }, NOW);
+  const removedOne = applyOwnerContextTurn(chat, "Remove Alice", 4, NOW);
+  assert.match(removedOne.text ?? "", /Removed Alice/);
+  const left = getPendingAction(chat, NOW)?.meeting?.attendees.map((item) => item.name);
+  assert.deepEqual(left, ["Bob", "Carol"]);
 }
 
 {
@@ -975,6 +998,49 @@ const say = (text: string, now = NOW) =>
     now: NOW,
   });
   assert.equal(noted, undefined);
+}
+
+{
+  const chat = 45;
+  const scheduled = createScheduledSend({
+    key: "swap-to",
+    sendAt: "2026-11-18T04:30:00.000Z",
+    itemText: "Send email to Alice",
+    tag: "work",
+    request: JSON.stringify({ instruction: "hello", to: [{ mailbox: { email: "alice@example.com" } }], subject: "Hello" }),
+    confirmChat: chat,
+    confirmMessage: 1,
+  });
+  assert.ok(scheduled);
+  savePendingAction(chat, {
+    action: "draft_email",
+    status: "open",
+    ownerWords: "Draft to Alice",
+    confirmChat: chat,
+    confirmMessage: 1,
+    updatedAt: new Date().toISOString(),
+    email: {
+      to: [{ query: "Alice", name: "Alice", email: "alice@example.com", resolved: true }],
+      cc: [],
+      notes: [],
+      purpose: "hello",
+      subject: "Hello",
+      account: "work",
+      waiting: "confirm",
+      draftId: "draft-alice",
+      scheduledSendId: scheduled!.id,
+    },
+  }, new Date());
+  syncDraftRecipient({
+    chatId: chat,
+    draftId: "draft-alice",
+    to: "bob@example.com",
+    subject: "Hello",
+    account: "work",
+  });
+  assert.equal(getPendingAction(chat, NOW)?.email?.to[0]?.email, "bob@example.com");
+  assert.equal(getPendingAction(chat, NOW)?.email?.scheduledSendId, undefined);
+  assert.equal(getScheduledSend(scheduled!.id)?.status, "cancelled");
 }
 
 console.log("cross-turn context checks passed.");

@@ -271,15 +271,23 @@ export function syncDraftRecipient(input: {
   const notes = input.body
     ? [...pending.email.notes.filter((note) => !note.startsWith("Current draft:")), `Current draft:\n${input.body}`]
     : pending.email.notes;
+  const nextTo = to.length > 0 ? to : pending.email.to;
+  const previous = pending.email.to.map((person) => person.email).sort().join(",");
+  const changedPeople = nextTo.map((person) => person.email).sort().join(",") !== previous;
+  if (changedPeople && pending.email.scheduledSendId) {
+    cancelLinkedSend(pending.email);
+  }
   savePendingAction(input.chatId, {
     ...pending,
     email: {
       ...pending.email,
-      to: to.length > 0 ? to : pending.email.to,
+      to: nextTo,
       subject: input.subject || pending.email.subject,
       notes,
       draftId: pending.email.draftId || input.draftId,
       account: input.account,
+      scheduledSendId: changedPeople ? undefined : pending.email.scheduledSendId,
+      sendAt: changedPeople ? undefined : pending.email.sendAt,
     },
   });
 }
@@ -729,7 +737,7 @@ export function applyOwnerContextTurn(
         ...next,
         meeting: {
           ...next.meeting,
-          attendees: next.meeting.attendees.filter((item) => item.email !== matched[0]!.email),
+          attendees: next.meeting.attendees.filter((item) => item !== matched[0]),
         },
       };
       savePendingAction(chatId, next, now);
