@@ -276,6 +276,8 @@ export function syncDraftRecipient(input: {
   const changedPeople = nextTo.map((person) => person.email).sort().join(",") !== previous;
   if (changedPeople && pending.email.scheduledSendId) {
     cancelLinkedSend(pending.email);
+  } else if (!changedPeople && pending.email.scheduledSendId && input.body) {
+    appendScheduledSendInstruction(pending.email.scheduledSendId, input.body);
   }
   savePendingAction(input.chatId, {
     ...pending,

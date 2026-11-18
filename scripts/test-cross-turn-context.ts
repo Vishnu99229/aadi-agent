@@ -1041,6 +1041,33 @@ const say = (text: string, now = NOW) =>
   assert.equal(getPendingAction(chat, NOW)?.email?.to[0]?.email, "bob@example.com");
   assert.equal(getPendingAction(chat, NOW)?.email?.scheduledSendId, undefined);
   assert.equal(getScheduledSend(scheduled!.id)?.status, "cancelled");
+  const kept = createScheduledSend({
+    key: "keep-body",
+    sendAt: "2026-11-18T05:30:00.000Z",
+    itemText: "Send email to Bob",
+    tag: "work",
+    request: JSON.stringify({ instruction: "hello", subject: "Hello" }),
+    confirmChat: chat,
+    confirmMessage: 2,
+  });
+  assert.ok(kept);
+  savePendingAction(chat, {
+    ...getPendingAction(chat, new Date())!,
+    email: {
+      ...getPendingAction(chat, new Date())!.email!,
+      scheduledSendId: kept!.id,
+    },
+  }, new Date());
+  syncDraftRecipient({
+    chatId: chat,
+    draftId: "draft-alice",
+    to: "bob@example.com",
+    subject: "Hello",
+    body: "Delivery is Friday.",
+    account: "work",
+  });
+  assert.equal(getPendingAction(chat, new Date())?.email?.scheduledSendId, kept!.id);
+  assert.match(getScheduledSend(kept!.id)!.request, /Delivery is Friday/);
 }
 
 console.log("cross-turn context checks passed.");
