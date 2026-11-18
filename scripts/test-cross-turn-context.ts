@@ -42,6 +42,13 @@ import { setGmailClientForTests } from "../src/google/mail.ts";
 import { applyIgnore, taskIsIgnored } from "../src/ignore.ts";
 import { TEST_SIGNATURE_HTML } from "./fakes.ts";
 
+/** The plain-text part of a MIME message, decoded, as Gmail's payload would give it. */
+function plainOf(raw: string): string {
+  const encoded = /Content-Type: text\/plain[^\r\n]*\r?\nContent-Transfer-Encoding: base64\r?\n\r?\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1];
+  return encoded
+    ? Buffer.from(encoded.replace(/\s/g, ""), "base64").toString("utf8")
+    : raw.split(/\r?\n\r?\n/).slice(1).join("\n");
+}
 const cards: Array<{ text: string; markup?: { inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>> } }> = [];
 const drafts = new Map<string, { to: string; subject: string; body: string }>();
 let draftCount = 0;
@@ -53,7 +60,7 @@ const gmail = {
         const id = `draft-${draftCount}`;
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
         const header = (name: string) => new RegExp(`^${name}:\\s*(.*)$`, "im").exec(raw)?.[1] ?? "";
-        const body = raw.split(/\r?\n\r?\n/).slice(1).join("\n");
+        const body = plainOf(raw);
         drafts.set(id, { to: header("To"), subject: header("Subject"), body });
         return { data: { id, message: { id, threadId: `thread-${draftCount}` } } };
       },
@@ -82,7 +89,7 @@ const gmail = {
       },
       update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string } } }) => {
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
-        const body = raw.split(/\r?\n\r?\n/).slice(1).join("\n");
+        const body = plainOf(raw);
         const header = (name: string) => new RegExp(`^${name}:\\s*(.*)$`, "im").exec(raw)?.[1] ?? "";
         const current = drafts.get(id);
         if (current) {

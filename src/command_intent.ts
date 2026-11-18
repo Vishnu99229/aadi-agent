@@ -344,6 +344,12 @@ const MEMORY = [
   new RegExp(`${LEAD}forget\\b`, "i"),
   /\bupdate\b[^.?!\n]{0,20}?\bmemor(?:y|ies)\b/i,
 ];
+/** "Remember my discussion with Hardik?", "remember the conversation we had": recalling
+ *  something from the past, not asking to save a memory. */
+const RECALL = [
+  /\bremember\s+(?:my|our|the|that|this)\s+(?:last\s+|previous\s+|earlier\s+|recent\s+)?(?:discussions?|conversations?|talks?|chats?|exchanges?)\b/i,
+  /\bremember\b[^.!\n]*\?\s*$/i,
+];
 const QA_BANK = /\b(?:learn|add|save|import)\b[^.?!\n]{0,40}?\b(?:q\s*&\s*a|q\s+and\s+a|qa)(?:\s+bank)?\b/i;
 
 /** These name what the command is about, so a "call" or an "email" inside them
@@ -444,7 +450,7 @@ export function commandIntents(ownWords: string): CommandKind[] {
   if (plain && any(ACCOUNT) && !NOT_A_DEAL.test(text)) {
     found.add("account");
   }
-  if (plain && any(MEMORY)) {
+  if (plain && any(MEMORY) && !any(RECALL)) {
     found.add("memory");
   }
   if (plain && QA_BANK.test(text)) {

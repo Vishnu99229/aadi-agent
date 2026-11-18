@@ -1,7 +1,7 @@
 import { addressIn, nameTokens, notASendCommand } from "./command_logic.js";
 import { namesFuzzyEqual } from "./contact_logic.js";
 import { rememberContactChoice } from "./contacts.js";
-import { retrieveRelevantContext } from "./context_lookup.js";
+import { retrieveRelevantContext, wantsHistoricalContext } from "./context_lookup.js";
 import {
   deletePendingActionContext,
   getPendingActionContext,
@@ -19,6 +19,7 @@ import {
 } from "./db.js";
 import { looksLikeIgnoreInstruction } from "./ignore.js";
 import { parseAddressList } from "./mail_helpers.js";
+import { sameConversation } from "./subject_logic.js";
 import { lastPresentedEntities, resolveReferentPhrase, type ReferentEntity } from "./referents.js";
 import { looksLikeTimeFill, parseOwnerTime } from "./time_parse.js";
 
@@ -363,7 +364,8 @@ export function draftChange(input: {
   };
 }
 
-function attendeesIn(header: string | undefined): ResolvedAttendee[] {
+/** The people on a To or Cc header, as the chat's email records them. */
+export function attendeesIn(header: string | undefined): ResolvedAttendee[] {
   return (header ? peopleIn(header) : []).map((person) => ({
     query: person.email,
     name: person.name || person.email,
@@ -749,7 +751,10 @@ function looksLikeEmailContext(text: string): boolean {
   if (/\b(?:add|remove|delete|set|create|schedule|book|cancel)\b/i.test(text) && /\b(?:task|reminder|bill|meeting|calendar)\b/i.test(text)) {
     return false;
   }
-  return /\b(?:about|regarding|mention|wants?|needs?|requirement|context|subject|shorter|longer)\b/i.test(text);
+  if (/\badd\s+(?:this|that|a|one more|another)\s+(?:point|line|sentence)\b/i.test(text)) {
+    return true;
+  }
+  return /\b(?:about|regarding|mention|wants?|needs?|requirement|context|subject|shorter|longer|wording|reword|rephrase|formal|tone)\b/i.test(text);
 }
 
 function recipientInstead(text: string): string | undefined {
@@ -760,8 +765,32 @@ function recipientInstead(text: string): string | undefined {
   return name || undefined;
 }
 
+const WHEN_WORDS =
+  /\b(?:tomorrow|today|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|scheduled|later)(?:'s|\u2019s)?\b/i;
+
+/** "Cancel tomorrow's email", "cancel the email to Bob": words that point at a different
+ *  email than the open one. Then the open email is left alone and the scheduled-send
+ *  tool finds the one he named. */
+function namesAnotherEmail(text: string, email: PendingEmailState): boolean {
+  if (WHEN_WORDS.test(text) && !email.scheduledSendId) {
+    return true;
+  }
+  const named = /\bto\s+([\p{L}][\p{L}.'-]*(?:\s+[\p{L}][\p{L}.'-]*){0,2})/iu.exec(text)?.[1] ?? "";
+  const asked = nameTokens(named).filter((token) => token.length >= 3 && !/^(?:the|that|this|him|her|them|tomorrow|today|tonight|send)$/.test(token));
+  if (asked.length === 0) {
+    return false;
+  }
+  const known = new Set(
+    [...email.to, ...email.cc].flatMap((person) => nameTokens(`${person.name} ${person.query} ${person.email.replace(/[@.]/g, " ")}`)),
+  );
+  return !asked.some((token) => known.has(token));
+}
+
 function correctionOfEmail(text: string, email: PendingEmailState | undefined): boolean {
   if (!email) {
+    return false;
+  }
+  if (namesAnotherEmail(text, email)) {
     return false;
   }
   if (/\b(?:don'?t send|do not send|never send)\b/i.test(text)) {
@@ -794,6 +823,16 @@ function cancelLinkedSend(email: PendingEmailState | undefined): void {
   }
   if (transitionScheduledSend(row.id, ["scheduled", "held"], "cancelled")) {
     markTaskDone(row.task_id);
+  }
+}
+
+/** A scheduled reply whose new subject no longer matches its thread. */
+function scheduledReplyLeavesThread(id: number, subject: string): boolean {
+  try {
+    const request = JSON.parse(getScheduledSend(id)?.request ?? "{}") as { threadId?: unknown; threadSubject?: unknown };
+    return typeof request.threadId === "string" && typeof request.threadSubject === "string" && !sameConversation(subject, request.threadSubject);
+  } catch {
+    return false;
   }
 }
 
@@ -876,6 +915,9 @@ export function matchOwnerSupplied(chatId: number | undefined, query: string, no
 export interface OwnerTurnResult {
   handled: boolean;
   text?: string;
+  /** Unhandled, but he asked about the past and this is what was found. The caller gives it
+   *  to the model as data to answer from, never as instructions. */
+  historyNote?: string;
   /** The draft is complete. The caller posts one Gmail approval card and does not repeat the body. */
   publishDraft?: boolean;
   /** A published Gmail draft whose Send card must be discarded with this turn. */
@@ -914,7 +956,9 @@ export function applyOwnerContextTurn(
     rememberContactChoice(local, { name: local, emails: [email], sources: ["known"] });
   }
   let contextNote = "";
-  if (/\b(?:remember|discussion|follow-?up|last week|same people|what happened|our conversation)\b/i.test(clean)) {
+  const unhandled = (): OwnerTurnResult =>
+    contextNote ? { handled: false, historyNote: contextNote } : { handled: false };
+  if (wantsHistoricalContext(clean)) {
     const found = retrieveRelevantContext(clean);
     if (found.kind === "many") {
       savePendingAction(chatId, { ...base, ownerSupplied: base.ownerSupplied }, now);
@@ -945,7 +989,7 @@ export function applyOwnerContextTurn(
   }
   let next: PendingAction = { ...base, ownerSupplied: supplied, confirmMessage: messageId || base.confirmMessage };
 
-  if (correctionOfEmail(clean, next.email) && next.email && next.status !== "cancelled") {
+  if (correctionOfEmail(clean, next.email) && next.email && next.status === "open") {
     const locked = lockedScheduleFor(next.email);
     if (locked) {
       return { handled: true, text: tooLateToCancelText(locked) };
@@ -1123,7 +1167,12 @@ export function applyOwnerContextTurn(
     }
     next = { ...next, email: { ...current, subject } };
     savePendingAction(chatId, next, now);
-    const text = scheduleNote || (current.draftId ? undefined : `The scheduled email's subject is now "${subject}".`);
+    const leaves = !scheduleNote && scheduleId ? scheduledReplyLeavesThread(scheduleId, subject) : false;
+    const text =
+      scheduleNote ||
+      (current.draftId
+        ? undefined
+        : `The scheduled email's subject is now "${subject}".${leaves ? " It will go out as a new conversation, not as a reply in the original thread." : ""}`);
     return { handled: true, subjectUpdate: subject, text };
   }
   const freshDraft = /\b(?:draft|write|compose)\b/i.test(clean) && /\b(?:e-?mails?|mail)\b/i.test(clean)
@@ -1150,7 +1199,7 @@ export function applyOwnerContextTurn(
       next.email!.notes.push(`recipient query: ${named}`);
     }
     savePendingAction(chatId, next, now);
-    return { handled: false };
+    return unhandled();
   }
 
   if (openEmail && next.email && emails.length === 1 && next.email.to.length === 0) {
@@ -1226,7 +1275,7 @@ export function applyOwnerContextTurn(
     next.email?.purpose !== base.email?.purpose ||
     (next.email?.notes.length ?? 0) !== (base.email?.notes.length ?? 0);
   if (!changed) {
-    return { handled: false };
+    return unhandled();
   }
   savePendingAction(chatId, next, now);
   if (
@@ -1245,7 +1294,7 @@ export function applyOwnerContextTurn(
       text: `${contextNote} Who should I write to?`,
     };
   }
-  return { handled: false };
+  return unhandled();
 }
 
 /** Tool-side gate: a context update must not send, and a cancelled email stays cancelled. */
@@ -1255,7 +1304,7 @@ export function holdEmailToolTurn(
   now = new Date(),
 ): string | undefined {
   const pending = getPendingAction(chatId, now);
-  if (correctionOfEmail(ownWords, pending?.email) && pending?.email && pending.status !== "cancelled") {
+  if (correctionOfEmail(ownWords, pending?.email) && pending?.email && pending.status === "open") {
     const locked = lockedScheduleFor(pending.email);
     if (locked) {
       return tooLateToCancelText(locked);

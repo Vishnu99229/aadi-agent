@@ -138,6 +138,30 @@ for (const text of notCommands) {
   const kinds = commandIntents(text);
   assert(kinds.length === 0, `"${text}" is not a command, got ${kinds.join(",")}`);
 }
+// "Follow-up" before a thing describes it: the word after it is not a person to follow up,
+// so these are exactly their own command, never also a sequence.
+for (const [text, kind] of [
+  ["Mark the KYC follow-up task done", "task"],
+  ["Complete the follow-up task", "task"],
+  ["send a follow-up email to Jeff", "send"],
+  ["Write a follow-up email to Dorothy", "draft"],
+  ["Schedule a follow-up call with Hardik", "calendar"],
+  ["Delete the follow-up reminder", "reminder"],
+] as const) {
+  const kinds = commandIntents(text);
+  assert(kinds.join(",") === kind, `"${text}" is only a ${kind} command, got ${kinds.join(",") || "none"}`);
+}
+assert(commandIntents("follow up with Abhishek").join(",") === "sequence", "following up with a person is still a sequence");
+assert(commandIntents("follow up Abhishek 4 times").join(",") === "sequence", "and so is follow up NAME N times");
+// Recalling a past conversation is not saving a memory.
+for (const text of [
+  "Remember my discussion with Hardik about Pinnacle?",
+  "Remember the discussion I had with Hardik about the reseller panel.",
+  "remember our last conversation with Acme?",
+]) {
+  assert(!commandIntents(text).includes("memory"), `"${text}" recalls, it does not save a memory`);
+}
+assert(commandIntents("Remember that Jeff prefers mornings").join(",") === "memory", "saving a fact is still a memory command");
 // One message, two commands; and the specific object wins over a generic word.
 assert(commandIntents("Book a call with Jeff on Monday. Email him the agenda.").join(",") === "send,calendar", "one message can hold two commands");
 assert(commandIntents("Cancel the reminder for the call").join(",") === "reminder", "a reminder about a call is a reminder");

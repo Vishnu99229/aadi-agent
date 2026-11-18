@@ -21,6 +21,7 @@ import {
 } from "../google/mail.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
+import { sameConversation } from "../subject_logic.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -145,6 +146,16 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
       ? header(headers, "Cc")
       : dropSelf(toAddressList(values.cc).join(", "));
 
+  // A reply whose subject he changes can't stay in its thread: Gmail keeps a reply there
+  // only while the subject matches. It becomes a new conversation, with no thread id and
+  // no reply headers, and the card says so.
+  const replying = Boolean(header(headers, "In-Reply-To"));
+  const leavesThread =
+    replying &&
+    typeof values.subject === "string" &&
+    values.subject.trim() !== "" &&
+    !sameConversation(subject, header(headers, "Subject"));
+
   // Keep the signature only on drafts Aadi signed; scheduling drafts stay
   // plain text.
   const raw = buildMimeMessage(
@@ -153,8 +164,8 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
       ["Cc", cc],
       ["Bcc", header(headers, "Bcc")],
       ["Subject", subject],
-      ["In-Reply-To", header(headers, "In-Reply-To")],
-      ["References", header(headers, "References")],
+      ["In-Reply-To", leavesThread ? "" : header(headers, "In-Reply-To")],
+      ["References", leavesThread ? "" : header(headers, "References")],
     ],
     body,
     current.signed ? await signatureHtmlFor(account) : "",
@@ -165,13 +176,17 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     requestBody: {
       id: values.draft_id,
       message: {
-        threadId: threadId ?? undefined,
+        ...(leavesThread ? {} : { threadId: threadId ?? undefined }),
         raw: Buffer.from(raw, "utf8").toString("base64url"),
       },
     },
   });
 
   const draftId = result.data.id ?? values.draft_id;
+  const draftThread = leavesThread ? result.data.message?.threadId ?? threadId : threadId;
+  const conversationNote = leavesThread
+    ? "New subject: this will go out as a new conversation, not as a reply in the original thread."
+    : "";
   // The scheduled email this draft belongs to gets the same recipients, subject and body,
   // whether the edit came from chat, an Edit tap, or a contextual rewrite.
   let sync: ScheduleSync = { kind: "none" };
@@ -195,7 +210,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     sync.kind === "synced" ? "The scheduled email was updated to match this draft." : scheduleSyncNotice(sync);
   await queueDraftApproval({
     draftId,
-    threadId,
+    threadId: draftThread,
     to: safeHeader(to),
     cc: cc ? safeHeader(cc) : undefined,
     subject: safeHeader(subject),
@@ -203,6 +218,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     googleAccount: account.id,
     extraLines: [
       ...(cc ? [`Cc: ${safeHeader(cc)}`] : []),
+      ...(conversationNote ? [conversationNote] : []),
       ...(scheduleNote ? [scheduleNote] : []),
     ],
   });
@@ -213,6 +229,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     tag: account.tag,
     to: safeHeader(to),
     cc: cc ? safeHeader(cc) : null,
+    ...(leavesThread ? { new_conversation: conversationNote } : {}),
     ...(sync.kind === "none" ? {} : { schedule: sync.kind, scheduled_email: scheduleNote }),
   });
 }

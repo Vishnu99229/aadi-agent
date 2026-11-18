@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { addOneMonthYmd } from "./bill_cycle.js";
+import { sameConversation } from "./subject_logic.js";
 import { assertTestSeam } from "./test_seam.js";
 
 export type MessageRole = "user" | "assistant" | "tool";
@@ -5556,7 +5557,13 @@ export function writeScheduledCopy(id: number, change: ScheduledCopyChange): Sch
       request.cc = scheduledSlots(change.cc);
     }
     const subject = change.subject?.trim();
+    const before = typeof request.subject === "string" ? request.subject : "";
     if (subject) {
+      // A subject he changed, not one copied over unchanged, decides at send time whether a
+      // reply can stay in its thread.
+      if (before && !sameConversation(subject, before)) {
+        request.subjectEdited = true;
+      }
       request.subject = subject;
       request.finalSubject = subject;
     }
@@ -5582,6 +5589,16 @@ export function writeScheduledCopy(id: number, change: ScheduledCopyChange): Sch
          WHERE id = ? AND status IN ('scheduled', 'held') AND request = ?`,
       )
       .run(next, id, row.request).changes === 1;
+    if (written && subject && subject !== before) {
+      // The task list and /scheduledsends show the subject that will go out.
+      const parts = row.item_text.split(" — ");
+      if (parts.length >= 3) {
+        parts[1] = subject;
+        const itemText = parts.join(" — ");
+        db.prepare("UPDATE scheduled_sends SET item_text = ? WHERE id = ?").run(itemText, id);
+        db.prepare("UPDATE tasks SET text = ? WHERE id = ? AND text = ?").run(itemText, row.task_id, row.item_text);
+      }
+    }
     return written ? { ok: true, changed: true } : { ok: false, status: getScheduledSend(id)?.status ?? "missing" };
   })();
 }

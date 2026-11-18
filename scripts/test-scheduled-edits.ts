@@ -5,7 +5,7 @@ import type { gmail_v1 } from "googleapis";
 import { applyOwnerContextTurn, focusSelectedDraft, getPendingAction } from "../src/action_context.ts";
 import { setApprovalsTestHooks } from "../src/approvals.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
-import { reviseLinkedDraft } from "../src/context_draft.ts";
+import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import {
   createScheduledSend,
   getScheduledSend,
@@ -52,9 +52,30 @@ interface SentMail {
   cc: string;
   subject: string;
   body: string;
+  threadId?: string;
+  inReplyTo: string;
 }
 const sends: SentMail[] = [];
-type StoredDraft = { to: string; cc: string; subject: string; body: string };
+type StoredDraft = {
+  to: string;
+  cc: string;
+  subject: string;
+  body: string;
+  inReplyTo?: string;
+  references?: string;
+  threadId?: string;
+};
+/** Threads he can reply to. Raghavendra wrote "Voice AI Discussion". */
+const threads = new Map([
+  [
+    "voice-thread",
+    {
+      subject: "Voice AI Discussion",
+      from: "Raghavendra KV <raghavendra.kv@tenxpipe.com>",
+      messageId: "<voice-1@tenxpipe.com>",
+    },
+  ],
+]);
 /** Each mailbox keeps its own drafts, as Gmail does. */
 const mailboxes = { work: new Map<string, StoredDraft>(), personal: new Map<string, StoredDraft>() };
 const drafts = mailboxes.work;
@@ -75,8 +96,11 @@ function bodyOf(raw: string): string {
   return raw.split(/\r?\n\r?\n/).slice(1).join("\n").trim();
 }
 
-function storeDraft(store: Map<string, StoredDraft>, id: string, raw: string): void {
+function storeDraft(store: Map<string, StoredDraft>, id: string, raw: string, threadId?: string): void {
   store.set(id, {
+    inReplyTo: headerOf(raw, "In-Reply-To") || undefined,
+    references: headerOf(raw, "References") || undefined,
+    threadId: threadId ?? `thread-${id}`,
     to: headerOf(raw, "To"),
     cc: headerOf(raw, "Cc"),
     subject: headerOf(raw, "Subject"),
@@ -128,20 +152,46 @@ function mailbox(account: "work" | "personal"): gmail_v1.Gmail {
           cc: headerOf(raw, "Cc"),
           subject: headerOf(raw, "Subject"),
           body: bodyOf(raw),
+          threadId: (requestBody as { threadId?: string }).threadId,
+          inReplyTo: headerOf(raw, "In-Reply-To"),
         });
         return { data: { id: `sent-${sends.length}` } };
       },
     },
     threads: {
-      get: async () => {
-        throw Object.assign(new Error("not found"), { response: { status: 404 }, code: 404 });
+      get: async ({ id }: { id: string }) => {
+        const thread = threads.get(id);
+        if (!thread) {
+          throw Object.assign(new Error("not found"), { response: { status: 404 }, code: 404 });
+        }
+        return {
+          data: {
+            id,
+            messages: [
+              {
+                id: `${id}-1`,
+                threadId: id,
+                labelIds: ["INBOX"],
+                internalDate: "1700000000000",
+                payload: {
+                  headers: [
+                    { name: "From", value: thread.from },
+                    { name: "To", value: ME },
+                    { name: "Subject", value: thread.subject },
+                    { name: "Message-ID", value: thread.messageId },
+                  ],
+                },
+              },
+            ],
+          },
+        };
       },
     },
     drafts: {
-      create: async ({ requestBody }: { requestBody: { message: { raw: string } } }) => {
+      create: async ({ requestBody }: { requestBody: { message: { raw: string; threadId?: string } } }) => {
         draftCounter += 1;
         const id = `${prefix}-${draftCounter}`;
-        storeDraft(drafts, id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"));
+        storeDraft(drafts, id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"), requestBody.message.threadId);
         return { data: { id, message: { id, threadId: `thread-${id}` } } };
       },
       get: async ({ id }: { id: string }) => {
@@ -154,12 +204,14 @@ function mailbox(account: "work" | "personal"): gmail_v1.Gmail {
             id,
             message: {
               id,
-              threadId: `thread-${id}`,
+              threadId: draft.threadId,
               payload: {
                 headers: [
                   { name: "To", value: draft.to },
                   { name: "Cc", value: draft.cc },
                   { name: "Subject", value: draft.subject },
+                  ...(draft.inReplyTo ? [{ name: "In-Reply-To", value: draft.inReplyTo }] : []),
+                  ...(draft.references ? [{ name: "References", value: draft.references }] : []),
                 ],
                 mimeType: "text/plain",
                 body: { data: Buffer.from(draft.body, "utf8").toString("base64url") },
@@ -168,9 +220,11 @@ function mailbox(account: "work" | "personal"): gmail_v1.Gmail {
           },
         };
       },
-      update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string } } }) => {
-        storeDraft(drafts, id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"));
-        return { data: { id, message: { id, threadId: `thread-${id}` } } };
+      update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string; threadId?: string } } }) => {
+        // Without a thread id, Gmail files the draft in a new thread of its own.
+        const threadId = requestBody.message.threadId ?? `new-thread-${id}`;
+        storeDraft(drafts, id, Buffer.from(requestBody.message.raw, "base64url").toString("utf8"), threadId);
+        return { data: { id, message: { id, threadId } } };
       },
       delete: async ({ id }: { id: string }) => {
         drafts.delete(id);
@@ -216,8 +270,34 @@ setApprovalsTestHooks({ telegram, gmailFor: (account) => (account === "personal"
 
 // ---- models: the Email Agent rewrites, the Command writer writes at send time ----
 setAgentModelSetting("email", { primary: "anthropic:haiku", fallbacks: [] });
+/** What the Email Agent was shown, newest last. */
+const agentFacts: string[] = [];
+const KYC_DRAFT =
+  "Hi Raghavendra,\n\nEpicode can integrate with your dialer.\nWe will automate the KYC requirements: document capture and identity verification.\nHappy to start with a two-week pilot.";
+
+/** Revises exactly the body it is shown, so a stale or missing body shows up in the result. */
+function reviseShown(facts: string): string | undefined {
+  const shown = /Current body:\n([\s\S]*?)\n\nVishnu's correction:\n([\s\S]*?)\n\n/.exec(facts);
+  if (!shown) {
+    return undefined;
+  }
+  const lines = shown[1]!.trimEnd().split("\n");
+  const correction = shown[2]!.trim();
+  if (/shorter/i.test(correction)) {
+    return lines.slice(0, -1).join("\n");
+  }
+  if (/formal/i.test(correction)) {
+    return lines.join("\n").replace(/^Hi /, "Dear ");
+  }
+  return `${lines.join("\n")}\n${correction.replace(/^(?:add this point:|mention that)\s*/i, "")}`;
+}
+
 function emailAgentReply(params: Pick<CompleteParams, "messages">): CompleteResult {
   const facts = params.messages.map((message) => (typeof message.content === "string" ? message.content : "")).join("\n");
+  agentFacts.push(facts);
+  if (/dialer|KYC/i.test(facts)) {
+    return modelReply({ text: JSON.stringify({ subject: "Dialer and KYC", body: reviseShown(facts) ?? KYC_DRAFT }) });
+  }
   const friday = /friday/i.test(facts) ? " The proposal will be shared Friday." : "";
   return modelReply({ text: JSON.stringify({ subject: "Agent subject", body: `Hi,\n\nHere is where the proposal stands.${friday}` }) });
 }
@@ -698,6 +778,169 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
   assert(getScheduledSend(row.id)!.request === sentRow.request, "the sent record still never changes");
   await runScheduledSendTick(new Date(FIRE.getTime() + 60_000));
   assert(sends.length === sentCount, "nothing is resent");
+}
+
+// 14. A generated draft is the email from creation on: each revision starts from the draft
+//     Gmail holds, so "make it shorter" keeps the KYC requirements.
+{
+  const chat = 14;
+  const before = draftCounter;
+  say(chat, "Draft an email to Raghavendra.");
+  say(chat, "raghavendra.kv@tenxpipe.com");
+  const ready = say(chat, "Raghavendra wants dialer integration and automated KYC flows.");
+  assert(ready.publishDraft, "the context is ready to draft");
+  const posted = await publishReadyDraft(chat);
+  assert(posted.posted && posted.draftId && draftCounter === before + 1, "one draft is created");
+  const draftId = posted.draftId;
+  assert(drafts.get(draftId)!.body.startsWith(KYC_DRAFT), "Gmail holds the generated email");
+  let email = getPendingAction(chat)?.email;
+  assert(email?.draftId === draftId && email.account === "work", "the chat's email is that draft, in the work mailbox");
+  assert(email.to[0]?.email === "raghavendra.kv@tenxpipe.com", "to Raghavendra");
+  assert(email.notes.some((note) => note === `Current draft:\n${KYC_DRAFT}`), "the generated body survives creation");
+  assert(email.notes.some((note) => /automated KYC flows/.test(note)), "and so do the facts he gave");
+
+  const shorter = say(chat, "Make it shorter");
+  assert(shorter.reviseEmail, "make it shorter is a revision");
+  assert((await reviseLinkedDraft(chat, shorter.reviseEmail)) === "Updated the draft.", "it is revised");
+  assert(agentFacts.at(-1)!.includes(KYC_DRAFT), "the Email Agent saw the whole current draft");
+  const short = drafts.get(draftId)!.body;
+  assert(/KYC requirements: document capture and identity verification/.test(short), `the KYC requirements stay, got ${short}`);
+  assert(!/two-week pilot/.test(short), "and it is shorter");
+
+  const added = say(chat, "Add this point: pricing is per verified customer");
+  await reviseLinkedDraft(chat, added.reviseEmail!);
+  assert(agentFacts.at(-1)!.includes("Current body:\nHi Raghavendra,\n\nEpicode can integrate with your dialer.\nWe will automate the KYC requirements"), "the next revision starts from the shortened draft");
+  assert(/KYC requirements/.test(drafts.get(draftId)!.body) && /pricing is per verified customer/.test(drafts.get(draftId)!.body), "both the requirements and the new point are there");
+
+  // An Edit-tap edit outside this chat: Gmail's copy is still what the next revision reads,
+  // and its To line is not put back to an older one.
+  const outside = "Hi Raghavendra,\n\nWe will automate the KYC requirements for your branches.";
+  await updateDraft({ draft_id: draftId, body: outside, to: "Raghavendra KV <raghu@tenxpipe.com>" });
+  const formal = say(chat, "Change the wording to be more formal");
+  await reviseLinkedDraft(chat, formal.reviseEmail!);
+  assert(agentFacts.at(-1)!.includes(`Current body:\n${outside}`), "the revision reads the draft as saved, not the chat's older copy");
+  const now = drafts.get(draftId)!;
+  assert(now.body.startsWith("Dear Raghavendra,\n\nWe will automate the KYC requirements for your branches."), `the saved draft is the one revised, got ${now.body}`);
+  assert(now.to.includes("raghu@tenxpipe.com") && !now.to.includes("raghavendra.kv@"), `the draft's To line stays as saved, got ${now.to}`);
+  email = getPendingAction(chat)?.email;
+  assert(email?.to[0]?.email === "raghu@tenxpipe.com" && email.draftId === draftId, "the chat follows the saved draft's people and id");
+  assert(draftCounter === before + 1, "every revision updated the same draft");
+}
+
+// 15. Scheduled replies: an unchanged subject stays "Re:" in the thread; a subject he changes
+//     goes out exactly, as a new conversation, and the card, record and email all agree.
+{
+  const raghav = "raghavendra.kv@tenxpipe.com";
+  const scheduleReply = async (chat: number, extra: Record<string, unknown> = {}) => {
+    const result = await sendEmailFromTool(
+      { to: [raghav], instruction: "Reply with the integration plan.", thread_id: "voice-thread", send_on: SEND_DAY, send_time: "10:00", ...extra },
+      turnIn(chat, `reply to ${raghav} on ${SEND_DAY} at 10am with the integration plan`),
+    );
+    assert(result.startsWith("Scheduled:"), `the reply is scheduled, got ${result}`);
+    return newestOpen();
+  };
+  const itemSubject = (row: ScheduledSendRecord) => getScheduledSend(row.id)!.item_text.split(" — ")[1];
+
+  // a. Unchanged: "Re:", the thread, and the reply headers.
+  {
+    const row = await scheduleReply(151);
+    assert(requestOf(row.id).subject === "Re: Voice AI Discussion", "a reply keeps the thread's subject");
+    const before = sends.length;
+    await fire();
+    const sent = sends.at(-1)!;
+    assert(sends.length === before + 1, "one reply");
+    assert(sent.subject === "Re: Voice AI Discussion" && sent.threadId === "voice-thread" && sent.inReplyTo === "<voice-1@tenxpipe.com>", `it stays in the thread, got ${JSON.stringify(sent)}`);
+    await runScheduledSendTick(new Date(FIRE.getTime() + 60_000));
+    assert(sends.length === before + 1, "and never goes twice");
+  }
+
+  // b. Changed in chat, with no draft: his exact subject, as a new conversation.
+  {
+    const chat = 152;
+    const row = await scheduleReply(chat);
+    const changed = say(chat, "Change the subject to Dialer and KYC Automation Proposal");
+    assert(/subject is now "Dialer and KYC Automation Proposal"/.test(changed.text ?? "") && /new conversation/.test(changed.text ?? ""), `he is told it starts a new conversation, got ${changed.text}`);
+    assert(itemSubject(row) === "Dialer and KYC Automation Proposal", "the scheduled item shows the new subject");
+    assert(getTask(row.task_id)!.text === getScheduledSend(row.id)!.item_text, "and so does the task");
+    const before = sends.length;
+    await fire();
+    const sent = sends.at(-1)!;
+    assert(sends.length === before + 1 && sent.subject === "Dialer and KYC Automation Proposal", `the new subject goes out exactly, got ${sent.subject}`);
+    assert(!sent.threadId && !sent.inReplyTo, `as a new conversation, got ${JSON.stringify(sent)}`);
+    assert(/new conversation/.test(told.at(-1) ?? ""), "and the sent notice says so");
+  }
+
+  // c. A reply draft scheduled by id, then re-subjected: draft, card, record and email agree.
+  {
+    const chat = 153;
+    const reply = await gmail.users.drafts.create({
+      userId: "me",
+      requestBody: {
+        message: {
+          threadId: "voice-thread",
+          raw: Buffer.from(
+            `To: Raghavendra KV <${raghav}>\r\nSubject: Re: Voice AI Discussion\r\nIn-Reply-To: <voice-1@tenxpipe.com>\r\nReferences: <voice-1@tenxpipe.com>\r\n\r\nHi Raghavendra,\n\nHere is the integration plan.`,
+          ).toString("base64url"),
+        },
+      },
+    });
+    const draftId = reply.data.id!;
+    const row = await scheduleReply(chat, { draft_id: draftId });
+    assert(requestOf(row.id).draftId === draftId && requestOf(row.id).subject === "Re: Voice AI Discussion", "bound, still a reply");
+    assert(!(JSON.parse(getScheduledSend(row.id)!.request) as { subjectEdited?: boolean }).subjectEdited, "the unchanged subject is not an edit");
+
+    // A body-only edit keeps it in the thread.
+    await updateDraft({ draft_id: draftId, body: "Hi Raghavendra,\n\nHere is the full integration plan." }, turnIn(chat, "edit"));
+    assert(drafts.get(draftId)!.inReplyTo === "<voice-1@tenxpipe.com>" && drafts.get(draftId)!.threadId === "voice-thread", "a body edit stays a reply");
+
+    const result = await updateDraft({ draft_id: draftId, subject: "Dialer and KYC Automation Proposal" }, turnIn(chat, "change the subject"));
+    const card = told.at(-1)!;
+    assert(/Subject: Dialer and KYC Automation Proposal/.test(card), "the card shows the new subject");
+    assert(/new conversation, not as a reply in the original thread/.test(card), `the card says it starts a new conversation, got ${card}`);
+    assert(JSON.parse(result).new_conversation, "and so does the tool result");
+    const draft = drafts.get(draftId)!;
+    assert(draft.subject === "Dialer and KYC Automation Proposal" && !draft.inReplyTo && draft.threadId !== "voice-thread", `the Gmail draft is a new conversation too, got ${JSON.stringify(draft)}`);
+    const stored = requestOf(row.id);
+    assert(stored.finalSubject === "Dialer and KYC Automation Proposal" && itemSubject(row) === stored.finalSubject, "the scheduled record agrees");
+
+    const before = sends.length;
+    await fire();
+    const sent = sends.at(-1)!;
+    assert(sends.length === before + 1, "one email");
+    assert(sent.subject === stored.finalSubject && sent.subject === draft.subject, "the email sent has the same subject as the draft, card and record");
+    assert(!sent.threadId && !sent.inReplyTo, "and is not forced into the old thread");
+    assert(sent.body.startsWith("Hi Raghavendra,\n\nHere is the full integration plan."), "with the approved body");
+  }
+
+  // d. A reply draft whose subject he changed before scheduling goes out the same way.
+  {
+    const chat = 154;
+    const reply = await gmail.users.drafts.create({
+      userId: "me",
+      requestBody: {
+        message: {
+          threadId: "voice-thread",
+          raw: Buffer.from(
+            `To: Raghavendra KV <${raghav}>\r\nSubject: Re: Voice AI Discussion\r\nIn-Reply-To: <voice-1@tenxpipe.com>\r\nReferences: <voice-1@tenxpipe.com>\r\n\r\nHi Raghavendra,\n\nThe proposal.`,
+          ).toString("base64url"),
+        },
+      },
+    });
+    const draftId = reply.data.id!;
+    await updateDraft({ draft_id: draftId, subject: "Pilot proposal" });
+    const row = await scheduleReply(chat, { draft_id: draftId });
+    assert(requestOf(row.id).subject === "Pilot proposal" && itemSubject(row) === "Pilot proposal", "his subject is scheduled, not the thread's");
+    await fire();
+    const sent = sends.at(-1)!;
+    assert(sent.subject === "Pilot proposal" && !sent.threadId && !sent.inReplyTo, `it goes out as he wrote it, got ${JSON.stringify(sent)}`);
+  }
+
+  // Owner authorization still applies to scheduled replies.
+  const unowned = await sendEmailFromTool(
+    { to: [raghav], instruction: "x", thread_id: "voice-thread", send_on: SEND_DAY },
+    { userText: `reply to ${raghav} on ${SEND_DAY}` },
+  );
+  assert(unowned.startsWith("Not sent") && unowned.includes("own message"), "only his own message can schedule a reply");
 }
 
 console.log = log;

@@ -60,6 +60,7 @@ import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
 import { holdForVoiceNote } from "./voice_cards.js";
+import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const CHOICE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -103,6 +104,12 @@ export interface CommandRequest {
   /** A scheduled email made from this Gmail draft, named explicitly and checked against
    *  its mailbox and people. The only link between a draft and a schedule. */
   draftId?: string;
+  /** He changed the subject himself. A reply whose subject no longer matches its thread
+   *  goes out as a new conversation, with exactly his subject. */
+  subjectEdited?: boolean;
+  finalSubject?: string;
+  /** The thread's subject when a reply was scheduled. */
+  threadSubject?: string;
 }
 
 let telegram: Api | undefined;
@@ -210,6 +217,9 @@ export async function writeAndSend(
     note?: string;
     /** A finished subject and body. Skips a fresh rewrite from older instructions. */
     prepared?: { subject: string; body: string };
+    /** A subject he changed himself. On a reply it wins over the thread's, and if it no
+     *  longer matches the thread the email goes out as a new conversation. */
+    explicitSubject?: string;
   } = {},
 ): Promise<Outcome> {
   const to = request.to.map((slot) => slot.mailbox!);
@@ -267,14 +277,20 @@ export async function writeAndSend(
     };
   }
 
-  const subject = thread
-    ? replySubject(thread.subject)
-    : options.prepared?.subject.trim() || request.subject?.trim() || written.subject;
+  const explicit = options.explicitSubject?.trim();
+  // Gmail keeps a reply in its thread only while the subject matches, so a changed subject
+  // is sent as a new conversation: no thread id and no reply headers.
+  const newConversation = Boolean(thread && explicit && !sameConversation(explicit, thread.subject));
+  const subject = newConversation
+    ? explicit!
+    : thread
+      ? replySubject(thread.subject)
+      : explicit || options.prepared?.subject.trim() || request.subject?.trim() || written.subject;
   const toHeader = formatMailboxList(to);
   const ccHeader = formatMailboxList(cc);
   const selfAddresses = await loadFollowupSelfAddresses();
   const named = new Set([...to, ...cc].map((item) => item.email));
-  const leftOff = (thread?.mailboxes ?? []).filter(
+  const leftOff = (newConversation ? [] : thread?.mailboxes ?? []).filter(
     (item) =>
       !named.has(item.email) &&
       !selfAddresses.has(item.email) &&
@@ -296,9 +312,9 @@ export async function writeAndSend(
       subject,
       body: written.body,
       signatureHtml: await signatureHtmlFor(account),
-      threadId: request.threadId,
-      inReplyTo: thread?.inReplyTo ?? "",
-      references: thread?.references ?? "",
+      threadId: newConversation ? null : request.threadId,
+      inReplyTo: newConversation ? "" : thread?.inReplyTo ?? "",
+      references: newConversation ? "" : thread?.references ?? "",
     }));
   } catch (error) {
     if (error instanceof CommandSendRefusedError) {
@@ -342,6 +358,7 @@ export async function writeAndSend(
     `Sent to ${toHeader}.`,
     ...(ccHeader ? [`Cc: ${ccHeader}`] : []),
     `Subject: ${subject}`,
+    ...(newConversation ? ["Sent as a new conversation, because the subject no longer matches the thread."] : []),
     ...(leftOff.length > 0 ? [`Left off the thread: ${formatMailboxList(leftOff)}`] : []),
     ...(options.note ? [options.note] : []),
   ];
@@ -480,7 +497,15 @@ async function scheduleRequest(
         hint: "Ask Vishnu whether this is the right thread.",
       };
     }
-    subject = replySubject(thread.subject);
+    // A reply keeps the thread's "Re:" subject unless the draft he named carries a subject
+    // he changed. That one is kept exactly, and the email will start a new conversation.
+    if (draft?.subject && !sameConversation(draft.subject, thread.subject)) {
+      subject = draft.subject;
+      request = { ...request, subjectEdited: true };
+    } else {
+      subject = replySubject(thread.subject);
+    }
+    request = { ...request, threadSubject: thread.subject };
   }
   const shownSubject = subject || request.instruction.split(/\s+/).slice(0, 8).join(" ");
   const names = request.to.map((slot) => slot.mailbox!.name || slot.query).join(", ");

@@ -19,14 +19,33 @@ export interface ContextEvidence {
 let evidenceForTests: ((query: string) => ContextEvidence[]) | undefined;
 let stagedEvidence: ContextEvidence[] = [];
 
+/** How long one turn may wait for Gmail evidence before it carries on without it. */
+const EXTERNAL_LOOKUP_MS = 5000;
+
+const HISTORY_CUE = /\b(?:remember|discussion|follow-?up|last week|same people|what happened|our conversation)\b/i;
+const LOCAL_COMMAND =
+  /\b(?:cancel|don'?t send|do not send|never send|stop|unschedule)\b|\b(?:mark|complete|finish|close|delete|snooze|tick off)\b[^.?!]{0,40}\b(?:task|reminder|bill)s?\b/i;
+
+/**
+ * Whether a message asks about past conversations. Only then is Gmail searched for
+ * context, and only then is that context read. Cancellations and task updates stay
+ * local even when they mention a follow-up, and draft edits use the draft itself.
+ */
+export function wantsHistoricalContext(text: string): boolean {
+  return HISTORY_CUE.test(text) && !LOCAL_COMMAND.test(text);
+}
+
 /** Test stand-in for Gmail and Calendar evidence. Production searches those live, bounded. */
 async function liveGmailSnippets(query: string): Promise<ContextEvidence[]> {
-  const tokens = nameTokens(query).filter((token) => token.length >= 4).slice(0, 4);
+  // The names and topics he gave, not the words of the question ("remember", "discussion").
+  const tokens = nameTokens(query).filter((token) => token.length >= 4 && !STOP.has(token)).slice(0, 4);
   if (tokens.length === 0) {
     return [];
   }
   const found: ContextEvidence[] = [];
-  for (const accountId of ["work", "personal"] as GoogleAccountId[]) {
+  // "my personal email" searches only that mailbox.
+  const only = namedAccount(query);
+  for (const accountId of (only ? [only] : ["work", "personal"]) as GoogleAccountId[]) {
     if (found.length >= GMAIL_SNIPPET_LIMIT) {
       break;
     }
@@ -63,9 +82,35 @@ async function liveGmailSnippets(query: string): Promise<ContextEvidence[]> {
   return found;
 }
 
-/** Fills the next lookup with a few Gmail excerpts. A test provider replaces the live search. */
+/**
+ * Fills the next lookup with a few Gmail excerpts, only for a message that asks about the
+ * past. A slow or failing Gmail never holds up the turn: it carries on with local context.
+ * A test provider replaces the live search.
+ */
 export async function stageExternalContext(query: string): Promise<void> {
-  stagedEvidence = evidenceForTests ? evidenceForTests(query) : await liveGmailSnippets(query);
+  stagedEvidence = [];
+  if (!wantsHistoricalContext(query)) {
+    return;
+  }
+  if (evidenceForTests) {
+    stagedEvidence = evidenceForTests(query);
+    return;
+  }
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    stagedEvidence = await Promise.race([
+      liveGmailSnippets(query),
+      new Promise<ContextEvidence[]>((resolve) => {
+        timer = setTimeout(() => resolve([]), EXTERNAL_LOOKUP_MS);
+      }),
+    ]);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Context lookup failed (${errorType}).`);
+    stagedEvidence = [];
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function setContextEvidenceForTests(

@@ -1,5 +1,6 @@
 import {
   applyToSchedule,
+  attendeesIn,
   contextScheduleForDraft,
   getPendingAction,
   lockedScheduleFor,
@@ -8,6 +9,7 @@ import {
   tooLateText,
   type ScheduleSync,
 } from "./action_context.js";
+import { readDraftSnapshot } from "./approvals.js";
 import { getScheduledSend } from "./db.js";
 import { complete, type CompleteResult } from "./llm.js";
 import { resolveAgentModel } from "./models/agent_models.js";
@@ -37,12 +39,27 @@ If the facts do not mention a previous discussion, do not say there was one.
 Do not add a sign-off. Match the situation: follow-up, proposal, or a first note.
 No filler such as "I hope this email finds you well" or "just following up" when the facts already say what to ask.`;
 
-/** Keep the start of the facts and the latest instruction. A long draft must not push the correction off the end. */
+/** Keep the start of the facts and the latest instruction. Room for a whole ordinary email,
+ *  so a revision sees all of it; only a very long one is clipped in the middle. */
 function boundedFacts(facts: string): string {
-  if (facts.length <= 1800) {
+  if (facts.length <= 6000) {
     return facts;
   }
-  return `${facts.slice(0, 1100)}\n…\n${facts.slice(-600)}`;
+  return `${facts.slice(0, 4800)}\n…\n${facts.slice(-1200)}`;
+}
+
+/** The Gmail draft as it is saved now: the source for any revision, whatever the chat remembers. */
+async function savedDraft(email: { draftId?: string; account: "work" | "personal" }): Promise<
+  { to: string; cc: string; subject: string; body: string } | undefined
+> {
+  if (!email.draftId) {
+    return undefined;
+  }
+  return readDraftSnapshot(email.draftId, email.account);
+}
+
+function withCurrentDraft(notes: readonly string[], body: string): string[] {
+  return [...notes.filter((note) => !note.startsWith("Current draft:")), `Current draft:\n${body}`];
 }
 
 /** One email-agent call. Exported so tests can see which model was asked. */
@@ -71,9 +88,12 @@ export async function composeWithEmailAgent(facts: string): Promise<{ subject: s
  * Turns a finished pending draft into one Gmail draft and its approval card.
  * A later note updates that same draft. This never sends.
  */
-function revisionMode(text: string): "add" | "shorten" | "replace" {
+function revisionMode(text: string): "add" | "shorten" | "reword" | "replace" {
   if (/\b(?:shorter|brief|concise)\b/i.test(text)) {
     return "shorten";
+  }
+  if (/\b(?:wording|reword|rephrase|formal|tone|polish)\b/i.test(text)) {
+    return "reword";
   }
   if (
     /\b(?:also|as well|add|mention|include)\b/i.test(text) &&
@@ -129,20 +149,32 @@ export async function reviseLinkedDraft(
   if (locked) {
     return tooLateText(locked);
   }
-  const current = savedBody(email);
+  // The saved Gmail draft is the email being revised. The chat's copy may be older.
+  let live: Awaited<ReturnType<typeof savedDraft>>;
+  try {
+    live = await savedDraft(email);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Contextual revision could not read the draft (${errorType}).`);
+    return "I couldn't read the current draft, so I didn't change it.";
+  }
+  const current = live?.body.trim() ? live.body : savedBody(email);
+  const currentSubject = live?.subject.trim() || email.subject;
   const mode = revisionMode(instruction);
   const rule =
     mode === "add"
       ? "Add the new fact. Keep every fact that is still true."
       : mode === "shorten"
-        ? "Make the email shorter. Keep the commercial details and requirements he asked to retain."
-        : "Replace the fact he corrected. The old value must not remain as if it were still true. Do not invent pricing, channels, or dates that he did not state.";
+        ? "Make the email shorter. Keep every requirement, commercial detail, name and date in the current body; cut only wording."
+        : mode === "reword"
+          ? "Change only the wording and tone as he asks. Keep every fact, requirement, name and date in the current body."
+          : "Replace the fact he corrected. The old value must not remain as if it were still true. Do not invent pricing, channels, or dates that he did not state.";
   const newSubject = options.subject?.trim();
   let written: { subject: string; body: string };
   try {
     written = await composeWithEmailAgent(
       [
-        `Current subject: ${newSubject || email.subject || "(none)"}`,
+        `Current subject: ${newSubject || currentSubject || "(none)"}`,
         `Current body:\n${current || "(empty)"}`,
         `Vishnu's correction:\n${instruction}`,
         rule,
@@ -154,16 +186,15 @@ export async function reviseLinkedDraft(
     console.error(`Contextual revision failed (${errorType}).`);
     return "I didn't change the email. The previous wording is still in place.";
   }
-  const subject = newSubject || email.subject?.trim() || written.subject;
-  const notes = email.notes.filter((note) => !note.startsWith("Current draft:"));
-  notes.push(`Current draft:\n${written.body}`);
+  const subject = newSubject || currentSubject?.trim() || written.subject;
+  const notes = withCurrentDraft(email.notes, written.body);
   const notices: string[] = [];
   if (email.draftId) {
     let result: string;
     try {
+      // No To or Cc: a body rewrite keeps exactly the people the draft has now.
       result = await updateDraft({
         draft_id: email.draftId,
-        to: email.to.map((item) => item.email).join(", "),
         subject,
         body: written.body,
       });
@@ -196,11 +227,13 @@ export async function reviseLinkedDraft(
     }
   }
   const keepSchedule = sync.kind === "synced" || (sync.kind === "none" && !email.scheduledSendId);
+  const people = live?.to.trim() ? { to: attendeesIn(live.to), cc: attendeesIn(live.cc) } : {};
+  const updated = { ...email, ...people, subject, notes };
   savePendingAction(
     chatId,
     {
       ...pending,
-      email: keepSchedule ? { ...email, subject, notes } : { ...email, subject, notes, scheduledSendId: undefined, sendAt: undefined },
+      email: keepSchedule ? updated : { ...updated, scheduledSendId: undefined, sendAt: undefined },
     },
     now,
   );
@@ -222,10 +255,20 @@ export async function publishReadyDraft(
   }
   const to = email.to.map((item) => item.email).join(", ");
   const name = email.to[0]?.name || "there";
+  // An existing draft is revised from what Gmail holds now, not from the chat's older copy.
+  let live: Awaited<ReturnType<typeof savedDraft>>;
+  try {
+    live = await savedDraft(email);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Contextual draft could not read the draft (${errorType}).`);
+    return { posted: false };
+  }
+  const notes = live?.body.trim() ? withCurrentDraft(email.notes, live.body) : email.notes;
   const facts = [
     `Recipient: ${name} <${email.to[0]?.email}>`,
     `Vishnu's instruction: ${email.purpose}`,
-    email.notes.length ? `Notes:\n${email.notes.join("\n")}` : "",
+    notes.length ? `Notes:\n${notes.join("\n")}` : "",
     "Write the email. The To line is already chosen. Do not name a different recipient.",
   ].filter(Boolean).join("\n\n");
   const turn = {
@@ -251,10 +294,8 @@ export async function publishReadyDraft(
         ? applyToSchedule(scheduleId, { body })
         : { kind: "none" };
       const notice = [refused, scheduleSyncNotice(sync)].filter(Boolean).filter((item, index, all) => all.indexOf(item) === index).join(" ");
-      const notes = email.notes.filter((note) => !note.startsWith("Current draft:"));
-      notes.push(`Current draft:\n${body}`);
       const kept = sync.kind === "synced" || sync.kind === "none" ? email : { ...email, scheduledSendId: undefined, sendAt: undefined };
-      savePendingAction(chatId, { ...pending, email: { ...kept, notes } }, now);
+      savePendingAction(chatId, { ...pending, email: { ...kept, notes: withCurrentDraft(email.notes, body) } }, now);
       return { posted: true, draftId: email.draftId, notice: notice || undefined };
     }
     const subject = written.subject || email.subject || subjectFrom(email.purpose);
@@ -266,9 +307,23 @@ export async function publishReadyDraft(
     if (!draftId) {
       return { posted: false };
     }
+    // The new draft is the email from here on: his facts and people as before, plus the
+    // draft exactly as written. A schedule stays only if it was made from this draft.
+    const linked = getPendingAction(chatId, now)?.email;
+    const ownSchedule = linked?.draftId === draftId ? linked.scheduledSendId : undefined;
     savePendingAction(
       chatId,
-      { ...pending, email: { ...email, draftId, subject } },
+      {
+        ...pending,
+        email: {
+          ...email,
+          draftId,
+          subject,
+          notes: withCurrentDraft(email.notes, body),
+          scheduledSendId: ownSchedule,
+          sendAt: ownSchedule ? linked?.sendAt : undefined,
+        },
+      },
       now,
     );
     return { posted: true, draftId };

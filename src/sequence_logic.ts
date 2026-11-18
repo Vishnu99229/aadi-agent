@@ -376,8 +376,12 @@ export const FOLLOW_UP_ON_EMAIL: readonly RegExp[] = [
 
 /** "follow up with Abhishek", "follow up Abhishek 4 times". Not "follow up with me". */
 const NOT_A_FOLLOW_PERSON = "me|us|myself|with|on|the|my|a|an|to|for|about|tomorrow|today|this|that";
+/** "the follow-up task", "a follow-up email", "a follow-up call": the word describes a
+ *  thing, so the word after it is not a person to follow up. */
+const FOLLOW_UP_THING =
+  "e-?mails?|mails?|messages?|repl(?:y|ies)|calls?|meetings?|tasks?|reminders?|notes?|items?|lists?|dates?|questions?|points?|actions?|drafts?|plans?|sessions?|demos?|chats?|discussions?|conversations?";
 const FOLLOW_UP_WITH_PERSON = new RegExp(
-  `\\bfollow[\\s-]*up(?!s)\\s+(?:with\\s+(?!(?:${NOT_A_FOLLOW_PERSON}|sequences?)\\b)|(?!(?:${NOT_A_FOLLOW_PERSON}|sequences?)\\b))\\p{L}`,
+  `\\bfollow[\\s-]*up(?!s)\\s+(?:with\\s+(?!(?:${NOT_A_FOLLOW_PERSON}|sequences?)\\b)|(?!(?:${NOT_A_FOLLOW_PERSON}|sequences?|${FOLLOW_UP_THING})\\b))\\p{L}`,
   "iu",
 );
 

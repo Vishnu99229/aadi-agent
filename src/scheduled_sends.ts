@@ -187,6 +187,7 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
       beforeSend: () => claimScheduledSend(row.id, now.toISOString(), row.request),
       note: late ? `This went out late: it was due ${scheduledWhen(row.send_at)}.` : undefined,
       prepared: snapshot,
+      explicitSubject: request.subjectEdited ? request.finalSubject || request.subject : undefined,
     },
   );
   if (outcome.result === "sent") {
