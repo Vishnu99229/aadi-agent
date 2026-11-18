@@ -17,7 +17,8 @@ import {
   savePendingAction,
   TASK_TTL_MS,
 } from "../src/action_context.ts";
-import { sendEmailFromTool } from "../src/command_email.ts";
+import { bookPendingMeetingAt, sendEmailFromTool } from "../src/command_email.ts";
+import { resetOwnerMeetingTestHooks, setOwnerMeetingTestHooks } from "../src/owner_meeting.ts";
 import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import { CONTEXT_MESSAGE_SCAN, retrieveRelevantContext, setContextEvidenceForTests } from "../src/context_lookup.ts";
 import {
@@ -125,6 +126,7 @@ setGmailClientForTests(() => gmail);
 setGoogleAccountForTests(() => ({ id: "work", tag: "work", label: "Epicode", client: {} }) as never);
 setApprovalsTestHooks({ telegram, gmailFor: () => gmail });
 const modelsUsed: string[] = [];
+let lastFacts = "";
 let failPrimary = false;
 setAgentModelSetting("email", { primary: "anthropic:haiku", fallbacks: ["anthropic:sonnet"] });
 setRouteModelCompleteForTests(async (spec, params) => {
@@ -133,6 +135,7 @@ setRouteModelCompleteForTests(async (spec, params) => {
     throw new Error("primary down");
   }
   const facts = params.messages.map((message) => (typeof message.content === "string" ? message.content : "")).join("\n");
+  lastFacts = facts;
   const voice = /voice agent requirements/i.test(facts) ? " I'll cover the voice agent requirements." : "";
   const shorter = /\bshorter\b/i.test(facts) ? " Brief version." : "";
   const dialer = /dialer/i.test(facts) ? " Epicode can look at your dialer and KYC workflow." : "";
@@ -1068,6 +1071,82 @@ const say = (text: string, now = NOW) =>
   });
   assert.equal(getPendingAction(chat, new Date())?.email?.scheduledSendId, kept!.id);
   assert.match(getScheduledSend(kept!.id)!.request, /Delivery is Friday/);
+}
+
+{
+  const chat = 46;
+  const scheduled = createScheduledSend({
+    key: "keep-original-instruction",
+    sendAt: "2026-11-18T04:30:00.000Z",
+    itemText: "Send the proposal",
+    tag: "work",
+    request: JSON.stringify({
+      instruction: "Share the proposal on Wednesday and include the pricing.",
+      subject: "Hello",
+      to: [],
+    }),
+    confirmChat: chat,
+    confirmMessage: 1,
+  });
+  assert.ok(scheduled);
+  savePendingAction(chat, {
+    action: "send_email",
+    status: "open",
+    ownerWords: "Schedule the proposal",
+    confirmChat: chat,
+    confirmMessage: 1,
+    updatedAt: NOW.toISOString(),
+    email: {
+      to: [{ query: "Raghavendra", name: "Raghavendra", email: "raghavendra.kv@tenxpipe.com", resolved: true }],
+      cc: [],
+      notes: [],
+      purpose: "Hello",
+      subject: "Hello",
+      account: "work",
+      waiting: "confirm",
+      scheduledSendId: scheduled!.id,
+    },
+  }, NOW);
+  const turn = applyOwnerContextTurn(chat, "mention that delivery is Friday", 2, NOW);
+  assert.equal(turn.reviseEmail, "mention that delivery is Friday");
+  await reviseLinkedDraft(chat, turn.reviseEmail!, NOW);
+  assert.match(lastFacts, /Share the proposal on Wednesday and include the pricing/);
+}
+
+{
+  const chat = 47;
+  savePendingAction(chat, {
+    action: "create_meeting",
+    status: "open",
+    ownerWords: "Book another meeting with the same people from the personal calendar",
+    confirmChat: chat,
+    confirmMessage: 1,
+    updatedAt: NOW.toISOString(),
+    meeting: {
+      title: "Catch up",
+      calendar: "personal",
+      waiting: "time",
+      resolutionAttempts: {},
+      attendees: [{ query: "Rita", name: "Rita", email: "rita@acme.example", resolved: true }],
+    },
+  }, NOW);
+  let bookedAccount: string | undefined;
+  setOwnerMeetingTestHooks({
+    insertCommand: async (event) => {
+      bookedAccount = event.account;
+      return { id: "evt-personal", hangoutLink: "https://meet.example/personal" };
+    },
+  });
+  const booked = await bookPendingMeetingAt(
+    chat,
+    "2026-11-18T10:00:00.000Z",
+    { chatId: chat, messageId: 2 },
+    NOW,
+  );
+  assert.match(booked, /^Booked:/);
+  assert.equal(bookedAccount, "personal");
+  assert.equal(getPendingAction(chat, NOW)?.bookedMeeting?.accountId, "personal");
+  resetOwnerMeetingTestHooks();
 }
 
 console.log("cross-turn context checks passed.");

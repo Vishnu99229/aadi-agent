@@ -389,6 +389,8 @@ export async function createOwnerMeeting(
 
 export interface CommandEventInsert {
   title: string;
+  /** Which Google account receives the event. Defaults to work. */
+  account?: "work" | "personal";
   startIso?: string;
   endIso?: string;
   /** An all-day event: YYYY-MM-DD, with the end day exclusive. */
@@ -466,7 +468,7 @@ async function insertCommandEvent(
   if (testHooks.insertCommand) {
     return testHooks.insertCommand(event);
   }
-  const account = await getGoogleAccount("work");
+  const account = await getGoogleAccount(event.account === "personal" ? "personal" : "work");
   const calendar = google.calendar({ version: "v3", auth: account.client });
   const invites = event.attendees.length > 0;
   const created = await calendar.events.insert({
@@ -559,7 +561,7 @@ export async function createCommandEvent(input: {
   if (!gate.ok) {
     return { ok: false, text: `a delivery check refused it (${gate.reason}).` };
   }
-  if (!claimCommandSend({ key: input.key, account: "work", threadId: null })) {
+  if (!claimCommandSend({ key: input.key, account: input.event.account === "personal" ? "personal" : "work", threadId: null })) {
     return { ok: false, text: "this command was already handled." };
   }
   const clash = await clashNote(input.event.startIso, input.event.endIso);
@@ -643,6 +645,7 @@ export async function bookResolvedMeeting(input: {
   startIso: string;
   endIso: string;
   attendees: ParsedMailbox[];
+  account?: "work" | "personal";
   now: Date;
 }): Promise<{ text: string; booked: boolean; eventId?: string }> {
   if (new Date(input.startIso).getTime() < input.now.getTime() - PAST_GRACE_MS) {
@@ -654,7 +657,13 @@ export async function bookResolvedMeeting(input: {
   const result = await createCommandEvent({
     key: `${input.key}:${input.startIso}`,
     confirmation: input.confirmation,
-    event: { title, startIso: input.startIso, endIso: input.endIso, attendees: input.attendees },
+    event: {
+      title,
+      startIso: input.startIso,
+      endIso: input.endIso,
+      attendees: input.attendees,
+      account: input.account === "personal" ? "personal" : "work",
+    },
     resolved: new Set(input.attendees.map((item) => item.email.toLowerCase())),
   });
   if (!result.ok) {

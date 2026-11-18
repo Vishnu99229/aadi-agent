@@ -80,9 +80,12 @@ function savedBody(email: { notes: string[]; purpose?: string; scheduledSendId?:
     const row = getScheduledSend(email.scheduledSendId);
     if (row) {
       try {
-        const request = JSON.parse(row.request) as { finalBody?: string };
+        const request = JSON.parse(row.request) as { finalBody?: string; instruction?: string };
         if (request.finalBody?.trim()) {
           return request.finalBody;
+        }
+        if (request.instruction?.trim()) {
+          return request.instruction;
         }
       } catch {
         // The row stays as it is. The draft notes are the fallback.

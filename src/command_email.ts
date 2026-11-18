@@ -482,12 +482,13 @@ async function finishRequest(
     startIso: request.meeting!.startIso,
     endIso: request.meeting!.endIso,
     attendees,
+    account: request.account === "personal" ? "personal" : "work",
     now,
   });
   if (result.booked && result.eventId && confirmation) {
     rememberBookedMeeting(confirmation.chatId, {
       eventId: result.eventId,
-      accountId: "work",
+      accountId: request.account === "personal" ? "personal" : "work",
       title: request.meeting!.title ?? request.to[0]?.query ?? "Meeting",
       startIso: request.meeting!.startIso,
       attendees: attendees.map((person) => ({
@@ -851,6 +852,7 @@ export async function bookMeetingFromTool(
   if (typeof slots === "string") {
     return slots;
   }
+  const calendar = pending?.meeting?.calendar === "personal" ? "personal" : "work";
   const duration =
     typeof values.duration_minutes === "number"
       ? values.duration_minutes
@@ -873,7 +875,7 @@ export async function bookMeetingFromTool(
       updatedAt: now.toISOString(),
       meeting: {
         title,
-        calendar: "work",
+        calendar,
         attendees: resolved,
         durationMinutes: duration,
         waiting: resolved.every((item) => item.resolved) ? "time" : "attendees",
@@ -903,7 +905,7 @@ export async function bookMeetingFromTool(
     threadId: null,
     instruction: "",
     ownWords: authWords,
-    account: "work",
+    account: calendar,
     meeting: {
       title,
       startIso: times.startIso,
@@ -919,7 +921,7 @@ export async function bookMeetingFromTool(
     ),
   );
   if (!result.startsWith("Not booked")) {
-    clearPendingAction(confirmation.chatId);
+    clearPendingAction(confirmation.chatId, now);
   }
   return result;
 }
