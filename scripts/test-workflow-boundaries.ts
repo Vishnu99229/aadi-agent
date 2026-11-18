@@ -20,10 +20,12 @@ import { setCommandEmailTestHooks } from "../src/command_email.ts";
 import { rememberContactChoice } from "../src/contacts.ts";
 import { retrieveRelevantContext, setContextEvidenceForTests, stageExternalContext } from "../src/context_lookup.ts";
 import {
+  claimDraftDelivery,
   createScheduledSend,
   getScheduledSend,
   reopenPendingActionForTests,
   saveMessage,
+  transitionScheduledSend,
   upsertCalendarEventRef,
 } from "../src/db.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
@@ -517,6 +519,48 @@ const pendingBeforeRestart = schedule({
 });
 assert.equal(getScheduledSend(pendingBeforeRestart.id)?.status, "scheduled");
 assert.match(getScheduledSend(pendingBeforeRestart.id)?.request ?? "", /From home/);
+
+const copied = await draftNewEmail(
+  { to: "alice@example.com", cc: "bob@example.com", subject: "Notes", body: "Hello Alice." },
+  turn("Draft an email to alice@example.com and cc bob@example.com"),
+);
+const copiedId = /draft_id:\s*(\S+)/.exec(copied)?.[1];
+assert.ok(copiedId);
+await say("Add carol@example.com to Cc.");
+assert.match(drafts.get(copiedId)!.cc, /bob@example.com/);
+assert.match(drafts.get(copiedId)!.cc, /carol@example.com/);
+
+const retryable = await draft("alice@example.com", "Retry", "Nothing was attempted.");
+const retryableSchedule = schedule({
+  draftId: retryable.id,
+  account: "work",
+  to: "alice@example.com",
+  subject: "Retry",
+  body: "Nothing was attempted.",
+  key: "failed-before-claim",
+  remember: false,
+});
+assert.equal(transitionScheduledSend(retryableSchedule.id, ["scheduled"], "failed"), true);
+const sendsBeforeRetry = draftSends.length;
+await tap("send", retryable.actionId);
+assert.equal(draftSends.length, sendsBeforeRetry + 1, "a pre-send failure must not block the Send card");
+
+const blocked = await draft("alice@example.com", "Claimed", "Gmail may have it.");
+const blockedSchedule = schedule({
+  draftId: blocked.id,
+  account: "work",
+  to: "alice@example.com",
+  subject: "Claimed",
+  body: "Gmail may have it.",
+  key: "failed-after-claim",
+  remember: false,
+});
+assert.equal(claimDraftDelivery(blocked.id, "work", new Date().toISOString()).state, "claimed");
+assert.equal(transitionScheduledSend(blockedSchedule.id, ["sending"], "failed"), true);
+const sendsBeforeBlocked = draftSends.length;
+const blockedAnswers = await tap("send", blocked.actionId);
+assert.equal(draftSends.length, sendsBeforeBlocked);
+assert.match(blockedAnswers.join(" "), /won't try again|Sent mail/i);
 
 saveMessage("user", "Hardik said Pinnacle wants the proposal on Friday.");
 const history = retrieveRelevantContext("remember the discussion with Hardik about Pinnacle");

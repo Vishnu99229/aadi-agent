@@ -5679,7 +5679,7 @@ export function claimDraftDelivery(draftId: string, account: string, nowIso: str
     if (sent) {
       return { state: "already_sent", id: sent.id, itemText: sent.item_text };
     }
-    const failed = rows.find((row) => row.status === "failed");
+    const failed = rows.find((row) => row.status === "failed" && row.claimed_at);
     if (failed) {
       return { state: "unconfirmed", id: failed.id, itemText: failed.item_text };
     }

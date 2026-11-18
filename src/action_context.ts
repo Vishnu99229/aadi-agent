@@ -423,6 +423,7 @@ export function linkPublishedDraft(input: {
   chatId: number;
   draftId: string;
   to: string;
+  cc?: string;
   subject: string;
   body?: string;
   account: "work" | "personal";
@@ -450,7 +451,7 @@ export function linkPublishedDraft(input: {
     updatedAt: new Date().toISOString(),
     email: {
       to: to.length > 0 ? to : pending?.email?.to ?? [],
-      cc: pending?.email?.cc ?? [],
+      cc: input.cc !== undefined ? attendeesIn(input.cc) : pending?.email?.cc ?? [],
       notes: linkedSchedule
         ? [
             ...(pending?.email?.notes ?? []).filter((note) => !note.startsWith("Current draft:")),
@@ -501,9 +502,16 @@ export function syncDraftRecipient(input: {
   const notes = input.body
     ? [...pending.email.notes.filter((note) => !note.startsWith("Current draft:")), `Current draft:\n${input.body}`]
     : pending.email.notes;
+  const cc = change.cc?.map((person) => ({
+    query: person.email,
+    name: person.name || person.email,
+    email: person.email,
+    resolved: true,
+  }));
   let email: PendingEmailState = {
     ...pending.email,
     to: to.length > 0 ? to : pending.email.to,
+    cc: cc ?? pending.email.cc,
     subject: input.subject || pending.email.subject,
     notes,
     draftId: pending.email.draftId || input.draftId,
@@ -554,7 +562,7 @@ export function rememberScheduledSend(input: {
     updatedAt: new Date().toISOString(),
     email: {
       to: attendeesIn(input.to),
-      cc: [],
+      cc: sameEmail && open ? open.cc : [],
       notes,
       subject: input.subject,
       purpose: sameEmail && open ? open.purpose ?? input.subject : input.subject,

@@ -146,6 +146,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       chatId: turn.confirmation.chatId,
       draftId,
       to: toHeader,
+      cc: ccHeader,
       subject,
       body: values.body,
       account: account.id,
