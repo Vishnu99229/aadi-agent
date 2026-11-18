@@ -520,7 +520,7 @@ export async function noteCalendarReference(input: {
   if (/^(?:add|remove|drop|replace|book|schedule)\b/i.test(text) || !/\bmeeting\b/i.test(text)) {
     return undefined;
   }
-  if (/\b(?:e-?mail|inbox)\b/i.test(text) && !/\b(?:book|schedule|calendar)\b/i.test(text)) {
+  if (/\b(?:e-?mails?|inbox|draft|compose)\b/i.test(text) && !/\b(?:book|schedule)\b/i.test(text)) {
     return undefined;
   }
   if (!/\b(?:remember|which|find)\b/i.test(text)) {
@@ -607,7 +607,7 @@ export async function reviseReferencedMeeting(input: {
       return `${edit.name} is not on ${booked.title}.`;
     }
     if (matched.length > 1) {
-      return `Which ${edit.name}? ${matched.map((person) => `${person.name} <${person.email}>`).join(", ")}`;
+      return `Which ${edit.name}? ${matched.map((person) => person.email ? `${person.name} <${person.email}>` : person.name).join(", ")}`;
     }
     next = next.filter((person) => person.resource || person.email !== matched[0]!.email);
   } else if (edit.op === "add") {
@@ -629,7 +629,7 @@ export async function reviseReferencedMeeting(input: {
       return `${edit.from} is not on ${booked.title}.`;
     }
     if (matched.length > 1) {
-      return `Which ${edit.from}? ${matched.map((item) => `${item.name} <${item.email}>`).join(", ")}`;
+      return `Which ${edit.from}? ${matched.map((item) => item.email ? `${item.name} <${item.email}>` : item.name).join(", ")}`;
     }
     const without = next.filter((item) => item.resource || item.email !== matched[0]!.email);
     next = without.some((item) => item.email === person.email) ? without : [...without, { ...person, resource: false }];

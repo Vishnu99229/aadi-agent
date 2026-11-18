@@ -198,6 +198,8 @@ export async function writeAndSend(
     /** Runs once the email is written, right before Gmail. False stops the send. */
     beforeSend?: () => boolean;
     note?: string;
+    /** A finished subject and body. Skips a fresh rewrite from older instructions. */
+    prepared?: { subject: string; body: string };
   } = {},
 ): Promise<Outcome> {
   const to = request.to.map((slot) => slot.mailbox!);
@@ -234,7 +236,9 @@ export async function writeAndSend(
   }
 
   let written: { subject: string; body: string };
-  try {
+  if (options.prepared?.body.trim()) {
+    written = { subject: options.prepared.subject, body: options.prepared.body };
+  } else try {
     written = await writeCommandEmail({
       gmail,
       ownWords: request.ownWords,
@@ -253,7 +257,9 @@ export async function writeAndSend(
     };
   }
 
-  const subject = thread ? replySubject(thread.subject) : request.subject?.trim() || written.subject;
+  const subject = thread
+    ? replySubject(thread.subject)
+    : options.prepared?.subject.trim() || request.subject?.trim() || written.subject;
   const toHeader = formatMailboxList(to);
   const ccHeader = formatMailboxList(cc);
   const selfAddresses = await loadFollowupSelfAddresses();

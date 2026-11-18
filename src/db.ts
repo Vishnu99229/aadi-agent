@@ -5478,28 +5478,90 @@ export function createScheduledSend(input: {
   })();
 }
 
-export function setScheduledSendSubject(id: number, subject: string): void {
+/** Applies a change only while the row is still scheduled or held. A claim already in
+ *  progress changes nothing, so the worker cannot send a half-updated copy. */
+export function patchScheduledRequest(
+  id: number,
+  patch: (request: Record<string, unknown>) => void,
+): boolean {
   const row = getScheduledSend(id);
   if (!row || (row.status !== "scheduled" && row.status !== "held")) {
-    return;
+    return false;
   }
-  const request = JSON.parse(row.request) as { subject?: string };
-  request.subject = subject;
-  db.prepare(
-    "UPDATE scheduled_sends SET request = ? WHERE id = ? AND status IN ('scheduled', 'held')",
-  ).run(JSON.stringify(request), id);
+  let request: Record<string, unknown>;
+  try {
+    request = JSON.parse(row.request) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  patch(request);
+  return (
+    db
+      .prepare(
+        `UPDATE scheduled_sends SET request = ?
+         WHERE id = ? AND status IN ('scheduled', 'held')`,
+      )
+      .run(JSON.stringify(request), id).changes === 1
+  );
 }
 
-export function appendScheduledSendInstruction(id: number, note: string): void {
+export function setScheduledSendSubject(id: number, subject: string): boolean {
+  return patchScheduledRequest(id, (request) => {
+    request.subject = subject;
+  });
+}
+
+export function appendScheduledSendInstruction(id: number, note: string): boolean {
+  return patchScheduledRequest(id, (request) => {
+    const instruction = typeof request.instruction === "string" ? request.instruction : "";
+    request.instruction = `${instruction}\n${note}`.trim();
+  });
+}
+
+export function bindScheduledDraft(id: number, draftId: string): boolean {
+  return patchScheduledRequest(id, (request) => {
+    request.draftId = draftId;
+  });
+}
+
+/** Replaces the scheduled subject and body. Fails if the row changed or is already sending. */
+export function replaceScheduledContent(id: number, subject: string, body: string): boolean {
   const row = getScheduledSend(id);
   if (!row || (row.status !== "scheduled" && row.status !== "held")) {
-    return;
+    return false;
   }
-  const request = JSON.parse(row.request) as { instruction?: string };
-  request.instruction = `${request.instruction ?? ""}\n${note}`.trim();
-  db.prepare(
-    "UPDATE scheduled_sends SET request = ? WHERE id = ? AND status IN ('scheduled', 'held')",
-  ).run(JSON.stringify(request), id);
+  let request: Record<string, unknown>;
+  try {
+    request = JSON.parse(row.request) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  const version = typeof request.finalVersion === "number" ? request.finalVersion : 0;
+  request.finalVersion = version + 1;
+  request.finalSubject = subject;
+  request.finalBody = body;
+  request.subject = subject;
+  request.instruction = body;
+  return (
+    db
+      .prepare(
+        `UPDATE scheduled_sends SET request = ?
+         WHERE id = ? AND status IN ('scheduled', 'held') AND request = ?`,
+      )
+      .run(JSON.stringify(request), id, row.request).changes === 1
+  );
+}
+
+export function retargetScheduledSend(
+  id: number,
+  people: Array<{ name: string; email: string }>,
+): boolean {
+  return patchScheduledRequest(id, (request) => {
+    request.to = people.map((person) => ({
+      query: person.name || person.email,
+      mailbox: { email: person.email.toLowerCase(), name: person.name || person.email },
+    }));
+  });
 }
 
 export function getScheduledSend(id: number): ScheduledSendRecord | undefined {

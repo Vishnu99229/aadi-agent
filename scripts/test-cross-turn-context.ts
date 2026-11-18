@@ -18,7 +18,7 @@ import {
   TASK_TTL_MS,
 } from "../src/action_context.ts";
 import { sendEmailFromTool } from "../src/command_email.ts";
-import { publishReadyDraft } from "../src/context_draft.ts";
+import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import { CONTEXT_MESSAGE_SCAN, retrieveRelevantContext, setContextEvidenceForTests } from "../src/context_lookup.ts";
 import {
   createMemory,
@@ -328,13 +328,13 @@ const say = (text: string, now = NOW) =>
   assert.equal((await publishReadyDraft(other, NOW)).posted, true);
   const createdOnce = draftCount;
   const last = applyOwnerContextTurn(other, "Mention their voice agent requirements.", 4, NOW);
-  assert.equal(last.publishDraft, true);
-  assert.equal((await publishReadyDraft(other, NOW)).posted, true);
+  assert.equal(last.reviseEmail, "Mention their voice agent requirements.");
+  assert.match(await reviseLinkedDraft(other, last.reviseEmail!, NOW), /Updated the draft/);
   assert.equal(draftCount, createdOnce, "an added note updates the same draft");
   assert.match(cards.at(-1)!.text, /voice agent requirements/);
   const shorter = applyOwnerContextTurn(other, "Make it shorter.", 41, NOW);
-  assert.equal(shorter.publishDraft, true);
-  assert.equal((await publishReadyDraft(other, NOW)).posted, true);
+  assert.equal(shorter.reviseEmail, "Make it shorter.");
+  assert.match(await reviseLinkedDraft(other, shorter.reviseEmail!, NOW), /Updated the draft/);
   assert.equal(draftCount, createdOnce, "Make it shorter updates the same draft");
   assert.match(cards.at(-1)!.text, /Brief version/);
   const draft = getPendingAction(other, NOW);
@@ -450,9 +450,9 @@ const say = (text: string, now = NOW) =>
   const afternoon = new Date(NOW.getTime() + 5 * 60 * 60 * 1000);
   assert.equal(getPendingAction(chat, afternoon)?.email?.draftId, first.draftId);
   const added = applyOwnerContextTurn(chat, "Add something about our dialer.", 4, afternoon);
-  assert.equal(added.publishDraft, true);
-  const second = await publishReadyDraft(chat, afternoon);
-  assert.equal(second.draftId, first.draftId);
+  assert.equal(added.reviseEmail, "Add something about our dialer.");
+  await reviseLinkedDraft(chat, added.reviseEmail!, afternoon);
+  assert.equal(getPendingAction(chat, afternoon)?.email?.draftId, first.draftId);
   assert.match(cards.at(-1)!.text, /dialer/);
 }
 
@@ -1039,8 +1039,8 @@ const say = (text: string, now = NOW) =>
     account: "work",
   });
   assert.equal(getPendingAction(chat, NOW)?.email?.to[0]?.email, "bob@example.com");
-  assert.equal(getPendingAction(chat, NOW)?.email?.scheduledSendId, undefined);
-  assert.equal(getScheduledSend(scheduled!.id)?.status, "cancelled");
+  assert.equal(getScheduledSend(scheduled!.id)?.status, "scheduled");
+  assert.match(getScheduledSend(scheduled!.id)?.request ?? "", /bob@example.com/);
   const kept = createScheduledSend({
     key: "keep-body",
     sendAt: "2026-11-18T05:30:00.000Z",

@@ -1,4 +1,5 @@
 import { getPendingAction, savePendingAction } from "./action_context.js";
+import { getScheduledSend, markTaskDone, replaceScheduledContent, transitionScheduledSend } from "./db.js";
 import { complete, type CompleteResult } from "./llm.js";
 import { resolveAgentModel } from "./models/agent_models.js";
 import { handler as draftNewEmail } from "./tools/draft_new_email.js";
@@ -61,6 +62,111 @@ export async function composeWithEmailAgent(facts: string): Promise<{ subject: s
  * Turns a finished pending draft into one Gmail draft and its approval card.
  * A later note updates that same draft. This never sends.
  */
+function revisionMode(text: string): "add" | "shorten" | "replace" {
+  if (/\b(?:shorter|brief|concise)\b/i.test(text)) {
+    return "shorten";
+  }
+  if (
+    /\b(?:also|as well|add|mention|include)\b/i.test(text) &&
+    !/\b(?:instead|change|actually|make that|correct)\b/i.test(text)
+  ) {
+    return "add";
+  }
+  return "replace";
+}
+
+function savedBody(email: { notes: string[]; purpose?: string; scheduledSendId?: number }): string {
+  if (email.scheduledSendId) {
+    const row = getScheduledSend(email.scheduledSendId);
+    if (row) {
+      try {
+        const request = JSON.parse(row.request) as { finalBody?: string };
+        if (request.finalBody?.trim()) {
+          return request.finalBody;
+        }
+      } catch {
+        // The row stays as it is. The draft notes are the fallback.
+      }
+    }
+  }
+  const note = [...email.notes].reverse().find((item) => item.startsWith("Current draft:"));
+  if (note) {
+    return note.replace(/^Current draft:\n?/, "");
+  }
+  return email.purpose ?? "";
+}
+
+/**
+ * Rewrites the open draft from Vishnu's correction and stores that text as the
+ * scheduled copy. A failed schedule write cancels the send instead of leaving
+ * the old wording queued.
+ */
+export async function reviseLinkedDraft(chatId: number, instruction: string, now = new Date()): Promise<string> {
+  const pending = getPendingAction(chatId, now);
+  const email = pending?.email;
+  if (!pending || !email) {
+    return "I don't have an email open to change.";
+  }
+  const current = savedBody(email);
+  const mode = revisionMode(instruction);
+  const rule =
+    mode === "add"
+      ? "Add the new fact. Keep every fact that is still true."
+      : mode === "shorten"
+        ? "Make the email shorter. Keep the commercial details and requirements he asked to retain."
+        : "Replace the fact he corrected. The old value must not remain as if it were still true. Do not invent pricing, channels, or dates that he did not state.";
+  let written: { subject: string; body: string };
+  try {
+    written = await composeWithEmailAgent(
+      [
+        `Current subject: ${email.subject || "(none)"}`,
+        `Current body:\n${current || "(empty)"}`,
+        `Vishnu's correction:\n${instruction}`,
+        rule,
+        "Keep the same recipient. Do not add a sign-off.",
+      ].join("\n\n"),
+    );
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Contextual revision failed (${errorType}).`);
+    return "I didn't change the email. The previous wording is still in place.";
+  }
+  const subject = email.subject?.trim() || written.subject;
+  if (email.draftId) {
+    await updateDraft({
+      draft_id: email.draftId,
+      to: email.to.map((item) => item.email).join(", "),
+      subject,
+      body: written.body,
+    });
+  }
+  const notes = email.notes.filter((note) => !note.startsWith("Current draft:"));
+  notes.push(`Current draft:\n${written.body}`);
+  let scheduleNote = "";
+  if (email.scheduledSendId) {
+    const replaced = replaceScheduledContent(email.scheduledSendId, subject, written.body);
+    if (!replaced) {
+      const row = getScheduledSend(email.scheduledSendId);
+      if (row && transitionScheduledSend(row.id, ["scheduled", "held"], "cancelled")) {
+        markTaskDone(row.task_id);
+        scheduleNote = " I stopped the scheduled send because the new wording could not be saved.";
+      } else {
+        scheduleNote = " The scheduled send may already be going out with the previous wording.";
+      }
+      savePendingAction(chatId, {
+        ...pending,
+        email: { ...email, subject, notes, scheduledSendId: undefined, sendAt: undefined },
+      }, now);
+      return `Updated the draft.${scheduleNote}`;
+    }
+  }
+  savePendingAction(chatId, { ...pending, email: { ...email, subject, notes } }, now);
+  if (!email.scheduledSendId) {
+    return "Updated the draft.";
+  }
+  return "Updated the draft. The scheduled copy matches it.";
+}
+
 export async function publishReadyDraft(
   chatId: number,
   now = new Date(),

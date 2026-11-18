@@ -17,7 +17,7 @@ import { runCapability, runOwnerTurn, tryDirectAnswer } from "./agents/orchestra
 import { parseSettingPhrase } from "./settings_logic.js";
 import { applyOwnerContextTurn, continuePendingAction, getPendingAction, savePendingAction } from "./action_context.js";
 import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
-import { publishReadyDraft } from "./context_draft.js";
+import { publishReadyDraft, reviseLinkedDraft } from "./context_draft.js";
 import { handler as updateDraft } from "./tools/update_draft.js";
 import { stageExternalContext } from "./context_lookup.js";
 import { bookPendingMeetingAt, handleCommandSendCallback } from "./command_email.js";
@@ -1386,6 +1386,26 @@ async function handleUserText(
       userText,
       ctx.message.message_id,
     );
+    if (contextTurn.redirectDraft) {
+      await updateDraft(
+        { draft_id: contextTurn.redirectDraft.draftId, to: contextTurn.redirectDraft.to },
+        {
+          iteration: 1,
+          calledTools: [],
+          confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
+          userText,
+        },
+      );
+      if (contextTurn.text) {
+        await ctx.reply(contextTurn.text);
+      }
+      return;
+    }
+    if (contextTurn.reviseEmail) {
+      const revised = await reviseLinkedDraft(ctx.chat.id, contextTurn.reviseEmail);
+      await ctx.reply(revised);
+      return;
+    }
     if (contextTurn.subjectUpdate) {
       const draftId = getPendingAction(ctx.chat.id)?.email?.draftId;
       if (draftId) {
@@ -1398,6 +1418,9 @@ async function handleUserText(
             userText,
           },
         );
+        if (contextTurn.text) {
+          await ctx.reply(contextTurn.text);
+        }
         return;
       }
     }

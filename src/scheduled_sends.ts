@@ -60,6 +60,17 @@ function requestOf(row: ScheduledSendRecord): CommandRequest {
   return JSON.parse(row.request) as CommandRequest;
 }
 
+function finalizedCopy(request: CommandRequest): { subject: string; body: string } | undefined {
+  const saved = request as CommandRequest & { finalBody?: string; finalSubject?: string };
+  if (typeof saved.finalBody !== "string" || !saved.finalBody.trim()) {
+    return undefined;
+  }
+  return {
+    subject: saved.finalSubject?.trim() || request.subject?.trim() || "Update",
+    body: saved.finalBody,
+  };
+}
+
 /** Whether a slot still points at the same person, or what to ask him. */
 export type RecheckResult =
   | { ok: true }
@@ -143,17 +154,21 @@ export async function fireScheduledSend(row: ScheduledSendRecord, now: Date): Pr
     return;
   }
   const late = now.getTime() - new Date(row.send_at).getTime() > LATE_AFTER_MS;
+  const snapshot = finalizedCopy(request);
   const outcome = await writeAndSend(
-    {
-      ...request,
-      instruction: `${request.instruction}\n(He asked for this earlier, to go out now. Reflect anything that has changed since.)`,
-    },
+    snapshot
+      ? request
+      : {
+          ...request,
+          instruction: `${request.instruction}\n(He asked for this earlier, to go out now. Reflect anything that has changed since.)`,
+        },
     `sched:${row.id}`,
     { chatId: row.confirm_chat, messageId: row.confirm_message },
     now,
     {
       beforeSend: () => claimScheduledSend(row.id, now.toISOString()),
       note: late ? `This went out late: it was due ${scheduledWhen(row.send_at)}.` : undefined,
+      prepared: snapshot,
     },
   );
   if (outcome.result === "sent") {

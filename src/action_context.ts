@@ -9,6 +9,8 @@ import {
   listCanonicalContacts,
   markTaskDone,
   appendScheduledSendInstruction,
+  bindScheduledDraft,
+  retargetScheduledSend,
   setScheduledSendSubject,
   transitionScheduledSend,
   upsertCalendarEventRef,
@@ -59,6 +61,8 @@ export interface PendingEmailState {
   account: "work" | "personal";
   scheduledSendId?: number;
   draftId?: string;
+  /** A recipient change waiting until Vishnu picks one confirmed person. */
+  pendingRedirect?: string;
   waiting: "recipient" | "purpose" | "confirm";
 }
 
@@ -194,6 +198,51 @@ export function rememberBookedMeeting(
 }
 
 /** Point "that meeting" at an older event without dropping an open draft. */
+/** A newly created draft inherits a schedule only when that row already names this draft. */
+function scheduleOwnsDraft(scheduledSendId: number, draftId: string): boolean {
+  const row = getScheduledSend(scheduledSendId);
+  if (!row || (row.status !== "scheduled" && row.status !== "held") || !draftId) {
+    return false;
+  }
+  try {
+    const request = JSON.parse(row.request) as { draftId?: string };
+    return request.draftId === draftId;
+  } catch {
+    return false;
+  }
+}
+
+/** The open email already points at this schedule, and the row does not name a different draft. */
+function contextScheduleForDraft(email: PendingEmailState): number | undefined {
+  if (!email.scheduledSendId) {
+    return undefined;
+  }
+  const row = getScheduledSend(email.scheduledSendId);
+  if (!row || (row.status !== "scheduled" && row.status !== "held")) {
+    return undefined;
+  }
+  try {
+    const request = JSON.parse(row.request) as { draftId?: string };
+    if (request.draftId && request.draftId !== email.draftId) {
+      return undefined;
+    }
+    if (!email.draftId && request.draftId) {
+      return undefined;
+    }
+    return email.scheduledSendId;
+  } catch {
+    return undefined;
+  }
+}
+
+function stopScheduleIfPatchFailed(email: PendingEmailState, patched: boolean): PendingEmailState {
+  if (patched || !email.scheduledSendId) {
+    return email;
+  }
+  cancelLinkedSend(email);
+  return { ...email, scheduledSendId: undefined, sendAt: undefined };
+}
+
 /** Remember a Gmail draft the Email Agent just created, so a later cancel can drop its Send card. */
 export function linkPublishedDraft(input: {
   chatId: number;
@@ -211,8 +260,10 @@ export function linkPublishedDraft(input: {
     email,
     resolved: true,
   }));
-  const previous = (pending?.email?.to ?? []).map((person) => person.email);
-  const samePeople = to.length > 0 && to.some((person) => previous.includes(person.email));
+  const linkedSchedule =
+    pending?.email?.scheduledSendId && input.draftId
+      ? scheduleOwnsDraft(pending.email.scheduledSendId, input.draftId)
+      : false;
   savePendingAction(input.chatId, {
     action: pending?.action === "send_email" ? "send_email" : "draft_email",
     status: "open",
@@ -225,7 +276,7 @@ export function linkPublishedDraft(input: {
     email: {
       to: to.length > 0 ? to : pending?.email?.to ?? [],
       cc: pending?.email?.cc ?? [],
-      notes: samePeople
+      notes: linkedSchedule
         ? [
             ...(pending?.email?.notes ?? []).filter((note) => !note.startsWith("Current draft:")),
             ...(input.body ? [`Current draft:\n${input.body}`] : []),
@@ -234,12 +285,12 @@ export function linkPublishedDraft(input: {
           ? [`Current draft:\n${input.body}`]
           : [],
       subject: input.subject,
-      purpose: samePeople ? pending?.email?.purpose ?? input.subject : input.subject,
+      purpose: linkedSchedule ? pending?.email?.purpose ?? input.subject : input.subject,
       account: input.account,
       waiting: "confirm",
-      draftId: input.draftId || (samePeople ? pending?.email?.draftId : undefined),
-      sendAt: samePeople ? pending?.email?.sendAt : undefined,
-      scheduledSendId: samePeople ? pending?.email?.scheduledSendId : undefined,
+      draftId: input.draftId,
+      sendAt: linkedSchedule ? pending?.email?.sendAt : undefined,
+      scheduledSendId: linkedSchedule ? pending?.email?.scheduledSendId : undefined,
     },
   });
 }
@@ -274,24 +325,35 @@ export function syncDraftRecipient(input: {
   const nextTo = to.length > 0 ? to : pending.email.to;
   const previous = pending.email.to.map((person) => person.email).sort().join(",");
   const changedPeople = nextTo.map((person) => person.email).sort().join(",") !== previous;
-  if (changedPeople && pending.email.scheduledSendId) {
-    cancelLinkedSend(pending.email);
-  } else if (!changedPeople && pending.email.scheduledSendId && input.body) {
-    appendScheduledSendInstruction(pending.email.scheduledSendId, input.body);
+  let email: PendingEmailState = {
+    ...pending.email,
+    to: nextTo,
+    subject: input.subject || pending.email.subject,
+    notes,
+    draftId: pending.email.draftId || input.draftId,
+    account: input.account,
+  };
+  const linkedId = contextScheduleForDraft(email);
+  email = linkedId ? email : { ...email, scheduledSendId: undefined, sendAt: undefined };
+  if (email.scheduledSendId) {
+    if (changedPeople) {
+      const retargeted = retargetScheduledSend(
+        email.scheduledSendId,
+        nextTo.map((person) => ({ name: person.name, email: person.email })),
+      );
+      email = stopScheduleIfPatchFailed(email, retargeted);
+    }
+    if (email.scheduledSendId && input.subject && input.subject !== pending.email.subject) {
+      email = stopScheduleIfPatchFailed(email, setScheduledSendSubject(email.scheduledSendId, input.subject));
+    }
+    if (email.scheduledSendId && input.body) {
+      email = stopScheduleIfPatchFailed(email, appendScheduledSendInstruction(email.scheduledSendId, input.body));
+    }
+    if (email.scheduledSendId && email.draftId) {
+      bindScheduledDraft(email.scheduledSendId, email.draftId);
+    }
   }
-  savePendingAction(input.chatId, {
-    ...pending,
-    email: {
-      ...pending.email,
-      to: nextTo,
-      subject: input.subject || pending.email.subject,
-      notes,
-      draftId: pending.email.draftId || input.draftId,
-      account: input.account,
-      scheduledSendId: changedPeople ? undefined : pending.email.scheduledSendId,
-      sendAt: changedPeople ? undefined : pending.email.sendAt,
-    },
-  });
+  savePendingAction(input.chatId, { ...pending, email });
 }
 
 /** So "cancel that email" can stop a send that was scheduled from this chat. */
@@ -332,6 +394,10 @@ export function rememberScheduledSend(input: {
       draftId: sameDraft ? linked.email.draftId || undefined : undefined,
     },
   });
+  const draftId = sameDraft ? linked.email.draftId : undefined;
+  if (draftId) {
+    bindScheduledDraft(input.scheduledSendId, draftId);
+  }
 }
 
 export function focusBookedMeeting(
@@ -521,6 +587,14 @@ function looksLikeEmailContext(text: string): boolean {
   return /\b(?:about|regarding|mention|wants?|needs?|requirement|context|subject|shorter|longer)\b/i.test(text);
 }
 
+function recipientInstead(text: string): string | undefined {
+  const match =
+    /^(?:actually,?\s+)?(?:please\s+)?(?:send|e-?mail)\s+it\s+to\s+(.+?)\s+instead\.?$/i.exec(text.trim())
+    ?? /^(?:change|switch|update)\s+(?:the\s+)?recipient\s+to\s+(.+?)\.?$/i.exec(text.trim());
+  const name = match?.[1]?.trim();
+  return name || undefined;
+}
+
 function correctionOfEmail(text: string, email: PendingEmailState | undefined): boolean {
   if (!email) {
     return false;
@@ -630,6 +704,10 @@ export interface OwnerTurnResult {
   retireDraftId?: string;
   /** Replace only the subject of the open Gmail draft. */
   subjectUpdate?: string;
+  /** Change the open draft's To line without rewriting the message. */
+  redirectDraft?: { draftId: string; to: string };
+  /** Rewrite the open draft from this instruction, replacing superseded facts. */
+  reviseEmail?: string;
 }
 
 /**
@@ -724,22 +802,24 @@ export function applyOwnerContextTurn(
     const name = remove[1]!.replace(/\s+from\s+.*$/i, "").trim();
     const token = name.toLowerCase();
     const words = token.includes("@") ? [token] : token.split(/\s+/).filter((word) => word.length >= 3);
-    const matched = next.meeting.attendees.filter((item) => {
-      const hay = `${item.name} ${item.query} ${item.email}`.toLowerCase();
-      return words.length > 0 && words.every((word) => hay.includes(word));
+    const matched = next.meeting.attendees.flatMap((item, index) => {
+      const hay = `${item.name} ${item.query}`.toLowerCase();
+      const hit = words.length > 0 && words.every((word) => hay.includes(word));
+      return hit ? [{ item, index }] : [];
     });
     if (matched.length > 1) {
       return {
         handled: true,
-        text: `Which ${name}? ${matched.map((item) => item.email).join(", ")}`,
+        text: `Which ${name}? ${matched.map(({ item }) => item.name || item.query || "unnamed").join(", ")}`,
       };
     }
     if (matched.length === 1) {
+      const dropAt = matched[0]!.index;
       next = {
         ...next,
         meeting: {
           ...next.meeting,
-          attendees: next.meeting.attendees.filter((item) => item !== matched[0]),
+          attendees: next.meeting.attendees.filter((_, index) => index !== dropAt),
         },
       };
       savePendingAction(chatId, next, now);
@@ -757,9 +837,19 @@ export function applyOwnerContextTurn(
         ...next.email,
         to: [{ query: other.name, name: other.name, email: other.email, resolved: true }],
       };
-      const hadSchedule = Boolean(email.scheduledSendId);
-      if (hadSchedule) {
-        cancelLinkedSend(email);
+      let scheduleNote = "";
+      const scheduleId = contextScheduleForDraft(email);
+      if (scheduleId) {
+        const retargeted = retargetScheduledSend(scheduleId, [
+          { name: other.name, email: other.email },
+        ]);
+        if (!retargeted) {
+          cancelLinkedSend(email);
+          email.scheduledSendId = undefined;
+          email.sendAt = undefined;
+          scheduleNote = " I stopped the scheduled send so it cannot go to the previous address.";
+        }
+      } else if (email.scheduledSendId) {
         email.scheduledSendId = undefined;
         email.sendAt = undefined;
       }
@@ -767,25 +857,83 @@ export function applyOwnerContextTurn(
       savePendingAction(chatId, next, now);
       return {
         handled: true,
-        text: `Using ${other.email} instead. Nothing has been sent.${hadSchedule ? " The scheduled send was cancelled so it will not go to the previous address." : ""}`,
+        text: `Using ${other.email} instead. Nothing has been sent.${scheduleNote}`,
         publishDraft: Boolean(email.draftId),
       };
     }
   }
 
   const openEmail = next.status === "open" && (next.action === "draft_email" || next.action === "send_email");
+  const redirectName = recipientInstead(clean);
+  if (openEmail && next.email && (redirectName || next.email.pendingRedirect)) {
+    const asked = redirectName ?? next.email.pendingRedirect ?? "";
+    const typed = emails.length === 1 ? emails[0] : undefined;
+    const found = typed
+      ? { kind: "one" as const, contact: { email: typed, name: typed.split("@")[0]?.replace(/[._]+/g, " ") ?? typed, messageId, at: now.toISOString() } }
+      : matchOwnerSupplied(chatId, asked === next.email.pendingRedirect && !redirectName ? clean : asked, now);
+    if (found.kind === "many") {
+      next = { ...next, email: { ...next.email, pendingRedirect: asked } };
+      savePendingAction(chatId, next, now);
+      return {
+        handled: true,
+        text: `Which ${asked}? ${found.contacts.map((item) => `${item.name} <${item.email}>`).join(", ")}`,
+      };
+    }
+    if (found.kind === "none") {
+      next = { ...next, email: { ...next.email, pendingRedirect: asked } };
+      savePendingAction(chatId, next, now);
+      return {
+        handled: true,
+        text: `I don't have a confirmed address for ${asked}. Tell me which address to use.`,
+      };
+    }
+    const person = found.contact;
+    let email: PendingEmailState = {
+      ...next.email,
+      pendingRedirect: undefined,
+      to: [{ query: person.name, name: person.name, email: person.email, resolved: true }],
+    };
+    let scheduleNote = "";
+    const scheduleId = contextScheduleForDraft(email);
+    if (scheduleId) {
+      const retargeted = retargetScheduledSend(scheduleId, [{ name: person.name, email: person.email }]);
+      if (!retargeted) {
+        cancelLinkedSend(email);
+        email = { ...email, scheduledSendId: undefined, sendAt: undefined };
+        scheduleNote = " I stopped the scheduled send because its recipient could not be changed.";
+      }
+    }
+    next = { ...next, status: "open", email };
+    savePendingAction(chatId, next, now);
+    return {
+      handled: true,
+      text: scheduleNote
+        ? `The draft now says ${person.email}.${scheduleNote}`
+        : `Using ${person.email} instead. The subject, message, and time stay.`,
+      redirectDraft: email.draftId ? { draftId: email.draftId, to: person.email } : undefined,
+    };
+  }
   const subjectChange = /^(?:please\s+)?(?:change|set|update|make)\s+(?:the\s+)?subject\s+(?:to|as|:)\s+(.+?)\.?$/i.exec(clean)
     ?? /^subject\s*(?:to|:)\s+(.+?)\.?$/i.exec(clean);
   if (subjectChange && openEmail && next.email?.draftId) {
     const subject = subjectChange[1]!.trim();
-    if (next.email.scheduledSendId) {
-      setScheduledSendSubject(next.email.scheduledSendId, subject);
+    let scheduleNote = "";
+    let current = next.email;
+    const scheduleId = contextScheduleForDraft(current);
+    if (scheduleId) {
+      const updated = setScheduledSendSubject(scheduleId, subject);
+      if (!updated) {
+        cancelLinkedSend(current);
+        current = { ...current, scheduledSendId: undefined, sendAt: undefined };
+        scheduleNote = " I stopped the scheduled send because its subject could not be updated.";
+      }
     }
-    next = { ...next, email: { ...next.email, subject } };
+    next = { ...next, email: { ...current, subject } };
     savePendingAction(chatId, next, now);
-    return { handled: true, subjectUpdate: subject };
+    return { handled: true, subjectUpdate: subject, text: scheduleNote || undefined };
   }
-  const freshDraft = /\bdraft\b/i.test(clean) && /\b(?:email|e-mail|mail)\b/i.test(clean);
+  const freshDraft = /\b(?:draft|write|compose)\b/i.test(clean) && /\b(?:e-?mails?|mail)\b/i.test(clean)
+    && !/\b(?:shorter|longer|subject)\b/i.test(clean);
   if (freshDraft) {
     const named = clean.replace(/^.*\bto\s+/i, "").replace(/[.?!].*$/, "").trim();
     next = {
@@ -835,10 +983,10 @@ export function applyOwnerContextTurn(
     !messageAuthorizesExternalSend(clean) &&
     emails.length === 0
   ) {
-    const notes = [...next.email.notes, clean, ...(contextNote ? [contextNote] : [])];
-    if (next.email.scheduledSendId) {
-      appendScheduledSendInstruction(next.email.scheduledSendId, clean);
+    if (next.email.draftId || next.email.scheduledSendId) {
+      return { handled: true, reviseEmail: clean };
     }
+    const notes = [...next.email.notes, clean, ...(contextNote ? [contextNote] : [])];
     next = {
       ...next,
       email: {
