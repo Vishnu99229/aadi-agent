@@ -13,6 +13,7 @@ import {
   resolveGmailMessage,
   signatureHtmlFor,
 } from "../google/mail.js";
+import { linkPublishedDraft } from "../action_context.js";
 import { parseAddressList } from "../mail_helpers.js";
 import { isSelfEmail } from "../mom_logic.js";
 
@@ -204,11 +205,23 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     draftId: result.data.id,
     threadId,
     to,
+    cc: cc || undefined,
     subject,
     body: values.body,
     googleAccount: account.id,
     extraLines: cc ? [`Cc: ${cc}`] : undefined,
   });
+  if (turn.confirmation) {
+    linkPublishedDraft({
+      chatId: turn.confirmation.chatId,
+      draftId: result.data.id,
+      to,
+      cc,
+      subject,
+      body: values.body,
+      account: account.id,
+    });
+  }
 
   return JSON.stringify({
     draft_id: result.data.id,

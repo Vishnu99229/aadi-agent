@@ -562,6 +562,33 @@ const blockedAnswers = await tap("send", blocked.actionId);
 assert.equal(draftSends.length, sendsBeforeBlocked);
 assert.match(blockedAnswers.join(" "), /won't try again|Sent mail/i);
 
+const twice = await draft("alice@example.com", "Twice", "Send this only once.");
+const firstCopy = schedule({
+  draftId: twice.id,
+  account: "work",
+  to: "alice@example.com",
+  subject: "Twice",
+  body: "Send this only once.",
+  key: "twice-first",
+  remember: false,
+});
+const secondCopy = schedule({
+  draftId: twice.id,
+  account: "work",
+  to: "alice@example.com",
+  subject: "Twice",
+  body: "Send this only once.",
+  key: "twice-second",
+  remember: false,
+});
+const messagesBeforeTwice = messageSends.length;
+await fireScheduledSend(firstCopy, new Date());
+assert.equal(messageSends.length, messagesBeforeTwice + 1);
+assert.equal(getScheduledSend(firstCopy.id)?.status, "sent");
+assert.equal(getScheduledSend(secondCopy.id)?.status, "cancelled");
+await fireScheduledSend(getScheduledSend(secondCopy.id)!, new Date());
+assert.equal(messageSends.length, messagesBeforeTwice + 1);
+
 saveMessage("user", "Hardik said Pinnacle wants the proposal on Friday.");
 const history = retrieveRelevantContext("remember the discussion with Hardik about Pinnacle");
 assert.equal(history.kind, "one");

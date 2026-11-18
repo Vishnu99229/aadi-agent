@@ -5651,7 +5651,12 @@ function draftDeliveryRows(draftId: string, account: string): ScheduledSendRecor
  * scheduled worker both take it before Gmail, so only one of them proceeds.
  * A sent, in-flight, or unconfirmed attempt blocks another try.
  */
-export function claimDraftDelivery(draftId: string, account: string, nowIso: string): DraftDeliveryClaim {
+export function claimDraftDelivery(
+  draftId: string,
+  account: string,
+  nowIso: string,
+  only?: { scheduleId: number; request: string },
+): DraftDeliveryClaim {
   const classify = (depth: number): DraftDeliveryClaim => {
     if (depth > 3) {
       return { state: "in_progress", id: 0, itemText: "That email is already being sent." };
@@ -5661,7 +5666,10 @@ export function claimDraftDelivery(draftId: string, account: string, nowIso: str
     if (sending) {
       return { state: "in_progress", id: sending.id, itemText: sending.item_text };
     }
-    const open = rows.find((row) => row.status === "scheduled" || row.status === "held");
+    const openRows = rows.filter((row) => row.status === "scheduled" || row.status === "held");
+    const open = only
+      ? openRows.find((row) => row.id === only.scheduleId && row.request === only.request)
+      : openRows[0];
     if (open) {
       const claimed =
         db
@@ -5671,6 +5679,12 @@ export function claimDraftDelivery(draftId: string, account: string, nowIso: str
           )
           .run(nowIso, open.id).changes === 1;
       if (claimed) {
+        for (const other of openRows) {
+          if (other.id === open.id) continue;
+          if (transitionScheduledSend(other.id, ["scheduled", "held"], "cancelled")) {
+            markTaskDone(other.task_id);
+          }
+        }
         return { state: "claimed", id: open.id, taskId: open.task_id };
       }
       return classify(depth + 1);
@@ -5685,7 +5699,7 @@ export function claimDraftDelivery(draftId: string, account: string, nowIso: str
     }
     return { state: "none" };
   };
-  return db.transaction(() => classify(0))();
+  return db.transaction(() => classify(0)).immediate();
 }
 
 /** Drops queued deliveries for this draft. An attempt already underway is left alone. */

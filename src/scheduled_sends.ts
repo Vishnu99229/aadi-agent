@@ -11,6 +11,7 @@ import { nameTokens, notAnEventCommand, scheduledTargetWords } from "./command_l
 import { resolveRecipient } from "./command_recipients.js";
 import { config } from "./config.js";
 import {
+  claimDraftDelivery,
   claimScheduledSend,
   getScheduledSend,
   holdScheduledSend,
@@ -185,7 +186,13 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
     { chatId: row.confirm_chat, messageId: row.confirm_message },
     now,
     {
-      beforeSend: () => claimScheduledSend(row.id, now.toISOString(), row.request),
+      beforeSend: () =>
+        request.draftId
+          ? claimDraftDelivery(request.draftId, request.account, now.toISOString(), {
+              scheduleId: row.id,
+              request: row.request,
+            }).state === "claimed"
+          : claimScheduledSend(row.id, now.toISOString(), row.request),
       note: late ? `This went out late: it was due ${scheduledWhen(row.send_at)}.` : undefined,
       prepared: snapshot,
       explicitSubject: request.subjectEdited ? request.finalSubject || request.subject : undefined,
