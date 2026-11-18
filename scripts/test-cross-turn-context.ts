@@ -10,6 +10,7 @@ import {
   authorizationWords,
   getPendingAction,
   holdEmailToolTurn,
+  linkPublishedDraft,
   matchOwnerSupplied,
   pendingResolvedEmails,
   savePendingAction,
@@ -30,7 +31,7 @@ import {
 import { setApprovalsTestHooks, handleApprovalCallback, retireOwnerDraft } from "../src/approvals.ts";
 import { setRouteModelCompleteForTests } from "../src/llm.ts";
 import { resetAgentModelSettings, setAgentModelSetting } from "../src/models/agent_models.ts";
-import { attendeesForEmailDraft, attendeesForNewMeeting, resetOwnerCalendarTestHooks, reviseReferencedMeeting, setOwnerCalendarTestHooks } from "../src/owner_calendar.ts";
+import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, resetOwnerCalendarTestHooks, reviseReferencedMeeting, setOwnerCalendarTestHooks } from "../src/owner_calendar.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { handler as updateDraftTool } from "../src/tools/update_draft.ts";
 import { rememberBookedMeeting } from "../src/action_context.ts";
@@ -902,6 +903,78 @@ const say = (text: string, now = NOW) =>
   assert.match(cards.at(-1)!.text, /Subject: Quarterly report/);
   assert.match(cards.at(-1)!.text, /sameer@example\.com/i);
   assert.match(cards.at(-1)!.text, /UmFnaGF2ZW5kcmE|Raghavendra/);
+}
+
+{
+  const chat = 43;
+  const scheduled = createScheduledSend({
+    key: "alice-schedule",
+    sendAt: "2026-11-18T04:30:00.000Z",
+    itemText: "Send email to Alice",
+    tag: "work",
+    request: JSON.stringify({ instruction: "hello", to: [], subject: "Hello" }),
+    confirmChat: chat,
+    confirmMessage: 1,
+  });
+  assert.ok(scheduled);
+  savePendingAction(chat, {
+    action: "send_email",
+    status: "open",
+    ownerWords: "Send Alice an email tomorrow",
+    confirmChat: chat,
+    confirmMessage: 1,
+    updatedAt: NOW.toISOString(),
+    email: {
+      to: [{ query: "Alice", name: "Alice", email: "alice@example.com", resolved: true }],
+      cc: [],
+      notes: ["Current draft:\nSecret Alice note"],
+      purpose: "hello",
+      subject: "Hello",
+      account: "work",
+      waiting: "confirm",
+      draftId: "draft-alice",
+      scheduledSendId: scheduled!.id,
+      sendAt: "2026-11-18T04:30:00.000Z",
+    },
+  }, NOW);
+  linkPublishedDraft({
+    chatId: chat,
+    draftId: "draft-bob",
+    to: "bob@example.com",
+    subject: "Invoice",
+    body: "The invoice is attached.",
+    account: "work",
+  });
+  const email = getPendingAction(chat, NOW)?.email;
+  assert.equal(email?.draftId, "draft-bob");
+  assert.equal(email?.to[0]?.email, "bob@example.com");
+  assert.equal(email?.scheduledSendId, undefined);
+  assert.equal(getScheduledSend(scheduled!.id)?.status, "scheduled");
+  savePendingAction(chat, {
+    ...getPendingAction(chat, NOW)!,
+    email: { ...email!, draftId: "draft-bob", scheduledSendId: scheduled!.id, subject: "Invoice" },
+  }, NOW);
+  const retitled = applyOwnerContextTurn(chat, "Change the subject to Quarterly report.", 3, NOW);
+  assert.equal(retitled.subjectUpdate, "Quarterly report");
+  const stored = JSON.parse(getScheduledSend(scheduled!.id)!.request) as { subject?: string };
+  assert.equal(stored.subject, "Quarterly report");
+}
+
+{
+  const chat = 44;
+  rememberBookedMeeting(chat, {
+    eventId: "acme-mail",
+    accountId: "work",
+    title: "Acme",
+    startIso: "2026-11-16T10:00:00+05:30",
+    attendees: [{ name: "Rita", email: "rita@acme.example" }],
+  }, NOW);
+  const noted = await noteCalendarReference({
+    chatId: chat,
+    text: "Find the email about yesterday's Acme meeting.",
+    now: NOW,
+  });
+  assert.equal(noted, undefined);
 }
 
 console.log("cross-turn context checks passed.");

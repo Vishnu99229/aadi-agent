@@ -520,6 +520,9 @@ export async function noteCalendarReference(input: {
   if (/^(?:add|remove|drop|replace|book|schedule)\b/i.test(text) || !/\bmeeting\b/i.test(text)) {
     return undefined;
   }
+  if (/\b(?:e-?mail|inbox)\b/i.test(text) && !/\b(?:book|schedule|calendar)\b/i.test(text)) {
+    return undefined;
+  }
   if (!/\b(?:remember|which|find)\b/i.test(text)) {
     return undefined;
   }

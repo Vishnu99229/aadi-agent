@@ -9,6 +9,7 @@ import {
   listCanonicalContacts,
   markTaskDone,
   appendScheduledSendInstruction,
+  setScheduledSendSubject,
   transitionScheduledSend,
   upsertCalendarEventRef,
   upsertPendingActionContext,
@@ -210,6 +211,8 @@ export function linkPublishedDraft(input: {
     email,
     resolved: true,
   }));
+  const previous = (pending?.email?.to ?? []).map((person) => person.email);
+  const samePeople = to.length > 0 && to.some((person) => previous.includes(person.email));
   savePendingAction(input.chatId, {
     action: pending?.action === "send_email" ? "send_email" : "draft_email",
     status: "open",
@@ -222,17 +225,21 @@ export function linkPublishedDraft(input: {
     email: {
       to: to.length > 0 ? to : pending?.email?.to ?? [],
       cc: pending?.email?.cc ?? [],
-      notes: [
-        ...(pending?.email?.notes ?? []).filter((note) => !note.startsWith("Current draft:")),
-        ...(input.body ? [`Current draft:\n${input.body}`] : []),
-      ],
+      notes: samePeople
+        ? [
+            ...(pending?.email?.notes ?? []).filter((note) => !note.startsWith("Current draft:")),
+            ...(input.body ? [`Current draft:\n${input.body}`] : []),
+          ]
+        : input.body
+          ? [`Current draft:\n${input.body}`]
+          : [],
       subject: input.subject,
-      purpose: pending?.email?.purpose ?? input.subject,
+      purpose: samePeople ? pending?.email?.purpose ?? input.subject : input.subject,
       account: input.account,
       waiting: "confirm",
-      draftId: input.draftId || pending?.email?.draftId,
-      sendAt: pending?.email?.sendAt,
-      scheduledSendId: pending?.email?.scheduledSendId,
+      draftId: input.draftId || (samePeople ? pending?.email?.draftId : undefined),
+      sendAt: samePeople ? pending?.email?.sendAt : undefined,
+      scheduledSendId: samePeople ? pending?.email?.scheduledSendId : undefined,
     },
   });
 }
@@ -761,6 +768,9 @@ export function applyOwnerContextTurn(
     ?? /^subject\s*(?:to|:)\s+(.+?)\.?$/i.exec(clean);
   if (subjectChange && openEmail && next.email?.draftId) {
     const subject = subjectChange[1]!.trim();
+    if (next.email.scheduledSendId) {
+      setScheduledSendSubject(next.email.scheduledSendId, subject);
+    }
     next = { ...next, email: { ...next.email, subject } };
     savePendingAction(chatId, next, now);
     return { handled: true, subjectUpdate: subject };
