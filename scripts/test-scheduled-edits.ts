@@ -3,7 +3,7 @@
 import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { applyOwnerContextTurn, focusSelectedDraft, getPendingAction } from "../src/action_context.ts";
-import { setApprovalsTestHooks } from "../src/approvals.ts";
+import { queueDraftApproval, setApprovalsTestHooks } from "../src/approvals.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import {
@@ -840,6 +840,30 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
     return newestOpen();
   };
   const itemSubject = (row: ScheduledSendRecord) => getScheduledSend(row.id)!.item_text.split(" — ")[1];
+  /** A reply draft as draft_reply leaves it: in the thread, with its approval card. */
+  const replyDraft = async (body: string): Promise<string> => {
+    const created = await gmail.users.drafts.create({
+      userId: "me",
+      requestBody: {
+        message: {
+          threadId: "voice-thread",
+          raw: Buffer.from(
+            `To: Raghavendra KV <${raghav}>\r\nSubject: Re: Voice AI Discussion\r\nIn-Reply-To: <voice-1@tenxpipe.com>\r\nReferences: <voice-1@tenxpipe.com>\r\n\r\n${body}`,
+          ).toString("base64url"),
+        },
+      },
+    });
+    const draftId = created.data.id!;
+    await queueDraftApproval({
+      draftId,
+      threadId: "voice-thread",
+      to: `Raghavendra KV <${raghav}>`,
+      subject: "Re: Voice AI Discussion",
+      body,
+      googleAccount: "work",
+    });
+    return draftId;
+  };
 
   // a. Unchanged: "Re:", the thread, and the reply headers.
   {
@@ -873,18 +897,7 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
   // c. A reply draft scheduled by id, then re-subjected: draft, card, record and email agree.
   {
     const chat = 153;
-    const reply = await gmail.users.drafts.create({
-      userId: "me",
-      requestBody: {
-        message: {
-          threadId: "voice-thread",
-          raw: Buffer.from(
-            `To: Raghavendra KV <${raghav}>\r\nSubject: Re: Voice AI Discussion\r\nIn-Reply-To: <voice-1@tenxpipe.com>\r\nReferences: <voice-1@tenxpipe.com>\r\n\r\nHi Raghavendra,\n\nHere is the integration plan.`,
-          ).toString("base64url"),
-        },
-      },
-    });
-    const draftId = reply.data.id!;
+    const draftId = await replyDraft("Hi Raghavendra,\n\nHere is the integration plan.");
     const row = await scheduleReply(chat, { draft_id: draftId });
     assert(requestOf(row.id).draftId === draftId && requestOf(row.id).subject === "Re: Voice AI Discussion", "bound, still a reply");
     assert(!(JSON.parse(getScheduledSend(row.id)!.request) as { subjectEdited?: boolean }).subjectEdited, "the unchanged subject is not an edit");
@@ -915,18 +928,7 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
   // d. A reply draft whose subject he changed before scheduling goes out the same way.
   {
     const chat = 154;
-    const reply = await gmail.users.drafts.create({
-      userId: "me",
-      requestBody: {
-        message: {
-          threadId: "voice-thread",
-          raw: Buffer.from(
-            `To: Raghavendra KV <${raghav}>\r\nSubject: Re: Voice AI Discussion\r\nIn-Reply-To: <voice-1@tenxpipe.com>\r\nReferences: <voice-1@tenxpipe.com>\r\n\r\nHi Raghavendra,\n\nThe proposal.`,
-          ).toString("base64url"),
-        },
-      },
-    });
-    const draftId = reply.data.id!;
+    const draftId = await replyDraft("Hi Raghavendra,\n\nThe proposal.");
     await updateDraft({ draft_id: draftId, subject: "Pilot proposal" });
     const row = await scheduleReply(chat, { draft_id: draftId });
     assert(requestOf(row.id).subject === "Pilot proposal" && itemSubject(row) === "Pilot proposal", "his subject is scheduled, not the thread's");
