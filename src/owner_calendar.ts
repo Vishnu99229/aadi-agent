@@ -58,6 +58,14 @@ export function resetOwnerCalendarTestHooks(): void {
 
 const NOT_A_PERSON = /@(?:resource\.)?calendar\.google\.com$|noreply|calendar-notification/i;
 
+function isEmailAboutPeople(phrase: string): boolean {
+  return /\b(?:draft|e-?mail|mail|write)\b/i.test(phrase) && !/\b(?:book|schedule)\b/i.test(phrase);
+}
+
+function isMeetingBooking(phrase: string): boolean {
+  return /\b(?:book|schedule|another meeting|new meeting|meet with)\b/i.test(phrase);
+}
+
 function reuseRequest(
   phrase: string,
   now: Date,
@@ -192,6 +200,13 @@ function eventDay(start: string): string {
   }
   const instant = new Date(start);
   return Number.isFinite(instant.getTime()) ? istYmd(instant) : "";
+}
+
+function peopleMatching(
+  name: string,
+  attendees: ReadonlyArray<{ name: string; email: string; resource?: boolean }>,
+): Array<{ name: string; email: string }> {
+  return attendees.filter((person) => !person.resource && personMatches(name, person));
 }
 
 function personMatches(name: string, attendee: { name: string; email: string }): boolean {
@@ -584,11 +599,14 @@ export async function reviseReferencedMeeting(input: {
   };
   let next = current.map((person) => ({ ...person }));
   if (edit.op === "remove") {
-    const kept = next.filter((person) => person.resource || !personMatches(edit.name, person));
-    if (kept.length === next.length) {
+    const matched = peopleMatching(edit.name, next);
+    if (matched.length === 0) {
       return `${edit.name} is not on ${booked.title}.`;
     }
-    next = kept;
+    if (matched.length > 1) {
+      return `Which ${edit.name}? ${matched.map((person) => `${person.name} <${person.email}>`).join(", ")}`;
+    }
+    next = next.filter((person) => person.resource || person.email !== matched[0]!.email);
   } else if (edit.op === "add") {
     const person = resolveNew(edit.name);
     if (typeof person === "string") {
@@ -603,10 +621,14 @@ export async function reviseReferencedMeeting(input: {
     if (typeof person === "string") {
       return person;
     }
-    const without = next.filter((item) => item.resource || !personMatches(edit.from, item));
-    if (without.length === next.length) {
+    const matched = peopleMatching(edit.from, next);
+    if (matched.length === 0) {
       return `${edit.from} is not on ${booked.title}.`;
     }
+    if (matched.length > 1) {
+      return `Which ${edit.from}? ${matched.map((item) => `${item.name} <${item.email}>`).join(", ")}`;
+    }
+    const without = next.filter((item) => item.resource || item.email !== matched[0]!.email);
     next = without.some((item) => item.email === person.email) ? without : [...without, { ...person, resource: false }];
   }
   const updated = await updateEventAttendees({
@@ -732,15 +754,12 @@ export async function updateEventAttendees(input: {
   return `Updated ${input.event.title}. Attendees: ${expected.join(", ")}. ${policy.note}`;
 }
 
-/** Attendees of the one meeting Vishnu named. Several matches are listed, not guessed. */
-export async function attendeesForNewMeeting(
-  phrase: string,
-  now = new Date(),
-): Promise<
+type ReusedAttendees =
   | { kind: "none" }
   | { kind: "many"; question: string }
-  | { kind: "one"; title: string; accountId: GoogleAccountId; attendees: Array<{ email: string; name: string }> }
-> {
+  | { kind: "one"; title: string; accountId: GoogleAccountId; attendees: Array<{ email: string; name: string }> };
+
+async function reusedAttendees(phrase: string, now: Date): Promise<ReusedAttendees> {
   const request = reuseRequest(phrase, now);
   if (!request) {
     return { kind: "none" };
@@ -765,9 +784,25 @@ export async function attendeesForNewMeeting(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.log(`calendar attendee read failed (${errorType})`);
-    return { kind: "many", question: `I found ${event.title} but couldn't read its guests, so I didn't start a new meeting.` };
+    return { kind: "many", question: `I found ${event.title} but couldn't read its guests, so I didn't copy them.` };
   }
   return { kind: "one", title: event.title, accountId: event.accountId, attendees: peopleFromApi(listed) };
+}
+
+/** Attendees of the one meeting Vishnu named for a new booking. An email request is not a booking. */
+export async function attendeesForNewMeeting(phrase: string, now = new Date()): Promise<ReusedAttendees> {
+  if (!isMeetingBooking(phrase) || isEmailAboutPeople(phrase)) {
+    return { kind: "none" };
+  }
+  return reusedAttendees(phrase, now);
+}
+
+/** Attendees to put on an email about a previous meeting. Does not book anything. */
+export async function attendeesForEmailDraft(phrase: string, now = new Date()): Promise<ReusedAttendees> {
+  if (!isEmailAboutPeople(phrase) || !/\b(?:same people|everyone from)\b/i.test(phrase)) {
+    return { kind: "none" };
+  }
+  return reusedAttendees(phrase, now);
 }
 
 function istYmd(value: Date): string {

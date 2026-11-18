@@ -18,13 +18,17 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "update_draft",
   description:
-    "Update an existing Gmail draft in place without sending it: replace its To list, Cc list, plain-text body, or any combination. Preserves subject and thread. Refreshes the existing approval card; do not create a new draft to change recipients. Sending requires separate Telegram approval and is not available to this tool.",
+    "Update an existing Gmail draft in place without sending it: replace its subject, To list, Cc list, plain-text body, or any combination. Refreshes the existing approval card and keeps the same draft id. Sending requires separate Telegram approval and is not available to this tool.",
   inputSchema: {
     type: "object",
     properties: {
       draft_id: {
         type: "string",
         description: "The Gmail draft ID returned by draft_reply or draft_new_email.",
+      },
+      subject: {
+        type: "string",
+        description: "Replacement subject. Omit to keep the current subject.",
       },
       to: {
         description:
@@ -62,6 +66,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     body?: unknown;
     cc?: unknown;
     to?: unknown;
+    subject?: unknown;
   };
   if (typeof values.draft_id !== "string" || !values.draft_id.trim()) {
     throw new Error("draft_id must be a non-empty Gmail draft ID.");
@@ -75,9 +80,10 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   if (
     values.body === undefined &&
     values.cc === undefined &&
-    values.to === undefined
+    values.to === undefined &&
+    (typeof values.subject !== "string" || !values.subject.trim())
   ) {
-    throw new Error("Pass body, to, cc, or a combination.");
+    throw new Error("Pass body, to, cc, subject, or a combination.");
   }
 
   const pending = getPendingActionForDraft(values.draft_id.trim());
@@ -94,7 +100,9 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     values.to === undefined
       ? header(headers, "To")
       : dropSelf(toAddressList(values.to).join(", "));
-  const subject = header(headers, "Subject");
+  const subject = typeof values.subject === "string" && values.subject.trim()
+    ? safeHeader(values.subject)
+    : header(headers, "Subject");
   if (!message || !threadId || !to) {
     throw new Error("The Gmail draft is missing its recipient metadata.");
   }
@@ -139,7 +147,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   });
 
   const draftId = result.data.id ?? values.draft_id;
-  if (turn?.confirmation && (values.to !== undefined || typeof values.body === "string")) {
+  if (turn?.confirmation && (values.to !== undefined || typeof values.body === "string" || typeof values.subject === "string")) {
     syncDraftRecipient({
       chatId: turn.confirmation.chatId,
       draftId,

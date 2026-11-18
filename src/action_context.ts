@@ -611,6 +611,8 @@ export interface OwnerTurnResult {
   publishDraft?: boolean;
   /** A published Gmail draft whose Send card must be discarded with this turn. */
   retireDraftId?: string;
+  /** Replace only the subject of the open Gmail draft. */
+  subjectUpdate?: string;
 }
 
 /**
@@ -705,12 +707,24 @@ export function applyOwnerContextTurn(
     const name = remove[1]!.replace(/\s+from\s+.*$/i, "").trim();
     const token = name.toLowerCase();
     const words = token.includes("@") ? [token] : token.split(/\s+/).filter((word) => word.length >= 3);
-    const attendees = next.meeting.attendees.filter((item) => {
+    const matched = next.meeting.attendees.filter((item) => {
       const hay = `${item.name} ${item.query} ${item.email}`.toLowerCase();
-      return words.length === 0 || !words.every((word) => hay.includes(word));
+      return words.length > 0 && words.every((word) => hay.includes(word));
     });
-    if (attendees.length !== next.meeting.attendees.length) {
-      next = { ...next, meeting: { ...next.meeting, attendees } };
+    if (matched.length > 1) {
+      return {
+        handled: true,
+        text: `Which ${name}? ${matched.map((item) => item.email).join(", ")}`,
+      };
+    }
+    if (matched.length === 1) {
+      next = {
+        ...next,
+        meeting: {
+          ...next.meeting,
+          attendees: next.meeting.attendees.filter((item) => item.email !== matched[0]!.email),
+        },
+      };
       savePendingAction(chatId, next, now);
       return {
         handled: true,
@@ -743,6 +757,14 @@ export function applyOwnerContextTurn(
   }
 
   const openEmail = next.status === "open" && (next.action === "draft_email" || next.action === "send_email");
+  const subjectChange = /^(?:please\s+)?(?:change|set|update|make)\s+(?:the\s+)?subject\s+(?:to|as|:)\s+(.+?)\.?$/i.exec(clean)
+    ?? /^subject\s*(?:to|:)\s+(.+?)\.?$/i.exec(clean);
+  if (subjectChange && openEmail && next.email?.draftId) {
+    const subject = subjectChange[1]!.trim();
+    next = { ...next, email: { ...next.email, subject } };
+    savePendingAction(chatId, next, now);
+    return { handled: true, subjectUpdate: subject };
+  }
   const freshDraft = /\bdraft\b/i.test(clean) && /\b(?:email|e-mail|mail)\b/i.test(clean);
   if (freshDraft) {
     const named = clean.replace(/^.*\bto\s+/i, "").replace(/[.?!].*$/, "").trim();

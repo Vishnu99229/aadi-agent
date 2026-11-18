@@ -30,7 +30,7 @@ import {
 import { setApprovalsTestHooks, handleApprovalCallback, retireOwnerDraft } from "../src/approvals.ts";
 import { setRouteModelCompleteForTests } from "../src/llm.ts";
 import { resetAgentModelSettings, setAgentModelSetting } from "../src/models/agent_models.ts";
-import { attendeesForNewMeeting, resetOwnerCalendarTestHooks, reviseReferencedMeeting, setOwnerCalendarTestHooks } from "../src/owner_calendar.ts";
+import { attendeesForEmailDraft, attendeesForNewMeeting, resetOwnerCalendarTestHooks, reviseReferencedMeeting, setOwnerCalendarTestHooks } from "../src/owner_calendar.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { handler as updateDraftTool } from "../src/tools/update_draft.ts";
 import { rememberBookedMeeting } from "../src/action_context.ts";
@@ -80,9 +80,15 @@ const gmail = {
       update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string } } }) => {
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
         const body = raw.split(/\r?\n\r?\n/).slice(1).join("\n");
+        const header = (name: string) => new RegExp(`^${name}:\\s*(.*)$`, "im").exec(raw)?.[1] ?? "";
         const current = drafts.get(id);
         if (current) {
-          drafts.set(id, { ...current, body });
+          drafts.set(id, {
+            ...current,
+            body,
+            subject: header("Subject") || current.subject,
+            to: header("To") || current.to,
+          });
         }
         return { data: { id, message: { id, threadId: `thread-${id}` } } };
       },
@@ -771,6 +777,131 @@ const say = (text: string, now = NOW) =>
   const another = applyOwnerContextTurn(chat, "Draft an email to bob@example.com about the invoice.", 8, NOW);
   assert.notEqual(another.publishDraft, true);
   assert.equal(getPendingAction(chat, NOW)?.email?.draftId, undefined);
+}
+
+{
+  setOwnerCalendarTestHooks({
+    list: async ({ title }) =>
+      title.toLowerCase().includes("acme")
+        ? [{ accountId: "work" as const, eventId: "acme-1", title: "Acme", start: "2026-11-16T10:00:00+05:30", attendeeCount: 2 }]
+        : [],
+    getAttendees: async () => [
+      { email: "rita@acme.example", displayName: "Rita" },
+      { email: "omar@acme.example", displayName: "Omar" },
+    ],
+  });
+  const phrase = "Draft an email to everyone from yesterday's Acme meeting.";
+  assert.equal((await attendeesForNewMeeting(phrase, NOW)).kind, "none");
+  const mailed = await attendeesForEmailDraft(phrase, NOW);
+  assert.equal(mailed.kind, "one");
+  if (mailed.kind === "one") {
+    assert.deepEqual(mailed.attendees.map((person) => person.email), ["rita@acme.example", "omar@acme.example"]);
+  }
+  const booking = await attendeesForNewMeeting(
+    "Book another meeting with the same people from yesterday's Acme meeting.",
+    NOW,
+  );
+  assert.equal(booking.kind, "one");
+  resetOwnerCalendarTestHooks();
+}
+
+{
+  const chat = 40;
+  const attendees = [
+    { name: "Alice Smith", email: "alice.smith@example.com" },
+    { name: "Alice Jones", email: "alice.jones@example.com" },
+    { name: "Nithish", email: "nithish@epicode.in" },
+  ];
+  let current = attendees.map((person) => ({ email: person.email, displayName: person.name }));
+  let patches = 0;
+  setOwnerCalendarTestHooks({
+    patch: async ({ attendees: next }) => {
+      patches += 1;
+      current = next.map((person) => ({ email: person.email ?? "", displayName: person.displayName ?? "" }));
+      return { attendees: current };
+    },
+    getAttendees: async () => current,
+  });
+  rememberBookedMeeting(chat, {
+    eventId: "evt-alice",
+    accountId: "work",
+    title: "Standup",
+    startIso: "2026-11-18T10:00:00+05:30",
+    attendees,
+  }, NOW);
+  const ambiguous = await reviseReferencedMeeting({
+    chatId: chat,
+    text: "Remove Alice from that meeting.",
+    confirmation: { chatId: chat, messageId: 2 },
+    now: NOW,
+  });
+  assert.match(ambiguous ?? "", /Which Alice/);
+  assert.match(ambiguous ?? "", /alice\.smith@example\.com/);
+  assert.match(ambiguous ?? "", /alice\.jones@example\.com/);
+  assert.equal(patches, 0);
+  assert.equal(current.length, 3);
+  const one = await reviseReferencedMeeting({
+    chatId: chat,
+    text: "Remove Alice Smith from that meeting.",
+    confirmation: { chatId: chat, messageId: 3 },
+    now: NOW,
+  });
+  assert.match(one ?? "", /^Updated /);
+  assert.equal(current.some((person) => person.email === "alice.smith@example.com"), false);
+  assert.equal(current.some((person) => person.email === "alice.jones@example.com"), true);
+  assert.equal(patches, 1);
+  resetOwnerCalendarTestHooks();
+}
+
+{
+  const chat = 41;
+  savePendingAction(chat, {
+    action: "create_meeting",
+    status: "open",
+    ownerWords: "Book Alice and Alice",
+    confirmChat: chat,
+    confirmMessage: 1,
+    updatedAt: NOW.toISOString(),
+    meeting: {
+      calendar: "work",
+      waiting: "time",
+      resolutionAttempts: {},
+      attendees: [
+        { query: "Alice Smith", name: "Alice Smith", email: "alice.smith@example.com", resolved: true },
+        { query: "Alice Jones", name: "Alice Jones", email: "alice.jones@example.com", resolved: true },
+      ],
+    },
+  }, NOW);
+  const asked = applyOwnerContextTurn(chat, "Remove Alice", 2, NOW);
+  assert.match(asked.text ?? "", /Which Alice/);
+  assert.equal(getPendingAction(chat, NOW)?.meeting?.attendees.length, 2);
+}
+
+{
+  const chat = 42;
+  applyOwnerContextTurn(chat, "Draft an email to Sameer.", 1, NOW);
+  applyOwnerContextTurn(chat, "sameer@example.com", 2, NOW);
+  const ready = applyOwnerContextTurn(chat, "It's about the dialer.", 3, NOW);
+  assert.equal(ready.publishDraft, true);
+  const before = draftCount;
+  const posted = await publishReadyDraft(chat, NOW);
+  assert.ok(posted.draftId);
+  const stored = drafts.get(posted.draftId!);
+  assert.ok(stored);
+  const changed = applyOwnerContextTurn(chat, "Change the subject to Quarterly report.", 4, NOW);
+  assert.equal(changed.subjectUpdate, "Quarterly report");
+  assert.notEqual(changed.publishDraft, true);
+  await updateDraftTool(
+    { draft_id: posted.draftId, subject: changed.subjectUpdate },
+    { iteration: 1, calledTools: [], confirmation: { chatId: chat, messageId: 4 }, userText: "Change the subject to Quarterly report." },
+  );
+  assert.equal(draftCount, before + 1);
+  assert.equal(drafts.get(posted.draftId!)?.subject, "Quarterly report");
+  assert.equal(drafts.get(posted.draftId!)?.to, stored!.to);
+  assert.equal(getPendingAction(chat, NOW)?.email?.draftId, posted.draftId);
+  assert.match(cards.at(-1)!.text, /Subject: Quarterly report/);
+  assert.match(cards.at(-1)!.text, /sameer@example\.com/i);
+  assert.match(cards.at(-1)!.text, /UmFnaGF2ZW5kcmE|Raghavendra/);
 }
 
 console.log("cross-turn context checks passed.");

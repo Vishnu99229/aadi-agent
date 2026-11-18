@@ -15,9 +15,10 @@ import {
 } from "./contact_questions.js";
 import { runCapability, runOwnerTurn, tryDirectAnswer } from "./agents/orchestrator.js";
 import { parseSettingPhrase } from "./settings_logic.js";
-import { applyOwnerContextTurn, continuePendingAction, savePendingAction } from "./action_context.js";
-import { attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
+import { applyOwnerContextTurn, continuePendingAction, getPendingAction, savePendingAction } from "./action_context.js";
+import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
 import { publishReadyDraft } from "./context_draft.js";
+import { handler as updateDraft } from "./tools/update_draft.js";
 import { stageExternalContext } from "./context_lookup.js";
 import { bookPendingMeetingAt, handleCommandSendCallback } from "./command_email.js";
 import { looksLikeCommandTurn } from "./command_logic.js";
@@ -1316,6 +1317,39 @@ async function handleUserText(
       await ctx.reply(revised);
       return;
     }
+    const mailed = await attendeesForEmailDraft(userText);
+    if (mailed.kind === "many") {
+      await ctx.reply(mailed.question);
+      return;
+    }
+    if (mailed.kind === "one") {
+      savePendingAction(ctx.chat.id, {
+        action: "draft_email",
+        status: "open",
+        ownerWords: userText,
+        confirmChat: ctx.chat.id,
+        confirmMessage: ctx.message.message_id,
+        updatedAt: new Date().toISOString(),
+        email: {
+          to: mailed.attendees.map((person) => ({
+            query: person.name || person.email,
+            name: person.name || person.email,
+            email: person.email,
+            resolved: true,
+          })),
+          cc: [],
+          notes: [userText],
+          purpose: userText,
+          account: mailed.accountId,
+          waiting: "confirm",
+        },
+      });
+      const posted = await publishReadyDraft(ctx.chat.id);
+      if (!posted.posted) {
+        await ctx.reply("I found the guests but couldn't create the draft.");
+      }
+      return;
+    }
     const reused = await attendeesForNewMeeting(userText);
     if (reused.kind === "many") {
       await ctx.reply(reused.question);
@@ -1352,6 +1386,21 @@ async function handleUserText(
       userText,
       ctx.message.message_id,
     );
+    if (contextTurn.subjectUpdate) {
+      const draftId = getPendingAction(ctx.chat.id)?.email?.draftId;
+      if (draftId) {
+        await updateDraft(
+          { draft_id: draftId, subject: contextTurn.subjectUpdate },
+          {
+            iteration: 1,
+            calledTools: [],
+            confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
+            userText,
+          },
+        );
+        return;
+      }
+    }
     if (contextTurn.retireDraftId) {
       const retired = await retireOwnerDraft(contextTurn.retireDraftId);
       if (retired === "delete_failed") {
