@@ -1553,7 +1553,7 @@ await expectCancelled("delete_task", async (row) => {
   const row = newestRow();
   const count = sends.length;
   const { claimScheduledSend } = await import("../src/db.ts");
-  assert(claimScheduledSend(row.id, AFTER.toISOString()), "claimed");
+  assert(claimScheduledSend(row.id, AFTER.toISOString(), row.request), "claimed");
   await runScheduledSendTick(new Date(AFTER.getTime() + 29 * 60_000));
   assert(getScheduledSend(row.id)!.status === "sending", "it waits");
   const before = told.length;

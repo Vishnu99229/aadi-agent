@@ -1,5 +1,13 @@
 import type { LlmTool } from "../llm.js";
-import { syncDraftRecipient } from "../action_context.js";
+import {
+  draftChange,
+  lockedScheduleForDraft,
+  scheduleSyncNotice,
+  syncBoundSchedules,
+  syncDraftRecipient,
+  tooLateText,
+  type ScheduleSync,
+} from "../action_context.js";
 import { queueDraftApproval } from "../approvals.js";
 import { getPendingActionForDraft } from "../db.js";
 import {
@@ -18,7 +26,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "update_draft",
   description:
-    "Update an existing Gmail draft in place without sending it: replace its subject, To list, Cc list, plain-text body, or any combination. Refreshes the existing approval card and keeps the same draft id. Sending requires separate Telegram approval and is not available to this tool.",
+    "Update an existing Gmail draft in place without sending it: replace its subject, To list, Cc list, plain-text body, or any combination. Refreshes the existing approval card and keeps the same draft id. If the draft belongs to a scheduled email, that email gets the same change; the result's scheduled_email field says what happened and must be passed on to Vishnu. Sending requires separate Telegram approval and is not available to this tool.",
   inputSchema: {
     type: "object",
     properties: {
@@ -60,6 +68,17 @@ function safeHeader(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }
 
+/** What Vishnu must hear about a scheduled email after an update_draft call: a refusal,
+ *  or a scheduled copy that was stopped or was already going out. Undefined when it matches. */
+export function draftUpdateNotice(result: string): string | undefined {
+  try {
+    const parsed = JSON.parse(result) as { schedule?: ScheduleSync["kind"]; scheduled_email?: string };
+    return parsed.schedule === "stopped" || parsed.schedule === "too_late" ? parsed.scheduled_email : undefined;
+  } catch {
+    return result;
+  }
+}
+
 export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
   const values = input as {
     draft_id?: unknown;
@@ -84,6 +103,12 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     (typeof values.subject !== "string" || !values.subject.trim())
   ) {
     throw new Error("Pass body, to, cc, subject, or a combination.");
+  }
+
+  // An email that is already going out can't take this edit. Say so before changing anything.
+  const locked = lockedScheduleForDraft(values.draft_id.trim(), turn?.confirmation?.chatId);
+  if (locked) {
+    return tooLateText(locked);
   }
 
   const pending = getPendingActionForDraft(values.draft_id.trim());
@@ -147,16 +172,28 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   });
 
   const draftId = result.data.id ?? values.draft_id;
-  if (turn?.confirmation && (values.to !== undefined || typeof values.body === "string" || typeof values.subject === "string")) {
-    syncDraftRecipient({
-      chatId: turn.confirmation.chatId,
+  // The scheduled email this draft belongs to gets the same recipients, subject and body,
+  // whether the edit came from chat, an Edit tap, or a contextual rewrite.
+  let sync: ScheduleSync = { kind: "none" };
+  if (
+    values.to !== undefined ||
+    values.cc !== undefined ||
+    typeof values.body === "string" ||
+    typeof values.subject === "string"
+  ) {
+    const fields = {
       draftId,
       to: safeHeader(to),
+      cc: values.cc === undefined ? undefined : safeHeader(cc),
       subject: safeHeader(subject),
       body: typeof values.body === "string" ? body : undefined,
-      account: account.id,
-    });
+    };
+    sync = turn?.confirmation
+      ? syncDraftRecipient({ chatId: turn.confirmation.chatId, ...fields, account: account.id })
+      : syncBoundSchedules(draftId, draftChange(fields));
   }
+  const scheduleNote =
+    sync.kind === "synced" ? "The scheduled email was updated to match this draft." : scheduleSyncNotice(sync);
   await queueDraftApproval({
     draftId,
     threadId,
@@ -165,7 +202,10 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     subject: safeHeader(subject),
     body,
     googleAccount: account.id,
-    extraLines: cc ? [`Cc: ${safeHeader(cc)}`] : undefined,
+    extraLines: [
+      ...(cc ? [`Cc: ${safeHeader(cc)}`] : []),
+      ...(scheduleNote ? [scheduleNote] : []),
+    ],
   });
 
   return JSON.stringify({
@@ -174,5 +214,6 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     tag: account.tag,
     to: safeHeader(to),
     cc: cc ? safeHeader(cc) : null,
+    ...(sync.kind === "none" ? {} : { schedule: sync.kind, scheduled_email: scheduleNote }),
   });
 }

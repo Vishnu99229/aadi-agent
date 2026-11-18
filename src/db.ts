@@ -5478,44 +5478,42 @@ export function createScheduledSend(input: {
   })();
 }
 
-/** Applies a change only while the row is still scheduled or held. A claim already in
- *  progress changes nothing, so the worker cannot send a half-updated copy. */
+function editableScheduledStatus(status: ScheduledSendStatus): boolean {
+  return status === "scheduled" || status === "held";
+}
+
+/** Applies a change only while the row is still scheduled or held, and only to the exact
+ *  version it read. The worker claims that same text, so a copy it prepared from an older
+ *  version is refused and prepared again from this one. */
 export function patchScheduledRequest(
   id: number,
   patch: (request: Record<string, unknown>) => void,
 ): boolean {
-  const row = getScheduledSend(id);
-  if (!row || (row.status !== "scheduled" && row.status !== "held")) {
-    return false;
-  }
-  let request: Record<string, unknown>;
-  try {
-    request = JSON.parse(row.request) as Record<string, unknown>;
-  } catch {
-    return false;
-  }
-  patch(request);
-  return (
-    db
-      .prepare(
-        `UPDATE scheduled_sends SET request = ?
-         WHERE id = ? AND status IN ('scheduled', 'held')`,
-      )
-      .run(JSON.stringify(request), id).changes === 1
-  );
-}
-
-export function setScheduledSendSubject(id: number, subject: string): boolean {
-  return patchScheduledRequest(id, (request) => {
-    request.subject = subject;
-  });
-}
-
-export function appendScheduledSendInstruction(id: number, note: string): boolean {
-  return patchScheduledRequest(id, (request) => {
-    const instruction = typeof request.instruction === "string" ? request.instruction : "";
-    request.instruction = `${instruction}\n${note}`.trim();
-  });
+  return db.transaction((): boolean => {
+    const row = getScheduledSend(id);
+    if (!row || !editableScheduledStatus(row.status)) {
+      return false;
+    }
+    let request: Record<string, unknown>;
+    try {
+      request = JSON.parse(row.request) as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+    patch(request);
+    const next = JSON.stringify(request);
+    if (next === row.request) {
+      return true;
+    }
+    return (
+      db
+        .prepare(
+          `UPDATE scheduled_sends SET request = ?
+           WHERE id = ? AND status IN ('scheduled', 'held') AND request = ?`,
+        )
+        .run(next, id, row.request).changes === 1
+    );
+  })();
 }
 
 export function bindScheduledDraft(id: number, draftId: string): boolean {
@@ -5524,44 +5522,123 @@ export function bindScheduledDraft(id: number, draftId: string): boolean {
   });
 }
 
-/** Replaces the scheduled subject and body. Fails if the row changed or is already sending. */
-export function replaceScheduledContent(id: number, subject: string, body: string): boolean {
-  const row = getScheduledSend(id);
-  if (!row || (row.status !== "scheduled" && row.status !== "held")) {
-    return false;
+/** A person the scheduled email goes to. The address is the choice he made, so it is
+ *  also what the send-time check looks up. */
+export interface ScheduledPerson {
+  name: string;
+  email: string;
+}
+
+function scheduledSlots(people: readonly ScheduledPerson[]): Array<Record<string, unknown>> {
+  return people.map((person) => {
+    const email = person.email.toLowerCase();
+    return { query: email, mailbox: { email, name: person.name || email } };
+  });
+}
+
+function slotAddresses(slots: unknown): string {
+  if (!Array.isArray(slots)) {
+    return "";
   }
-  let request: Record<string, unknown>;
-  try {
-    request = JSON.parse(row.request) as Record<string, unknown>;
-  } catch {
-    return false;
-  }
-  const version = typeof request.finalVersion === "number" ? request.finalVersion : 0;
-  request.finalVersion = version + 1;
-  request.finalSubject = subject;
-  request.finalBody = body;
-  request.subject = subject;
-  request.instruction = body;
-  return (
-    db
+  return slots
+    .map((slot) => {
+      const mailbox = (slot as { mailbox?: { email?: unknown } } | null)?.mailbox;
+      return typeof mailbox?.email === "string" ? mailbox.email.toLowerCase() : "";
+    })
+    .sort()
+    .join(",");
+}
+
+function sameAddressSet(slots: unknown, people: readonly ScheduledPerson[]): boolean {
+  return slotAddresses(slots) === people.map((person) => person.email.toLowerCase()).sort().join(",");
+}
+
+/** Everything the scheduled worker reads from an approved draft edit. */
+export interface ScheduledCopyChange {
+  to?: readonly ScheduledPerson[];
+  cc?: readonly ScheduledPerson[];
+  subject?: string;
+  /** The finished body. It is sent as it is, with no rewrite at send time. */
+  body?: string;
+  draftId?: string;
+}
+
+export type ScheduledCopyResult =
+  | { ok: true; changed: boolean }
+  | { ok: false; status: ScheduledSendStatus | "missing" | "unreadable" };
+
+/**
+ * One write for every field the worker reads: recipients, subject, the finalized subject
+ * and body, and the draft it belongs to. Either all of it lands or none of it does, and
+ * only while the row can still change. The worker's claim compares the request text, so
+ * any change here makes a copy it already prepared stale.
+ */
+export function writeScheduledCopy(id: number, change: ScheduledCopyChange): ScheduledCopyResult {
+  return db.transaction((): ScheduledCopyResult => {
+    const row = getScheduledSend(id);
+    if (!row) {
+      return { ok: false, status: "missing" };
+    }
+    if (!editableScheduledStatus(row.status)) {
+      return { ok: false, status: row.status };
+    }
+    let request: Record<string, unknown>;
+    try {
+      request = JSON.parse(row.request) as Record<string, unknown>;
+    } catch {
+      return { ok: false, status: "unreadable" };
+    }
+    // The same people keep the names and choices already stored for them.
+    if (change.to && change.to.length > 0 && !sameAddressSet(request.to, change.to)) {
+      request.to = scheduledSlots(change.to);
+    }
+    if (change.cc && !sameAddressSet(request.cc, change.cc)) {
+      request.cc = scheduledSlots(change.cc);
+    }
+    const subject = change.subject?.trim();
+    if (subject) {
+      request.subject = subject;
+      request.finalSubject = subject;
+    }
+    if (typeof change.body === "string" && change.body.trim()) {
+      request.finalBody = change.body;
+      request.instruction = change.body;
+      if (typeof request.finalSubject !== "string" && typeof request.subject === "string") {
+        request.finalSubject = request.subject;
+      }
+    }
+    if (change.draftId) {
+      request.draftId = change.draftId;
+    }
+    let next = JSON.stringify(request);
+    if (next === row.request) {
+      return { ok: true, changed: false };
+    }
+    if (subject || change.body) {
+      const version = typeof request.finalVersion === "number" ? request.finalVersion : 0;
+      request.finalVersion = version + 1;
+      next = JSON.stringify(request);
+    }
+    const written = db
       .prepare(
         `UPDATE scheduled_sends SET request = ?
          WHERE id = ? AND status IN ('scheduled', 'held') AND request = ?`,
       )
-      .run(JSON.stringify(request), id, row.request).changes === 1
-  );
+      .run(next, id, row.request).changes === 1;
+    return written ? { ok: true, changed: true } : { ok: false, status: getScheduledSend(id)?.status ?? "missing" };
+  })();
 }
 
-export function retargetScheduledSend(
-  id: number,
-  people: Array<{ name: string; email: string }>,
-): boolean {
-  return patchScheduledRequest(id, (request) => {
-    request.to = people.map((person) => ({
-      query: person.name || person.email,
-      mailbox: { email: person.email.toLowerCase(), name: person.name || person.email },
-    }));
-  });
+/** Every scheduled email a Gmail draft was bound to and that has not ended without sending. */
+export function listScheduledSendsForDraft(draftId: string): ScheduledSendRecord[] {
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_sends
+       WHERE status IN ('scheduled', 'held', 'sending', 'sent')
+         AND json_valid(request) AND json_extract(request, '$.draftId') = ?
+       ORDER BY id DESC`,
+    )
+    .all(draftId) as ScheduledSendRecord[];
 }
 
 export function getScheduledSend(id: number): ScheduledSendRecord | undefined {
@@ -5606,16 +5683,18 @@ export function listStaleScheduledSends(cutoffIso: string): ScheduledSendRecord[
     .all(cutoffIso) as ScheduledSendRecord[];
 }
 
-/** The last check before Gmail. Fails if he cancelled, by any route, in the meantime. */
-export function claimScheduledSend(id: number, nowIso: string): boolean {
+/** The last check before Gmail, in one statement. Fails if he cancelled, by any route, or
+ *  if the saved request is no longer the exact one this copy was prepared from. After it
+ *  succeeds the row is 'sending' and no correction can change it. */
+export function claimScheduledSend(id: number, nowIso: string, preparedRequest: string): boolean {
   return (
     db
       .prepare(
         `UPDATE scheduled_sends SET status = 'sending', claimed_at = ?
-         WHERE id = ? AND status = 'scheduled'
+         WHERE id = ? AND status = 'scheduled' AND request = ?
            AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = scheduled_sends.task_id AND tasks.status = 'open')`,
       )
-      .run(nowIso, id).changes === 1
+      .run(nowIso, id, preparedRequest).changes === 1
   );
 }
 
@@ -5632,11 +5711,14 @@ export function transitionScheduledSend(
   );
 }
 
-export function holdScheduledSend(id: number, request: string): boolean {
+/** Holds only the version the worker checked, so a correction saved meanwhile is kept. */
+export function holdScheduledSend(id: number, request: string, checkedRequest: string): boolean {
   return (
     db
-      .prepare("UPDATE scheduled_sends SET status = 'held', request = ? WHERE id = ? AND status = 'scheduled'")
-      .run(request, id).changes === 1
+      .prepare(
+        "UPDATE scheduled_sends SET status = 'held', request = ? WHERE id = ? AND status = 'scheduled' AND request = ?",
+      )
+      .run(request, id, checkedRequest).changes === 1
   );
 }
 
@@ -5657,11 +5739,12 @@ export function recordScheduledSendSent(id: number, sentMessageId: string | null
   );
 }
 
+/** Retries a send that is still scheduled. A cancel that landed meanwhile stays cancelled. */
 export function retryScheduledSend(id: number, retryAt: string): number {
-  db.prepare(
-    "UPDATE scheduled_sends SET status = 'scheduled', retry_at = ?, write_failures = write_failures + 1 WHERE id = ?",
-  ).run(retryAt, id);
-  return getScheduledSend(id)?.write_failures ?? 0;
+  const changed = db.prepare(
+    "UPDATE scheduled_sends SET retry_at = ?, write_failures = write_failures + 1 WHERE id = ? AND status = 'scheduled'",
+  ).run(retryAt, id).changes;
+  return changed === 1 ? getScheduledSend(id)?.write_failures ?? 0 : 0;
 }
 
 export type IgnoreEntityType =

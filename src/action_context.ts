@@ -7,16 +7,19 @@ import {
   getPendingActionContext,
   getScheduledSend,
   listCanonicalContacts,
+  listScheduledSendsForDraft,
   markTaskDone,
-  appendScheduledSendInstruction,
   bindScheduledDraft,
-  retargetScheduledSend,
-  setScheduledSendSubject,
   transitionScheduledSend,
   upsertCalendarEventRef,
   upsertPendingActionContext,
+  writeScheduledCopy,
+  type ScheduledCopyChange,
+  type ScheduledPerson,
+  type ScheduledSendRecord,
 } from "./db.js";
 import { looksLikeIgnoreInstruction } from "./ignore.js";
+import { parseAddressList } from "./mail_helpers.js";
 import { lastPresentedEntities, resolveReferentPhrase, type ReferentEntity } from "./referents.js";
 import { looksLikeTimeFill, parseOwnerTime } from "./time_parse.js";
 
@@ -213,7 +216,7 @@ function scheduleOwnsDraft(scheduledSendId: number, draftId: string): boolean {
 }
 
 /** The open email already points at this schedule, and the row does not name a different draft. */
-function contextScheduleForDraft(email: PendingEmailState): number | undefined {
+export function contextScheduleForDraft(email: PendingEmailState): number | undefined {
   if (!email.scheduledSendId) {
     return undefined;
   }
@@ -235,12 +238,145 @@ function contextScheduleForDraft(email: PendingEmailState): number | undefined {
   }
 }
 
-function stopScheduleIfPatchFailed(email: PendingEmailState, patched: boolean): PendingEmailState {
-  if (patched || !email.scheduledSendId) {
-    return email;
+/** What an approved edit did to the scheduled email it belongs to. */
+export type ScheduleSync =
+  | { kind: "none" }
+  | { kind: "synced"; id: number }
+  | { kind: "stopped"; id: number; itemText: string }
+  | { kind: "too_late"; id: number; itemText: string; sent: boolean };
+
+/** A scheduled email the worker has claimed. No correction can reach it any more. */
+export interface LockedSchedule {
+  id: number;
+  itemText: string;
+  sent: boolean;
+}
+
+function lockedRow(row: ScheduledSendRecord | undefined): LockedSchedule | undefined {
+  return row && (row.status === "sending" || row.status === "sent")
+    ? { id: row.id, itemText: row.item_text, sent: row.status === "sent" }
+    : undefined;
+}
+
+function rowNamesOtherDraft(row: ScheduledSendRecord, draftId: string | undefined): boolean {
+  try {
+    const bound = (JSON.parse(row.request) as { draftId?: string }).draftId;
+    return Boolean(bound && bound !== draftId);
+  } catch {
+    return false;
   }
-  cancelLinkedSend(email);
-  return { ...email, scheduledSendId: undefined, sendAt: undefined };
+}
+
+/** The open email's scheduled send, once it is going out or gone. */
+export function lockedScheduleFor(email: PendingEmailState | undefined): LockedSchedule | undefined {
+  if (!email?.scheduledSendId) {
+    return undefined;
+  }
+  const row = getScheduledSend(email.scheduledSendId);
+  return row && !rowNamesOtherDraft(row, email.draftId) ? lockedRow(row) : undefined;
+}
+
+/** Before a draft edit: the scheduled email this draft belongs to, when it can no longer change. */
+export function lockedScheduleForDraft(draftId: string, chatId?: number): LockedSchedule | undefined {
+  const rows = listScheduledSendsForDraft(draftId);
+  if (rows.some((row) => row.status === "scheduled" || row.status === "held")) {
+    return undefined;
+  }
+  const bound = lockedRow(rows[0]);
+  if (bound || chatId === undefined) {
+    return bound;
+  }
+  const email = getPendingAction(chatId)?.email;
+  return email?.draftId === draftId ? lockedScheduleFor(email) : undefined;
+}
+
+/** The refusal for a correction that arrives after the send was claimed. Nothing changed. */
+export function tooLateText(locked: LockedSchedule): string {
+  return locked.sent
+    ? `Too late: that scheduled email already went out with the previous version, so I didn't change anything. (${locked.itemText})`
+    : `Too late: that scheduled email is already being sent with the previous version, so I didn't change anything. (${locked.itemText})`;
+}
+
+/** What Vishnu must be told after an edit. Empty when the scheduled copy simply matches. */
+export function scheduleSyncNotice(sync: ScheduleSync): string {
+  if (sync.kind === "stopped") {
+    return `I couldn't copy this change into the scheduled email, so I cancelled it. Nothing will go out at the scheduled time. (${sync.itemText})`;
+  }
+  if (sync.kind === "too_late") {
+    return sync.sent
+      ? `Too late for the scheduled email: it had already gone out with the previous version, so this change didn't reach it. (${sync.itemText})`
+      : `Too late for the scheduled email: it had already started sending with the previous version, so this change didn't reach it. (${sync.itemText})`;
+  }
+  return "";
+}
+
+/**
+ * Copies an approved change into one scheduled email in a single write. If the write
+ * can't land, the send is cancelled so the older copy can't go out. If the worker has
+ * already claimed it, that is reported as too late, never as done.
+ */
+export function applyToSchedule(id: number, change: ScheduledCopyChange): ScheduleSync {
+  if (writeScheduledCopy(id, change).ok) {
+    return { kind: "synced", id };
+  }
+  const row = getScheduledSend(id);
+  const locked = lockedRow(row);
+  if (locked) {
+    return { kind: "too_late", ...locked };
+  }
+  if (row && (row.status === "scheduled" || row.status === "held")) {
+    if (transitionScheduledSend(row.id, ["scheduled", "held"], "cancelled")) {
+      markTaskDone(row.task_id);
+      console.log(`Scheduled send ${row.id}: status -> cancelled reason=sync_failed`);
+      return { kind: "stopped", id: row.id, itemText: row.item_text };
+    }
+    const after = lockedRow(getScheduledSend(id));
+    if (after) {
+      return { kind: "too_late", ...after };
+    }
+  }
+  return { kind: "none" };
+}
+
+const SYNC_RANK: Record<ScheduleSync["kind"], number> = { none: 0, synced: 1, too_late: 2, stopped: 3 };
+
+function worse(left: ScheduleSync, right: ScheduleSync): ScheduleSync {
+  return SYNC_RANK[right.kind] > SYNC_RANK[left.kind] ? right : left;
+}
+
+/** Every open scheduled email this Gmail draft was bound to, whichever chat or button edited it. */
+export function syncBoundSchedules(draftId: string, change: ScheduledCopyChange): ScheduleSync {
+  const rows = listScheduledSendsForDraft(draftId);
+  const open = rows.filter((row) => row.status === "scheduled" || row.status === "held");
+  if (open.length === 0) {
+    const locked = lockedRow(rows[0]);
+    return locked ? { kind: "too_late", ...locked } : { kind: "none" };
+  }
+  return open.reduce<ScheduleSync>(
+    (result, row) => worse(result, applyToSchedule(row.id, { ...change, draftId })),
+    { kind: "none" },
+  );
+}
+
+function peopleIn(header: string): ScheduledPerson[] {
+  return parseAddressList(header).map((mailbox) => ({ name: mailbox.name, email: mailbox.email }));
+}
+
+/** The draft's fields as the scheduled worker reads them. */
+export function draftChange(input: {
+  draftId: string;
+  to?: string;
+  cc?: string;
+  subject?: string;
+  body?: string;
+}): ScheduledCopyChange {
+  return {
+    to: input.to === undefined ? undefined : peopleIn(input.to),
+    cc: input.cc === undefined ? undefined : peopleIn(input.cc),
+    subject: input.subject,
+    body: input.body,
+    draftId: input.draftId,
+  };
 }
 
 /** Remember a Gmail draft the Email Agent just created, so a later cancel can drop its Send card. */
@@ -295,39 +431,40 @@ export function linkPublishedDraft(input: {
   });
 }
 
-/** Keep the chat's draft pointed at the address a later update_draft wrote. */
+/**
+ * Keep the chat's draft pointed at what a later update_draft wrote, and copy the same
+ * recipients, subject and body into the scheduled email it belongs to.
+ */
 export function syncDraftRecipient(input: {
   chatId: number;
   draftId: string;
   to: string;
+  cc?: string;
   subject: string;
   body?: string;
   account: "work" | "personal";
-}): void {
+}): ScheduleSync {
   const pending = getPendingAction(input.chatId);
-  const addresses = [...input.to.matchAll(new RegExp(EMAIL_RE.source, "gi"))].map((match) => match[0].toLowerCase());
-  const to = addresses.map((email) => ({
-    query: email,
-    name: email.split("@")[0]?.replace(/[._]+/g, " ").trim() || email,
-    email,
-    resolved: true,
-  }));
+  const change = draftChange(input);
   if (pending?.email?.draftId && pending.email.draftId !== input.draftId) {
-    return;
+    return syncBoundSchedules(input.draftId, change);
   }
   if (!pending?.email) {
     linkPublishedDraft(input);
-    return;
+    return syncBoundSchedules(input.draftId, change);
   }
+  const to = (change.to ?? []).map((person) => ({
+    query: person.email,
+    name: person.name || person.email,
+    email: person.email,
+    resolved: true,
+  }));
   const notes = input.body
     ? [...pending.email.notes.filter((note) => !note.startsWith("Current draft:")), `Current draft:\n${input.body}`]
     : pending.email.notes;
-  const nextTo = to.length > 0 ? to : pending.email.to;
-  const previous = pending.email.to.map((person) => person.email).sort().join(",");
-  const changedPeople = nextTo.map((person) => person.email).sort().join(",") !== previous;
   let email: PendingEmailState = {
     ...pending.email,
-    to: nextTo,
+    to: to.length > 0 ? to : pending.email.to,
     subject: input.subject || pending.email.subject,
     notes,
     draftId: pending.email.draftId || input.draftId,
@@ -335,25 +472,15 @@ export function syncDraftRecipient(input: {
   };
   const linkedId = contextScheduleForDraft(email);
   email = linkedId ? email : { ...email, scheduledSendId: undefined, sendAt: undefined };
+  let sync: ScheduleSync = { kind: "none" };
   if (email.scheduledSendId) {
-    if (changedPeople) {
-      const retargeted = retargetScheduledSend(
-        email.scheduledSendId,
-        nextTo.map((person) => ({ name: person.name, email: person.email })),
-      );
-      email = stopScheduleIfPatchFailed(email, retargeted);
-    }
-    if (email.scheduledSendId && input.subject && input.subject !== pending.email.subject) {
-      email = stopScheduleIfPatchFailed(email, setScheduledSendSubject(email.scheduledSendId, input.subject));
-    }
-    if (email.scheduledSendId && input.body) {
-      email = stopScheduleIfPatchFailed(email, appendScheduledSendInstruction(email.scheduledSendId, input.body));
-    }
-    if (email.scheduledSendId && email.draftId) {
-      bindScheduledDraft(email.scheduledSendId, email.draftId);
+    sync = applyToSchedule(email.scheduledSendId, change);
+    if (sync.kind !== "synced") {
+      email = { ...email, scheduledSendId: undefined, sendAt: undefined };
     }
   }
   savePendingAction(input.chatId, { ...pending, email });
+  return worse(sync, syncBoundSchedules(input.draftId, change));
 }
 
 /** So "cancel that email" can stop a send that was scheduled from this chat. */
@@ -631,6 +758,18 @@ function cancelLinkedSend(email: PendingEmailState | undefined): void {
   }
 }
 
+function tooLateToCancelText(locked: LockedSchedule): string {
+  return locked.sent
+    ? `Too late to cancel: that scheduled email already went out. (${locked.itemText})`
+    : `Too late to cancel: that scheduled email is already being sent. (${locked.itemText})`;
+}
+
+/** "Change the subject to X and mention Y": the subject, and the rest as a rewrite. */
+function splitSubjectChange(captured: string): { subject: string; rest?: string } {
+  const joined = /^(.+?)\s+and\s+(?:also\s+)?((?:mention|add|say|include|note|tell (?:him|her|them)|let (?:him|her|them) know)\s.+)$/i.exec(captured);
+  return joined ? { subject: joined[1]!.trim(), rest: joined[2]!.trim() } : { subject: captured.trim() };
+}
+
 export type OwnerReference =
   | { kind: "none" }
   | { kind: "one"; contact: OwnerSuppliedContact }
@@ -702,7 +841,7 @@ export interface OwnerTurnResult {
   publishDraft?: boolean;
   /** A published Gmail draft whose Send card must be discarded with this turn. */
   retireDraftId?: string;
-  /** Replace only the subject of the open Gmail draft. */
+  /** Replace only the subject of the open Gmail draft. With reviseEmail, the subject that rewrite uses. */
   subjectUpdate?: string;
   /** Change the open draft's To line without rewriting the message. */
   redirectDraft?: { draftId: string; to: string };
@@ -768,6 +907,10 @@ export function applyOwnerContextTurn(
   let next: PendingAction = { ...base, ownerSupplied: supplied, confirmMessage: messageId || base.confirmMessage };
 
   if (correctionOfEmail(clean, next.email) && next.email && next.status !== "cancelled") {
+    const locked = lockedScheduleFor(next.email);
+    if (locked) {
+      return { handled: true, text: tooLateToCancelText(locked) };
+    }
     cancelLinkedSend(next.email);
     const retireDraftId = next.email.draftId;
     next = {
@@ -832,6 +975,10 @@ export function applyOwnerContextTurn(
 
   if (/\b(?:the other one|not that one)\b/i.test(clean) && supplied.length === 2 && next.email?.to[0]) {
     const other = supplied.find((item) => item.email !== next.email!.to[0]!.email);
+    const locked = other ? lockedScheduleFor(next.email) : undefined;
+    if (locked) {
+      return { handled: true, text: tooLateText(locked) };
+    }
     if (other && next.email) {
       const email = {
         ...next.email,
@@ -840,14 +987,11 @@ export function applyOwnerContextTurn(
       let scheduleNote = "";
       const scheduleId = contextScheduleForDraft(email);
       if (scheduleId) {
-        const retargeted = retargetScheduledSend(scheduleId, [
-          { name: other.name, email: other.email },
-        ]);
-        if (!retargeted) {
-          cancelLinkedSend(email);
+        const sync = applyToSchedule(scheduleId, { to: [{ name: other.name, email: other.email }] });
+        if (sync.kind !== "synced") {
           email.scheduledSendId = undefined;
           email.sendAt = undefined;
-          scheduleNote = " I stopped the scheduled send so it cannot go to the previous address.";
+          scheduleNote = ` ${scheduleSyncNotice(sync)}`.trimEnd();
         }
       } else if (email.scheduledSendId) {
         email.scheduledSendId = undefined;
@@ -888,6 +1032,10 @@ export function applyOwnerContextTurn(
       };
     }
     const person = found.contact;
+    const locked = lockedScheduleFor(next.email);
+    if (locked) {
+      return { handled: true, text: tooLateText(locked) };
+    }
     let email: PendingEmailState = {
       ...next.email,
       pendingRedirect: undefined,
@@ -896,11 +1044,10 @@ export function applyOwnerContextTurn(
     let scheduleNote = "";
     const scheduleId = contextScheduleForDraft(email);
     if (scheduleId) {
-      const retargeted = retargetScheduledSend(scheduleId, [{ name: person.name, email: person.email }]);
-      if (!retargeted) {
-        cancelLinkedSend(email);
+      const sync = applyToSchedule(scheduleId, { to: [{ name: person.name, email: person.email }] });
+      if (sync.kind !== "synced") {
         email = { ...email, scheduledSendId: undefined, sendAt: undefined };
-        scheduleNote = " I stopped the scheduled send because its recipient could not be changed.";
+        scheduleNote = ` ${scheduleSyncNotice(sync)}`.trimEnd();
       }
     }
     next = { ...next, status: "open", email };
@@ -915,22 +1062,30 @@ export function applyOwnerContextTurn(
   }
   const subjectChange = /^(?:please\s+)?(?:change|set|update|make)\s+(?:the\s+)?subject\s+(?:to|as|:)\s+(.+?)\.?$/i.exec(clean)
     ?? /^subject\s*(?:to|:)\s+(.+?)\.?$/i.exec(clean);
-  if (subjectChange && openEmail && next.email?.draftId) {
-    const subject = subjectChange[1]!.trim();
+  if (subjectChange && openEmail && (next.email?.draftId || next.email?.scheduledSendId)) {
+    const locked = lockedScheduleFor(next.email);
+    if (locked) {
+      return { handled: true, text: tooLateText(locked) };
+    }
+    const { subject, rest } = splitSubjectChange(subjectChange[1]!);
+    if (rest) {
+      // The rewrite carries the new subject, so both land together or not at all.
+      return { handled: true, reviseEmail: rest, subjectUpdate: subject };
+    }
     let scheduleNote = "";
-    let current = next.email;
+    let current = next.email!;
     const scheduleId = contextScheduleForDraft(current);
     if (scheduleId) {
-      const updated = setScheduledSendSubject(scheduleId, subject);
-      if (!updated) {
-        cancelLinkedSend(current);
+      const sync = applyToSchedule(scheduleId, { subject });
+      if (sync.kind !== "synced") {
         current = { ...current, scheduledSendId: undefined, sendAt: undefined };
-        scheduleNote = " I stopped the scheduled send because its subject could not be updated.";
+        scheduleNote = scheduleSyncNotice(sync);
       }
     }
     next = { ...next, email: { ...current, subject } };
     savePendingAction(chatId, next, now);
-    return { handled: true, subjectUpdate: subject, text: scheduleNote || undefined };
+    const text = scheduleNote || (current.draftId ? undefined : `The scheduled email's subject is now "${subject}".`);
+    return { handled: true, subjectUpdate: subject, text };
   }
   const freshDraft = /\b(?:draft|write|compose)\b/i.test(clean) && /\b(?:e-?mails?|mail)\b/i.test(clean)
     && !/\b(?:shorter|longer|subject)\b/i.test(clean);
@@ -984,7 +1139,8 @@ export function applyOwnerContextTurn(
     emails.length === 0
   ) {
     if (next.email.draftId || next.email.scheduledSendId) {
-      return { handled: true, reviseEmail: clean };
+      const locked = lockedScheduleFor(next.email);
+      return locked ? { handled: true, text: tooLateText(locked) } : { handled: true, reviseEmail: clean };
     }
     const notes = [...next.email.notes, clean, ...(contextNote ? [contextNote] : [])];
     next = {
@@ -1061,6 +1217,10 @@ export function holdEmailToolTurn(
 ): string | undefined {
   const pending = getPendingAction(chatId, now);
   if (correctionOfEmail(ownWords, pending?.email) && pending?.email && pending.status !== "cancelled") {
+    const locked = lockedScheduleFor(pending.email);
+    if (locked) {
+      return tooLateToCancelText(locked);
+    }
     cancelLinkedSend(pending.email);
     savePendingAction(
       chatId,

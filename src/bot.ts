@@ -18,7 +18,7 @@ import { parseSettingPhrase } from "./settings_logic.js";
 import { applyOwnerContextTurn, continuePendingAction, getPendingAction, savePendingAction } from "./action_context.js";
 import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
 import { publishReadyDraft, reviseLinkedDraft } from "./context_draft.js";
-import { handler as updateDraft } from "./tools/update_draft.js";
+import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.js";
 import { stageExternalContext } from "./context_lookup.js";
 import { bookPendingMeetingAt, handleCommandSendCallback } from "./command_email.js";
 import { looksLikeCommandTurn } from "./command_logic.js";
@@ -1387,7 +1387,7 @@ async function handleUserText(
       ctx.message.message_id,
     );
     if (contextTurn.redirectDraft) {
-      await updateDraft(
+      const result = await updateDraft(
         { draft_id: contextTurn.redirectDraft.draftId, to: contextTurn.redirectDraft.to },
         {
           iteration: 1,
@@ -1396,31 +1396,40 @@ async function handleUserText(
           userText,
         },
       );
-      if (contextTurn.text) {
-        await ctx.reply(contextTurn.text);
+      const reply = [contextTurn.text, draftUpdateNotice(result)].filter(Boolean).join("\n");
+      if (reply) {
+        await ctx.reply(reply);
       }
       return;
     }
     if (contextTurn.reviseEmail) {
-      const revised = await reviseLinkedDraft(ctx.chat.id, contextTurn.reviseEmail);
+      const revised = await reviseLinkedDraft(ctx.chat.id, contextTurn.reviseEmail, new Date(), {
+        subject: contextTurn.subjectUpdate,
+      });
       await ctx.reply(revised);
       return;
     }
     if (contextTurn.subjectUpdate) {
       const draftId = getPendingAction(ctx.chat.id)?.email?.draftId;
+      let notice: string | undefined;
       if (draftId) {
-        await updateDraft(
-          { draft_id: draftId, subject: contextTurn.subjectUpdate },
-          {
-            iteration: 1,
-            calledTools: [],
-            confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
-            userText,
-          },
+        notice = draftUpdateNotice(
+          await updateDraft(
+            { draft_id: draftId, subject: contextTurn.subjectUpdate },
+            {
+              iteration: 1,
+              calledTools: [],
+              confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
+              userText,
+            },
+          ),
         );
-        if (contextTurn.text) {
-          await ctx.reply(contextTurn.text);
-        }
+      }
+      const reply = [contextTurn.text, notice].filter(Boolean).join("\n");
+      if (reply) {
+        await ctx.reply(reply);
+      }
+      if (draftId || reply) {
         return;
       }
     }
@@ -1436,8 +1445,11 @@ async function handleUserText(
     if (contextTurn.publishDraft && !hasPendingDraftEdit(userId)) {
       const posted = await publishReadyDraft(ctx.chat.id);
       if (posted.posted) {
-        if (contextTurn.text) {
-          await ctx.reply(contextTurn.text);
+        const reply = posted.notice?.startsWith("Too late:")
+          ? posted.notice
+          : [contextTurn.text, posted.notice].filter(Boolean).join("\n");
+        if (reply) {
+          await ctx.reply(reply);
         }
         return;
       }
