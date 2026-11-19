@@ -2263,13 +2263,21 @@ export function clearDocumentPendingTasks(id: number): void {
 }
 
 export function deleteExpiredDocuments(): number {
-  const result = db
-    .prepare(
-      `DELETE FROM documents
-       WHERE created_at <= datetime('now', '-7 days')`,
-    )
-    .run();
-  return result.changes;
+  return db.transaction(() => {
+    db.prepare(
+      `DELETE FROM telegram_document_refs
+       WHERE document_id IN (
+         SELECT id FROM documents WHERE created_at <= datetime('now', '-7 days')
+       )`,
+    ).run();
+    const result = db
+      .prepare(
+        `DELETE FROM documents
+         WHERE created_at <= datetime('now', '-7 days')`,
+      )
+      .run();
+    return result.changes;
+  })();
 }
 
 export function createNote(

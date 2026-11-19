@@ -66,6 +66,8 @@ export interface PendingEmailState {
   draftId?: string;
   /** A recipient change waiting until Vishnu picks one confirmed person. */
   pendingRedirect?: string;
+  /** The recipient was filled in after a failed schedule. The old permission does not carry over. */
+  needsFreshAuthorization?: boolean;
   waiting: "recipient" | "purpose" | "confirm";
 }
 
@@ -817,14 +819,14 @@ function correctionOfEmail(text: string, email: PendingEmailState | undefined): 
   if (namesAnotherEmail(text, email)) {
     return false;
   }
-  if (/\b(?:don'?t send|do not send|never send)\b/i.test(text)) {
+  if (/\b(?:don'?t send|do not send|never send|stop sending)\b/i.test(text)) {
     return true;
   }
-  if (/\bcancel\b/i.test(text)) {
+  if (/\b(?:cancel|stop)\b/i.test(text)) {
     if (/\b(?:meeting|reminder|task|bill|event)\b/i.test(text)) {
       return false;
     }
-    return /\b(?:email|e-mail|mail|draft|it|that)\b/i.test(text);
+    return /\b(?:email|e-mail|mail|draft|it|that|sending)\b/i.test(text);
   }
   if (/^(?:not|no)\b/i.test(text.trim()) && /\b(?:context|explain|tell you)\b/i.test(text)) {
     return true;
@@ -1399,6 +1401,16 @@ export function holdEmailToolTurn(
     !messageAuthorizesExternalSend(ownWords)
   ) {
     return "Not sent: that email was cancelled. Nothing from it will go out. Say send when you want a new one.";
+  }
+  if (pending?.status === "open" && pending.email?.needsFreshAuthorization) {
+    const confirms =
+      messageAuthorizesExternalSend(ownWords) &&
+      /\b(?:send|schedule)\b/i.test(ownWords) &&
+      notASendCommand(ownWords) === undefined;
+    if (!confirms) {
+      return "Not sent: the recipient is saved, but this message does not schedule or send it. Say schedule it to confirm. Nothing went out.";
+    }
+    return undefined;
   }
   if (pending?.status === "open" && pending.email && !messageAuthorizesExternalSend(ownWords)) {
     if (notASendCommand(ownWords) === undefined && /\b(?:send|e-?mail|mail|reply|schedule)\b/i.test(ownWords)) {

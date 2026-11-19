@@ -62,11 +62,56 @@ export function emailReferenceForTurn(
   return entry && entry.expiresAt > now ? entry.email : undefined;
 }
 
+/** A Send/Edit/Discard card. Replying "send it" confirms that draft; it is not a new recipient. */
+export function isDraftApprovalText(text: string | undefined): boolean {
+  return /draft waiting for approval|draft approval|waiting for your send tap/i.test(text ?? "");
+}
+
+/** "Don't send", "cancel it", "stop sending". A meeting or task cancel is not an email cancel. */
+export function isNegativeSendCommand(text: string): boolean {
+  if (/\b(?:meeting|calendar|reminder|task|bill|event)\b/i.test(text) && !/\b(?:don'?t|do not|never)\s+send\b|\bstop\s+sending\b/i.test(text)) {
+    return false;
+  }
+  return /\b(?:don'?t|do not|never)\s+send\b|\bstop\s+sending\b|\b(?:cancel|discard|unschedule)\b|\bstop\s+(?:it|that|this|the email|sending)\b/i.test(text);
+}
+
+export type OwnerEmailIntent = "cancel" | "resolve" | "draft" | "schedule" | "send" | "confirm_draft" | "none";
+
+/** What this message asks for. OCR text is never consulted; only the owner's words. */
+export function classifyOwnerEmailIntent(text: string, replyingToApproval = false): OwnerEmailIntent {
+  const clean = text.trim();
+  if (isNegativeSendCommand(clean)) {
+    return "cancel";
+  }
+  if (replyingToApproval && /^(?:please\s+)?send(?:\s+it)?(?:\s+now)?[.!]*$/i.test(clean)) {
+    return "confirm_draft";
+  }
+  if (
+    /\b(?:refer|extract|read|show)\b/i.test(clean) &&
+    /\b(?:address|e-?mail|photo|image|ocr)\b/i.test(clean) &&
+    !/\b(?:send|draft|schedule|compose|write)\b/i.test(clean)
+  ) {
+    return "resolve";
+  }
+  if (/\b(?:draft|compose|prepare)\b/i.test(clean) && !/\bsend\b/i.test(clean)) {
+    return "draft";
+  }
+  if (/\bwrite\b/i.test(clean) && /\b(?:e-?mail|mail)\b/i.test(clean) && !/\bsend\b/i.test(clean)) {
+    return "draft";
+  }
+  if (/\bschedule\b/i.test(clean) && !/\bsend\s+(?:it\s+)?now\b/i.test(clean)) {
+    return "schedule";
+  }
+  if (/\bsend\b/i.test(clean)) {
+    return "send";
+  }
+  return "none";
+}
+
 /** A recipient being discussed is not the same as one explicitly referenced. */
 export function refersToEarlierEmail(text: string, replying = false): boolean {
-  // Cancelling or editing an already scheduled email belongs to its own
-  // workflow; OCR recipient discovery must never delay that cancellation.
-  if (/\b(?:cancel|stop|discard|unschedule)\b/i.test(text)) {
+  // Cancellation belongs to its own workflow and must run before OCR discovery.
+  if (isNegativeSendCommand(text)) {
     return false;
   }
   if (addressIn(text) && !/\b(?:verify|compare|check)\b/i.test(text)) {
@@ -77,9 +122,11 @@ export function refersToEarlierEmail(text: string, replying = false): boolean {
     /\b(?:above|quoted)\b/i.test(text) ||
     /\b(?:previous|earlier|last|prior)\s+(?:message|photo|card|image|ocr)\b/i.test(text) ||
     /\b(?:this|that)\s+(?:message|photo|card|image|ocr)\b/i.test(text) ||
+    /\b(?:use|refer(?:ring)?(?:\s+to)?)\s+(?:this|that|the)\s+(?:e-?mail|email|address|contact)\b/i.test(text) ||
     /\b(?:e-?mail|address|recipient|contact)\b.{0,40}\b(?:in|from|on)\s+(?:the\s+)?(?:this|that)\b(?:\s+(?:message|photo|card|image|ocr|text))?(?:\s*[.!?])?$/i.test(text);
-  const repliedToIt = replying && /\b(?:send|draft|compose|write|schedule|mail|email)\b.*\b(?:it|this|that)\b/i.test(text);
-  return (hasEmailTopic && pointsBack) || repliedToIt;
+  // Replying "send it" is a draft confirmation, not a request to mine a new address.
+  const repliedAboutAddress = replying && hasEmailTopic && /\b(?:this|that|it|above)\b/i.test(text) && pointsBack;
+  return (hasEmailTopic && pointsBack) || repliedAboutAddress;
 }
 
 export function addressesFromReference(text: string): string[] {

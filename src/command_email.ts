@@ -60,6 +60,7 @@ import {
 import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
+import { sendPendingDraftByText } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -855,12 +856,33 @@ export async function sendEmailFromTool(
   if (values.attachment_requested === true || asksForAttachment(ownWords)) {
     return "Not sent: he asked for a file and I can't attach one here, so nothing went out. Ask him whether to send it without the file or draft it so he can add it.";
   }
-  const when = parseSendAt(values.send_on, values.send_time, now);
+  const pendingEmail = getPendingAction(confirmation.chatId, now)?.email;
+  let when = parseSendAt(values.send_on, values.send_time, now);
   if (typeof when === "object") {
     return when.refused;
   }
+  if (
+    pendingEmail?.needsFreshAuthorization &&
+    pendingEmail.sendAt &&
+    !(/\bsend\b/i.test(ownWords) && /\bnow\b/i.test(ownWords))
+  ) {
+    when = when ?? pendingEmail.sendAt;
+  }
   if (when === undefined && mentionsSendDate(ownWords)) {
     return "Not sent: he gave a date or time, so nothing went out. Call send_email again with send_on, and send_time if he gave one.";
+  }
+  if (when === undefined && /\bschedule\b/i.test(ownWords) && !/\bsend\s+(?:it\s+)?now\b/i.test(ownWords)) {
+    return "Not sent: he asked to schedule it, so nothing went out immediately. Ask him for the day and time.";
+  }
+  if (
+    when === undefined &&
+    /\bsend\b/i.test(ownWords) &&
+    /\bnow\b/i.test(ownWords) &&
+    pendingEmail?.draftId &&
+    pendingEmail.scheduledSendId
+  ) {
+    const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId);
+    return delivered.message;
   }
   let toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);

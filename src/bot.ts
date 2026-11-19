@@ -23,12 +23,13 @@ import {
   savePendingAction,
   messageAuthorizesExternalSend,
 } from "./action_context.js";
-import { bindEmailReferenceForTurn, refersToEarlierEmail, resolveEmailReference } from "./email_references.js";
+import { bindEmailReferenceForTurn, classifyOwnerEmailIntent, isDraftApprovalText, refersToEarlierEmail, resolveEmailReference } from "./email_references.js";
 import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
 import { publishReadyDraft, reviseLinkedDraft } from "./context_draft.js";
+import { handler as draftNewEmailTool } from "./tools/draft_new_email.js";
 import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.js";
 import { stageExternalContext } from "./context_lookup.js";
-import { bookPendingMeetingAt, handleCommandSendCallback } from "./command_email.js";
+import { bookPendingMeetingAt, handleCommandSendCallback, sendEmailFromTool } from "./command_email.js";
 import { looksLikeCommandTurn } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
 import { FORWARDED_TOOLS } from "./tools/index.js";
@@ -1380,42 +1381,98 @@ async function handleUserText(
     return;
   }
   if (emailReference.kind === "one" && ctx.chat && ctx.message) {
-    bindEmailReferenceForTurn(ctx.chat.id, ctx.message.message_id, emailReference.email);
-    const startsEmail = /\b(?:draft|write|compose|send|schedule)\b/i.test(userText);
-    const hasContent = /\b(?:about|regarding|mention|saying|say|telling|tell|inform|invite|following up on|follow up about|with the subject|subject is|body is)\b/i.test(userText);
-    // A bare request to use the OCR address is an identity choice, not a licence
-    // to re-use an unrelated old Gmail thread as its subject or body.
-    if (!startsEmail || !hasContent) {
+    const intent = classifyOwnerEmailIntent(userText, isDraftApprovalText(ctx.message.reply_to_message?.text ?? ctx.message.reply_to_message?.caption));
+    if (intent !== "confirm_draft" && intent !== "cancel") {
+      bindEmailReferenceForTurn(ctx.chat.id, ctx.message.message_id, emailReference.email);
+      const hasContent = /\b(?:about|regarding|mention|saying|say|telling|tell|inform|invite|following up on|follow up about|with the subject|subject is|body is)\b/i.test(userText);
       const existing = getPendingAction(ctx.chat.id);
       const continuing = existing?.status === "open" &&
         existing.action === "send_email" && existing.email?.waiting === "recipient" &&
-        !existing.email.draftId && !existing.email.scheduledSendId && !/\bdraft\b/i.test(userText);
-      if (!startsEmail && !continuing) {
-        await ctx.reply(`The email address in the referenced ${emailReference.documentId ? "OCR/photo" : "message"} is ${emailReference.email}. What would you like me to do with it? No draft or schedule was changed.`);
+        !existing.email.draftId && !existing.email.scheduledSendId && intent !== "draft";
+      const account = (continuing ? existing.email?.account : undefined) ?? (/\bpersonal\b/i.test(userText) ? "personal" : "work");
+      if (continuing || ((intent === "draft" || intent === "schedule") && !hasContent) || intent === "resolve" || intent === "none") {
+        if (!continuing && intent !== "draft" && intent !== "schedule") {
+          await ctx.reply(`The email address in the referenced ${emailReference.documentId ? "OCR/photo" : "message"} is ${emailReference.email}. What would you like me to do with it? No draft or schedule was changed.`);
+          return;
+        }
+        const carried = continuing ? existing.email : undefined;
+        const tomorrowAt = /\btomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(userText);
+        let phraseSendAt = carried?.sendAt;
+        if (!phraseSendAt && tomorrowAt && intent === "schedule") {
+          const hour = Number(tomorrowAt[1]);
+          const minute = tomorrowAt[2] ?? "00";
+          const marker = tomorrowAt[3]?.toLowerCase();
+          let resolved = hour;
+          if (marker === "pm" && hour < 12) resolved += 12;
+          if (marker === "am" && hour === 12) resolved = 0;
+          const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+          const [year, month, day] = today.split("-").map(Number);
+          const next = new Date(Date.UTC(year!, month! - 1, day!));
+          next.setUTCDate(next.getUTCDate() + 1);
+          phraseSendAt = `${next.toISOString().slice(0, 10)}T${String(resolved).padStart(2, "0")}:${minute}:00+05:30`;
+        }
+        savePendingAction(ctx.chat.id, {
+          action: intent === "draft" ? "draft_email" : "send_email",
+          status: "open",
+          ownerWords: continuing ? existing!.ownerWords : userText,
+          confirmChat: ctx.chat.id,
+          confirmMessage: ctx.message.message_id,
+          updatedAt: new Date().toISOString(),
+          email: {
+            ...carried,
+            to: [{ query: emailReference.email, name: "", email: emailReference.email, resolved: true }],
+            cc: carried?.cc ?? [],
+            notes: carried?.notes ?? [],
+            purpose: carried?.purpose,
+            sendAt: phraseSendAt,
+            account,
+            needsFreshAuthorization: intent !== "draft" && (continuing || intent === "schedule"),
+            waiting: carried?.purpose ? "confirm" : "purpose",
+          },
+        });
+        const nextStep = carried?.purpose
+          ? "I kept the previously requested wording and time. Please say 'schedule it' to confirm. Nothing has been scheduled yet."
+          : "What should the email say? I won't use a previous draft or send anything yet.";
+        await ctx.reply(`I found ${emailReference.email} in the referenced ${emailReference.documentId ? "OCR/photo" : "message"}. ${nextStep}`);
         return;
       }
-      const carried = continuing ? existing.email : undefined;
-      savePendingAction(ctx.chat.id, {
-        action: continuing ? "send_email" : "draft_email",
-        status: "open",
-        ownerWords: continuing ? existing.ownerWords : userText,
-        ...(continuing ? { authorizedAt: existing.authorizedAt } : {}),
-        confirmChat: ctx.chat.id,
-        confirmMessage: ctx.message.message_id,
-        updatedAt: new Date().toISOString(),
-        email: {
-          ...carried,
-          to: [{ query: emailReference.email, name: "", email: emailReference.email, resolved: true }],
-          cc: carried?.cc ?? [],
-          notes: carried?.notes ?? [],
-          account: carried?.account ?? (/\bpersonal\b/i.test(userText) ? "personal" : "work"),
-          waiting: carried?.purpose ? "confirm" : "purpose",
+      const confirmation = { chatId: ctx.chat.id, messageId: ctx.message.message_id };
+      if (intent === "draft") {
+        const created = await draftNewEmailTool(
+          { to: emailReference.email, subject: "Following up", body: userText, account },
+          { iteration: 1, calledTools: [], userText, confirmation },
+        );
+        await ctx.reply(created);
+        return;
+      }
+      const dated = /\bon\s+(\d{4}-\d{2}-\d{2})\s+at\s+(\d{1,2}:\d{2})\b/i.exec(userText);
+      const tomorrow = /\btomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(userText);
+      let sendOn = dated?.[1];
+      let sendTime = dated?.[2];
+      if (!sendOn && tomorrow && intent === "schedule") {
+        const hour = Number(tomorrow[1]);
+        const minute = tomorrow[2] ?? "00";
+        const marker = tomorrow[3]?.toLowerCase();
+        let resolved = hour;
+        if (marker === "pm" && hour < 12) resolved += 12;
+        if (marker === "am" && hour === 12) resolved = 0;
+        const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+        const [year, month, day] = today.split("-").map(Number);
+        const next = new Date(Date.UTC(year!, month! - 1, day!));
+        next.setUTCDate(next.getUTCDate() + 1);
+        sendOn = next.toISOString().slice(0, 10);
+        sendTime = `${String(resolved).padStart(2, "0")}:${minute}`;
+      }
+      const result = await sendEmailFromTool(
+        {
+          to: [emailReference.email],
+          instruction: userText,
+          account,
+          ...(sendOn && sendTime ? { send_on: sendOn, send_time: sendTime } : {}),
         },
-      });
-      const nextStep = carried?.purpose
-        ? "I kept the previously requested wording and time. Please say 'schedule it' to confirm. Nothing has been scheduled yet."
-        : "What should the email say? I won't use a previous draft or send anything yet.";
-      await ctx.reply(`I found ${emailReference.email} in the referenced ${emailReference.documentId ? "OCR/photo" : "message"}. ${nextStep}`);
+        { confirmation, userText },
+      );
+      await ctx.reply(result);
       return;
     }
   }
@@ -1514,7 +1571,8 @@ async function handleUserText(
       userText,
       ctx.message.message_id,
     );
-    if (emailReference.kind === "one" && /\b(?:draft|write|compose|send|schedule)\b/i.test(userText)) {
+    const referenceIntent = classifyOwnerEmailIntent(userText, isDraftApprovalText(ctx.message.reply_to_message?.text ?? ctx.message.reply_to_message?.caption));
+    if (emailReference.kind === "one" && referenceIntent !== "confirm_draft" && referenceIntent !== "cancel" && /\b(?:draft|write|compose|send|schedule)\b/i.test(userText)) {
       // Bind the new request to this selected address, not the last draft/card.
       const sending = messageAuthorizesExternalSend(userText) &&
         (/\b(?:send|schedule)\b/i.test(userText) || !/\b(?:draft|write|compose|prepare)\b/i.test(userText));
