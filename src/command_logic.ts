@@ -27,7 +27,7 @@ const NOT_A_COMMAND: ReadonlyArray<readonly [RegExp, string]> = [
 const DRAFT_WORD = /\b(?:draft|prepare|write|compose)\b/i;
 /** "Draft this, but don't send" / "without sending": the draft is allowed, the send is not. */
 const SEND_IS_FORBIDDEN =
-  /\b(?:don'?t|don’t|do not|never|without)\b[^.?!\n]{0,40}\bsend(?:ing)?\b/i;
+  /\b(?:(?:don'?t|don’t|do not|never|without)\b(?!\s+forget)[^.?!\n]{0,40}\bsend(?:ing)?|stop\s+sending)\b/i;
 
 /**
  * Drop constraints that limit a requested action ("without attendees",
@@ -45,17 +45,13 @@ export function withoutActionConstraints(text: string): string {
     .replace(SEND_IS_FORBIDDEN, " ");
 }
 
-/** Why these words aren't a command to send, or undefined when they may be.
- *  "Draft", "write" and "prepare" stay reviewable unless he also said send. "Reply to X"
- *  is a command to send. "Draft but don't send" is a draft, not a refusal to act.
- *  Only the command part counts: "send" or "don't send" in the email body does not. */
 export function notASendCommand(ownWords: string): string | undefined {
   const command = splitOwnerEmailCommand(ownWords).command;
-  if (DRAFT_WORD.test(command) && SEND_IS_FORBIDDEN.test(command)) {
-    return "he asked for a draft";
+  if (SEND_IS_FORBIDDEN.test(ownWords)) {
+    return DRAFT_WORD.test(ownWords) ? "he asked for a draft" : "he said not to";
   }
   for (const [pattern, reason] of NOT_A_COMMAND) {
-    if (pattern.test(command)) {
+    if (pattern.test(ownWords)) {
       return reason;
     }
   }
@@ -109,29 +105,41 @@ export function looksLikeCommandTurn(text: string): boolean {
   return COMMAND_TURN.some((pattern) => pattern.test(text));
 }
 
-/** Markers that start the email's wording. Bare "that" is not one: it would cut
- *  "send that email" and "schedule that for tomorrow". "that" counts only after
- *  say/saying/tell/telling/mention. */
 const CONTENT_STARTS =
-  /\b(?:saying|say|telling|tell|about|regarding|asking|ki|to confirm|(?:(?:say(?:ing)?|tell(?:ing)?|mention(?:ing)?)\s+that))\b/i;
+  /\b(?:saying|say|telling|tell|about|regarding|asking|ki|to confirm|mention(?:ing)?\s+that|that(?!\s+(?:email|mail|draft|message|reply|one|card|it|for|to|now|out)\b))\b/gi;
+
+const DELIVERY_CLAUSE =
+  /\b(?:send|schedule)\s+(?:it|this|that|the\s+(?:email|mail))\s+(?:for|at|on|tomorrow|today|tonight|next|later|in)\b/i;
+
+export function deliveryTimeHold(text: string): string | undefined {
+  if (DELIVERY_CLAUSE.test(text)) {
+    return "Not sent: you mentioned when to send it. Tell me the day and time and I'll schedule it.";
+  }
+}
+
 /** Malayalam puts "saying" after what's said, so any date there may be its content. */
 const CONTENT_ENDS = /\bennu\b/i;
 const SEND_DATE =
   /\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|\b(?:tomorrow|tonight|next week|later today|kal|naale)\b|\bon\s+\d{1,2}(?:st|nd|rd|th)?\b|\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/i;
 
-/** The owner's instruction versus what the email should say. Malayalam `ennu`
- *  means the wording came first, so the command stays the whole sentence and a
- *  date in it is never the send time. */
+/** Grants and triggers (including draft/send selection, delivery time, external
+ *  authorization and cancel/discard routing) read the command. Send prohibitions
+ *  and delivery clauses hold across the whole message. A body can veto a send.
+ *  A delivery clause without a valid send_on asks for the time. Only command
+ *  dates can set it. Malayalam `ennu` marks preceding wording and disables
+ *  date extraction for the whole sentence. */
 export function splitOwnerEmailCommand(text: string): { command: string; content: string } {
   if (CONTENT_ENDS.test(text)) {
     const at = text.search(CONTENT_ENDS);
     return { command: text, content: at === -1 ? "" : text.slice(0, at) };
   }
-  const start = text.search(CONTENT_STARTS);
-  if (start === -1) {
-    return { command: text, content: "" };
+  for (const match of text.matchAll(CONTENT_STARTS)) {
+    const command = text.slice(0, match.index);
+    if (command.trim()) {
+      return { command, content: text.slice(match.index) };
+    }
   }
-  return { command: text.slice(0, start), content: text.slice(start) };
+  return { command: text, content: "" };
 }
 
 /** He gave a date or time for the send, as opposed to one inside the email: "email

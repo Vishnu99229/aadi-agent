@@ -229,6 +229,7 @@ const SEND_SOMETHING =
 const IMPERATIVE_START =
   "(?:^|[.!?\\n]\\s*|\\b(?:please|pls|kindly|now|can you|could you|would you)\\s+)";
 const REPLY_TO = new RegExp(`${IMPERATIVE_START}(?:reply|respond)\\s+(?:back\\s+)?to\\b`, "i");
+const TELL_BY_EMAIL = new RegExp(`${IMPERATIVE_START}tell\\s+[\\p{L}\\p{M}'’-]+(?:\\s+[\\p{L}\\p{M}'’-]+){0,3}\\s+by\\s+e-?mail\\b`, "iu");
 const EMAIL_SOMEONE = new RegExp(
   `${IMPERATIVE_START}(?:e-?mail|mail)\\s+(?!(?:from|thread|threads|about|said|says|address|id|list|inbox|is|was|and|or|to me)\\b)[\\p{L}\\p{N}]`,
   "iu",
@@ -408,13 +409,15 @@ export function commandIntents(ownWords: string): CommandKind[] {
     found.add("sales_fact_remove");
   }
   const emailCommand = splitOwnerEmailCommand(text).command;
-  if ((SEND_SOMETHING.test(emailCommand) || REPLY_TO.test(emailCommand) || EMAIL_SOMEONE.test(emailCommand)) && !notASendCommand(text)) {
+  const emailRequest = SEND_SOMETHING.test(emailCommand) || REPLY_TO.test(emailCommand) ||
+    TELL_BY_EMAIL.test(emailCommand) || EMAIL_SOMEONE.test(emailCommand);
+  if (emailRequest && !notASendCommand(text)) {
     found.add("send");
   }
   if (plain && DRAFT.some((pattern) => pattern.test(emailCommand)) && !found.has("send")) {
     found.add("draft");
   }
-  if (plain && DISCARD_DRAFT.test(text)) {
+  if (plain && DISCARD_DRAFT.test(emailCommand)) {
     found.add("draft_discard");
   }
   if (

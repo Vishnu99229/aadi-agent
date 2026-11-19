@@ -3,6 +3,7 @@ import type { gmail_v1 } from "googleapis";
 import {
   addressIn,
   asksForAttachment,
+  deliveryTimeHold,
   isAutomatedAddress,
   mentionsSendDate,
   nameTokens,
@@ -814,7 +815,10 @@ function parseSendAt(
   const date = sendOn.trim();
   const time = typeof sendTime === "string" && sendTime.trim() ? sendTime.trim() : DEFAULT_SEND_TIME;
   const at = new Date(`${date}T${time.padStart(5, "0")}:00+05:30`);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(time) || Number.isNaN(at.getTime())) {
+  // Date normalizes impossible dates and 24:00. Require the same IST minute back.
+  const local = new Date(at.getTime() + 330 * 60_000);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(time) ||
+      Number.isNaN(at.getTime()) || local.toISOString().slice(0, 16) !== `${date}T${time.padStart(5, "0")}`) {
     return { refused: "Not scheduled: send_on must be YYYY-MM-DD and send_time HH:MM in IST." };
   }
   if (at.getTime() <= now.getTime()) {
@@ -866,6 +870,10 @@ export async function sendEmailFromTool(
   }
   const pendingEmail = getPendingAction(confirmation.chatId, now)?.email;
   let when = parseSendAt(values.send_on, values.send_time, now);
+  const deliveryHold = deliveryTimeHold(ownWords);
+  if (deliveryHold && typeof when !== "string") {
+    return deliveryHold;
+  }
   if (typeof when === "object") {
     return when.refused;
   }

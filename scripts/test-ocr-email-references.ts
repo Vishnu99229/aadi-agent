@@ -32,6 +32,7 @@ import { queueDraftApproval } from "../src/approvals.ts";
 import { getPendingAction, savePendingAction } from "../src/action_context.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { handler as draftReply } from "../src/tools/draft_reply.ts";
+import { handler as confirmDraft } from "../src/tools/confirm_send_pending_draft.ts";
 import { handler as updateDraft } from "../src/tools/update_draft.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import { rememberContactChoice } from "../src/contacts.ts";
@@ -408,6 +409,19 @@ await queueDraftApproval({
   googleAccount: "work",
 });
 const cardMessage = cardIds.at(-1)!;
+// Even a model call naming the right card must honor a veto or delivery hold.
+for (const userText of [
+  "Send the draft about the renewal, don't send it till I check",
+  "Send the draft about the renewal, send it tomorrow",
+]) {
+  const before = draftSends;
+  const result = await confirmDraft({ draft_id: cardDraft }, {
+    userText, confirmation: { chatId: 1, messageId: nextMessageId() }, iteration: 1, calledTools: [],
+  });
+  assert.match(result, /^Not sent:/);
+  assert.equal(draftSends, before);
+}
+
 const sendsBeforeCard = draftSends;
 await say("send it", { message_id: cardMessage, text: "Draft waiting for approval\nTo: alice@example.com\nSubject: Original" });
 assert.equal(sentAccounts.filter((item) => item === `send:work:${cardDraft}`).length, 1);
@@ -566,7 +580,7 @@ async function ocrSay(chatId: number, text: string): Promise<void> {
   const jeffDraft = "Draft an email to Jeff saying please send me the deck";
   assert.equal(splitOwnerEmailCommand("send that email to Jeff").content, "");
   assert.equal(splitOwnerEmailCommand("schedule that for tomorrow at 5 pm").content, "");
-  assert.match(splitOwnerEmailCommand("tell him that the call moved to 5 pm").content, /^tell him that/i);
+  assert.equal(splitOwnerEmailCommand("tell him that the call moved to 5 pm").content, "that the call moved to 5 pm");
   assert.equal(classifyOwnerEmailIntent(photo), "draft");
   assert.equal(notASendCommand(photo), "he asked for a draft");
   assert.equal(classifyOwnerEmailIntent(invoice), "draft");
@@ -749,6 +763,74 @@ rememberContactChoice("Dorothy", { name: "Dorothy", emails: ["dorothy@example.co
   assert.match(replies.at(-1) ?? "", /Bcc/i);
   assert.equal(gmailDrafts, draftsBefore);
   assert.equal(messageSends + draftSends, sendsBefore);
+}
+
+{
+  const before = [gmailDrafts, draftSends, messageSends];
+  const userText = "Send an email to Jeff saying hi, send it tomorrow at 9 am";
+  const turn = { userText, confirmation: { chatId: 59, messageId: nextMessageId() }, iteration: 1, calledTools: [] };
+  const args = { subject: "Hello", body: "Hi", send_immediately: true };
+  for (const result of [
+    await draftNewEmail({ ...args, to: "jeff@example.com" }, turn),
+    await draftReply({ ...args, email_id: "thread" }, turn),
+  ]) {
+    assert.equal(result, "Not sent: you mentioned when to send it. Tell me the day and time and I'll schedule it.");
+  }
+  assert.deepEqual([gmailDrafts, draftSends, messageSends], before);
+}
+
+for (const [userText, recipient] of [
+  ["Tell Jeff by email that the deck is ready", "Jeff"],
+  ["Send Jeff an email that the call is at 5 pm", "Jeff"],
+  ["Email Munil that we'll meet tomorrow", "Munil"],
+  ["send that email to Jeff", "Jeff"],
+] as const) {
+  assert.ok(commandIntents(userText).includes("send"), userText);
+  const before = messageSends + draftSends;
+  const result = await sendEmailFromTool(
+    { to: [recipient], instruction: "Hello" },
+    { userText, confirmation: { chatId: 60, messageId: nextMessageId() } },
+  );
+  assert.match(result, /^Sent to/);
+  assert.equal(messageSends + draftSends, before + 1);
+  assert.equal(latestSentTo.includes(`${recipient.toLowerCase()}@example.com`), true);
+  assert.equal(latestSchedule(60), undefined);
+}
+
+{
+  const before = messageSends + draftSends;
+  const sendOn = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date(tomorrowIso("18:00")));
+  const wording = "Email Jeff about the renewal and schedule it for tomorrow at 6 pm";
+  assert.equal(parseOwnerEmailSendAt(wording), undefined);
+  await sendEmailFromTool(
+    { to: ["Jeff"], instruction: "The renewal", send_on: sendOn, send_time: "18:00" },
+    { userText: wording, confirmation: { chatId: 61, messageId: nextMessageId() } },
+  );
+  assert.equal(latestSchedule(61)?.send_at, tomorrowIso("18:00"));
+  assert.equal(messageSends + draftSends, before);
+}
+
+{
+  const chatId = 62;
+  const before = messageSends + draftSends;
+  savePendingAction(chatId, {
+    action: "send_email", status: "open", ownerWords: "Email Jeff", authorizedAt: new Date().toISOString(),
+    confirmChat: chatId, confirmMessage: 1, updatedAt: new Date().toISOString(),
+    email: { to: [{ query: "Jeff", name: "Jeff", email: "jeff@example.com", resolved: true }],
+      cc: [], notes: [], purpose: "The deck", account: "work", waiting: "confirm" },
+  });
+  const send = (userText: string, timing = {}) => sendEmailFromTool(
+    { to: ["Jeff"], instruction: "The deck", ...timing }, { userText, confirmation: { chatId, messageId: nextMessageId() } },
+  );
+  await send("tell him that the call moved to 5 pm");
+  assert.equal(latestSchedule(chatId), undefined);
+  assert.equal(messageSends + draftSends, before);
+  const words = "schedule that for tomorrow at 5 pm";
+  const parsed = parseOwnerEmailSendAt(words);
+  assert.ok(parsed && "sendTime" in parsed);
+  await send(words, { send_on: parsed.sendOn, send_time: parsed.sendTime });
+  assert.equal(latestSchedule(chatId)?.send_at, tomorrowIso("17:00"));
+  assert.equal(messageSends + draftSends, before);
 }
 
 db.pragma("foreign_keys = ON");

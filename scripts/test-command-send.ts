@@ -1189,6 +1189,33 @@ function clearScheduled(): void {
   }
 }
 
+// Exercise the send tool even if the model ignored the owner's stop.
+{
+  const askWhen = "Not sent: you mentioned when to send it. Tell me the day and time and I'll schedule it.";
+  const renewal = "Email Jeff about the renewal and schedule it for tomorrow at 6 pm";
+  const counts = () => [sends.length, draftsSent.length, draftsCreated.length, listOpenScheduledSends().length].join(",");
+  const before = counts();
+  const input = { to: ["Jeff"], instruction: "The renewal" };
+  for (const words of [renewal, "Send an email to Jeff saying hi, send it tomorrow at 9 am"]) {
+    for (const send_on of [undefined, "invalid", "2027-02-30"]) {
+      const result = await sendEmailFromTool({ ...input, send_on }, turn(words));
+      assert(result === askWhen && counts() === before, words);
+    }
+  }
+  for (const words of [
+    "Send Jeff an email about the renewal but don't send it till I check",
+    "Send Jeff an email saying don't send the invoice yet", // A body-only veto is intentional.
+    "Send Jeff an email about renewals without sending",
+    "Send Jeff an email about renewals, stop sending",
+  ]) {
+    const result = await sendEmailFromTool(input, turn(words));
+    assert(result.includes("he said not to") && result.includes("ask him") && counts() === before, words);
+  }
+  const draftOnly = "Email Jeff about the pricing, don't send it yet, just make a draft";
+  const refused = await sendEmailFromTool(input, turn(draftOnly));
+  assert(refused.includes("he asked for a draft") && counts() === before, draftOnly);
+}
+
 // When he gave a date, it can't go out now.
 assert(mentionsSendDate("send Selvaraj an email on Monday saying hello"), "on Monday");
 assert(mentionsSendDate("email Selvaraj tomorrow"), "tomorrow");

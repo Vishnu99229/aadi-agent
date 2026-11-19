@@ -1,3 +1,4 @@
+import { deliveryTimeHold, notASendCommand } from "../command_logic.js";
 import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import {
@@ -128,6 +129,10 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("body must be a non-empty plain-text reply.");
   }
 
+  if (values.send_immediately === true) {
+    const hold = deliveryTimeHold(turn.userText ?? "");
+    if (hold) return hold;
+  }
   const { account, message: original } = await resolveGmailMessage(
     values.email_id.trim(),
     parseGoogleAccountFilter(values.account),
@@ -194,7 +199,8 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("Gmail created the draft without returning a draft ID.");
   }
 
-  const sendImmediately = values.send_immediately === true;
+  const sendImmediately =
+    values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({
       draftId: result.data.id,

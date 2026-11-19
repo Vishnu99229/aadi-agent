@@ -813,11 +813,12 @@ function namesAnotherEmail(text: string, email: PendingEmailState): boolean {
   return !asked.some((token) => known.has(token));
 }
 
-function correctionOfEmail(text: string, email: PendingEmailState | undefined): boolean {
+function correctionOfEmail(ownWords: string, email: PendingEmailState | undefined): boolean {
   if (!email) {
     return false;
   }
-  if (namesAnotherEmail(text, email)) {
+  const text = splitOwnerEmailCommand(ownWords).command;
+  if (namesAnotherEmail(ownWords, email)) {
     return false;
   }
   if (/\b(?:don'?t send|do not send|never send|stop sending)\b/i.test(text)) {

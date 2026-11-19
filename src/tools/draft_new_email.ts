@@ -11,7 +11,7 @@ import {
 import { parseAddressList } from "../mail_helpers.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor, signaturePlainText } from "../google/mail.js";
-import { notASendCommand } from "../command_logic.js";
+import { deliveryTimeHold, notASendCommand } from "../command_logic.js";
 import { linkPublishedDraft } from "../action_context.js";
 import { emailReferenceForTurn, refersToEarlierEmail } from "../email_references.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
@@ -121,6 +121,10 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("to has no remaining recipient after dropping Vishnu's own addresses.");
   }
 
+  if (values.send_immediately === true) {
+    const hold = deliveryTimeHold(turn.userText ?? "");
+    if (hold) return hold;
+  }
   const account = await getGoogleAccount(
     values.account === "personal" ? "personal" : "work",
   );
