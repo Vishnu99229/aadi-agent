@@ -16,6 +16,7 @@ import {
 import { linkPublishedDraft } from "../action_context.js";
 import { parseAddressList } from "../mail_helpers.js";
 import { isSelfEmail } from "../mom_logic.js";
+import { emailReferenceForTurn } from "../email_references.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -108,6 +109,10 @@ export function dropSelf(header: string): string {
 }
 
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
+  const referencedEmail = emailReferenceForTurn(turn.confirmation?.chatId, turn.confirmation?.messageId);
+  if (referencedEmail) {
+    return `Not drafted: ${referencedEmail} was selected from the OCR/photo or quoted message, not from a Gmail thread. Use draft_new_email for that address; no old reply was created.`;
+  }
   const values = input as {
     email_id?: unknown;
     body?: unknown;

@@ -24,6 +24,7 @@ import {
 } from "./action_context.js";
 import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
+import { emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
@@ -861,9 +862,22 @@ export async function sendEmailFromTool(
   if (when === undefined && mentionsSendDate(ownWords)) {
     return "Not sent: he gave a date or time, so nothing went out. Call send_email again with send_on, and send_time if he gave one.";
   }
-  const toQueries = stringList(values.to);
+  let toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
   const instruction = typeof values.instruction === "string" ? values.instruction.trim() : "";
+  const referencedEmail = emailReferenceForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
+  if (referencedEmail) {
+    // The owner's reference picked this one address. A model cannot substitute
+    // a stale Gmail recipient or tack on people from an unrelated thread.
+    const refersToSelected = toQueries.length === 1 &&
+      (toQueries[0]!.toLowerCase() === referencedEmail ||
+       refersToEarlierEmail(toQueries[0]!) ||
+       /^(?:it|him|her|them|this|that|the contact)$/i.test(toQueries[0]!.trim()));
+    if (!refersToSelected || ccQueries.length > 0 && !/\bcc\b/i.test(ownWords)) {
+      return `Not ${when ? "scheduled" : "sent"}: the referenced photo/message identifies ${referencedEmail}, not the recipient the agent selected. Nothing went out.`;
+    }
+    toQueries = [referencedEmail];
+  }
   if (toQueries.length === 0) {
     return "Not sent: he didn't name anyone. Ask him who it's for.";
   }
@@ -878,6 +892,28 @@ export async function sendEmailFromTool(
     confirmation.chatId,
   );
   if (typeof slots === "string") {
+    // A missing address must not discard the owner's original scheduled
+    // instruction and time. A follow-up can identify the person without
+    // having to repeat all the wording. This stores no permission beyond the
+    // existing short send-authorization window, and does not schedule yet.
+    if (when && /\b(?:send|schedule)\b/i.test(ownWords)) {
+      const unresolved = (query: string): ResolvedAttendee => ({
+        query, name: query, email: "", resolved: false,
+      });
+      savePendingAction(confirmation.chatId, {
+        action: "send_email", status: "open",
+        ownerWords: ownWords, authorizedAt: now.toISOString(),
+        confirmChat: confirmation.chatId, confirmMessage: confirmation.messageId,
+        updatedAt: now.toISOString(),
+        email: {
+          to: toQueries.map(unresolved), cc: ccQueries.map(unresolved),
+          notes: [instruction], purpose: instruction, subject: typeof values.subject === "string" ? values.subject : undefined,
+          sendAt: when, account: values.account === "personal" ? "personal" : "work",
+          waiting: "recipient",
+        },
+      }, now);
+      return `${slots} I kept the email wording and scheduled time. Identify the recipient, then explicitly confirm scheduling.`;
+    }
     return slots;
   }
   const request: CommandRequest = {

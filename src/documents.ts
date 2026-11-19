@@ -10,6 +10,7 @@ import {
   clearDocumentPendingTasks,
   deleteExpiredDocuments,
   getDocument,
+  rememberTelegramDocumentRef,
   updateDocument,
   type DocumentActionItem,
   type ItemTag,
@@ -616,6 +617,12 @@ export async function processIncomingPhoto(
       photo.analysis.extracted_text || extractedFallback(photo.analysis),
     );
 
+    // The source photo must remain addressable even when Aadi's OCR response
+    // was a long message or the conversation has since discussed other emails.
+    if (ctx.chat && ctx.message) {
+      rememberTelegramDocumentRef(ctx.chat.id, ctx.message.message_id, record.id);
+    }
+
     const pending =
       photo.analysis.action_items.length > 0
         ? photo.analysis.action_items
@@ -623,7 +630,10 @@ export async function processIncomingPhoto(
     const answeredPrompt = Boolean(userPrompt) && photo.source === "ocr";
     if (answeredPrompt) {
       const keyboard = documentKeyboard(record.id, Boolean(pending?.length));
-      await ctx.reply(photo.reply, { reply_markup: keyboard });
+      const sent = await ctx.reply(photo.reply, { reply_markup: keyboard });
+      if (ctx.chat) {
+        rememberTelegramDocumentRef(ctx.chat.id, sent.message_id, record.id);
+      }
       return { documentId: record.id, answeredPrompt: true };
     }
     if (userPrompt) {
@@ -635,7 +645,10 @@ export async function processIncomingPhoto(
         ? `${photo.reply}\n\nDocument id: ${record.id} (use read_document for follow-ups)`
         : formatDocumentReply(record.id, photo.analysis);
     const keyboard = documentKeyboard(record.id, Boolean(pending?.length));
-    await ctx.reply(reply, { reply_markup: keyboard });
+    const sent = await ctx.reply(reply, { reply_markup: keyboard });
+    if (ctx.chat) {
+      rememberTelegramDocumentRef(ctx.chat.id, sent.message_id, record.id);
+    }
     return { documentId: record.id, answeredPrompt: false };
   } catch (error) {
     console.error(

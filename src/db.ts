@@ -243,6 +243,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_documents_created
     ON documents (created_at);
 
+  -- An OCR/photo result and the Telegram messages that point to it.  The chat
+  -- scope prevents a reply in one chat from selecting another chat's document.
+  CREATE TABLE IF NOT EXISTS telegram_document_refs (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    document_id INTEGER NOT NULL REFERENCES documents(id),
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_document_refs_recent
+    ON telegram_document_refs (chat_id, created_ms DESC);
+
   CREATE TABLE IF NOT EXISTS jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -2170,6 +2183,41 @@ export function getDocument(id: number): DocumentRecord | undefined {
        FROM documents WHERE id = ?`,
     )
     .get(id) as DocumentRecord | undefined;
+}
+
+export function rememberTelegramDocumentRef(
+  chatId: number,
+  messageId: number,
+  documentId: number,
+  now = Date.now(),
+): void {
+  db.prepare(
+    `INSERT INTO telegram_document_refs (chat_id, message_id, document_id, created_ms)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(chat_id, message_id) DO UPDATE SET
+       document_id = excluded.document_id, created_ms = excluded.created_ms`,
+  ).run(chatId, messageId, documentId, now);
+}
+
+export function documentRefForTelegramMessage(
+  chatId: number,
+  messageId: number,
+  sinceMs: number,
+): number | undefined {
+  const row = db.prepare(
+    `SELECT document_id FROM telegram_document_refs
+     WHERE chat_id = ? AND message_id = ? AND created_ms >= ?`,
+  ).get(chatId, messageId, sinceMs) as { document_id: number } | undefined;
+  return row?.document_id;
+}
+
+export function latestTelegramDocumentRef(chatId: number, sinceMs: number): number | undefined {
+  const row = db.prepare(
+    `SELECT document_id FROM telegram_document_refs
+     WHERE chat_id = ? AND created_ms >= ?
+     ORDER BY created_ms DESC, rowid DESC LIMIT 1`,
+  ).get(chatId, sinceMs) as { document_id: number } | undefined;
+  return row?.document_id;
 }
 
 /** Non-expired documents (same 7-day rule as deleteExpiredDocuments), newest first. */
