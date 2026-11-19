@@ -347,6 +347,27 @@ assert(
   "draft but don't send authorizes a draft and blocks sending",
 );
 assert(notASendCommand("don't send Selvaraj anything") === "he said not to", "a bare don't-send is still a refusal");
+// Plans, questions and reminders count only in the command part; prohibitions count anywhere.
+for (const phrase of [
+  "Email Jeff saying I'll send the proposal by Friday",
+  "Reply to Dorothy saying thanks, I will send the deck",
+  "Send Jeff an email saying should we send the PO this week?",
+]) {
+  assert(notASendCommand(phrase) === undefined, `"${phrase}": a plan or question in the body is not a stop`);
+  assert(commandIntents(phrase).includes("send"), `"${phrase}" is a send`);
+}
+for (const [phrase, reason] of [
+  ["I'll send Jeff the deck tomorrow", "he described a plan"],
+  ["Should I send Jeff the deck?", "he asked a question"],
+  ["Remind me to send Jeff the deck", "he asked for a reminder"],
+  ["Send Jeff an email about the renewal but don't send it till I check", "he said not to"],
+] as const) {
+  assert(notASendCommand(phrase) === reason, `"${phrase}" is "${reason}"`);
+}
+{
+  const draftOnly = "Email Jeff about the pricing, don't send it yet, just make a draft";
+  assert(notASendCommand(draftOnly) !== undefined && !commandIntents(draftOnly).includes("send"), `"${draftOnly}" is blocked`);
+}
 {
   const draft = commandIntents("Draft an email to qa@example.com with subject Hi but don't send it");
   assert(draft.includes("draft") && !draft.includes("send"), `draft-not-send intents: ${draft.join(",")}`);
@@ -1189,6 +1210,33 @@ function clearScheduled(): void {
   }
 }
 
+// Exercise the send tool even if the model ignored the owner's stop.
+{
+  const askWhen = "Not sent: you mentioned when to send it. Tell me the day and time and I'll schedule it.";
+  const renewal = "Email Jeff about the renewal and schedule it for tomorrow at 6 pm";
+  const counts = () => [sends.length, draftsSent.length, draftsCreated.length, listOpenScheduledSends().length].join(",");
+  const before = counts();
+  const input = { to: ["Jeff"], instruction: "The renewal" };
+  for (const words of [renewal, "Send an email to Jeff saying hi, send it tomorrow at 9 am"]) {
+    for (const send_on of [undefined, "invalid", "2027-02-30"]) {
+      const result = await sendEmailFromTool({ ...input, send_on }, turn(words));
+      assert(result === askWhen && counts() === before, words);
+    }
+  }
+  for (const words of [
+    "Send Jeff an email about the renewal but don't send it till I check",
+    "Send Jeff an email saying don't send the invoice yet", // A body-only veto is intentional.
+    "Send Jeff an email about renewals without sending",
+    "Send Jeff an email about renewals, stop sending",
+  ]) {
+    const result = await sendEmailFromTool(input, turn(words));
+    assert(result.includes("he said not to") && result.includes("ask him") && counts() === before, words);
+  }
+  const draftOnly = "Email Jeff about the pricing, don't send it yet, just make a draft";
+  const refused = await sendEmailFromTool(input, turn(draftOnly));
+  assert(refused.includes("he asked for a draft") && counts() === before, draftOnly);
+}
+
 // When he gave a date, it can't go out now.
 assert(mentionsSendDate("send Selvaraj an email on Monday saying hello"), "on Monday");
 assert(mentionsSendDate("email Selvaraj tomorrow"), "tomorrow");
@@ -1197,6 +1245,9 @@ assert(!mentionsSendDate("send Selvaraj an email saying we're on for Monday"), "
 assert(!mentionsSendDate("email Selvaraj about the Tuesday kickoff"), "nor here");
 assert(!mentionsSendDate("Selvaraj-nu oru mail ayakku, Tuesday confirm aanu ennu parayu"), "nor before Malayalam's ennu");
 assert(!mentionsSendDate("Selvaraj ko mail bhej do ki Tuesday confirm hai"), "nor after Hindi's ki");
+assert(mentionsSendDate("schedule that for tomorrow at 5 pm"), "that after schedule is not a content marker");
+assert(!mentionsSendDate("tell him that the call moved to 5 pm"), "that after tell is the email wording");
+assert(!mentionsSendDate("send that email to Jeff"), "send that email has no send date");
 {
   const name = person("Kiran");
   const count = sends.length;

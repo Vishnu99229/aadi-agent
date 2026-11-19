@@ -18,7 +18,10 @@ import {
   type ToolCall,
 } from "../src/llm.ts";
 import { FORWARDED_TOOLS, tools, type ToolTurn } from "../src/tools/index.ts";
-import { modelReply } from "./fakes.ts";
+import { setApprovalsTestHooks } from "../src/approvals.ts";
+import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
+import { setGmailClientForTests } from "../src/google/mail.ts";
+import { fakeGmail, fakeTelegramApi, modelReply, type GmailLog } from "./fakes.ts";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -170,6 +173,12 @@ assert(commandIntents("Delete the task about the Talkdesk call").join(",") === "
 assert(commandIntents("remind me to book a meeting with Jeff").join(",") === "reminder", "remind me to book is a reminder, not a booking");
 assert(commandIntents("Remind me to follow up with Jeff").join(",") === "sequence", "remind me to follow up with X is the sequence card, not a reminder");
 assert(commandIntents("draft and send an email to Jeff saying Monday works").join(",") === "send", "draft and send is a send");
+assert(commandIntents("Draft an email to Jeff saying please send me the deck").join(",") === "draft", "send in the body is not a send command");
+assert(commandIntents("Write an email to Jeff saying please send the invoice").join(",") === "draft", "write stays a draft when send is only in the body");
+assert(commandIntents("Draft an email to Jeff saying we had to cancel the order").join(",") === "draft", "cancel in the body is not a cancel");
+assert(commandIntents("Email Munil about the pricing call").join(",") === "send", "email X about stays a send");
+assert(commandIntents("Reply to Dorothy saying thanks, we'll share the deck tomorrow").join(",") === "send", "tomorrow in the body is not a schedule");
+assert(commandIntents("Send Jeff an email saying the proposal is ready").join(",") === "send", "send ... saying stays a send");
 
 // ---- who a sequence request names ----
 assert(JSON.stringify(sequenceTargets("Start a sequence for Dorothy Copeland.")) === '["Dorothy Copeland"]', "a name");
@@ -474,6 +483,29 @@ saveMessage("assistant", "Marked the Airtel bill paid. Next one due is LinkedIn 
   assert(ran.length === 0, "a forwarded message runs nothing in code");
   assert(seen.every((params) => params.toolChoice === undefined), "and forces nothing");
   assert(reply === "That's a forwarded note.", "its reply passes through");
+}
+
+// Exercise the normal agent loop and Gmail draft tool with an overeager immediate-send flag.
+{
+  setToolInterceptorForTests(undefined);
+  const words = "Email Jeff about the pricing, don't send it yet, just make a draft";
+  assert(commandIntents(words).length === 0, "the veto removes the send guarantee");
+  const gmailLog: GmailLog = { sent: [], created: [] };
+  const gmail = fakeGmail(gmailLog);
+  setGmailClientForTests(() => gmail);
+  setGoogleAccountForTests((id) => ({ id, tag: id, label: id, client: {} }) as LoadedGoogleAccount);
+  setApprovalsTestHooks({ telegram: fakeTelegramApi({ sent: [], edited: [] }), gmailFor: () => gmail });
+  let requested = false;
+  setCompleteForTests(async (params) => {
+    if (!params.tools.length) return modelReply({ text: '{"facts":[]}' });
+    if (requested) return modelReply({ text: "Draft ready for review." });
+    requested = true;
+    return modelReply({ tools: [{ name: "draft_new_email", input: {
+      to: "jeff@example.com", subject: "Pricing", body: "Here is the pricing.", send_immediately: true,
+    } }] });
+  });
+  await say(words);
+  assert(gmailLog.created.length === 1 && gmailLog.sent.length === 0, "Jeff has one reviewable draft");
 }
 
 setCompleteForTests(undefined);

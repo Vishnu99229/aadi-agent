@@ -22,6 +22,7 @@ import {
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 import { sameConversation } from "../subject_logic.js";
+import { emailReferenceForTurn } from "../email_references.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -81,6 +82,10 @@ export function draftUpdateNotice(result: string): string | undefined {
 }
 
 export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
+  const referencedEmail = emailReferenceForTurn(turn?.confirmation?.chatId, turn?.confirmation?.messageId);
+  if (referencedEmail) {
+    return `Not updated: the owner selected ${referencedEmail} from OCR/a quoted message. This is a new recipient reference, not permission to rewrite an older Gmail draft.`;
+  }
   const values = input as {
     draft_id?: unknown;
     body?: unknown;

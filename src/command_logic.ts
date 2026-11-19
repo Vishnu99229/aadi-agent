@@ -27,7 +27,7 @@ const NOT_A_COMMAND: ReadonlyArray<readonly [RegExp, string]> = [
 const DRAFT_WORD = /\b(?:draft|prepare|write|compose)\b/i;
 /** "Draft this, but don't send" / "without sending": the draft is allowed, the send is not. */
 const SEND_IS_FORBIDDEN =
-  /\b(?:don'?t|don’t|do not|never|without)\b[^.?!\n]{0,40}\bsend(?:ing)?\b/i;
+  /\b(?:(?:don'?t|don’t|do not|never|without)\b(?!\s+forget)[^.?!\n]{0,40}\bsend(?:ing)?|stop\s+sending)\b/i;
 
 /**
  * Drop constraints that limit a requested action ("without attendees",
@@ -45,19 +45,17 @@ export function withoutActionConstraints(text: string): string {
     .replace(SEND_IS_FORBIDDEN, " ");
 }
 
-/** Why these words aren't a command to send, or undefined when they may be.
- *  "Draft", "write" and "prepare" stay reviewable unless he also said send. "Reply to X"
- *  is a command to send. "Draft but don't send" is a draft, not a refusal to act. */
 export function notASendCommand(ownWords: string): string | undefined {
-  if (DRAFT_WORD.test(ownWords) && SEND_IS_FORBIDDEN.test(ownWords)) {
-    return "he asked for a draft";
+  const command = splitOwnerEmailCommand(ownWords).command;
+  if (SEND_IS_FORBIDDEN.test(ownWords)) {
+    return DRAFT_WORD.test(ownWords) ? "he asked for a draft" : "he said not to";
   }
   for (const [pattern, reason] of NOT_A_COMMAND) {
-    if (pattern.test(ownWords)) {
+    if (pattern.test(reason === "he said not to" ? ownWords : command)) {
       return reason;
     }
   }
-  if (DRAFT_WORD.test(ownWords) && !/\bsend\b/i.test(ownWords)) {
+  if (DRAFT_WORD.test(command) && !/\bsend\b/i.test(command)) {
     return "he asked for a draft";
   }
   return undefined;
@@ -107,11 +105,42 @@ export function looksLikeCommandTurn(text: string): boolean {
   return COMMAND_TURN.some((pattern) => pattern.test(text));
 }
 
-const CONTENT_STARTS = /\b(?:saying|say|that|telling|tell|about|regarding|asking|ki|to confirm)\b/i;
+const CONTENT_STARTS =
+  /\b(?:saying|say|telling|tell|about|regarding|asking|ki|to confirm|mention(?:ing)?\s+that|that(?!\s+(?:email|mail|draft|message|reply|one|card|it|for|to|now|out)\b))\b/gi;
+
+const DELIVERY_CLAUSE =
+  /\b(?:send|schedule)\s+(?:it|this|that|the\s+(?:email|mail))\s+(?:for|at|on|tomorrow|today|tonight|next|later|in)\b/i;
+
+export function deliveryTimeHold(text: string): string | undefined {
+  if (DELIVERY_CLAUSE.test(text)) {
+    return "Not sent: you mentioned when to send it. Tell me the day and time and I'll schedule it.";
+  }
+}
+
 /** Malayalam puts "saying" after what's said, so any date there may be its content. */
 const CONTENT_ENDS = /\bennu\b/i;
 const SEND_DATE =
   /\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|\b(?:tomorrow|tonight|next week|later today|kal|naale)\b|\bon\s+\d{1,2}(?:st|nd|rd|th)?\b|\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/i;
+
+/** Grants and triggers (including draft/send selection, delivery time, external
+ *  authorization and cancel/discard routing) read the command. Send prohibitions
+ *  and delivery clauses hold across the whole message. A body can veto a send.
+ *  A delivery clause without a valid send_on asks for the time. Only command
+ *  dates can set it. Malayalam `ennu` marks preceding wording and disables
+ *  date extraction for the whole sentence. */
+export function splitOwnerEmailCommand(text: string): { command: string; content: string } {
+  if (CONTENT_ENDS.test(text)) {
+    const at = text.search(CONTENT_ENDS);
+    return { command: text, content: at === -1 ? "" : text.slice(0, at) };
+  }
+  for (const match of text.matchAll(CONTENT_STARTS)) {
+    const command = text.slice(0, match.index);
+    if (command.trim()) {
+      return { command, content: text.slice(match.index) };
+    }
+  }
+  return { command: text, content: "" };
+}
 
 /** He gave a date or time for the send, as opposed to one inside the email: "email
  *  Selvaraj on Monday" against "email Selvaraj saying we're on for Monday". */
@@ -119,8 +148,87 @@ export function mentionsSendDate(ownWords: string): boolean {
   if (CONTENT_ENDS.test(ownWords)) {
     return false;
   }
-  const start = ownWords.search(CONTENT_STARTS);
-  return SEND_DATE.test(start === -1 ? ownWords : ownWords.slice(0, start));
+  return SEND_DATE.test(splitOwnerEmailCommand(ownWords).command);
+}
+
+export type OwnerEmailSendAt = { sendOn: string; sendTime: string } | { refused: string };
+
+function padClock(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function istYmd(now: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+function addCalendarDays(ymd: string, days: number): string {
+  const [year, month, day] = ymd.split("-").map(Number);
+  const next = new Date(Date.UTC(year!, month! - 1, day!));
+  next.setUTCDate(next.getUTCDate() + days);
+  return next.toISOString().slice(0, 10);
+}
+
+/** 12 am → 00:00, 12 pm → 12:00. Hour+meridian that cannot be a clock (0 am,
+ *  17:30 pm) is refused rather than guessed. No am/pm means 24-hour time. */
+function resolveClock(
+  hour: number,
+  minute: number,
+  meridian: string | undefined,
+): { hh: string; mm: string } | undefined {
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+    return undefined;
+  }
+  const marker = meridian?.toLowerCase();
+  if (marker === "am" || marker === "pm") {
+    if (hour < 1 || hour > 12) {
+      return undefined;
+    }
+    let resolved = hour;
+    if (marker === "pm" && hour < 12) {
+      resolved += 12;
+    }
+    if (marker === "am" && hour === 12) {
+      resolved = 0;
+    }
+    return { hh: padClock(resolved), mm: padClock(minute) };
+  }
+  if (hour < 0 || hour > 23) {
+    return undefined;
+  }
+  return { hh: padClock(hour), mm: padClock(minute) };
+}
+
+const CONTRADICTORY_TIME = "Not scheduled: that time doesn't make sense. Ask him for the day and time.";
+
+/** Send-at from the command part only, as YYYY-MM-DD + HH:MM in IST. A date in
+ *  the email wording is ignored. Malayalam `ennu` never yields a send time. */
+export function parseOwnerEmailSendAt(text: string, now = new Date()): OwnerEmailSendAt | undefined {
+  if (CONTENT_ENDS.test(text)) {
+    return undefined;
+  }
+  const command = splitOwnerEmailCommand(text).command;
+  const dated = /\bon\s+(\d{4}-\d{2}-\d{2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(command);
+  if (dated) {
+    const clock = resolveClock(Number(dated[2]), dated[3] ? Number(dated[3]) : 0, dated[4]);
+    if (!clock) {
+      return { refused: CONTRADICTORY_TIME };
+    }
+    return { sendOn: dated[1]!, sendTime: `${clock.hh}:${clock.mm}` };
+  }
+  const tomorrow = /\btomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(command);
+  if (!tomorrow) {
+    return undefined;
+  }
+  const clock = resolveClock(Number(tomorrow[1]), tomorrow[2] ? Number(tomorrow[2]) : 0, tomorrow[3]);
+  if (!clock) {
+    return { refused: CONTRADICTORY_TIME };
+  }
+  return { sendOn: addCalendarDays(istYmd(now), 1), sendTime: `${clock.hh}:${clock.mm}` };
 }
 
 const NOT_A_TARGET = new Set([

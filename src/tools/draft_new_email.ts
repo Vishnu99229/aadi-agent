@@ -11,8 +11,9 @@ import {
 import { parseAddressList } from "../mail_helpers.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor, signaturePlainText } from "../google/mail.js";
-import { notASendCommand } from "../command_logic.js";
+import { deliveryTimeHold, notASendCommand } from "../command_logic.js";
 import { linkPublishedDraft } from "../action_context.js";
+import { emailReferenceForTurn, refersToEarlierEmail } from "../email_references.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 
@@ -74,20 +75,36 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   if (typeof values.to !== "string" || !values.to.trim()) {
     throw new Error("to must be a non-empty email address.");
   }
+  const referencedEmail = emailReferenceForTurn(
+    turn.confirmation?.chatId,
+    turn.confirmation?.messageId,
+  );
+  const selectedTo = referencedEmail && refersToEarlierEmail(values.to)
+    ? referencedEmail
+    : values.to.trim();
+  if (referencedEmail) {
+    const chosen = parseAddressList(selectedTo);
+    if (
+      chosen.length !== 1 || chosen[0]!.email.toLowerCase() !== referencedEmail ||
+      (values.cc !== undefined && !/\bcc\b/i.test(turn.userText ?? ""))
+    ) {
+      return `Not drafted: the referenced photo/message identifies ${referencedEmail}, but the agent chose different recipients. No Gmail draft was created.`;
+    }
+  }
   if (typeof values.subject !== "string" || !values.subject.trim()) {
     throw new Error("subject must be a non-empty string.");
   }
   if (typeof values.body !== "string" || !values.body.trim()) {
     throw new Error("body must be a non-empty plain-text email.");
   }
-  if (parseAddressList(values.to).length === 0) {
+  if (parseAddressList(selectedTo).length === 0) {
     throw new Error(
       "to has no email address. Find the address with search_emails or ask Vishnu.",
     );
   }
 
   const subject = values.subject.trim();
-  let toHeader = dropSelf(values.to.trim());
+  let toHeader = dropSelf(selectedTo);
   let ccHeader = "";
   if (values.cc !== undefined) {
     ccHeader = dropSelf(toAddressList(values.cc).join(", "));
@@ -104,6 +121,10 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("to has no remaining recipient after dropping Vishnu's own addresses.");
   }
 
+  if (values.send_immediately === true) {
+    const hold = deliveryTimeHold(turn.userText ?? "");
+    if (hold) return hold;
+  }
   const account = await getGoogleAccount(
     values.account === "personal" ? "personal" : "work",
   );

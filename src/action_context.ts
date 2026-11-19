@@ -1,4 +1,4 @@
-import { addressIn, nameTokens, notASendCommand } from "./command_logic.js";
+import { addressIn, nameTokens, notASendCommand, splitOwnerEmailCommand } from "./command_logic.js";
 import { namesFuzzyEqual } from "./contact_logic.js";
 import { rememberContactChoice } from "./contacts.js";
 import { retrieveRelevantContext, wantsHistoricalContext } from "./context_lookup.js";
@@ -66,6 +66,8 @@ export interface PendingEmailState {
   draftId?: string;
   /** A recipient change waiting until Vishnu picks one confirmed person. */
   pendingRedirect?: string;
+  /** The recipient was filled in after a failed schedule. The old permission does not carry over. */
+  needsFreshAuthorization?: boolean;
   waiting: "recipient" | "purpose" | "confirm";
 }
 
@@ -749,7 +751,8 @@ function shell(chatId: number, now: Date, existing?: PendingAction): PendingActi
 }
 
 export function messageAuthorizesExternalSend(text: string): boolean {
-  return /\b(?:send|e-?mail|mail|schedule)\b/i.test(text) && !/\b(?:don'?t|do not|never)\s+(?:send|e-?mail|mail|schedule)\b/i.test(text) && !/\bdraft\b/i.test(text);
+  const command = splitOwnerEmailCommand(text).command;
+  return /\b(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\b(?:don'?t|do not|never)\s+(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\bdraft\b/i.test(command);
 }
 
 function looksLikeEmailContext(text: string): boolean {
@@ -810,21 +813,22 @@ function namesAnotherEmail(text: string, email: PendingEmailState): boolean {
   return !asked.some((token) => known.has(token));
 }
 
-function correctionOfEmail(text: string, email: PendingEmailState | undefined): boolean {
+function correctionOfEmail(ownWords: string, email: PendingEmailState | undefined): boolean {
   if (!email) {
     return false;
   }
-  if (namesAnotherEmail(text, email)) {
+  const text = splitOwnerEmailCommand(ownWords).command;
+  if (namesAnotherEmail(ownWords, email)) {
     return false;
   }
-  if (/\b(?:don'?t send|do not send|never send)\b/i.test(text)) {
+  if (/\b(?:don'?t send|do not send|never send|stop sending)\b/i.test(text)) {
     return true;
   }
-  if (/\bcancel\b/i.test(text)) {
+  if (/\b(?:cancel|stop)\b/i.test(text)) {
     if (/\b(?:meeting|reminder|task|bill|event)\b/i.test(text)) {
       return false;
     }
-    return /\b(?:email|e-mail|mail|draft|it|that)\b/i.test(text);
+    return /\b(?:email|e-mail|mail|draft|it|that|sending)\b/i.test(text);
   }
   if (/^(?:not|no)\b/i.test(text.trim()) && /\b(?:context|explain|tell you)\b/i.test(text)) {
     return true;
@@ -1400,8 +1404,20 @@ export function holdEmailToolTurn(
   ) {
     return "Not sent: that email was cancelled. Nothing from it will go out. Say send when you want a new one.";
   }
+  if (pending?.status === "open" && pending.email?.needsFreshAuthorization) {
+    const command = splitOwnerEmailCommand(ownWords).command;
+    const confirms =
+      messageAuthorizesExternalSend(ownWords) &&
+      /\b(?:send|schedule)\b/i.test(command) &&
+      notASendCommand(ownWords) === undefined;
+    if (!confirms) {
+      return "Not sent: the recipient is saved, but this message does not schedule or send it. Say schedule it to confirm. Nothing went out.";
+    }
+    return undefined;
+  }
   if (pending?.status === "open" && pending.email && !messageAuthorizesExternalSend(ownWords)) {
-    if (notASendCommand(ownWords) === undefined && /\b(?:send|e-?mail|mail|reply|schedule)\b/i.test(ownWords)) {
+    const command = splitOwnerEmailCommand(ownWords).command;
+    if (notASendCommand(ownWords) === undefined && /\b(?:send|e-?mail|mail|reply|schedule)\b/i.test(command)) {
       return undefined;
     }
     const stillAuthorized =

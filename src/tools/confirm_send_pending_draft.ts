@@ -1,3 +1,4 @@
+import { deliveryTimeHold, notASendCommand } from "../command_logic.js";
 import type { LlmTool } from "../llm.js";
 import {
   eligibleDrafts,
@@ -44,6 +45,11 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   if (isAmbiguousSendAck(turn.userText)) {
     return 'Not sent: that reply is ambiguous. Say "send it" if you want it sent, or tell me what to change.';
   }
+  const words = turn.userText ?? "";
+  const stop = notASendCommand(words);
+  if (stop) return `Not sent: ${stop}. Confirm if you want this draft sent.`;
+  const hold = deliveryTimeHold(words);
+  if (hold) return hold;
   const draftId =
     typeof input === "object" &&
     input !== null &&

@@ -3,12 +3,14 @@ import type { gmail_v1 } from "googleapis";
 import {
   addressIn,
   asksForAttachment,
+  deliveryTimeHold,
   isAutomatedAddress,
   mentionsSendDate,
   nameTokens,
   namedInOwnWords,
   notAnEventCommand,
   notASendCommand,
+  splitOwnerEmailCommand,
 } from "./command_logic.js";
 import {
   authorizationWords,
@@ -24,6 +26,7 @@ import {
 } from "./action_context.js";
 import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
+import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
@@ -59,6 +62,7 @@ import {
 import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
+import { sendPendingDraftByText } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -746,6 +750,7 @@ function recipientSlots(
   now: Date,
   refusal: string,
   chatId?: number,
+  messageId?: number,
 ): RecipientSlot[] | string {
   const open = listOpenCommandChoices(new Date(now.getTime() - CHOICE_TTL_MS).toISOString());
   const offeredIn = (address: string) =>
@@ -757,9 +762,14 @@ function recipientSlots(
     });
   const answered = new Set<number>();
   const prior = pendingResolvedEmails(chatId, now);
+  const referenced = emailReferenceForTurn(chatId, messageId, now.getTime());
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
     const address = addressIn(query);
+    if (address && referenced && address === referenced) {
+      slots.push({ query, mailbox: { email: address, name: "" } });
+      continue;
+    }
     const offers = address ? offeredIn(address) : [];
     const remembered = prior.get(query.trim().toLowerCase()) ?? (address ? prior.get(address) : undefined);
     const supplied = matchOwnerSupplied(chatId, query, now);
@@ -805,7 +815,10 @@ function parseSendAt(
   const date = sendOn.trim();
   const time = typeof sendTime === "string" && sendTime.trim() ? sendTime.trim() : DEFAULT_SEND_TIME;
   const at = new Date(`${date}T${time.padStart(5, "0")}:00+05:30`);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(time) || Number.isNaN(at.getTime())) {
+  // Date normalizes impossible dates and 24:00. Require the same IST minute back.
+  const local = new Date(at.getTime() + 330 * 60_000);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(time) ||
+      Number.isNaN(at.getTime()) || local.toISOString().slice(0, 16) !== `${date}T${time.padStart(5, "0")}`) {
     return { refused: "Not scheduled: send_on must be YYYY-MM-DD and send_time HH:MM in IST." };
   }
   if (at.getTime() <= now.getTime()) {
@@ -831,6 +844,7 @@ export async function sendEmailFromTool(
     return "Not sent: only Vishnu's own message can send an email.";
   }
   const ownWords = turn.userText?.trim() ?? "";
+  const command = splitOwnerEmailCommand(ownWords).command;
   const held = holdEmailToolTurn(confirmation.chatId, ownWords, now);
   if (held) {
     return held;
@@ -854,16 +868,54 @@ export async function sendEmailFromTool(
   if (values.attachment_requested === true || asksForAttachment(ownWords)) {
     return "Not sent: he asked for a file and I can't attach one here, so nothing went out. Ask him whether to send it without the file or draft it so he can add it.";
   }
-  const when = parseSendAt(values.send_on, values.send_time, now);
+  const pendingEmail = getPendingAction(confirmation.chatId, now)?.email;
+  let when = parseSendAt(values.send_on, values.send_time, now);
+  const deliveryHold = deliveryTimeHold(ownWords);
+  if (deliveryHold && typeof when !== "string") {
+    return deliveryHold;
+  }
   if (typeof when === "object") {
     return when.refused;
+  }
+  if (
+    pendingEmail?.needsFreshAuthorization &&
+    pendingEmail.sendAt &&
+    !(/\bsend\b/i.test(command) && /\bnow\b/i.test(command))
+  ) {
+    when = when ?? pendingEmail.sendAt;
   }
   if (when === undefined && mentionsSendDate(ownWords)) {
     return "Not sent: he gave a date or time, so nothing went out. Call send_email again with send_on, and send_time if he gave one.";
   }
-  const toQueries = stringList(values.to);
+  if (when === undefined && /\bschedule\b/i.test(command) && !/\bsend\s+(?:it\s+)?now\b/i.test(command)) {
+    return "Not sent: he asked to schedule it, so nothing went out immediately. Ask him for the day and time.";
+  }
+  const referencedEmail = emailReferenceForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
+  if (
+    when === undefined &&
+    confirmsExistingDraft(ownWords) &&
+    !referencedEmail &&
+    pendingEmail?.draftId &&
+    pendingEmail.scheduledSendId
+  ) {
+    const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId);
+    return delivered.message;
+  }
+  let toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
   const instruction = typeof values.instruction === "string" ? values.instruction.trim() : "";
+  if (referencedEmail) {
+    // The owner's reference picked this one address. A model cannot substitute
+    // a stale Gmail recipient or tack on people from an unrelated thread.
+    const refersToSelected = toQueries.length === 1 &&
+      (toQueries[0]!.toLowerCase() === referencedEmail ||
+       refersToEarlierEmail(toQueries[0]!) ||
+       /^(?:it|him|her|them|this|that|the contact)$/i.test(toQueries[0]!.trim()));
+    if (!refersToSelected || ccQueries.length > 0 && !/\bcc\b/i.test(ownWords)) {
+      return `Not ${when ? "scheduled" : "sent"}: the referenced photo/message identifies ${referencedEmail}, not the recipient the agent selected. Nothing went out.`;
+    }
+    toQueries = [referencedEmail];
+  }
   if (toQueries.length === 0) {
     return "Not sent: he didn't name anyone. Ask him who it's for.";
   }
@@ -876,8 +928,31 @@ export async function sendEmailFromTool(
     now,
     when ? "Not scheduled" : "Not sent",
     confirmation.chatId,
+    confirmation.messageId,
   );
   if (typeof slots === "string") {
+    // A missing address must not discard the owner's original scheduled
+    // instruction and time. A follow-up can identify the person without
+    // having to repeat all the wording. This stores no permission beyond the
+    // existing short send-authorization window, and does not schedule yet.
+    if (when && /\b(?:send|schedule)\b/i.test(command)) {
+      const unresolved = (query: string): ResolvedAttendee => ({
+        query, name: query, email: "", resolved: false,
+      });
+      savePendingAction(confirmation.chatId, {
+        action: "send_email", status: "open",
+        ownerWords: ownWords, authorizedAt: now.toISOString(),
+        confirmChat: confirmation.chatId, confirmMessage: confirmation.messageId,
+        updatedAt: now.toISOString(),
+        email: {
+          to: toQueries.map(unresolved), cc: ccQueries.map(unresolved),
+          notes: [instruction], purpose: instruction, subject: typeof values.subject === "string" ? values.subject : undefined,
+          sendAt: when, account: values.account === "personal" ? "personal" : "work",
+          waiting: "recipient",
+        },
+      }, now);
+      return `${slots} I kept the email wording and scheduled time. Identify the recipient, then explicitly confirm scheduling.`;
+    }
     return slots;
   }
   const request: CommandRequest = {
