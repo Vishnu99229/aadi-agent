@@ -1,4 +1,4 @@
-import { addressIn, nameTokens, notASendCommand } from "./command_logic.js";
+import { addressIn, nameTokens, notASendCommand, splitOwnerEmailCommand } from "./command_logic.js";
 import { namesFuzzyEqual } from "./contact_logic.js";
 import { rememberContactChoice } from "./contacts.js";
 import { retrieveRelevantContext, wantsHistoricalContext } from "./context_lookup.js";
@@ -751,7 +751,8 @@ function shell(chatId: number, now: Date, existing?: PendingAction): PendingActi
 }
 
 export function messageAuthorizesExternalSend(text: string): boolean {
-  return /\b(?:send|e-?mail|mail|schedule)\b/i.test(text) && !/\b(?:don'?t|do not|never)\s+(?:send|e-?mail|mail|schedule)\b/i.test(text) && !/\bdraft\b/i.test(text);
+  const command = splitOwnerEmailCommand(text).command;
+  return /\b(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\b(?:don'?t|do not|never)\s+(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\bdraft\b/i.test(command);
 }
 
 function looksLikeEmailContext(text: string): boolean {
@@ -1403,9 +1404,10 @@ export function holdEmailToolTurn(
     return "Not sent: that email was cancelled. Nothing from it will go out. Say send when you want a new one.";
   }
   if (pending?.status === "open" && pending.email?.needsFreshAuthorization) {
+    const command = splitOwnerEmailCommand(ownWords).command;
     const confirms =
       messageAuthorizesExternalSend(ownWords) &&
-      /\b(?:send|schedule)\b/i.test(ownWords) &&
+      /\b(?:send|schedule)\b/i.test(command) &&
       notASendCommand(ownWords) === undefined;
     if (!confirms) {
       return "Not sent: the recipient is saved, but this message does not schedule or send it. Say schedule it to confirm. Nothing went out.";
@@ -1413,7 +1415,8 @@ export function holdEmailToolTurn(
     return undefined;
   }
   if (pending?.status === "open" && pending.email && !messageAuthorizesExternalSend(ownWords)) {
-    if (notASendCommand(ownWords) === undefined && /\b(?:send|e-?mail|mail|reply|schedule)\b/i.test(ownWords)) {
+    const command = splitOwnerEmailCommand(ownWords).command;
+    if (notASendCommand(ownWords) === undefined && /\b(?:send|e-?mail|mail|reply|schedule)\b/i.test(command)) {
       return undefined;
     }
     const stillAuthorized =

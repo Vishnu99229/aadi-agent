@@ -170,6 +170,12 @@ assert(commandIntents("Delete the task about the Talkdesk call").join(",") === "
 assert(commandIntents("remind me to book a meeting with Jeff").join(",") === "reminder", "remind me to book is a reminder, not a booking");
 assert(commandIntents("Remind me to follow up with Jeff").join(",") === "sequence", "remind me to follow up with X is the sequence card, not a reminder");
 assert(commandIntents("draft and send an email to Jeff saying Monday works").join(",") === "send", "draft and send is a send");
+assert(commandIntents("Draft an email to Jeff saying please send me the deck").join(",") === "draft", "send in the body is not a send command");
+assert(commandIntents("Write an email to Jeff saying please send the invoice").join(",") === "draft", "write stays a draft when send is only in the body");
+assert(commandIntents("Draft an email to Jeff saying we had to cancel the order").join(",") === "draft", "cancel in the body is not a cancel");
+assert(commandIntents("Email Munil about the pricing call").join(",") === "send", "email X about stays a send");
+assert(commandIntents("Reply to Dorothy saying thanks, we'll share the deck tomorrow").join(",") === "send", "tomorrow in the body is not a schedule");
+assert(commandIntents("Send Jeff an email saying the proposal is ready").join(",") === "send", "send ... saying stays a send");
 
 // ---- who a sequence request names ----
 assert(JSON.stringify(sequenceTargets("Start a sequence for Dorothy Copeland.")) === '["Dorothy Copeland"]', "a name");

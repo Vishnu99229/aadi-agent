@@ -31,7 +31,7 @@ import { handler as draftNewEmailTool } from "./tools/draft_new_email.js";
 import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.js";
 import { stageExternalContext } from "./context_lookup.js";
 import { bookPendingMeetingAt, handleCommandSendCallback, sendEmailFromTool } from "./command_email.js";
-import { looksLikeCommandTurn } from "./command_logic.js";
+import { looksLikeCommandTurn, parseOwnerEmailSendAt, splitOwnerEmailCommand } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
 import { FORWARDED_TOOLS } from "./tools/index.js";
 import { handleSequenceCallback, handleSequenceCommand } from "./sequences.js";
@@ -1397,20 +1397,14 @@ async function handleUserText(
           return;
         }
         const carried = continuing ? existing.email : undefined;
-        const tomorrowAt = /\btomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(userText);
+        const parsedWhen = parseOwnerEmailSendAt(userText);
+        if (parsedWhen && "refused" in parsedWhen) {
+          await ctx.reply(parsedWhen.refused);
+          return;
+        }
         let phraseSendAt = carried?.sendAt;
-        if (!phraseSendAt && tomorrowAt && intent === "schedule") {
-          const hour = Number(tomorrowAt[1]);
-          const minute = tomorrowAt[2] ?? "00";
-          const marker = tomorrowAt[3]?.toLowerCase();
-          let resolved = hour;
-          if (marker === "pm" && hour < 12) resolved += 12;
-          if (marker === "am" && hour === 12) resolved = 0;
-          const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
-          const [year, month, day] = today.split("-").map(Number);
-          const next = new Date(Date.UTC(year!, month! - 1, day!));
-          next.setUTCDate(next.getUTCDate() + 1);
-          phraseSendAt = `${next.toISOString().slice(0, 10)}T${String(resolved).padStart(2, "0")}:${minute}:00+05:30`;
+        if (!phraseSendAt && parsedWhen && intent !== "draft") {
+          phraseSendAt = `${parsedWhen.sendOn}T${parsedWhen.sendTime}:00+05:30`;
         }
         savePendingAction(ctx.chat.id, {
           action: intent === "draft" ? "draft_email" : "send_email",
@@ -1477,23 +1471,10 @@ async function handleUserText(
         await ctx.reply(created);
         return;
       }
-      const dated = /\bon\s+(\d{4}-\d{2}-\d{2})\s+at\s+(\d{1,2}:\d{2})\b/i.exec(userText);
-      const tomorrow = /\btomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(userText);
-      let sendOn = dated?.[1];
-      let sendTime = dated?.[2];
-      if (!sendOn && tomorrow && intent === "schedule") {
-        const hour = Number(tomorrow[1]);
-        const minute = tomorrow[2] ?? "00";
-        const marker = tomorrow[3]?.toLowerCase();
-        let resolved = hour;
-        if (marker === "pm" && hour < 12) resolved += 12;
-        if (marker === "am" && hour === 12) resolved = 0;
-        const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
-        const [year, month, day] = today.split("-").map(Number);
-        const next = new Date(Date.UTC(year!, month! - 1, day!));
-        next.setUTCDate(next.getUTCDate() + 1);
-        sendOn = next.toISOString().slice(0, 10);
-        sendTime = `${String(resolved).padStart(2, "0")}:${minute}`;
+      const parsedWhen = parseOwnerEmailSendAt(userText);
+      if (parsedWhen && "refused" in parsedWhen) {
+        await ctx.reply(parsedWhen.refused);
+        return;
       }
       const result = await sendEmailFromTool(
         {
@@ -1501,7 +1482,7 @@ async function handleUserText(
           cc: copies,
           instruction: request.instruction,
           account,
-          ...(sendOn && sendTime ? { send_on: sendOn, send_time: sendTime } : {}),
+          ...(parsedWhen ? { send_on: parsedWhen.sendOn, send_time: parsedWhen.sendTime } : {}),
         },
         { confirmation, userText },
       );
@@ -1605,10 +1586,16 @@ async function handleUserText(
       ctx.message.message_id,
     );
     const referenceIntent = classifyOwnerEmailIntent(userText, isDraftApprovalText(ctx.message.reply_to_message?.text ?? ctx.message.reply_to_message?.caption));
-    if (emailReference.kind === "one" && referenceIntent !== "confirm_draft" && referenceIntent !== "cancel" && /\b(?:draft|write|compose|send|schedule)\b/i.test(userText)) {
+    const referenceCommand = splitOwnerEmailCommand(userText).command;
+    if (emailReference.kind === "one" && referenceIntent !== "confirm_draft" && referenceIntent !== "cancel" && /\b(?:draft|write|compose|send|schedule)\b/i.test(referenceCommand)) {
       // Bind the new request to this selected address, not the last draft/card.
       const sending = messageAuthorizesExternalSend(userText) &&
-        (/\b(?:send|schedule)\b/i.test(userText) || !/\b(?:draft|write|compose|prepare)\b/i.test(userText));
+        (/\b(?:send|schedule)\b/i.test(referenceCommand) || !/\b(?:draft|write|compose|prepare)\b/i.test(referenceCommand));
+      const parsedWhen = parseOwnerEmailSendAt(userText);
+      if (parsedWhen && "refused" in parsedWhen) {
+        await ctx.reply(parsedWhen.refused);
+        return;
+      }
       savePendingAction(ctx.chat.id, {
         action: sending ? "send_email" : "draft_email",
         status: "open",
@@ -1624,6 +1611,9 @@ async function handleUserText(
           purpose: userText,
           account: /\bpersonal\b/i.test(userText) ? "personal" : "work",
           waiting: "confirm",
+          ...(parsedWhen && sending
+            ? { sendAt: `${parsedWhen.sendOn}T${parsedWhen.sendTime}:00+05:30` }
+            : {}),
         },
       });
     }

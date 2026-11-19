@@ -47,17 +47,19 @@ export function withoutActionConstraints(text: string): string {
 
 /** Why these words aren't a command to send, or undefined when they may be.
  *  "Draft", "write" and "prepare" stay reviewable unless he also said send. "Reply to X"
- *  is a command to send. "Draft but don't send" is a draft, not a refusal to act. */
+ *  is a command to send. "Draft but don't send" is a draft, not a refusal to act.
+ *  Only the command part counts: "send" or "don't send" in the email body does not. */
 export function notASendCommand(ownWords: string): string | undefined {
-  if (DRAFT_WORD.test(ownWords) && SEND_IS_FORBIDDEN.test(ownWords)) {
+  const command = splitOwnerEmailCommand(ownWords).command;
+  if (DRAFT_WORD.test(command) && SEND_IS_FORBIDDEN.test(command)) {
     return "he asked for a draft";
   }
   for (const [pattern, reason] of NOT_A_COMMAND) {
-    if (pattern.test(ownWords)) {
+    if (pattern.test(command)) {
       return reason;
     }
   }
-  if (DRAFT_WORD.test(ownWords) && !/\bsend\b/i.test(ownWords)) {
+  if (DRAFT_WORD.test(command) && !/\bsend\b/i.test(command)) {
     return "he asked for a draft";
   }
   return undefined;
@@ -107,11 +109,30 @@ export function looksLikeCommandTurn(text: string): boolean {
   return COMMAND_TURN.some((pattern) => pattern.test(text));
 }
 
-const CONTENT_STARTS = /\b(?:saying|say|that|telling|tell|about|regarding|asking|ki|to confirm)\b/i;
+/** Markers that start the email's wording. Bare "that" is not one: it would cut
+ *  "send that email" and "schedule that for tomorrow". "that" counts only after
+ *  say/saying/tell/telling/mention. */
+const CONTENT_STARTS =
+  /\b(?:saying|say|telling|tell|about|regarding|asking|ki|to confirm|(?:(?:say(?:ing)?|tell(?:ing)?|mention(?:ing)?)\s+that))\b/i;
 /** Malayalam puts "saying" after what's said, so any date there may be its content. */
 const CONTENT_ENDS = /\bennu\b/i;
 const SEND_DATE =
   /\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|\b(?:tomorrow|tonight|next week|later today|kal|naale)\b|\bon\s+\d{1,2}(?:st|nd|rd|th)?\b|\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/i;
+
+/** The owner's instruction versus what the email should say. Malayalam `ennu`
+ *  means the wording came first, so the command stays the whole sentence and a
+ *  date in it is never the send time. */
+export function splitOwnerEmailCommand(text: string): { command: string; content: string } {
+  if (CONTENT_ENDS.test(text)) {
+    const at = text.search(CONTENT_ENDS);
+    return { command: text, content: at === -1 ? "" : text.slice(0, at) };
+  }
+  const start = text.search(CONTENT_STARTS);
+  if (start === -1) {
+    return { command: text, content: "" };
+  }
+  return { command: text.slice(0, start), content: text.slice(start) };
+}
 
 /** He gave a date or time for the send, as opposed to one inside the email: "email
  *  Selvaraj on Monday" against "email Selvaraj saying we're on for Monday". */
@@ -119,8 +140,87 @@ export function mentionsSendDate(ownWords: string): boolean {
   if (CONTENT_ENDS.test(ownWords)) {
     return false;
   }
-  const start = ownWords.search(CONTENT_STARTS);
-  return SEND_DATE.test(start === -1 ? ownWords : ownWords.slice(0, start));
+  return SEND_DATE.test(splitOwnerEmailCommand(ownWords).command);
+}
+
+export type OwnerEmailSendAt = { sendOn: string; sendTime: string } | { refused: string };
+
+function padClock(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function istYmd(now: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+function addCalendarDays(ymd: string, days: number): string {
+  const [year, month, day] = ymd.split("-").map(Number);
+  const next = new Date(Date.UTC(year!, month! - 1, day!));
+  next.setUTCDate(next.getUTCDate() + days);
+  return next.toISOString().slice(0, 10);
+}
+
+/** 12 am → 00:00, 12 pm → 12:00. Hour+meridian that cannot be a clock (0 am,
+ *  17:30 pm) is refused rather than guessed. No am/pm means 24-hour time. */
+function resolveClock(
+  hour: number,
+  minute: number,
+  meridian: string | undefined,
+): { hh: string; mm: string } | undefined {
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+    return undefined;
+  }
+  const marker = meridian?.toLowerCase();
+  if (marker === "am" || marker === "pm") {
+    if (hour < 1 || hour > 12) {
+      return undefined;
+    }
+    let resolved = hour;
+    if (marker === "pm" && hour < 12) {
+      resolved += 12;
+    }
+    if (marker === "am" && hour === 12) {
+      resolved = 0;
+    }
+    return { hh: padClock(resolved), mm: padClock(minute) };
+  }
+  if (hour < 0 || hour > 23) {
+    return undefined;
+  }
+  return { hh: padClock(hour), mm: padClock(minute) };
+}
+
+const CONTRADICTORY_TIME = "Not scheduled: that time doesn't make sense. Ask him for the day and time.";
+
+/** Send-at from the command part only, as YYYY-MM-DD + HH:MM in IST. A date in
+ *  the email wording is ignored. Malayalam `ennu` never yields a send time. */
+export function parseOwnerEmailSendAt(text: string, now = new Date()): OwnerEmailSendAt | undefined {
+  if (CONTENT_ENDS.test(text)) {
+    return undefined;
+  }
+  const command = splitOwnerEmailCommand(text).command;
+  const dated = /\bon\s+(\d{4}-\d{2}-\d{2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(command);
+  if (dated) {
+    const clock = resolveClock(Number(dated[2]), dated[3] ? Number(dated[3]) : 0, dated[4]);
+    if (!clock) {
+      return { refused: CONTRADICTORY_TIME };
+    }
+    return { sendOn: dated[1]!, sendTime: `${clock.hh}:${clock.mm}` };
+  }
+  const tomorrow = /\btomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(command);
+  if (!tomorrow) {
+    return undefined;
+  }
+  const clock = resolveClock(Number(tomorrow[1]), tomorrow[2] ? Number(tomorrow[2]) : 0, tomorrow[3]);
+  if (!clock) {
+    return { refused: CONTRADICTORY_TIME };
+  }
+  return { sendOn: addCalendarDays(istYmd(now), 1), sendTime: `${clock.hh}:${clock.mm}` };
 }
 
 const NOT_A_TARGET = new Set([

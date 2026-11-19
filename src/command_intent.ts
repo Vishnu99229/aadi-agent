@@ -1,4 +1,4 @@
-import { notAnEventCommand, notASendCommand, withoutActionConstraints } from "./command_logic.js";
+import { notAnEventCommand, notASendCommand, splitOwnerEmailCommand, withoutActionConstraints } from "./command_logic.js";
 import { isExplicitSequenceRequest } from "./sequence_logic.js";
 
 /** Commands where a reply must come from a tool that ran this turn, never from
@@ -407,10 +407,11 @@ export function commandIntents(ownWords: string): CommandKind[] {
   if (plain && REMOVE_SALES_FACT.test(text)) {
     found.add("sales_fact_remove");
   }
-  if ((SEND_SOMETHING.test(text) || REPLY_TO.test(text) || EMAIL_SOMEONE.test(text)) && !notASendCommand(text)) {
+  const emailCommand = splitOwnerEmailCommand(text).command;
+  if ((SEND_SOMETHING.test(emailCommand) || REPLY_TO.test(emailCommand) || EMAIL_SOMEONE.test(emailCommand)) && !notASendCommand(text)) {
     found.add("send");
   }
-  if (plain && any(DRAFT) && !found.has("send")) {
+  if (plain && DRAFT.some((pattern) => pattern.test(emailCommand)) && !found.has("send")) {
     found.add("draft");
   }
   if (plain && DISCARD_DRAFT.test(text)) {

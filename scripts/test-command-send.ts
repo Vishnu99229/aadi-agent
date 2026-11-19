@@ -1197,6 +1197,9 @@ assert(!mentionsSendDate("send Selvaraj an email saying we're on for Monday"), "
 assert(!mentionsSendDate("email Selvaraj about the Tuesday kickoff"), "nor here");
 assert(!mentionsSendDate("Selvaraj-nu oru mail ayakku, Tuesday confirm aanu ennu parayu"), "nor before Malayalam's ennu");
 assert(!mentionsSendDate("Selvaraj ko mail bhej do ki Tuesday confirm hai"), "nor after Hindi's ki");
+assert(mentionsSendDate("schedule that for tomorrow at 5 pm"), "that after schedule is not a content marker");
+assert(!mentionsSendDate("tell him that the call moved to 5 pm"), "that after tell is the email wording");
+assert(!mentionsSendDate("send that email to Jeff"), "send that email has no send date");
 {
   const name = person("Kiran");
   const count = sends.length;

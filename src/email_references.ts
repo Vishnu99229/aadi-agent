@@ -3,7 +3,7 @@ import {
   getDocument,
   latestTelegramDocumentRef,
 } from "./db.js";
-import { addressIn } from "./command_logic.js";
+import { addressIn, splitOwnerEmailCommand } from "./command_logic.js";
 
 /** Only a recent, explicitly referenced source can select an email recipient.
  * The OCR text itself is data, never a command or send authorization. */
@@ -67,19 +67,23 @@ export function isDraftApprovalText(text: string | undefined): boolean {
   return /draft waiting for approval|draft approval|waiting for your send tap/i.test(text ?? "");
 }
 
-/** "Don't send", "cancel it", "stop sending". A meeting or task cancel is not an email cancel. */
+/** "Don't send", "cancel it", "stop sending". A meeting or task cancel is not an email cancel.
+ *  Only the command part counts, so "saying we had to cancel the order" is not a cancel. */
 export function isNegativeSendCommand(text: string): boolean {
-  if (/\b(?:meeting|calendar|reminder|task|bill|event)\b/i.test(text) && !/\b(?:don'?t|do not|never)\s+send\b|\bstop\s+sending\b/i.test(text)) {
+  const command = splitOwnerEmailCommand(text).command;
+  if (/\b(?:meeting|calendar|reminder|task|bill|event)\b/i.test(command) && !/\b(?:don'?t|do not|never)\s+send\b|\bstop\s+sending\b/i.test(command)) {
     return false;
   }
-  return /\b(?:don'?t|do not|never)\s+send\b|\bstop\s+sending\b|\b(?:cancel|discard|unschedule)\b|\bstop\s+(?:it|that|this|the email|sending)\b/i.test(text);
+  return /\b(?:don'?t|do not|never)\s+send\b|\bstop\s+sending\b|\b(?:cancel|discard|unschedule)\b|\bstop\s+(?:it|that|this|the email|sending)\b/i.test(command);
 }
 
 export type OwnerEmailIntent = "cancel" | "resolve" | "draft" | "schedule" | "send" | "confirm_draft" | "none";
 
-/** What this message asks for. OCR text is never consulted; only the owner's words. */
+/** What this message asks for. OCR text is never consulted; only the owner's words.
+ *  Intent words in the email body ("please send me the proposal") do not count. */
 export function classifyOwnerEmailIntent(text: string, replyingToApproval = false): OwnerEmailIntent {
   const clean = text.trim();
+  const command = splitOwnerEmailCommand(clean).command;
   if (isNegativeSendCommand(clean)) {
     return "cancel";
   }
@@ -87,22 +91,19 @@ export function classifyOwnerEmailIntent(text: string, replyingToApproval = fals
     return "confirm_draft";
   }
   if (
-    /\b(?:refer|extract|read|show)\b/i.test(clean) &&
-    /\b(?:address|e-?mail|photo|image|ocr)\b/i.test(clean) &&
-    !/\b(?:send|draft|schedule|compose|write)\b/i.test(clean)
+    /\b(?:refer|extract|read|show)\b/i.test(command) &&
+    /\b(?:address|e-?mail|photo|image|ocr)\b/i.test(command) &&
+    !/\b(?:send|draft|schedule|compose|write)\b/i.test(command)
   ) {
     return "resolve";
   }
-  if (/\b(?:draft|compose|prepare)\b/i.test(clean) && !/\bsend\b/i.test(clean)) {
+  if (/\b(?:draft|write|compose|prepare)\b/i.test(command) && !/\bsend\b/i.test(command)) {
     return "draft";
   }
-  if (/\bwrite\b/i.test(clean) && /\b(?:e-?mail|mail)\b/i.test(clean) && !/\bsend\b/i.test(clean)) {
-    return "draft";
-  }
-  if (/\bschedule\b/i.test(clean) && !/\bsend\s+(?:it\s+)?now\b/i.test(clean)) {
+  if (/\bschedule\b/i.test(command) && !/\bsend\s+(?:it\s+)?now\b/i.test(command)) {
     return "schedule";
   }
-  if (/\bsend\b/i.test(clean)) {
+  if (/\bsend\b/i.test(command)) {
     return "send";
   }
   return "none";
@@ -123,7 +124,8 @@ export function refersToEarlierEmail(text: string, replying = false): boolean {
     /\b(?:previous|earlier|last|prior)\s+(?:message|photo|card|image|ocr)\b/i.test(text) ||
     /\b(?:this|that)\s+(?:message|photo|card|image|ocr)\b/i.test(text) ||
     /\b(?:use|refer(?:ring)?(?:\s+to)?)\s+(?:this|that|the)\s+(?:e-?mail|email|address|contact)\b/i.test(text) ||
-    /\b(?:e-?mail|address|recipient|contact)\b.{0,40}\b(?:in|from|on)\s+(?:the\s+)?(?:this|that)\b(?:\s+(?:message|photo|card|image|ocr|text))?(?:\s*[.!?])?$/i.test(text);
+    /\b(?:e-?mail|address|recipient|contact)\b.{0,40}\b(?:in|from|on)\s+(?:the\s+)?(?:this|that)\b(?:\s+(?:message|photo|card|image|ocr|text))?(?:\s*[.!?])?$/i.test(text) ||
+    /\b(?:in|from)\s+(?:the\s+)?(?:photo|image|ocr)\b/i.test(text);
   // Replying "send it" is a draft confirmation, not a request to mine a new address.
   const repliedAboutAddress = replying && hasEmailTopic && /\b(?:this|that|it|above)\b/i.test(text) && pointsBack;
   return (hasEmailTopic && pointsBack) || repliedAboutAddress;

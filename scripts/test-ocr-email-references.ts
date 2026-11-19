@@ -4,10 +4,18 @@ import assert from "node:assert/strict";
 import { bot } from "../src/bot.ts";
 import {
   bindEmailReferenceForTurn,
+  classifyOwnerEmailIntent,
   emailReferenceForTurn,
+  isNegativeSendCommand,
   refersToEarlierEmail,
   resolveEmailReference,
 } from "../src/email_references.ts";
+import {
+  notASendCommand,
+  parseOwnerEmailSendAt,
+  splitOwnerEmailCommand,
+} from "../src/command_logic.ts";
+import { commandIntents } from "../src/command_intent.ts";
 import {
   createDocument,
   db,
@@ -17,6 +25,7 @@ import {
   getPendingActionContext,
   getScheduledSend,
   createScheduledSend,
+  listOpenScheduledSends,
   rememberTelegramDocumentRef,
 } from "../src/db.ts";
 import { queueDraftApproval } from "../src/approvals.ts";
@@ -168,6 +177,7 @@ assert.equal(refersToEarlierEmail("Cancel the scheduled email above"), false);
 assert.equal(refersToEarlierEmail("Don't send the email above"), false);
 assert.equal(refersToEarlierEmail("send it", true), false);
 assert.equal(refersToEarlierEmail("Get the email from the above photo"), true);
+assert.equal(refersToEarlierEmail("Draft an email to the address in the photo saying please send me the proposal"), true);
 assert.deepEqual(
   resolveEmailReference({
     chatId: 1,
@@ -523,6 +533,223 @@ const again = await sendEmailFromTool(
 );
 assert.match(again, /already|nothing was sent|no draft is waiting/i);
 assert.equal(draftSends + messageSends, beforeOnce + 1);
+
+function tomorrowIso(hhmm: string): string {
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+  const [year, month, day] = today.split("-").map(Number);
+  const next = new Date(Date.UTC(year!, month! - 1, day!));
+  next.setUTCDate(next.getUTCDate() + 1);
+  return new Date(`${next.toISOString().slice(0, 10)}T${hhmm}:00+05:30`).toISOString();
+}
+
+function latestSchedule(chatId: number) {
+  return listOpenScheduledSends()
+    .filter((row) => row.confirm_chat === chatId)
+    .sort((a, b) => a.id - b.id)
+    .at(-1);
+}
+
+async function ocrSay(chatId: number, text: string): Promise<void> {
+  rememberTelegramDocumentRef(chatId, 102, msops.id);
+  await say(text, { message_id: 102, text: "OCR: info@msopsai.com" }, chatId);
+}
+
+{
+  const photo = "Draft an email to the address in the photo saying please send me the proposal";
+  const invoice = "Write an email to the address above saying please send the invoice";
+  const cancelBody = "Draft an email to the address above saying we had to cancel the order";
+  const jeffDraft = "Draft an email to Jeff saying please send me the deck";
+  assert.equal(splitOwnerEmailCommand("send that email to Jeff").content, "");
+  assert.equal(splitOwnerEmailCommand("schedule that for tomorrow at 5 pm").content, "");
+  assert.match(splitOwnerEmailCommand("tell him that the call moved to 5 pm").content, /^tell him that/i);
+  assert.equal(classifyOwnerEmailIntent(photo), "draft");
+  assert.equal(notASendCommand(photo), "he asked for a draft");
+  assert.equal(classifyOwnerEmailIntent(invoice), "draft");
+  assert.equal(classifyOwnerEmailIntent(cancelBody), "draft");
+  assert.equal(isNegativeSendCommand(cancelBody), false);
+  assert.equal(notASendCommand(jeffDraft), "he asked for a draft");
+  assert.deepEqual([...commandIntents(jeffDraft)], ["draft"]);
+  const trailingSend = "Draft an email to Jeff about pricing and send it";
+  assert.equal(classifyOwnerEmailIntent(trailingSend), "draft");
+  assert.equal(notASendCommand(trailingSend), "he asked for a draft");
+  const scheduledThat = parseOwnerEmailSendAt("schedule that for tomorrow at 5 pm");
+  assert.equal(scheduledThat && "sendTime" in scheduledThat ? scheduledThat.sendTime : "", "17:00");
+  assert.equal(parseOwnerEmailSendAt("tell him that the call moved to 5 pm"), undefined);
+  assert.equal(parseOwnerEmailSendAt("Send an email to the address above saying the call is on 2026-11-25 at 10:00"), undefined);
+  assert.equal(
+    parseOwnerEmailSendAt("Schedule an email on 2026-11-25 at 0 am saying hello") &&
+      "refused" in (parseOwnerEmailSendAt("Schedule an email on 2026-11-25 at 0 am saying hello") ?? {}),
+    true,
+  );
+}
+
+{
+  const draftsBefore = gmailDrafts;
+  const sendsBefore = messageSends + draftSends;
+  const scheduledBefore = listOpenScheduledSends().length;
+  await ocrSay(40, "Draft an email to the address in the photo saying please send me the proposal");
+  assert.equal(gmailDrafts, draftsBefore + 1, "photo draft creates a Gmail draft");
+  assert.equal(messageSends + draftSends, sendsBefore, "photo draft must not send");
+  assert.equal(listOpenScheduledSends().length, scheduledBefore, "photo draft must not schedule");
+  assert.match(latestDraftRecipient, /info@msopsai\.com/i);
+}
+
+{
+  const draftsBefore = gmailDrafts;
+  const sendsBefore = messageSends + draftSends;
+  await ocrSay(41, "Write an email to the address above saying please send the invoice");
+  assert.equal(gmailDrafts, draftsBefore + 1, "write ... saying send is a draft");
+  assert.equal(messageSends + draftSends, sendsBefore);
+}
+
+{
+  const draftsBefore = gmailDrafts;
+  const sendsBefore = messageSends + draftSends;
+  await ocrSay(42, "Draft an email to the address above saying we had to cancel the order");
+  assert.equal(gmailDrafts, draftsBefore + 1, "cancel in the body stays a draft");
+  assert.equal(messageSends + draftSends, sendsBefore);
+  assert.equal(getPendingAction(42)?.action, "draft_email");
+}
+
+{
+  const sendsBefore = messageSends + draftSends;
+  const refused = await sendEmailFromTool(
+    { to: ["Jeff"], instruction: "please send me the deck" },
+    { userText: "Draft an email to Jeff saying please send me the deck", confirmation: { chatId: 43, messageId: 1 } },
+  );
+  assert.match(refused, /Not sent: he asked for a draft/);
+  assert.equal(messageSends + draftSends, sendsBefore);
+}
+
+rememberContactChoice("Jeff", { name: "Jeff", emails: ["jeff@example.com"], sources: ["known"] });
+rememberContactChoice("Munil", { name: "Munil", emails: ["munil@example.com"], sources: ["known"] });
+rememberContactChoice("Dorothy", { name: "Dorothy", emails: ["dorothy@example.com"], sources: ["known"] });
+
+{
+  const sendsBefore = messageSends;
+  const scheduledBefore = listOpenScheduledSends().length;
+  const sent = await sendEmailFromTool(
+    { to: ["Jeff"], instruction: "the proposal is ready" },
+    { userText: "Send Jeff an email saying the proposal is ready", confirmation: { chatId: 44, messageId: 1 } },
+  );
+  assert.match(sent, /Sent to/i);
+  assert.equal(messageSends, sendsBefore + 1);
+  assert.equal(listOpenScheduledSends().length, scheduledBefore);
+  assert.match(latestSentTo, /jeff@example\.com/i);
+}
+
+{
+  const sendsBefore = messageSends;
+  const sent = await sendEmailFromTool(
+    { to: ["Munil"], instruction: "the pricing call" },
+    { userText: "Email Munil about the pricing call", confirmation: { chatId: 45, messageId: 1 } },
+  );
+  assert.match(sent, /Sent to/i);
+  assert.equal(messageSends, sendsBefore + 1);
+  assert.match(latestSentTo, /munil@example\.com/i);
+}
+
+{
+  const sendsBefore = messageSends;
+  const scheduledBefore = listOpenScheduledSends().length;
+  const sent = await sendEmailFromTool(
+    { to: ["Dorothy"], instruction: "thanks, we'll share the deck tomorrow" },
+    { userText: "Reply to Dorothy saying thanks, we'll share the deck tomorrow", confirmation: { chatId: 46, messageId: 1 } },
+  );
+  assert.match(sent, /Sent to/i);
+  assert.equal(messageSends, sendsBefore + 1);
+  assert.equal(listOpenScheduledSends().length, scheduledBefore, "tomorrow in the body must not schedule");
+  assert.match(latestSentTo, /dorothy@example\.com/i);
+}
+
+{
+  const sendsBefore = messageSends + draftSends;
+  await ocrSay(47, "Send an email to the address above tomorrow at 6 pm saying hello");
+  assert.equal(messageSends + draftSends, sendsBefore, "command-part tomorrow must schedule, not send now");
+  assert.equal(latestSchedule(47)?.send_at, tomorrowIso("18:00"));
+}
+
+{
+  const sendsBefore = messageSends + draftSends;
+  await ocrSay(48, "Schedule an email to the address above for tomorrow at 6 pm saying our meeting is tomorrow at 10");
+  assert.equal(messageSends + draftSends, sendsBefore);
+  assert.equal(latestSchedule(48)?.send_at, tomorrowIso("18:00"));
+}
+
+{
+  const sendsBefore = messageSends + draftSends;
+  await ocrSay(49, "Schedule an email to the address above on 2026-11-25 at 5:30 pm saying hello");
+  assert.equal(messageSends + draftSends, sendsBefore);
+  assert.equal(latestSchedule(49)?.send_at, new Date("2026-11-25T17:30:00+05:30").toISOString());
+}
+
+{
+  const sendsBefore = messageSends + draftSends;
+  await ocrSay(50, "Schedule an email to the address above on 2026-11-25 at 12 am saying hello");
+  assert.equal(latestSchedule(50)?.send_at, new Date("2026-11-25T00:00:00+05:30").toISOString());
+  await ocrSay(51, "Schedule an email to the address above on 2026-11-25 at 12 pm saying hello");
+  assert.equal(latestSchedule(51)?.send_at, new Date("2026-11-25T12:00:00+05:30").toISOString());
+  const scheduledBefore = listOpenScheduledSends().length;
+  await ocrSay(52, "Schedule an email to the address above on 2026-11-25 at 17:30 pm saying hello");
+  assert.match(replies.at(-1) ?? "", /doesn't make sense|day and time/i);
+  assert.equal(messageSends + draftSends, sendsBefore);
+  assert.equal(listOpenScheduledSends().length, scheduledBefore, "contradictory 17:30 pm must not schedule");
+  assert.equal(latestSchedule(52), undefined);
+}
+
+{
+  const sendsBefore = messageSends;
+  const scheduledBefore = listOpenScheduledSends().length;
+  await ocrSay(53, "Send an email to the address above saying the call is on 2026-11-25 at 10:00");
+  assert.equal(messageSends, sendsBefore + 1, "a date in the body must send now");
+  assert.equal(listOpenScheduledSends().length, scheduledBefore);
+  assert.match(latestSentTo, /info@msopsai\.com/i);
+}
+
+{
+  const sendsBefore = messageSends;
+  const scheduledBefore = listOpenScheduledSends().length;
+  await ocrSay(54, "Send an email to the address above about our meeting tomorrow at 10:00");
+  assert.equal(messageSends, sendsBefore + 1, "about tomorrow is content, not a schedule");
+  assert.equal(listOpenScheduledSends().length, scheduledBefore);
+}
+
+{
+  const sendsBefore = messageSends + draftSends;
+  const scheduledBefore = listOpenScheduledSends().length;
+  await ocrSay(55, "Schedule an email to the address above saying our meeting is tomorrow at 10");
+  assert.match(replies.at(-1) ?? "", /day and time/i);
+  assert.equal(messageSends + draftSends, sendsBefore);
+  assert.equal(listOpenScheduledSends().length, scheduledBefore);
+}
+
+{
+  const sendsBefore = messageSends;
+  await ocrSay(56, "Send an email to the address above ki the call is on 2026-11-25 at 10:00");
+  assert.equal(messageSends, sendsBefore + 1, "Hindi ki keeps the date in the body");
+}
+
+{
+  const sendsBefore = messageSends;
+  const scheduledBefore = listOpenScheduledSends().length;
+  await ocrSay(57, "Send an email to the address above, the call is on 2026-11-25 at 10:00 ennu parayu");
+  assert.equal(messageSends, sendsBefore + 1, "Malayalam ennu never becomes the send time");
+  assert.equal(listOpenScheduledSends().length, scheduledBefore);
+}
+
+{
+  const draftsBefore = gmailDrafts;
+  const sendsBefore = messageSends + draftSends;
+  await ocrSay(58, "Send an email to the address above about the launch and Bcc Jeff");
+  assert.match(replies.at(-1) ?? "", /Bcc/i);
+  assert.equal(gmailDrafts, draftsBefore);
+  assert.equal(messageSends + draftSends, sendsBefore);
+}
 
 db.pragma("foreign_keys = ON");
 const expired = createDocument("old.jpg", "work", "old@example.com", null);

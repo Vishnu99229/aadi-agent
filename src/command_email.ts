@@ -9,6 +9,7 @@ import {
   namedInOwnWords,
   notAnEventCommand,
   notASendCommand,
+  splitOwnerEmailCommand,
 } from "./command_logic.js";
 import {
   authorizationWords,
@@ -839,6 +840,7 @@ export async function sendEmailFromTool(
     return "Not sent: only Vishnu's own message can send an email.";
   }
   const ownWords = turn.userText?.trim() ?? "";
+  const command = splitOwnerEmailCommand(ownWords).command;
   const held = holdEmailToolTurn(confirmation.chatId, ownWords, now);
   if (held) {
     return held;
@@ -870,14 +872,14 @@ export async function sendEmailFromTool(
   if (
     pendingEmail?.needsFreshAuthorization &&
     pendingEmail.sendAt &&
-    !(/\bsend\b/i.test(ownWords) && /\bnow\b/i.test(ownWords))
+    !(/\bsend\b/i.test(command) && /\bnow\b/i.test(command))
   ) {
     when = when ?? pendingEmail.sendAt;
   }
   if (when === undefined && mentionsSendDate(ownWords)) {
     return "Not sent: he gave a date or time, so nothing went out. Call send_email again with send_on, and send_time if he gave one.";
   }
-  if (when === undefined && /\bschedule\b/i.test(ownWords) && !/\bsend\s+(?:it\s+)?now\b/i.test(ownWords)) {
+  if (when === undefined && /\bschedule\b/i.test(command) && !/\bsend\s+(?:it\s+)?now\b/i.test(command)) {
     return "Not sent: he asked to schedule it, so nothing went out immediately. Ask him for the day and time.";
   }
   const referencedEmail = emailReferenceForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
@@ -925,7 +927,7 @@ export async function sendEmailFromTool(
     // instruction and time. A follow-up can identify the person without
     // having to repeat all the wording. This stores no permission beyond the
     // existing short send-authorization window, and does not schedule yet.
-    if (when && /\b(?:send|schedule)\b/i.test(ownWords)) {
+    if (when && /\b(?:send|schedule)\b/i.test(command)) {
       const unresolved = (query: string): ResolvedAttendee => ({
         query, name: query, email: "", resolved: false,
       });
