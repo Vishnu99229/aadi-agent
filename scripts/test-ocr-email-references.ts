@@ -25,6 +25,7 @@ import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { handler as draftReply } from "../src/tools/draft_reply.ts";
 import { handler as updateDraft } from "../src/tools/update_draft.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
+import { rememberContactChoice } from "../src/contacts.ts";
 import { setGoogleAccountForTests } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setApprovalsTestHooks } from "../src/approvals.ts";
@@ -42,7 +43,11 @@ let gmailDrafts = 0;
 let draftSends = 0;
 let messageSends = 0;
 let latestDraftRecipient = "";
+let latestDraftCc = "";
+let latestDraftSubject = "";
+let latestDraftBody = "";
 let latestSentTo = "";
+let latestSentCc = "";
 const sentAccounts: string[] = [];
 const gmailFor = (account: { id: string }) => ({
   users: {
@@ -52,6 +57,12 @@ const gmailFor = (account: { id: string }) => ({
         sentAccounts.push(account.id);
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
         latestDraftRecipient = /^To:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
+        latestDraftCc = /^Cc:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
+        latestDraftSubject = /^Subject:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
+        const encoded = /Content-Transfer-Encoding: base64\r?\n\r?\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1];
+        latestDraftBody = encoded
+          ? Buffer.from(encoded.replace(/\s/g, ""), "base64").toString("utf8").trim()
+          : raw.split(/\r?\n\r?\n/).slice(1).join("\n").trim();
         return { data: { id: `new-${gmailDrafts}`, message: { id: `new-${gmailDrafts}`, threadId: `thread-${gmailDrafts}` } } };
       },
       send: async ({ requestBody }: { requestBody: { id: string } }) => {
@@ -70,6 +81,7 @@ const gmailFor = (account: { id: string }) => ({
         messageSends++;
         const raw = Buffer.from(requestBody.raw, "base64url").toString("utf8");
         latestSentTo = /^To:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
+        latestSentCc = /^Cc:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
         sentAccounts.push(`message:${account.id}`);
         return { data: { id: `msg-${messageSends}` } };
       },
@@ -107,7 +119,18 @@ bot.api.config.use(async (_prev, method, payload) => {
   return { ok: true, result: true } as never;
 });
 await bot.init();
-setCompleteForTests(async () => modelReply({ text: JSON.stringify({ subject: "Our discussion", body: "Hello, following up on our discussion." }) }));
+setCompleteForTests(async (params) => {
+  const facts = params.messages.map((message) => (typeof message.content === "string" ? message.content : "")).join("\n");
+  const enjoyed = /enjoyed our meeting/i.test(facts);
+  return modelReply({
+    text: JSON.stringify({
+      subject: enjoyed ? "Glad we met" : "Our discussion",
+      body: enjoyed
+        ? "I enjoyed our meeting and would like to continue the conversation."
+        : "Hello, following up on our discussion.",
+    }),
+  });
+});
 
 const sarg = createDocument("sargvision.jpg", "personal", "Contact: contact@sargvision.com", null);
 const msops = createDocument("msopsai.jpg", "personal", "MsOpsAi | info@msopsai.com | Bangalore", null);
@@ -282,10 +305,87 @@ assert.equal(latestSentTo.toLowerCase().includes("vasanth"), false);
 assert.equal(messageSends, sendsBeforeAddress + 1);
 assert.equal(draftSends, 0);
 
+const oldDraft = "draft-old-scheduled";
+await queueDraftApproval({
+  draftId: oldDraft,
+  threadId: null,
+  to: "old-scheduled@example.com",
+  subject: "Old schedule",
+  body: "This is the older scheduled draft.",
+  googleAccount: "work",
+});
+const oldSchedule = createScheduledSend({
+  key: "old-scheduled-draft",
+  sendAt: new Date(Date.now() + 86_400_000).toISOString(),
+  itemText: "Send email to old — Old schedule — tomorrow",
+  tag: "work",
+  request: JSON.stringify({
+    kind: "email",
+    draftId: oldDraft,
+    account: "work",
+    to: [{ query: "old-scheduled@example.com", mailbox: { email: "old-scheduled@example.com", name: "Old" } }],
+    cc: [],
+    threadId: null,
+    instruction: "Older wording",
+    ownWords: "Schedule the old draft",
+    subject: "Old schedule",
+    finalSubject: "Old schedule",
+    finalBody: "This is the older scheduled draft.",
+  }),
+  confirmChat: 1,
+  confirmMessage: 1,
+});
+assert.ok(oldSchedule);
+savePendingAction(1, {
+  action: "send_email",
+  status: "open",
+  ownerWords: "Schedule the old draft",
+  confirmChat: 1,
+  confirmMessage: 1,
+  updatedAt: new Date().toISOString(),
+  email: {
+    to: [{ query: "old-scheduled@example.com", name: "Old", email: "old-scheduled@example.com", resolved: true }],
+    cc: [],
+    notes: [],
+    purpose: "Older wording",
+    subject: "Old schedule",
+    account: "work",
+    waiting: "confirm",
+    draftId: oldDraft,
+    scheduledSendId: oldSchedule!.id,
+  },
+}, new Date());
+const sendsBeforeNew = messageSends;
+const draftSendsBeforeNew = draftSends;
+await say("Send an email to the address above now about our discussion");
+assert.match(latestSentTo, /info@msopsai\.com/i);
+assert.doesNotMatch(latestSentTo, /old-scheduled@example\.com/i);
+assert.equal(messageSends, sendsBeforeNew + 1);
+assert.equal(draftSends, draftSendsBeforeNew, "the older scheduled draft must not be dispatched");
+assert.equal(getScheduledSend(oldSchedule!.id)?.status, "scheduled");
+
+rememberContactChoice("Alice", { name: "Alice", emails: ["alice.copied@example.com"], sources: ["known"] });
+const sendsBeforeCc = messageSends;
+await say("Send an email to the address above about the launch and Cc Alice");
+assert.match(latestSentTo, /info@msopsai\.com/i);
+assert.match(latestSentCc, /alice\.copied@example\.com/i);
+assert.equal(messageSends, sendsBeforeCc + 1);
+assert.equal(draftSends, draftSendsBeforeNew);
+
+const draftsBeforeCompose = gmailDrafts;
+await say("Draft an email to the address above saying I enjoyed our meeting");
+assert.equal(gmailDrafts, draftsBeforeCompose + 1);
+assert.equal(latestDraftSubject, "Glad we met");
+assert.match(latestDraftBody, /enjoyed our meeting/i);
+assert.doesNotMatch(latestDraftBody, /Draft an email to the address above/);
+assert.match(latestDraftRecipient, /info@msopsai\.com/i);
+assert.equal(messageSends, sendsBeforeCc + 1);
+
+const sendsBeforeSchedule = messageSends;
 await say("Use this email and schedule it tomorrow at 10", { message_id: 101, text: "OCR: contact@sargvision.com" });
 assert.equal(getPendingAction(1)?.email?.to[0]?.email, "contact@sargvision.com");
 assert.ok(getPendingAction(1)?.email?.sendAt);
-assert.equal(messageSends, sendsBeforeAddress + 1, "scheduling a referenced address does not send immediately");
+assert.equal(messageSends, sendsBeforeSchedule, "scheduling a referenced address does not send immediately");
 
 db.prepare("UPDATE pending_actions SET status = 'discarded' WHERE status = 'pending' AND type = 'send_draft'").run();
 const cardDraft = "draft-card";
@@ -349,7 +449,7 @@ savePendingAction(4, {
 }, new Date());
 await say("Don't send the email above", { message_id: 102, text: "OCR: info@msopsai.com" }, 4);
 assert.equal(getScheduledSend(scheduled!.id)?.status, "cancelled");
-assert.equal(messageSends, sendsBeforeAddress + 1);
+assert.equal(messageSends, sendsBeforeSchedule);
 
 const draftOnly = await sendEmailFromTool(
   { to: ["alice@example.com"], instruction: "Hello" },
@@ -361,7 +461,7 @@ const scheduleOnly = await sendEmailFromTool(
   { userText: "Schedule it", confirmation: { chatId: 8, messageId: 2 } },
 );
 assert.match(scheduleOnly, /nothing went out immediately/i);
-assert.equal(messageSends, sendsBeforeAddress + 1);
+assert.equal(messageSends, sendsBeforeSchedule);
 
 const personal = await sendEmailFromTool(
   { to: ["personal@example.com"], instruction: "A personal note", account: "personal" },

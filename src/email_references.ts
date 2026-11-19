@@ -129,6 +129,68 @@ export function refersToEarlierEmail(text: string, replying = false): boolean {
   return (hasEmailTopic && pointsBack) || repliedAboutAddress;
 }
 
+/** "send it now" confirms the draft already in hand. A new email, even one that says "now", does not. */
+export function confirmsExistingDraft(text: string): boolean {
+  if (isNegativeSendCommand(text) || refersToEarlierEmail(text) || addressIn(text)) {
+    return false;
+  }
+  if (/\b(?:cc|bcc|about|regarding|saying)\b/i.test(text)) {
+    return false;
+  }
+  return /^(?:please\s+)?send(?:\s+(?:it|this|that))?(?:\s+(?:draft|e-?mail|card))?(?:\s+now)?[.!]*$/i.test(text.trim());
+}
+
+export interface ReferencedEmailRequest {
+  intent: OwnerEmailIntent;
+  to: string;
+  cc: string[];
+  bcc: string[];
+  /** What the email should say. Not the raw Telegram command when he named the point. */
+  instruction: string;
+}
+
+/** Cc and Bcc he named. The address or name is data; it does not authorize a send. */
+export function copyRecipients(text: string): { cc: string[]; bcc: string[] } {
+  const take = (field: "cc" | "bcc"): string[] => {
+    const found: string[] = [];
+    const pattern = new RegExp(`\\b${field}\\s+([^\\n.]+)`, "gi");
+    for (const match of text.matchAll(pattern)) {
+      const chunk = match[1]!.replace(/\s+\b(?:and\s+)?(?:about|regarding|saying|say|telling)\b[\s\S]*$/i, "").trim();
+      for (const part of chunk.split(/\s*(?:,|;|\band\b)\s*/i)) {
+        const name = part.replace(/^(?:the|to)\s+/i, "").trim();
+        if (name && !/^(?:cc|bcc)$/i.test(name)) {
+          found.push(name);
+        }
+      }
+    }
+    return [...new Set(found)];
+  };
+  return { cc: take("cc"), bcc: take("bcc") };
+}
+
+/** The point of the email, without the routing words or a trailing Cc list. */
+export function compositionInstruction(text: string): string {
+  const said = /\b(?:saying|say|telling|tell(?:\s+them)?)\s+([\s\S]+)$/i.exec(text);
+  const about = /\b(?:about|regarding)\s+([\s\S]+)$/i.exec(text);
+  const raw = (said?.[1] ?? about?.[1] ?? text).trim();
+  return raw.replace(/\s*(?:,|;)?\s*\b(?:and\s+)?(?:cc|bcc)\b[\s\S]*$/i, "").trim() || text.trim();
+}
+
+export function buildReferencedEmailRequest(
+  text: string,
+  to: string,
+  replyingToApproval = false,
+): ReferencedEmailRequest {
+  const copies = copyRecipients(text);
+  return {
+    intent: classifyOwnerEmailIntent(text, replyingToApproval),
+    to,
+    cc: copies.cc,
+    bcc: copies.bcc,
+    instruction: compositionInstruction(text),
+  };
+}
+
 export function addressesFromReference(text: string): string[] {
   return [...new Set((text.match(EMAILS) ?? []).map((email) => email.toLowerCase()))];
 }

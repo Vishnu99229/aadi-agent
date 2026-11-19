@@ -24,7 +24,7 @@ import {
 } from "./action_context.js";
 import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
-import { emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
+import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
@@ -748,6 +748,7 @@ function recipientSlots(
   now: Date,
   refusal: string,
   chatId?: number,
+  messageId?: number,
 ): RecipientSlot[] | string {
   const open = listOpenCommandChoices(new Date(now.getTime() - CHOICE_TTL_MS).toISOString());
   const offeredIn = (address: string) =>
@@ -759,9 +760,14 @@ function recipientSlots(
     });
   const answered = new Set<number>();
   const prior = pendingResolvedEmails(chatId, now);
+  const referenced = emailReferenceForTurn(chatId, messageId, now.getTime());
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
     const address = addressIn(query);
+    if (address && referenced && address === referenced) {
+      slots.push({ query, mailbox: { email: address, name: "" } });
+      continue;
+    }
     const offers = address ? offeredIn(address) : [];
     const remembered = prior.get(query.trim().toLowerCase()) ?? (address ? prior.get(address) : undefined);
     const supplied = matchOwnerSupplied(chatId, query, now);
@@ -874,10 +880,11 @@ export async function sendEmailFromTool(
   if (when === undefined && /\bschedule\b/i.test(ownWords) && !/\bsend\s+(?:it\s+)?now\b/i.test(ownWords)) {
     return "Not sent: he asked to schedule it, so nothing went out immediately. Ask him for the day and time.";
   }
+  const referencedEmail = emailReferenceForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
   if (
     when === undefined &&
-    /\bsend\b/i.test(ownWords) &&
-    /\bnow\b/i.test(ownWords) &&
+    confirmsExistingDraft(ownWords) &&
+    !referencedEmail &&
     pendingEmail?.draftId &&
     pendingEmail.scheduledSendId
   ) {
@@ -887,7 +894,6 @@ export async function sendEmailFromTool(
   let toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
   const instruction = typeof values.instruction === "string" ? values.instruction.trim() : "";
-  const referencedEmail = emailReferenceForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
   if (referencedEmail) {
     // The owner's reference picked this one address. A model cannot substitute
     // a stale Gmail recipient or tack on people from an unrelated thread.
@@ -912,6 +918,7 @@ export async function sendEmailFromTool(
     now,
     when ? "Not scheduled" : "Not sent",
     confirmation.chatId,
+    confirmation.messageId,
   );
   if (typeof slots === "string") {
     // A missing address must not discard the owner's original scheduled

@@ -20,12 +20,13 @@ import {
   continuePendingAction,
   focusSelectedDraft,
   getPendingAction,
+  matchOwnerSupplied,
   savePendingAction,
   messageAuthorizesExternalSend,
 } from "./action_context.js";
-import { bindEmailReferenceForTurn, classifyOwnerEmailIntent, isDraftApprovalText, refersToEarlierEmail, resolveEmailReference } from "./email_references.js";
+import { bindEmailReferenceForTurn, buildReferencedEmailRequest, classifyOwnerEmailIntent, isDraftApprovalText, refersToEarlierEmail, resolveEmailReference } from "./email_references.js";
 import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
-import { publishReadyDraft, reviseLinkedDraft } from "./context_draft.js";
+import { composeWithEmailAgent, publishReadyDraft, reviseLinkedDraft } from "./context_draft.js";
 import { handler as draftNewEmailTool } from "./tools/draft_new_email.js";
 import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.js";
 import { stageExternalContext } from "./context_lookup.js";
@@ -1437,9 +1438,40 @@ async function handleUserText(
         return;
       }
       const confirmation = { chatId: ctx.chat.id, messageId: ctx.message.message_id };
+      const request = buildReferencedEmailRequest(userText, emailReference.email, false);
+      if (request.bcc.length > 0) {
+        await ctx.reply(`I found ${emailReference.email}, and you also asked for Bcc ${request.bcc.join(", ")}. I won't send or draft while a Bcc would be left off. Tell me if they should be on Cc instead.`);
+        return;
+      }
+      const copies: string[] = [];
+      for (const name of request.cc) {
+        const typed = name.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i)?.[0]?.toLowerCase();
+        if (typed) {
+          copies.push(typed);
+          continue;
+        }
+        const found = matchOwnerSupplied(ctx.chat.id, name, new Date());
+        if (found.kind !== "one") {
+          const which = found.kind === "many" ? found.contacts.map((item) => item.email).join(", ") : "I don't have a confirmed address";
+          await ctx.reply(`I found ${emailReference.email}. ${which} for ${name}, so I didn't ${intent === "draft" ? "draft" : "send"} without that Cc.`);
+          return;
+        }
+        copies.push(found.contact.email);
+      }
       if (intent === "draft") {
+        let written: { subject: string; body: string };
+        try {
+          written = await composeWithEmailAgent(
+            `Write one email from Vishnu. Do not copy his Telegram command.\nTo: ${request.to}\n${copies.length ? `Cc: ${copies.join(", ")}\n` : ""}Instruction:\n${request.instruction}`,
+          );
+        } catch (error) {
+          const errorType = error instanceof Error ? error.name : "UnknownError";
+          console.error(`Referenced draft composition failed (${errorType}).`);
+          await ctx.reply("I found the address but couldn't write the email, so no draft was created.");
+          return;
+        }
         const created = await draftNewEmailTool(
-          { to: emailReference.email, subject: "Following up", body: userText, account },
+          { to: request.to, cc: copies.length ? copies.join(", ") : undefined, subject: written.subject, body: written.body, account },
           { iteration: 1, calledTools: [], userText, confirmation },
         );
         await ctx.reply(created);
@@ -1465,8 +1497,9 @@ async function handleUserText(
       }
       const result = await sendEmailFromTool(
         {
-          to: [emailReference.email],
-          instruction: userText,
+          to: [request.to],
+          cc: copies,
+          instruction: request.instruction,
           account,
           ...(sendOn && sendTime ? { send_on: sendOn, send_time: sendTime } : {}),
         },
