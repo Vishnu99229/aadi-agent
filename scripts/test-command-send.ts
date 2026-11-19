@@ -347,6 +347,27 @@ assert(
   "draft but don't send authorizes a draft and blocks sending",
 );
 assert(notASendCommand("don't send Selvaraj anything") === "he said not to", "a bare don't-send is still a refusal");
+// Plans, questions and reminders count only in the command part; prohibitions count anywhere.
+for (const phrase of [
+  "Email Jeff saying I'll send the proposal by Friday",
+  "Reply to Dorothy saying thanks, I will send the deck",
+  "Send Jeff an email saying should we send the PO this week?",
+]) {
+  assert(notASendCommand(phrase) === undefined, `"${phrase}": a plan or question in the body is not a stop`);
+  assert(commandIntents(phrase).includes("send"), `"${phrase}" is a send`);
+}
+for (const [phrase, reason] of [
+  ["I'll send Jeff the deck tomorrow", "he described a plan"],
+  ["Should I send Jeff the deck?", "he asked a question"],
+  ["Remind me to send Jeff the deck", "he asked for a reminder"],
+  ["Send Jeff an email about the renewal but don't send it till I check", "he said not to"],
+] as const) {
+  assert(notASendCommand(phrase) === reason, `"${phrase}" is "${reason}"`);
+}
+{
+  const draftOnly = "Email Jeff about the pricing, don't send it yet, just make a draft";
+  assert(notASendCommand(draftOnly) !== undefined && !commandIntents(draftOnly).includes("send"), `"${draftOnly}" is blocked`);
+}
 {
   const draft = commandIntents("Draft an email to qa@example.com with subject Hi but don't send it");
   assert(draft.includes("draft") && !draft.includes("send"), `draft-not-send intents: ${draft.join(",")}`);

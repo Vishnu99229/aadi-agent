@@ -51,7 +51,7 @@ export function notASendCommand(ownWords: string): string | undefined {
     return DRAFT_WORD.test(ownWords) ? "he asked for a draft" : "he said not to";
   }
   for (const [pattern, reason] of NOT_A_COMMAND) {
-    if (pattern.test(ownWords)) {
+    if (pattern.test(reason === "he said not to" ? ownWords : command)) {
       return reason;
     }
   }
