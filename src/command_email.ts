@@ -5,6 +5,7 @@ import {
   asksForAttachment,
   isAutomatedAddress,
   mentionsSendDate,
+  nameTokens,
   namedInOwnWords,
   notAnEventCommand,
   notASendCommand,
@@ -13,7 +14,11 @@ import {
   authorizationWords,
   clearPendingAction,
   getPendingAction,
+  holdEmailToolTurn,
+  matchOwnerSupplied,
   pendingResolvedEmails,
+  rememberBookedMeeting,
+  rememberScheduledSend,
   savePendingAction,
   type ResolvedAttendee,
 } from "./action_context.js";
@@ -35,7 +40,14 @@ import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
-import { gmailClient, signatureHtmlFor } from "./google/mail.js";
+import {
+  gmailClient,
+  messageHeader as draftHeader,
+  plainTextBody,
+  resolveGmailDraft,
+  signatureHtmlFor,
+  stripSignature,
+} from "./google/mail.js";
 import { isSelfEmail } from "./mom_logic.js";
 import { bookResolvedMeeting, freeSlotsText, parseCommandTimes } from "./owner_meeting.js";
 import {
@@ -48,6 +60,7 @@ import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
 import { holdForVoiceNote } from "./voice_cards.js";
+import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const CHOICE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -88,6 +101,15 @@ export interface CommandRequest {
   /** Present on a scheduled email. */
   sendAt?: string;
   subject?: string;
+  /** A scheduled email made from this Gmail draft, named explicitly and checked against
+   *  its mailbox and people. The only link between a draft and a schedule. */
+  draftId?: string;
+  /** He changed the subject himself. A reply whose subject no longer matches its thread
+   *  goes out as a new conversation, with exactly his subject. */
+  subjectEdited?: boolean;
+  finalSubject?: string;
+  /** The thread's subject when a reply was scheduled. */
+  threadSubject?: string;
 }
 
 let telegram: Api | undefined;
@@ -193,6 +215,11 @@ export async function writeAndSend(
     /** Runs once the email is written, right before Gmail. False stops the send. */
     beforeSend?: () => boolean;
     note?: string;
+    /** A finished subject and body. Skips a fresh rewrite from older instructions. */
+    prepared?: { subject: string; body: string };
+    /** A subject he changed himself. On a reply it wins over the thread's, and if it no
+     *  longer matches the thread the email goes out as a new conversation. */
+    explicitSubject?: string;
   } = {},
 ): Promise<Outcome> {
   const to = request.to.map((slot) => slot.mailbox!);
@@ -229,7 +256,9 @@ export async function writeAndSend(
   }
 
   let written: { subject: string; body: string };
-  try {
+  if (options.prepared?.body.trim()) {
+    written = { subject: options.prepared.subject, body: options.prepared.body };
+  } else try {
     written = await writeCommandEmail({
       gmail,
       ownWords: request.ownWords,
@@ -248,12 +277,20 @@ export async function writeAndSend(
     };
   }
 
-  const subject = thread ? replySubject(thread.subject) : request.subject?.trim() || written.subject;
+  const explicit = options.explicitSubject?.trim();
+  // Gmail keeps a reply in its thread only while the subject matches, so a changed subject
+  // is sent as a new conversation: no thread id and no reply headers.
+  const newConversation = Boolean(thread && explicit && !sameConversation(explicit, thread.subject));
+  const subject = newConversation
+    ? explicit!
+    : thread
+      ? replySubject(thread.subject)
+      : explicit || options.prepared?.subject.trim() || request.subject?.trim() || written.subject;
   const toHeader = formatMailboxList(to);
   const ccHeader = formatMailboxList(cc);
   const selfAddresses = await loadFollowupSelfAddresses();
   const named = new Set([...to, ...cc].map((item) => item.email));
-  const leftOff = (thread?.mailboxes ?? []).filter(
+  const leftOff = (newConversation ? [] : thread?.mailboxes ?? []).filter(
     (item) =>
       !named.has(item.email) &&
       !selfAddresses.has(item.email) &&
@@ -275,9 +312,9 @@ export async function writeAndSend(
       subject,
       body: written.body,
       signatureHtml: await signatureHtmlFor(account),
-      threadId: request.threadId,
-      inReplyTo: thread?.inReplyTo ?? "",
-      references: thread?.references ?? "",
+      threadId: newConversation ? null : request.threadId,
+      inReplyTo: newConversation ? "" : thread?.inReplyTo ?? "",
+      references: newConversation ? "" : thread?.references ?? "",
     }));
   } catch (error) {
     if (error instanceof CommandSendRefusedError) {
@@ -321,6 +358,7 @@ export async function writeAndSend(
     `Sent to ${toHeader}.`,
     ...(ccHeader ? [`Cc: ${ccHeader}`] : []),
     `Subject: ${subject}`,
+    ...(newConversation ? ["Sent as a new conversation, because the subject no longer matches the thread."] : []),
     ...(leftOff.length > 0 ? [`Left off the thread: ${formatMailboxList(leftOff)}`] : []),
     ...(options.note ? [options.note] : []),
   ];
@@ -381,6 +419,49 @@ export function scheduledWhen(iso: string): string {
 
 /** Saved, with a visible task, once every recipient is settled. The email itself is
  *  written when it goes out, so it reflects whatever has changed by then. */
+function addressSet(items: readonly { email: string }[]): string {
+  return [...new Set(items.map((item) => item.email.toLowerCase()))].sort().join(",");
+}
+
+/**
+ * The draft he named for this schedule, checked: it is in the mailbox the email will go
+ * from, and it is addressed to exactly the people his own words resolved to. Its wording
+ * as it stands now, including any edits made before scheduling, becomes the scheduled copy.
+ */
+async function draftForSchedule(
+  request: CommandRequest,
+): Promise<{ subject: string; body: string; threadId: string | null } | string> {
+  const draftId = request.draftId!;
+  let found: Awaited<ReturnType<typeof resolveGmailDraft>>;
+  try {
+    found = await resolveGmailDraft(draftId, request.account);
+  } catch {
+    return `Not scheduled: I couldn't find that draft in your ${request.account} mailbox, so nothing was scheduled.`;
+  }
+  if (found.account.id !== request.account) {
+    return `Not scheduled: that draft is in a different mailbox, so nothing was scheduled.`;
+  }
+  const message = found.draft.message;
+  const headers = message?.payload?.headers;
+  const draftTo = parseAddressList(draftHeader(headers, "To"));
+  const draftCc = parseAddressList(draftHeader(headers, "Cc"));
+  const to = request.to.map((slot) => slot.mailbox!);
+  const cc = request.cc.map((slot) => slot.mailbox!);
+  if (addressSet(draftTo) !== addressSet(to) || addressSet(draftCc) !== addressSet(cc)) {
+    const shown = [formatMailboxList(draftTo), draftCc.length ? `Cc ${formatMailboxList(draftCc)}` : ""].filter(Boolean).join(", ");
+    return `Not scheduled: that draft is addressed to ${shown || "nobody"}, not ${formatMailboxList([...to, ...cc])}, so nothing was scheduled.`;
+  }
+  const body = stripSignature(plainTextBody(message?.payload ?? {}).trim()).body.trim();
+  if (!body) {
+    return "Not scheduled: that draft is empty, so nothing was scheduled.";
+  }
+  const replyThread = draftHeader(headers, "In-Reply-To") ? message?.threadId ?? null : null;
+  if (replyThread && request.threadId && replyThread !== request.threadId) {
+    return "Not scheduled: that draft replies on a different thread, so nothing was scheduled.";
+  }
+  return { subject: draftHeader(headers, "Subject").trim(), body, threadId: request.threadId ?? replyThread };
+}
+
 async function scheduleRequest(
   request: CommandRequest,
   base: string,
@@ -390,6 +471,15 @@ async function scheduleRequest(
     return { text: "Not scheduled: only Vishnu's own message can do that." };
   }
   const to = request.to.map((slot) => slot.mailbox!);
+  let draft: { subject: string; body: string } | undefined;
+  if (request.draftId) {
+    const checked = await draftForSchedule(request);
+    if (typeof checked === "string") {
+      return { text: checked, hint: "Tell Vishnu as it is. Nothing was scheduled." };
+    }
+    draft = checked;
+    request = { ...request, threadId: checked.threadId, subject: checked.subject || request.subject };
+  }
   let subject = request.subject?.trim() ?? "";
   if (request.threadId) {
     const gmail = gmailClient(await getGoogleAccount(request.account));
@@ -407,7 +497,15 @@ async function scheduleRequest(
         hint: "Ask Vishnu whether this is the right thread.",
       };
     }
-    subject = replySubject(thread.subject);
+    // A reply keeps the thread's "Re:" subject unless the draft he named carries a subject
+    // he changed. That one is kept exactly, and the email will start a new conversation.
+    if (draft?.subject && !sameConversation(draft.subject, thread.subject)) {
+      subject = draft.subject;
+      request = { ...request, subjectEdited: true };
+    } else {
+      subject = replySubject(thread.subject);
+    }
+    request = { ...request, threadSubject: thread.subject };
   }
   const shownSubject = subject || request.instruction.split(/\s+/).slice(0, 8).join(" ");
   const names = request.to.map((slot) => slot.mailbox!.name || slot.query).join(", ");
@@ -417,7 +515,11 @@ async function scheduleRequest(
     sendAt: request.sendAt!,
     itemText,
     tag: request.account === "personal" ? "personal" : "work",
-    request: JSON.stringify({ ...request, subject }),
+    request: JSON.stringify({
+      ...request,
+      subject,
+      ...(draft ? { finalSubject: subject, finalBody: draft.body } : {}),
+    }),
     confirmChat: confirmation.chatId,
     confirmMessage: confirmation.messageId,
   });
@@ -425,6 +527,16 @@ async function scheduleRequest(
     return { text: "Not scheduled again: this command was already handled." };
   }
   console.log(`Scheduled send ${row.id}: status -> scheduled`);
+  rememberScheduledSend({
+    chatId: confirmation.chatId,
+    scheduledSendId: row.id,
+    sendAt: request.sendAt!,
+    to: formatMailboxList(to),
+    subject: shownSubject,
+    account: request.account === "personal" ? "personal" : "work",
+    draftId: request.draftId,
+    body: draft?.body,
+  });
   const scheduledCard = {
     text: `Scheduled: ${itemText}`,
     caption: `Scheduled: ${itemText}`,
@@ -463,8 +575,21 @@ async function finishRequest(
     startIso: request.meeting!.startIso,
     endIso: request.meeting!.endIso,
     attendees,
+    account: request.account === "personal" ? "personal" : "work",
     now,
   });
+  if (result.booked && result.eventId && confirmation) {
+    rememberBookedMeeting(confirmation.chatId, {
+      eventId: result.eventId,
+      accountId: request.account === "personal" ? "personal" : "work",
+      title: request.meeting!.title ?? request.to[0]?.query ?? "Meeting",
+      startIso: request.meeting!.startIso,
+      attendees: attendees.map((person) => ({
+        name: person.name || person.email,
+        email: person.email.toLowerCase(),
+      })),
+    }, now);
+  }
   return { text: result.text };
 }
 
@@ -588,6 +713,29 @@ async function resolveAndContinue(
   return finishRequest(request, base, confirmation, now);
 }
 
+function ownerNamed(
+  query: string,
+  ownWords: string,
+  contact: { email: string; name: string },
+): boolean {
+  if (/^(?:him|her|them|it)$/i.test(query.trim())) {
+    return true;
+  }
+  if (/\b(?:this|that|the|same)\s+(?:email(?:\s+id)?|address)\b|\bemail i\b|\baddress i\b/i.test(query)) {
+    return true;
+  }
+  const said = (token: string) =>
+    new RegExp(`(?<![\\p{L}\\p{N}])${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "iu").test(ownWords);
+  const typed = addressIn(query);
+  if (typed && ownWords.toLowerCase().includes(typed)) {
+    return true;
+  }
+  const spoken = nameTokens(query).filter((token) => token.length >= 3);
+  const known = nameTokens(contact.name).filter((token) => token.length >= 3);
+  const first = known[0];
+  return (spoken.length > 0 && spoken.every(said)) || (first !== undefined && said(first));
+}
+
 /** Who he named, checked against his own words, or why it can't be used. An address
  *  Aadi already offered him counts, because he's answering that question. A
  *  previously resolved attendee on this workflow also counts, even if the email
@@ -608,12 +756,16 @@ function recipientSlots(
       );
     });
   const answered = new Set<number>();
-  const prior = pendingResolvedEmails(chatId);
+  const prior = pendingResolvedEmails(chatId, now);
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
     const address = addressIn(query);
     const offers = address ? offeredIn(address) : [];
     const remembered = prior.get(query.trim().toLowerCase()) ?? (address ? prior.get(address) : undefined);
+    const supplied = matchOwnerSupplied(chatId, query, now);
+    if (supplied.kind === "many") {
+      return `${refusal}: "${query}" matches more than one address Vishnu typed (${supplied.contacts.map((item) => item.email).join(", ")}). Ask which one.`;
+    }
     if (address && offers.length > 0) {
       offers.forEach((choice) => answered.add(choice.id));
       slots.push({ query, mailbox: { email: address, name: "" } });
@@ -621,6 +773,11 @@ function recipientSlots(
       slots.push({
         query,
         mailbox: { email: remembered.email, name: remembered.name },
+      });
+    } else if (supplied.kind === "one" && ownerNamed(query, ownWords, supplied.contact)) {
+      slots.push({
+        query,
+        mailbox: { email: supplied.contact.email, name: supplied.contact.name },
       });
     } else if (namedInOwnWords(query, ownWords)) {
       slots.push({ query });
@@ -674,6 +831,10 @@ export async function sendEmailFromTool(
     return "Not sent: only Vishnu's own message can send an email.";
   }
   const ownWords = turn.userText?.trim() ?? "";
+  const held = holdEmailToolTurn(confirmation.chatId, ownWords, now);
+  if (held) {
+    return held;
+  }
   const notCommand = notASendCommand(ownWords);
   if (notCommand) {
     return `Not sent: ${notCommand}. Use the right tool, or ask him if he wants it sent now.`;
@@ -688,6 +849,7 @@ export async function sendEmailFromTool(
     send_on?: unknown;
     send_time?: unknown;
     subject?: unknown;
+    draft_id?: unknown;
   };
   if (values.attachment_requested === true || asksForAttachment(ownWords)) {
     return "Not sent: he asked for a file and I can't attach one here, so nothing went out. Ask him whether to send it without the file or draft it so he can add it.";
@@ -710,7 +872,7 @@ export async function sendEmailFromTool(
   }
   const slots = recipientSlots(
     [...toQueries, ...ccQueries],
-    authorizationWords(confirmation.chatId, ownWords),
+    authorizationWords(confirmation.chatId, ownWords, now),
     now,
     when ? "Not scheduled" : "Not sent",
     confirmation.chatId,
@@ -730,6 +892,10 @@ export async function sendEmailFromTool(
     ...(when ? { sendAt: when } : {}),
     ...(typeof values.subject === "string" && values.subject.trim()
       ? { subject: values.subject.trim() }
+      : {}),
+    // Only a scheduled email is made from a draft. It is checked when it is scheduled.
+    ...(when && typeof values.draft_id === "string" && values.draft_id.trim()
+      ? { draftId: values.draft_id.trim() }
       : {}),
   };
   return asToolResult(
@@ -772,7 +938,7 @@ export async function bookMeetingFromTool(
     end_time?: unknown;
     duration_minutes?: unknown;
   };
-  const authWords = authorizationWords(confirmation.chatId, ownWords);
+  const authWords = authorizationWords(confirmation.chatId, ownWords, now);
   let queries = stringList(values.attendees);
   if (queries.length === 0 && pending?.meeting?.attendees.length) {
     queries = pending.meeting.attendees.map((item) => item.query);
@@ -784,6 +950,7 @@ export async function bookMeetingFromTool(
   if (typeof slots === "string") {
     return slots;
   }
+  const calendar = pending?.meeting?.calendar === "personal" ? "personal" : "work";
   const duration =
     typeof values.duration_minutes === "number"
       ? values.duration_minutes
@@ -806,7 +973,7 @@ export async function bookMeetingFromTool(
       updatedAt: now.toISOString(),
       meeting: {
         title,
-        calendar: "work",
+        calendar,
         attendees: resolved,
         durationMinutes: duration,
         waiting: resolved.every((item) => item.resolved) ? "time" : "attendees",
@@ -836,7 +1003,7 @@ export async function bookMeetingFromTool(
     threadId: null,
     instruction: "",
     ownWords: authWords,
-    account: "work",
+    account: calendar,
     meeting: {
       title,
       startIso: times.startIso,
@@ -852,7 +1019,7 @@ export async function bookMeetingFromTool(
     ),
   );
   if (!result.startsWith("Not booked")) {
-    clearPendingAction(confirmation.chatId);
+    clearPendingAction(confirmation.chatId, now);
   }
   return result;
 }

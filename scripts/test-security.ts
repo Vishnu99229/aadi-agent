@@ -787,9 +787,12 @@ assert(
 );
 const scheduledSrc = await readFile(join(root, "src/scheduled_sends.ts"), "utf8");
 const fireFn = scheduledSrc.slice(scheduledSrc.indexOf("export async function fireScheduledSend"));
+const beforeSend = fireFn.indexOf("beforeSend:");
 assert(
   fireFn.indexOf("recheckRecipients(request)") < fireFn.indexOf("writeAndSend(") &&
-    fireFn.includes("beforeSend: () => claimScheduledSend("),
+    beforeSend > fireFn.indexOf("writeAndSend(") &&
+    fireFn.includes("claimDraftDelivery(") &&
+    fireFn.includes("claimScheduledSend("),
   "a scheduled send re-resolves its recipients, then claims right before sending",
 );
 assert(

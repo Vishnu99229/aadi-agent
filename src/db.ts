@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { addOneMonthYmd } from "./bill_cycle.js";
+import { sameConversation } from "./subject_logic.js";
 import { assertTestSeam } from "./test_seam.js";
 
 export type MessageRole = "user" | "assistant" | "tool";
@@ -161,6 +162,22 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     tool_name TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS calendar_event_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    account_id TEXT NOT NULL CHECK (account_id IN ('work', 'personal')),
+    title TEXT NOT NULL,
+    start_iso TEXT NOT NULL,
+    attendees_json TEXT NOT NULL DEFAULT '[]',
+    focused INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    UNIQUE (chat_id, account_id, event_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_calendar_event_refs_chat
+    ON calendar_event_refs (chat_id, focused DESC, updated_at DESC);
 
   CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1129,6 +1146,46 @@ try {
   );
 }
 
+let messagesFtsReady = false;
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      content,
+      content='messages',
+      content_rowid='id',
+      tokenize='porter'
+    );
+    CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+      INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF content ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+      INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+  `);
+  messagesFtsReady = true;
+  const rebuilt = db
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get("messages_fts_rebuilt_v1") as { value: string } | undefined;
+  if (rebuilt?.value !== "1") {
+    db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild');`);
+    db.prepare(
+      `INSERT INTO settings (key, value) VALUES ('messages_fts_rebuilt_v1', '1')
+       ON CONFLICT(key) DO UPDATE SET value = '1'`,
+    ).run();
+    console.log("messages FTS index rebuilt");
+  }
+} catch (error) {
+  messagesFtsReady = false;
+  const errorType = error instanceof Error ? error.name : "UnknownError";
+  console.error(`Message FTS5 unavailable (${errorType}); search will scan a bounded slice.`);
+}
+
 let memoriesFtsReady = false;
 try {
   db.exec(`
@@ -1309,6 +1366,184 @@ export function getRecentMessages(limit = 10): StoredMessage[] {
     .all(safeLimit) as StoredMessage[];
 
   return rows.reverse();
+}
+
+export interface MessageHit {
+  id: number;
+  content: string;
+  created_at: string;
+}
+
+function messageSearchForms(tokens: readonly string[]): string[] {
+  const forms = new Set<string>();
+  for (const token of tokens) {
+    const word = token.toLowerCase();
+    if (word.length < 3) {
+      continue;
+    }
+    forms.add(word);
+    if (word.length >= 6 && forms.size < 12) {
+      for (let index = 0; index < word.length && forms.size < 12; index += 1) {
+        if (word[index] === "h" || word[index] === "i") {
+          const variant = `${word.slice(0, index)}${word[index] === "i" ? "y" : ""}${word.slice(index + 1)}`;
+          if (variant.length >= 3) {
+            forms.add(variant);
+          }
+        }
+      }
+    }
+  }
+  return [...forms].slice(0, 12);
+}
+
+/**
+ * Candidate chat lines for one lookup. FTS5 supplies a small set; the caller ranks it.
+ * Without FTS, only the latest 200 non-tool rows are read, then whole words are kept.
+ */
+export function searchRelevantMessages(tokens: readonly string[], limit = 24): MessageHit[] {
+  const safeLimit = Math.max(1, Math.min(24, Math.floor(limit)));
+  const forms = messageSearchForms(tokens);
+  if (forms.length === 0) {
+    return [];
+  }
+  if (messagesFtsReady) {
+    const match = forms.map((form) => `"${form.replace(/"/g, "")}"`).join(" OR ");
+    try {
+      return db
+        .prepare(
+          `SELECT m.id, m.content, m.created_at
+           FROM messages m
+           JOIN messages_fts f ON f.rowid = m.id
+           WHERE messages_fts MATCH ? AND m.role != 'tool'
+           ORDER BY bm25(messages_fts), m.id DESC
+           LIMIT ?`,
+        )
+        .all(match, safeLimit) as MessageHit[];
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Message FTS query failed (${errorType}); scanning a bounded slice.`);
+    }
+  }
+  const rows = db
+    .prepare(
+      `SELECT id, content, created_at
+       FROM messages
+       WHERE role != 'tool'
+       ORDER BY id DESC
+       LIMIT 200`,
+    )
+    .all() as MessageHit[];
+  return rows
+    .filter((row) =>
+      forms.some((form) => new RegExp(`(?<![\\p{L}\\p{N}])${form}(?![\\p{L}\\p{N}])`, "iu").test(row.content)),
+    )
+    .slice(0, safeLimit);
+}
+
+export interface CalendarEventRefRecord {
+  chatId: number;
+  eventId: string;
+  accountId: "work" | "personal";
+  title: string;
+  startIso: string;
+  attendees: Array<{ name: string; email: string }>;
+  focused: boolean;
+  updatedAt: string;
+}
+
+const CALENDAR_REF_LIMIT = 20;
+
+export function upsertCalendarEventRef(input: {
+  chatId: number;
+  eventId: string;
+  accountId: "work" | "personal";
+  title: string;
+  startIso: string;
+  attendees: Array<{ name: string; email: string }>;
+  focused?: boolean;
+  updatedAt: string;
+}): void {
+  const attendees = input.attendees.slice(0, 30);
+  const focused = input.focused ? 1 : 0;
+  db.transaction(() => {
+    if (focused) {
+      db.prepare(`UPDATE calendar_event_refs SET focused = 0 WHERE chat_id = ?`).run(input.chatId);
+    }
+    db.prepare(
+      `INSERT INTO calendar_event_refs
+        (chat_id, event_id, account_id, title, start_iso, attendees_json, focused, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(chat_id, account_id, event_id) DO UPDATE SET
+         title = excluded.title,
+         start_iso = excluded.start_iso,
+         attendees_json = excluded.attendees_json,
+         focused = CASE WHEN excluded.focused = 1 THEN 1 ELSE calendar_event_refs.focused END,
+         updated_at = excluded.updated_at`,
+    ).run(
+      input.chatId,
+      input.eventId,
+      input.accountId,
+      input.title,
+      input.startIso,
+      JSON.stringify(attendees),
+      focused,
+      input.updatedAt,
+    );
+    db.prepare(
+      `DELETE FROM calendar_event_refs
+       WHERE chat_id = ?
+         AND id NOT IN (
+           SELECT id FROM calendar_event_refs
+           WHERE chat_id = ?
+           ORDER BY focused DESC, updated_at DESC
+           LIMIT ?
+         )`,
+    ).run(input.chatId, input.chatId, CALENDAR_REF_LIMIT);
+  })();
+}
+
+export function listCalendarEventRefs(chatId: number): CalendarEventRefRecord[] {
+  const rows = db
+    .prepare(
+      `SELECT event_id, account_id, title, start_iso, attendees_json, focused, updated_at
+       FROM calendar_event_refs
+       WHERE chat_id = ?
+       ORDER BY focused DESC, updated_at DESC
+       LIMIT ?`,
+    )
+    .all(chatId, CALENDAR_REF_LIMIT) as Array<{
+    event_id: string;
+    account_id: "work" | "personal";
+    title: string;
+    start_iso: string;
+    attendees_json: string;
+    focused: number;
+    updated_at: string;
+  }>;
+  return rows.map((row) => {
+    let attendees: Array<{ name: string; email: string }> = [];
+    try {
+      const parsed = JSON.parse(row.attendees_json) as Array<{ name?: string; email?: string }>;
+      attendees = parsed
+        .map((person) => ({
+          name: person.name ?? "",
+          email: (person.email ?? "").toLowerCase(),
+        }))
+        .filter((person) => person.email);
+    } catch {
+      attendees = [];
+    }
+    return {
+      chatId,
+      eventId: row.event_id,
+      accountId: row.account_id,
+      title: row.title,
+      startIso: row.start_iso,
+      attendees,
+      focused: row.focused === 1,
+      updatedAt: row.updated_at,
+    };
+  });
 }
 
 export const CONVERSATION_SUMMARY_KEY = "conversation_summary";
@@ -1571,6 +1806,13 @@ export function transitionPendingAction(
     .run(to, id, from);
 
   return result.changes === 1;
+}
+
+/** Puts a finished approval back to pending. Tests use it to prove a stale Send
+ *  button still cannot deliver an email that already went out. */
+export function reopenPendingActionForTests(id: number): void {
+  assertTestSeam("reopenPendingActionForTests");
+  db.prepare("UPDATE pending_actions SET status = 'pending' WHERE id = ?").run(id);
 }
 
 export function setPendingActionDraftMeta(
@@ -5244,6 +5486,272 @@ export function createScheduledSend(input: {
   })();
 }
 
+function editableScheduledStatus(status: ScheduledSendStatus): boolean {
+  return status === "scheduled" || status === "held";
+}
+
+/** A person the scheduled email goes to. The address is the choice he made, so it is
+ *  also what the send-time check looks up. */
+export interface ScheduledPerson {
+  name: string;
+  email: string;
+}
+
+function scheduledSlots(people: readonly ScheduledPerson[]): Array<Record<string, unknown>> {
+  return people.map((person) => {
+    const email = person.email.toLowerCase();
+    return { query: email, mailbox: { email, name: person.name || email } };
+  });
+}
+
+function slotAddresses(slots: unknown): string {
+  if (!Array.isArray(slots)) {
+    return "";
+  }
+  return slots
+    .map((slot) => {
+      const mailbox = (slot as { mailbox?: { email?: unknown } } | null)?.mailbox;
+      return typeof mailbox?.email === "string" ? mailbox.email.toLowerCase() : "";
+    })
+    .sort()
+    .join(",");
+}
+
+function sameAddressSet(slots: unknown, people: readonly ScheduledPerson[]): boolean {
+  return slotAddresses(slots) === people.map((person) => person.email.toLowerCase()).sort().join(",");
+}
+
+/** Everything the scheduled worker reads from an approved draft edit. Which draft a row
+ *  belongs to is fixed when it is scheduled and is never changed here. */
+export interface ScheduledCopyChange {
+  to?: readonly ScheduledPerson[];
+  cc?: readonly ScheduledPerson[];
+  subject?: string;
+  /** The finished body. It is sent as it is, with no rewrite at send time. */
+  body?: string;
+}
+
+export type ScheduledCopyResult =
+  | { ok: true; changed: boolean }
+  | { ok: false; status: ScheduledSendStatus | "missing" | "unreadable" };
+
+/**
+ * One write for every field the worker reads: recipients, subject, and the finalized
+ * subject and body. Either all of it lands or none of it does, and
+ * only while the row can still change. The worker's claim compares the request text, so
+ * any change here makes a copy it already prepared stale.
+ */
+export function writeScheduledCopy(id: number, change: ScheduledCopyChange): ScheduledCopyResult {
+  return db.transaction((): ScheduledCopyResult => {
+    const row = getScheduledSend(id);
+    if (!row) {
+      return { ok: false, status: "missing" };
+    }
+    if (!editableScheduledStatus(row.status)) {
+      return { ok: false, status: row.status };
+    }
+    let request: Record<string, unknown>;
+    try {
+      request = JSON.parse(row.request) as Record<string, unknown>;
+    } catch {
+      return { ok: false, status: "unreadable" };
+    }
+    // The same people keep the names and choices already stored for them.
+    if (change.to && change.to.length > 0 && !sameAddressSet(request.to, change.to)) {
+      request.to = scheduledSlots(change.to);
+    }
+    if (change.cc && !sameAddressSet(request.cc, change.cc)) {
+      request.cc = scheduledSlots(change.cc);
+    }
+    const subject = change.subject?.trim();
+    const before = typeof request.subject === "string" ? request.subject : "";
+    if (subject) {
+      // A subject he changed, not one copied over unchanged, decides at send time whether a
+      // reply can stay in its thread.
+      if (before && !sameConversation(subject, before)) {
+        request.subjectEdited = true;
+      }
+      request.subject = subject;
+      request.finalSubject = subject;
+    }
+    if (typeof change.body === "string" && change.body.trim()) {
+      request.finalBody = change.body;
+      request.instruction = change.body;
+      if (typeof request.finalSubject !== "string" && typeof request.subject === "string") {
+        request.finalSubject = request.subject;
+      }
+    }
+    let next = JSON.stringify(request);
+    if (next === row.request) {
+      return { ok: true, changed: false };
+    }
+    if (subject || change.body) {
+      const version = typeof request.finalVersion === "number" ? request.finalVersion : 0;
+      request.finalVersion = version + 1;
+      next = JSON.stringify(request);
+    }
+    const written = db
+      .prepare(
+        `UPDATE scheduled_sends SET request = ?
+         WHERE id = ? AND status IN ('scheduled', 'held') AND request = ?`,
+      )
+      .run(next, id, row.request).changes === 1;
+    if (written && subject && subject !== before) {
+      // The task list and /scheduledsends show the subject that will go out.
+      const parts = row.item_text.split(" — ");
+      if (parts.length >= 3) {
+        parts[1] = subject;
+        const itemText = parts.join(" — ");
+        db.prepare("UPDATE scheduled_sends SET item_text = ? WHERE id = ?").run(itemText, id);
+        db.prepare("UPDATE tasks SET text = ? WHERE id = ? AND text = ?").run(itemText, row.task_id, row.item_text);
+      }
+    }
+    return written ? { ok: true, changed: true } : { ok: false, status: getScheduledSend(id)?.status ?? "missing" };
+  })();
+}
+
+/** Every scheduled email bound, when it was scheduled, to this Gmail draft in this mailbox,
+ *  and that has not ended without sending. A draft id alone never links two mailboxes. */
+export function listScheduledSendsForDraft(draftId: string, account: string): ScheduledSendRecord[] {
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_sends
+       WHERE status IN ('scheduled', 'held', 'sending', 'sent')
+         AND json_valid(request)
+         AND json_extract(request, '$.draftId') = ?
+         AND json_extract(request, '$.account') = ?
+       ORDER BY id DESC`,
+    )
+    .all(draftId, account) as ScheduledSendRecord[];
+}
+
+export type DraftDeliveryClaim =
+  | { state: "none" }
+  | { state: "claimed"; id: number; taskId: number }
+  | { state: "already_sent"; id: number; itemText: string }
+  | { state: "in_progress"; id: number; itemText: string }
+  | { state: "unconfirmed"; id: number; itemText: string };
+
+/** Scheduled rows for this draft in this mailbox, including attempts that already left the queue. */
+function draftDeliveryRows(draftId: string, account: string): ScheduledSendRecord[] {
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_sends
+       WHERE json_valid(request)
+         AND json_extract(request, '$.draftId') = ?
+         AND json_extract(request, '$.account') = ?
+         AND status IN ('scheduled', 'held', 'sending', 'sent', 'failed')
+       ORDER BY id DESC`,
+    )
+    .all(draftId, account) as ScheduledSendRecord[];
+}
+
+/**
+ * One claim for every way this draft can go out. The manual Send button and the
+ * scheduled worker both take it before Gmail, so only one of them proceeds.
+ * A sent, in-flight, or unconfirmed attempt blocks another try.
+ */
+export function claimDraftDelivery(
+  draftId: string,
+  account: string,
+  nowIso: string,
+  only?: { scheduleId: number; request: string },
+): DraftDeliveryClaim {
+  const classify = (depth: number): DraftDeliveryClaim => {
+    if (depth > 3) {
+      return { state: "in_progress", id: 0, itemText: "That email is already being sent." };
+    }
+    const rows = draftDeliveryRows(draftId, account);
+    const sending = rows.find((row) => row.status === "sending");
+    if (sending) {
+      return { state: "in_progress", id: sending.id, itemText: sending.item_text };
+    }
+    const openRows = rows.filter((row) => row.status === "scheduled" || row.status === "held");
+    const open = only
+      ? openRows.find((row) => row.id === only.scheduleId && row.request === only.request)
+      : openRows[0];
+    if (open) {
+      const claimed =
+        db
+          .prepare(
+            `UPDATE scheduled_sends SET status = 'sending', claimed_at = ?
+             WHERE id = ? AND status IN ('scheduled', 'held')
+               AND EXISTS (
+                 SELECT 1 FROM tasks
+                 WHERE tasks.id = scheduled_sends.task_id AND tasks.status = 'open'
+               )`,
+          )
+          .run(nowIso, open.id).changes === 1;
+      if (claimed) {
+        for (const other of openRows) {
+          if (other.id === open.id) continue;
+          if (transitionScheduledSend(other.id, ["scheduled", "held"], "cancelled")) {
+            markTaskDone(other.task_id);
+          }
+        }
+        return { state: "claimed", id: open.id, taskId: open.task_id };
+      }
+      const current = getScheduledSend(open.id);
+      if (current && (current.status === "scheduled" || current.status === "held")) {
+        return { state: "none" };
+      }
+      return classify(depth + 1);
+    }
+    const sent = rows.find((row) => row.status === "sent");
+    if (sent) {
+      return { state: "already_sent", id: sent.id, itemText: sent.item_text };
+    }
+    const failed = rows.find((row) => row.status === "failed" && row.claimed_at);
+    if (failed) {
+      return { state: "unconfirmed", id: failed.id, itemText: failed.item_text };
+    }
+    return { state: "none" };
+  };
+  return db.transaction(() => classify(0)).immediate();
+}
+
+/** Drops queued deliveries for this draft. An attempt already underway is left alone. */
+export function cancelOpenDraftSchedules(draftId: string, account: string): number {
+  let cancelled = 0;
+  for (const row of draftDeliveryRows(draftId, account)) {
+    if (row.status !== "scheduled" && row.status !== "held") {
+      continue;
+    }
+    if (transitionScheduledSend(row.id, ["scheduled", "held"], "cancelled")) {
+      markTaskDone(row.task_id);
+      cancelled += 1;
+    }
+  }
+  return cancelled;
+}
+
+export function draftDeliveryBlocksDiscard(draftId: string, account: string): "in_progress" | "already_sent" | undefined {
+  const rows = draftDeliveryRows(draftId, account);
+  if (rows.some((row) => row.status === "sending")) {
+    return "in_progress";
+  }
+  if (rows.some((row) => row.status === "sent")) {
+    return "already_sent";
+  }
+  return undefined;
+}
+
+/** The mailbox a draft was scheduled from, including after that send has finished. */
+export function accountBoundToDraft(draftId: string): "work" | "personal" | undefined {
+  const row = db
+    .prepare(
+      `SELECT json_extract(request, '$.account') AS account
+       FROM scheduled_sends
+       WHERE json_valid(request)
+         AND json_extract(request, '$.draftId') = ?
+         AND status IN ('scheduled', 'held', 'sending', 'sent', 'failed')
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get(draftId) as { account: unknown } | undefined;
+  return row?.account === "work" || row?.account === "personal" ? row.account : undefined;
+}
+
 export function getScheduledSend(id: number): ScheduledSendRecord | undefined {
   return db.prepare("SELECT * FROM scheduled_sends WHERE id = ?").get(id) as
     | ScheduledSendRecord
@@ -5286,16 +5794,18 @@ export function listStaleScheduledSends(cutoffIso: string): ScheduledSendRecord[
     .all(cutoffIso) as ScheduledSendRecord[];
 }
 
-/** The last check before Gmail. Fails if he cancelled, by any route, in the meantime. */
-export function claimScheduledSend(id: number, nowIso: string): boolean {
+/** The last check before Gmail, in one statement. Fails if he cancelled, by any route, or
+ *  if the saved request is no longer the exact one this copy was prepared from. After it
+ *  succeeds the row is 'sending' and no correction can change it. */
+export function claimScheduledSend(id: number, nowIso: string, preparedRequest: string): boolean {
   return (
     db
       .prepare(
         `UPDATE scheduled_sends SET status = 'sending', claimed_at = ?
-         WHERE id = ? AND status = 'scheduled'
+         WHERE id = ? AND status = 'scheduled' AND request = ?
            AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = scheduled_sends.task_id AND tasks.status = 'open')`,
       )
-      .run(nowIso, id).changes === 1
+      .run(nowIso, id, preparedRequest).changes === 1
   );
 }
 
@@ -5312,11 +5822,14 @@ export function transitionScheduledSend(
   );
 }
 
-export function holdScheduledSend(id: number, request: string): boolean {
+/** Holds only the version the worker checked, so a correction saved meanwhile is kept. */
+export function holdScheduledSend(id: number, request: string, checkedRequest: string): boolean {
   return (
     db
-      .prepare("UPDATE scheduled_sends SET status = 'held', request = ? WHERE id = ? AND status = 'scheduled'")
-      .run(request, id).changes === 1
+      .prepare(
+        "UPDATE scheduled_sends SET status = 'held', request = ? WHERE id = ? AND status = 'scheduled' AND request = ?",
+      )
+      .run(request, id, checkedRequest).changes === 1
   );
 }
 
@@ -5337,11 +5850,12 @@ export function recordScheduledSendSent(id: number, sentMessageId: string | null
   );
 }
 
+/** Retries a send that is still scheduled. A cancel that landed meanwhile stays cancelled. */
 export function retryScheduledSend(id: number, retryAt: string): number {
-  db.prepare(
-    "UPDATE scheduled_sends SET status = 'scheduled', retry_at = ?, write_failures = write_failures + 1 WHERE id = ?",
-  ).run(retryAt, id);
-  return getScheduledSend(id)?.write_failures ?? 0;
+  const changed = db.prepare(
+    "UPDATE scheduled_sends SET retry_at = ?, write_failures = write_failures + 1 WHERE id = ? AND status = 'scheduled'",
+  ).run(retryAt, id).changes;
+  return changed === 1 ? getScheduledSend(id)?.write_failures ?? 0 : 0;
 }
 
 export type IgnoreEntityType =

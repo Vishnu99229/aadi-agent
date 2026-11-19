@@ -11,6 +11,7 @@ import { nameTokens, notAnEventCommand, scheduledTargetWords } from "./command_l
 import { resolveRecipient } from "./command_recipients.js";
 import { config } from "./config.js";
 import {
+  claimDraftDelivery,
   claimScheduledSend,
   getScheduledSend,
   holdScheduledSend,
@@ -31,6 +32,7 @@ import { loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { getGoogleAccount } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
+import { retireDraftApproval } from "./approvals.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { allowOwnerChatCancelScheduledSend } from "./security/send_approval.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -42,6 +44,8 @@ const RETRY_AFTER_MS = 15 * 60 * 1000;
 const STALE_CLAIM_MS = 30 * 60 * 1000;
 const LATE_AFTER_MS = 10 * 60 * 1000;
 const MAX_HOLD_BUTTONS = 8;
+/** Corrections that land while a copy is being prepared. Past this, the next tick carries on. */
+const MAX_PREPARE_RESTARTS = 3;
 
 async function tell(text: string, keyboard?: InlineKeyboard): Promise<void> {
   try {
@@ -58,6 +62,17 @@ async function tell(text: string, keyboard?: InlineKeyboard): Promise<void> {
 
 function requestOf(row: ScheduledSendRecord): CommandRequest {
   return JSON.parse(row.request) as CommandRequest;
+}
+
+function finalizedCopy(request: CommandRequest): { subject: string; body: string } | undefined {
+  const saved = request as CommandRequest & { finalBody?: string; finalSubject?: string };
+  if (typeof saved.finalBody !== "string" || !saved.finalBody.trim()) {
+    return undefined;
+  }
+  return {
+    subject: saved.finalSubject?.trim() || request.subject?.trim() || "Update",
+    body: saved.finalBody,
+  };
 }
 
 /** Whether a slot still points at the same person, or what to ask him. */
@@ -115,11 +130,12 @@ async function recheckRecipients(request: CommandRequest): Promise<RecheckResult
   return { ok: true };
 }
 
-async function hold(row: ScheduledSendRecord, request: CommandRequest, check: Extract<RecheckResult, { ok: false }>): Promise<void> {
+/** False when the row changed or ended while its recipients were being checked. */
+async function hold(row: ScheduledSendRecord, request: CommandRequest, check: Extract<RecheckResult, { ok: false }>): Promise<boolean> {
   const slots = [...request.to, ...request.cc];
   slots[check.slotIndex]!.options = check.options;
-  if (!holdScheduledSend(row.id, JSON.stringify(request))) {
-    return;
+  if (!holdScheduledSend(row.id, JSON.stringify(request), row.request)) {
+    return false;
   }
   console.log(`Scheduled send ${row.id}: status -> held`);
   const keyboard = new InlineKeyboard();
@@ -131,38 +147,68 @@ async function hold(row: ScheduledSendRecord, request: CommandRequest, check: Ex
     `Held, not sent: ${row.item_text}\n${check.reason}. Who should it go to?`,
     keyboard,
   );
+  return true;
 }
 
-/** Writes it fresh, then sends. The claim sits right before Gmail, so a cancel by any
- *  route up to that moment stops it. */
-export async function fireScheduledSend(row: ScheduledSendRecord, now: Date): Promise<void> {
+/** A newer saved version of a row still waiting to go, or nothing. */
+function newerVersion(prepared: ScheduledSendRecord): ScheduledSendRecord | undefined {
+  const latest = getScheduledSend(prepared.id);
+  return latest && latest.status === "scheduled" && latest.request !== prepared.request ? latest : undefined;
+}
+
+/** Writes it fresh, then sends. The claim sits right before Gmail and names the exact
+ *  version this copy was prepared from, so a cancel by any route up to that moment stops
+ *  it, and a correction saved meanwhile throws this copy away for one built from the new
+ *  version. */
+export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, restarts = 0): Promise<void> {
+  const row = getScheduledSend(due.id);
+  if (!row || row.status !== "scheduled") {
+    return;
+  }
   const request = requestOf(row);
   const check = await recheckRecipients(request);
   if (!check.ok) {
-    await hold(row, request, check);
+    if (!(await hold(row, request, check))) {
+      await prepareAgain(row, now, restarts);
+    }
     return;
   }
   const late = now.getTime() - new Date(row.send_at).getTime() > LATE_AFTER_MS;
+  const snapshot = finalizedCopy(request);
   const outcome = await writeAndSend(
-    {
-      ...request,
-      instruction: `${request.instruction}\n(He asked for this earlier, to go out now. Reflect anything that has changed since.)`,
-    },
+    snapshot
+      ? request
+      : {
+          ...request,
+          instruction: `${request.instruction}\n(He asked for this earlier, to go out now. Reflect anything that has changed since.)`,
+        },
     `sched:${row.id}`,
     { chatId: row.confirm_chat, messageId: row.confirm_message },
     now,
     {
-      beforeSend: () => claimScheduledSend(row.id, now.toISOString()),
+      beforeSend: () =>
+        request.draftId
+          ? claimDraftDelivery(request.draftId, request.account, now.toISOString(), {
+              scheduleId: row.id,
+              request: row.request,
+            }).state === "claimed"
+          : claimScheduledSend(row.id, now.toISOString(), row.request),
       note: late ? `This went out late: it was due ${scheduledWhen(row.send_at)}.` : undefined,
+      prepared: snapshot,
+      explicitSubject: request.subjectEdited ? request.finalSubject || request.subject : undefined,
     },
   );
   if (outcome.result === "sent") {
     recordScheduledSendSent(row.id, outcome.messageId ?? null);
     markTaskDone(row.task_id);
+    if (request.draftId) {
+      await retireDraftApproval(request.draftId, request.account);
+    }
     console.log(`Scheduled send ${row.id}: status -> sent`);
     return;
   }
   if (outcome.result === "cancelled") {
+    await prepareAgain(row, now, restarts);
     return;
   }
   if (outcome.result === "write_failed") {
@@ -173,9 +219,29 @@ export async function fireScheduledSend(row: ScheduledSendRecord, now: Date): Pr
     }
     return;
   }
+  if (outcome.result === "not_sent" && newerVersion(row)) {
+    // Refused before the claim, and he has changed it since: check the new version instead.
+    await prepareAgain(row, now, restarts);
+    return;
+  }
   transitionScheduledSend(row.id, ["scheduled", "sending"], "failed");
   console.log(`Scheduled send ${row.id}: status -> failed`);
   await tell(`${row.item_text}\n${outcome.text}\nIt's still on your task list.`);
+}
+
+/** The copy just prepared is stale or was refused. Nothing was sent, so start again from
+ *  the version he saved last; a cancelled or held row stays as it is. */
+async function prepareAgain(prepared: ScheduledSendRecord, now: Date, restarts: number): Promise<void> {
+  const latest = newerVersion(prepared);
+  if (!latest) {
+    return;
+  }
+  if (restarts >= MAX_PREPARE_RESTARTS) {
+    console.log(`Scheduled send ${prepared.id}: still changing, next check picks it up`);
+    return;
+  }
+  console.log(`Scheduled send ${prepared.id}: changed while preparing, using the latest version`);
+  await fireScheduledSend(latest, now, restarts + 1);
 }
 
 /** One minute's work: closed tasks cancel, stuck sends are reported and never resent,
