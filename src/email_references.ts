@@ -64,6 +64,11 @@ export function emailReferenceForTurn(
 
 /** A recipient being discussed is not the same as one explicitly referenced. */
 export function refersToEarlierEmail(text: string, replying = false): boolean {
+  // Cancelling or editing an already scheduled email belongs to its own
+  // workflow; OCR recipient discovery must never delay that cancellation.
+  if (/\b(?:cancel|stop|discard|unschedule)\b/i.test(text)) {
+    return false;
+  }
   if (addressIn(text) && !/\b(?:verify|compare|check)\b/i.test(text)) {
     return false;
   }

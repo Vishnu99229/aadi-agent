@@ -96,6 +96,7 @@ assert.equal(resolveEmailReference({ chatId: 1, ownerText: "Draft an email to Jo
 assert.equal(refersToEarlierEmail("any email from Pinnacle this week?"), false);
 assert.equal(refersToEarlierEmail("Find my earlier email about KYC"), false);
 assert.equal(refersToEarlierEmail("make that email shorter"), false);
+assert.equal(refersToEarlierEmail("Cancel the scheduled email above"), false);
 assert.equal(refersToEarlierEmail("Get the email from the above photo"), true);
 assert.deepEqual(
   resolveEmailReference({
