@@ -2,14 +2,19 @@
 import assert from "node:assert/strict";
 import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
+import { setApprovalsTestHooks } from "../src/approvals.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
+import { writeCommandEmail } from "../src/command_writer.ts";
 import { composeWithEmailAgent } from "../src/context_draft.ts";
 import { createDocument, createMemory, listOpenScheduledSends } from "../src/db.ts";
 import {
+  fromNameForAddress,
+  neutralGreeting,
   outcomeFromLookup,
   setDomainLookupForTests,
   type DomainStatus,
 } from "../src/email_grounding.ts";
+import { handler as draftReply } from "../src/tools/draft_reply.ts";
 import { setGoogleAccountForTests } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests } from "../src/llm.ts";
@@ -32,9 +37,40 @@ const gmail = {
   users: {
     getProfile: async () => ({ data: { emailAddress: "vishnu@epicode.in" } }),
     settings: { sendAs: { list: async () => ({ data: { sendAs: [] } }) } },
+    threads: {
+      get: async () => ({
+        data: {
+          messages: [{
+            id: "m1",
+            internalDate: "1",
+            payload: {
+              headers: [
+                { name: "From", value: "Jeff Comstock <jeff@acme.com>" },
+                { name: "Subject", value: "Hello" },
+              ],
+              mimeType: "text/plain",
+              body: { data: Buffer.from("Hello", "utf8").toString("base64url") },
+            },
+          }],
+        },
+      }),
+    },
     messages: {
       list: async () => ({ data: { messages: [] } }),
-      get: async () => ({ data: { payload: { headers: [] } } }),
+      get: async () => ({
+        data: {
+          id: "reply-1",
+          threadId: "thread-jeff",
+          payload: {
+            headers: [
+              { name: "From", value: "Jeff Comstock <jeff@acme.com>" },
+              { name: "To", value: "vishnu@epicode.in" },
+              { name: "Subject", value: "Hello" },
+              { name: "Message-ID", value: "<jeff-1@acme.com>" },
+            ],
+          },
+        },
+      }),
       send: async ({ requestBody }: { requestBody: { raw: string } }) => {
         sends += 1;
         const raw = Buffer.from(requestBody.raw, "base64url").toString("utf8");
@@ -48,9 +84,9 @@ const gmail = {
 } as unknown as gmail_v1.Gmail;
 setGoogleAccountForTests((id) => ({ id, tag: id, label: id, client: {} }) as never);
 setGmailClientForTests(() => gmail);
-setCommandEmailTestHooks({
-  telegram: { sendMessage: async () => ({ message_id: 1 }) } as unknown as Api,
-});
+const telegram = { sendMessage: async () => ({ message_id: 1 }) } as unknown as Api;
+setCommandEmailTestHooks({ telegram });
+setApprovalsTestHooks({ telegram, gmailFor: () => gmail });
 setCompleteForTests(async (params) => {
   lastPrompt = params.messages.map((message) => (typeof message.content === "string" ? message.content : "")).join("\n");
   return modelReply({
@@ -156,6 +192,62 @@ createDocument("card.jpg", "work", "contact@sargvision.com\nSARGVISION INTELLIGE
   assert.match(draft.body, /^Hi Sargvision team,/);
   assert.doesNotMatch(draft.body, /Hi Nithish/);
   assert.match(lastPrompt, /RECIPIENT NAME: none, use a neutral greeting/);
+}
+
+assert.equal(fromNameForAddress(["Jeff Comstock <jeff@acme.com>", "Other Person <other@acme.com>"], "jeff@acme.com"), "Jeff Comstock");
+assert.equal(fromNameForAddress(["Vishnu Rajan <vishnu@epicode.in>"], "jeff@acme.com"), undefined);
+for (const domain of ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com", "rediffmail.com"]) {
+  assert.equal(neutralGreeting(`contact@${domain}`), "Hi,", domain);
+}
+assert.equal(neutralGreeting("contact@sargvision.com"), "Hi Sargvision team,");
+
+{
+  const written = await writeCommandEmail({
+    gmail,
+    ownWords: "Reply to the thread and say thanks",
+    instruction: "say thanks",
+    recipientNames: ["jeff@acme.com"],
+    recipientAddresses: ["jeff@acme.com"],
+    threadId: "thread-jeff",
+    now: new Date("2026-11-20T08:00:00Z"),
+  });
+  assert.match(written.body, /^Hi Jeff Comstock,/);
+  assert.doesNotMatch(written.body, /Hi Nithish/);
+  assert.match(lastPrompt, /RECIPIENT NAME: Jeff Comstock/);
+}
+
+{
+  let drafted = "";
+  const previous = gmail.users.drafts.create;
+  gmail.users.drafts.create = async ({ requestBody }: { requestBody: { message: { raw: string } } }) => {
+    const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
+    const encoded = /Content-Transfer-Encoding: base64\r?\n\r?\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1] ?? "";
+    drafted = Buffer.from(encoded.replace(/\s/g, ""), "base64").toString("utf8");
+    return { data: { id: "reply-draft", message: { id: "reply-draft", threadId: "thread-jeff" } } };
+  };
+  const created = await draftReply(
+    { email_id: "reply-1", body: "Hi Nithish,\n\nThanks for writing.", account: "work" },
+    { iteration: 1, calledTools: [], userText: "Reply in this thread and say thanks", confirmation: { chatId: 1, messageId: 9 } },
+  );
+  gmail.users.drafts.create = previous;
+  assert.match(created, /reply-draft/);
+  assert.match(drafted, /^Hi Jeff Comstock,/);
+  assert.doesNotMatch(drafted, /Hi Nithish/);
+}
+
+{
+  const before = sends;
+  const sent = await sendEmailFromTool(
+    { to: ["contact@gmail.com"], instruction: "the notes from today" },
+    {
+      userText: "Send an email to contact@gmail.com saying the notes from today",
+      confirmation: { chatId: 1, messageId: 8 },
+    },
+  );
+  assert.match(sent, /Sent to/i);
+  assert.equal(sends, before + 1);
+  assert.match(lastBody, /^Hi,/);
+  assert.doesNotMatch(lastBody, /Gmail team/);
 }
 
 console.log("email grounding checks passed");

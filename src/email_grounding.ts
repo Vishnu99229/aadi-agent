@@ -1,10 +1,15 @@
 import { Resolver } from "node:dns/promises";
 import { listCanonicalContacts, listDocuments } from "./db.js";
+import { parseAddressList } from "./mail_helpers.js";
 import { assertTestSeam } from "./test_seam.js";
 
 /** Generic mailboxes. A greeting may not treat the local part as a person's name. */
 const GENERIC_LOCAL = new Set([
   "contact", "info", "sales", "hello", "team", "support", "admin", "enquiry", "inquiry", "office",
+]);
+/** A generic local part here is still a person, not the mail provider. */
+const FREE_MAIL = new Set([
+  "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com", "rediffmail.com",
 ]);
 const NOT_A_PERSON = new Set([
   "send", "email", "schedule", "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday",
@@ -132,7 +137,8 @@ export function companyLabel(email: string, ocrText?: string): string {
 
 export function neutralGreeting(email: string, ocrText?: string): string {
   const local = email.split("@")[0]?.toLowerCase() ?? "";
-  if (!GENERIC_LOCAL.has(local)) {
+  const domain = email.split("@")[1]?.toLowerCase() ?? "";
+  if (!GENERIC_LOCAL.has(local) || FREE_MAIL.has(domain)) {
     return "Hi,";
   }
   const company = companyLabel(email, ocrText);
@@ -214,6 +220,24 @@ export function ocrTextForAddress(email: string): string | undefined {
     }
   }
   return undefined;
+}
+
+/** Display name on a From header whose address is the reply's To. Later headers win. */
+export function fromNameForAddress(fromHeaders: readonly string[], toEmail: string): string | undefined {
+  const want = toEmail.toLowerCase();
+  let found: string | undefined;
+  for (const header of fromHeaders) {
+    for (const mailbox of parseAddressList(header)) {
+      if (mailbox.email !== want) {
+        continue;
+      }
+      const usable = usableContactName(mailbox.name, toEmail);
+      if (usable) {
+        found = usable;
+      }
+    }
+  }
+  return found;
 }
 
 export function contactNameForAddress(email: string): string | undefined {

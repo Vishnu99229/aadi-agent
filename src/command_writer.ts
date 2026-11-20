@@ -5,7 +5,7 @@ import { searchHistory } from "./embeddings.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { plainTextBody } from "./google/mail.js";
 import { complete } from "./llm.js";
-import { groundGreeting, recipientGrounding, writerSearchText } from "./email_grounding.js";
+import { fromNameForAddress, groundGreeting, recipientGrounding, writerSearchText } from "./email_grounding.js";
 import { cleanDraftBody } from "./sequence_writer.js";
 import { stripSensitive } from "./sensitive.js";
 
@@ -120,9 +120,38 @@ async function section(label: string, read: () => Promise<string> | string): Pro
   }
 }
 
+/** From name on the thread message whose address is who this reply goes to. */
+export async function senderNameOnThread(
+  gmail: gmail_v1.Gmail,
+  threadId: string,
+  toEmail: string,
+): Promise<string | undefined> {
+  if (!toEmail.includes("@")) {
+    return undefined;
+  }
+  try {
+    const { data } = await gmail.users.threads.get({
+      userId: "me",
+      id: threadId,
+      format: "metadata",
+      metadataHeaders: ["From"],
+    });
+    const headers = (data.messages ?? [])
+      .filter((message) => !message.labelIds?.includes("DRAFT"))
+      .sort((left, right) => Number(left.internalDate ?? 0) - Number(right.internalDate ?? 0))
+      .map((message) => messageHeader(message, "From"))
+      .filter(Boolean);
+    return fromNameForAddress(headers, toEmail);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.log(`Command email: thread sender failed (${errorType})`);
+    return undefined;
+  }
+}
+
 /** The whole input the model sees. Card and account numbers are removed here. */
-export async function commandWriterInput(input: CommandEmailInput): Promise<string> {
-  const ground = recipientGrounding(input.ownWords, input.recipientAddresses[0] ?? "");
+export async function commandWriterInput(input: CommandEmailInput, knownName?: string): Promise<string> {
+  const ground = recipientGrounding(input.ownWords, input.recipientAddresses[0] ?? "", knownName);
   const query = writerSearchText(input.ownWords, input.instruction, input.recipientAddresses);
   const context = [
     input.threadId
@@ -154,13 +183,16 @@ export async function commandWriterInput(input: CommandEmailInput): Promise<stri
 export async function writeCommandEmail(
   input: CommandEmailInput,
 ): Promise<{ subject: string; body: string }> {
+  const knownName = input.threadId
+    ? await senderNameOnThread(input.gmail, input.threadId, input.recipientAddresses[0] ?? "")
+    : undefined;
   const result = await complete({
     backend: getTaskBackend("command"),
     noFallback: true,
     task: "command_send",
     effort: "high",
     system: { cacheable: COMMAND_WRITER_SYSTEM },
-    messages: [{ role: "user", content: await commandWriterInput(input) }],
+    messages: [{ role: "user", content: await commandWriterInput(input, knownName) }],
     tools: [],
     jsonSchema: WRITER_SCHEMA,
     maxTokens: 16000,
@@ -176,6 +208,6 @@ export async function writeCommandEmail(
   if (!body) {
     throw new Error("Command writer returned no body.");
   }
-  const ground = recipientGrounding(input.ownWords, input.recipientAddresses[0] ?? "");
+  const ground = recipientGrounding(input.ownWords, input.recipientAddresses[0] ?? "", knownName);
   return { subject, body: groundGreeting(body, ground.allowedName, ground.line) };
 }
