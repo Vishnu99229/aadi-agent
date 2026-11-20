@@ -28,6 +28,7 @@ import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
+import { mailDomainRefusal } from "./email_grounding.js";
 import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
 import {
@@ -228,6 +229,10 @@ export async function writeAndSend(
 ): Promise<Outcome> {
   const to = request.to.map((slot) => slot.mailbox!);
   const cc = request.cc.map((slot) => slot.mailbox!);
+  const domainRefusal = await mailDomainRefusal([...to, ...cc].map((item) => item.email));
+  if (domainRefusal) {
+    return { text: domainRefusal, result: "not_sent" };
+  }
   const key = sendKey(base, to);
   if (getCommandSendByKey(key)) {
     return { text: "Not sent again: this command was already handled.", result: "not_sent" };
@@ -473,6 +478,12 @@ async function scheduleRequest(
 ): Promise<Outcome> {
   if (!confirmation) {
     return { text: "Not scheduled: only Vishnu's own message can do that." };
+  }
+  const domainRefusal = await mailDomainRefusal(
+    [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email] : [])),
+  );
+  if (domainRefusal) {
+    return { text: domainRefusal, result: "not_sent" };
   }
   const to = request.to.map((slot) => slot.mailbox!);
   let draft: { subject: string; body: string } | undefined;

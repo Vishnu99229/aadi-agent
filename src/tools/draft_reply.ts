@@ -18,6 +18,7 @@ import { linkPublishedDraft } from "../action_context.js";
 import { parseAddressList } from "../mail_helpers.js";
 import { isSelfEmail } from "../mom_logic.js";
 import { emailReferenceForTurn } from "../email_references.js";
+import { groundGreeting, recipientGrounding } from "../email_grounding.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -173,6 +174,10 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     );
   }
   const cc = dropSelf(explicitCc);
+  const toEmail = parseAddressList(to)[0]?.email ?? "";
+  const fromName = parseAddressList(from).find((box) => box.email === toEmail)?.name;
+  const ground = toEmail ? recipientGrounding(turn.userText ?? "", toEmail, fromName) : undefined;
+  const body = ground ? groundGreeting(values.body, ground.allowedName, ground.line) : values.body;
 
   const subject = replySubject(header(headers, "Subject"));
   const raw = buildThreadReplyMime({
@@ -181,7 +186,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     subject,
     inReplyTo: messageId,
     references: header(headers, "References"),
-    body: values.body,
+    body,
     signatureHtml: await signatureHtmlFor(account),
   });
   console.log(`Draft MIME headers: ${mimeHeaderNames(raw)}`);
@@ -218,7 +223,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     to,
     cc: cc || undefined,
     subject,
-    body: values.body,
+    body,
     googleAccount: account.id,
     extraLines: cc ? [`Cc: ${cc}`] : undefined,
   });
@@ -229,7 +234,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       to,
       cc,
       subject,
-      body: values.body,
+      body,
       account: account.id,
     });
   }

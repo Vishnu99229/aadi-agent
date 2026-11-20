@@ -935,7 +935,8 @@ const say = (text: string, now = NOW) =>
   assert.equal(getPendingAction(chat, NOW)?.email?.draftId, posted.draftId);
   assert.match(cards.at(-1)!.text, /Subject: Quarterly report/);
   assert.match(cards.at(-1)!.text, /sameer@example\.com/i);
-  assert.match(cards.at(-1)!.text, /UmFnaGF2ZW5kcmE|Raghavendra/);
+  assert.match(cards.at(-1)!.text, /Hi Sameer/);
+  assert.match(cards.at(-1)!.text, /dialer/);
 }
 
 {
