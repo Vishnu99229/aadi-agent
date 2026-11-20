@@ -1457,6 +1457,7 @@ async function handleUserText(
         try {
           written = await composeWithEmailAgent(
             `Write one email from Vishnu. Do not copy his Telegram command.\nTo: ${request.to}\n${copies.length ? `Cc: ${copies.join(", ")}\n` : ""}Instruction:\n${request.instruction}`,
+            { ownWords: userText, toEmail: request.to },
           );
         } catch (error) {
           const errorType = error instanceof Error ? error.name : "UnknownError";

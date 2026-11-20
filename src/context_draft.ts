@@ -11,6 +11,7 @@ import {
 } from "./action_context.js";
 import { readDraftSnapshot } from "./approvals.js";
 import { getScheduledSend } from "./db.js";
+import { groundGreeting, recipientGrounding } from "./email_grounding.js";
 import { complete, type CompleteResult } from "./llm.js";
 import { resolveAgentModel } from "./models/agent_models.js";
 import { handler as draftNewEmail } from "./tools/draft_new_email.js";
@@ -37,7 +38,8 @@ The body is plain text, short, and specific to the facts you are given.
 Do not invent pricing, product claims, meetings, or requirements that are not in the facts.
 If the facts do not mention a previous discussion, do not say there was one.
 Do not add a sign-off. Match the situation: follow-up, proposal, or a first note.
-No filler such as "I hope this email finds you well" or "just following up" when the facts already say what to ask.`;
+No filler such as "I hope this email finds you well" or "just following up" when the facts already say what to ask.
+If RECIPIENT NAME says none, the first line must be the NEUTRAL GREETING. Never invent the recipient's name.`;
 
 /** Keep the start of the facts and the latest instruction. Room for a whole ordinary email,
  *  so a revision sees all of it; only a very long one is clipped in the middle. */
@@ -63,11 +65,22 @@ function withCurrentDraft(notes: readonly string[], body: string): string[] {
 }
 
 /** One email-agent call. Exported so tests can see which model was asked. */
-export async function composeWithEmailAgent(facts: string): Promise<{ subject: string; body: string; modelKey?: string }> {
+export async function composeWithEmailAgent(
+  facts: string,
+  grounding?: { ownWords: string; toEmail: string },
+): Promise<{ subject: string; body: string; modelKey?: string }> {
+  const ground = grounding?.toEmail.includes("@")
+    ? recipientGrounding(grounding.ownWords, grounding.toEmail)
+    : undefined;
   const resolved = resolveAgentModel("email", { needs: { tools: false } });
   const result: CompleteResult = await complete({
     system: { cacheable: WRITER_SYSTEM },
-    messages: [{ role: "user", content: boundedFacts(facts) }],
+    messages: [{
+      role: "user",
+      content: ground
+        ? `RECIPIENT NAME: ${ground.allowedName ?? "none, use a neutral greeting"}\nNEUTRAL GREETING: ${ground.line}\n\n${boundedFacts(facts)}`
+        : boundedFacts(facts),
+    }],
     tools: [],
     jsonSchema: DRAFT_SCHEMA,
     maxTokens: 500,
@@ -81,7 +94,11 @@ export async function composeWithEmailAgent(facts: string): Promise<{ subject: s
   if (!subject || !body) {
     throw new Error("email agent returned an empty draft");
   }
-  return { subject, body, modelKey: result.servedBy };
+  return {
+    subject,
+    body: ground ? groundGreeting(body, ground.allowedName, ground.line) : body,
+    modelKey: result.servedBy,
+  };
 }
 
 /**
@@ -180,6 +197,10 @@ export async function reviseLinkedDraft(
         rule,
         "Keep the same recipient. Do not add a sign-off.",
       ].join("\n\n"),
+      {
+        ownWords: instruction,
+        toEmail: live?.to.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i)?.[0] ?? email.to[0]?.email ?? "",
+      },
     );
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -280,6 +301,7 @@ export async function publishReadyDraft(
   try {
     const written = await composeWithEmailAgent(
       email.draftId ? `${facts}\n\nRevise the email. Keep the same intent.` : facts,
+      { ownWords: pending.ownerWords, toEmail: email.to[0]?.email ?? "" },
     );
     const body = written.body;
     if (email.draftId) {
