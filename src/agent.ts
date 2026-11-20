@@ -83,6 +83,9 @@ import {
   redactAllSecrets,
   stubLongToolOutputs,
 } from "./chat_history.js";
+import { maybeShadowFoldSummary } from "./local_model.js";
+import { modelForLegacyBackend } from "./models/registry.js";
+import { assertTestSeam } from "./test_seam.js";
 
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ITERATIONS = 8;
@@ -334,12 +337,21 @@ export interface RunAgentOptions {
   modelTier?: ReasoningTier;
 }
 
+type FoldSummaryResult = {
+  summary: string;
+  input: string;
+  cloudBackend: string;
+  cloudModel: string;
+};
+
 async function summariseOlderMessages(
   older: StoredMessage[],
   previous: string,
-): Promise<string> {
+): Promise<FoldSummaryResult> {
+  const chatBackend = getTaskBackend("chat");
+  const input = buildSummarizerInput(older, previous);
   const result = await complete({
-    backend: getTaskBackend("chat"),
+    backend: chatBackend,
     effort: "low",
     cacheTtl: "5m",
     task: "other",
@@ -351,11 +363,19 @@ async function summariseOlderMessages(
     messages: [
       {
         role: "user",
-        content: buildSummarizerInput(older, previous),
+        content: input,
       },
     ],
   });
-  return redactAllSecrets(result.textParts.join("\n").trim() || previous);
+  const summary = redactAllSecrets(
+    result.textParts.join("\n").trim() || previous,
+  );
+  const cloudBackend = result.servedBy ?? chatBackend;
+  const cloudModel =
+    result.servedModel ??
+    modelForLegacyBackend(chatBackend)?.modelId ??
+    chatBackend;
+  return { summary, input, cloudBackend, cloudModel };
 }
 
 function storedToLlmMessages(stored: StoredMessage[]): LlmMessage[] {
@@ -398,13 +418,22 @@ async function historyForAgent(skipHistory: boolean): Promise<{
       continue;
     }
     try {
-      summary = await summariseOlderMessages(block, summary);
+      const folded = await summariseOlderMessages(block, summary);
+      summary = folded.summary;
       foldedBlocks += 1;
       setSetting(CONVERSATION_SUMMARY_KEY, summary);
       setSetting(CONVERSATION_SUMMARY_UNTIL_KEY, String(last.id));
       console.log(
         `history fold: count=${block.length} until_id=${last.id}`,
       );
+      // Shadow only after cloud fold succeeded and was saved. Never await.
+      maybeShadowFoldSummary({
+        input: folded.input,
+        cloudSummary: summary,
+        cloudBackend: folded.cloudBackend,
+        cloudModel: folded.cloudModel,
+        untilId: last.id,
+      });
     } catch (error) {
       const errorType = error instanceof Error ? error.name : "UnknownError";
       console.error(`Conversation summary failed (${errorType}).`);
@@ -418,6 +447,15 @@ async function historyForAgent(skipHistory: boolean): Promise<{
     all.filter((message) => message.id > storedUntil),
   );
   return { summary, messages: remaining.slice(dropped) };
+}
+
+/** Test seam: same fold path runAgent uses, including fire-and-forget shadow. */
+export async function historyForAgentForTests(skipHistory = false): Promise<{
+  summary: string;
+  messages: StoredMessage[];
+}> {
+  assertTestSeam("historyForAgentForTests");
+  return historyForAgent(skipHistory);
 }
 
 function usageTaskForAgent(task: ModelTask | undefined): UsageTask {

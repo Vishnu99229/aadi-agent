@@ -720,6 +720,11 @@ export const config = {
   localLlmBaseUrl:
     process.env.LOCAL_LLM_BASE_URL?.trim() || "http://127.0.0.1:11434/v1",
   localLlmModel: process.env.LOCAL_LLM_MODEL?.trim() || "gemma4:e4b",
+  /** Shadow-only Ollama fold summaries. Never used for replies or tools. */
+  localModelEnabled: parseBool(process.env.LOCAL_MODEL_ENABLED, false),
+  localModelUrl:
+    process.env.LOCAL_MODEL_URL?.trim() || "http://100.107.110.118:11434",
+  localModelName: process.env.LOCAL_MODEL_NAME?.trim() || "gemma4:e2b",
   chatCostRates: readCostRates("LLM", SONNET_55_COST_DEFAULTS),
   backgroundCostRates: readCostRates("BACKGROUND", HAIKU_55_COST_DEFAULTS),
   geminiCostRates: readCostRates("GEMINI", GEMINI_FLASH_COST_DEFAULTS),

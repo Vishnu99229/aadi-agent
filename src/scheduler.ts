@@ -13,6 +13,7 @@ import {
 import { formatVersionLine, readDeployVersion, readLocalGitHash } from "./version.js";
 import { formatTurnsHealthLine } from "./turns.js";
 import { formatCreditHealthLine } from "./llm_fallback.js";
+import { formatLocalModelHealthLine } from "./local_model.js";
 
 export const GOOGLE_API_TIMEOUT_MS = 30_000;
 const JOB_TIMEOUT_MS = 5 * 60 * 1000;
@@ -596,6 +597,7 @@ export function formatHealthReport(now = new Date(), cwd = process.cwd()): strin
     formatVersionLine(readDeployVersion(cwd), readLocalGitHash(cwd)),
     formatTurnsHealthLine(now),
     formatCreditHealthLine(now.getTime()),
+    formatLocalModelHealthLine(now),
     ...formatAgentHealthLines(),
   ];
   const beatPath = heartbeatPath(cwd);

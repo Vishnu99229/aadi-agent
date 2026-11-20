@@ -878,6 +878,24 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_chat_turns_started
     ON chat_turns (started_at, outcome);
+
+  CREATE TABLE IF NOT EXISTS local_model_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    until_id INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
+    duration_ms INTEGER,
+    local_model TEXT NOT NULL,
+    cloud_backend TEXT NOT NULL,
+    cloud_model TEXT NOT NULL,
+    cloud_summary TEXT NOT NULL,
+    local_summary TEXT,
+    error TEXT,
+    input_chars INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_local_model_runs_created
+    ON local_model_runs (created_at DESC);
 `);
 
 if (!tableHasColumn("chat_turns", "forwarded")) {
@@ -4096,6 +4114,89 @@ export function listJobRuns(): JobRunRecord[] {
        FROM job_runs ORDER BY name ASC`,
     )
     .all() as JobRunRecord[];
+}
+
+export type LocalModelRunStatus = "ok" | "error";
+
+export type LocalModelRunRow = {
+  id: number;
+  created_at: string;
+  until_id: number;
+  status: LocalModelRunStatus;
+  duration_ms: number | null;
+  local_model: string;
+  cloud_backend: string;
+  cloud_model: string;
+  cloud_summary: string;
+  local_summary: string | null;
+  error: string | null;
+  input_chars: number;
+};
+
+export function insertLocalModelRun(input: {
+  untilId: number;
+  status: LocalModelRunStatus;
+  durationMs: number | null;
+  localModel: string;
+  cloudBackend: string;
+  cloudModel: string;
+  cloudSummary: string;
+  localSummary: string | null;
+  error: string | null;
+  inputChars: number;
+}): number {
+  const result = db
+    .prepare(
+      `INSERT INTO local_model_runs (
+         until_id, status, duration_ms, local_model, cloud_backend, cloud_model,
+         cloud_summary, local_summary, error, input_chars
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.untilId,
+      input.status,
+      input.durationMs,
+      input.localModel,
+      input.cloudBackend,
+      input.cloudModel,
+      input.cloudSummary,
+      input.localSummary,
+      input.error,
+      input.inputChars,
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function listLocalModelRuns(limit = 20): LocalModelRunRow[] {
+  const capped = Math.max(1, Math.min(200, Math.floor(limit)));
+  return db
+    .prepare(
+      `SELECT id, created_at, until_id, status, duration_ms, local_model,
+              cloud_backend, cloud_model, cloud_summary, local_summary, error,
+              input_chars
+       FROM local_model_runs
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(capped) as LocalModelRunRow[];
+}
+
+export function latestLocalModelRun(): LocalModelRunRow | undefined {
+  return db
+    .prepare(
+      `SELECT id, created_at, until_id, status, duration_ms, local_model,
+              cloud_backend, cloud_model, cloud_summary, local_summary, error,
+              input_chars
+       FROM local_model_runs
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get() as LocalModelRunRow | undefined;
+}
+
+export function clearLocalModelRunsForTests(): void {
+  assertTestSeam("clearLocalModelRunsForTests");
+  db.exec(`DELETE FROM local_model_runs`);
 }
 
 const MEETING_THREAD_COLUMNS = `thread_id, recipient_email, recipient_name, company, sender_type,
