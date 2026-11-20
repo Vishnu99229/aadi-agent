@@ -67,10 +67,10 @@ function withCurrentDraft(notes: readonly string[], body: string): string[] {
 /** One email-agent call. Exported so tests can see which model was asked. */
 export async function composeWithEmailAgent(
   facts: string,
-  grounding?: { ownWords: string; toEmail: string },
+  grounding?: { ownWords: string; toEmail: string; knownName?: string },
 ): Promise<{ subject: string; body: string; modelKey?: string }> {
   const ground = grounding?.toEmail.includes("@")
-    ? recipientGrounding(grounding.ownWords, grounding.toEmail)
+    ? recipientGrounding(grounding.ownWords, grounding.toEmail, grounding.knownName)
     : undefined;
   const resolved = resolveAgentModel("email", { needs: { tools: false } });
   const result: CompleteResult = await complete({
@@ -200,6 +200,7 @@ export async function reviseLinkedDraft(
       {
         ownWords: instruction,
         toEmail: live?.to.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i)?.[0] ?? email.to[0]?.email ?? "",
+        knownName: live?.to.split("<")[0]?.replace(/"/g, "").trim() || email.to[0]?.name,
       },
     );
   } catch (error) {

@@ -159,7 +159,7 @@ export function nameTypedForRecipient(ownWords: string, toEmail: string): string
       return parts.join(" ");
     }
   }
-  const told = new RegExp(`\\b(?:tell|email|e-mail|dear)\\s+(${PERSON})(?:\\s+(${PERSON}))?\\b`, "u").exec(ownWords);
+  const told = new RegExp(`\\b(?:tell|email|e-mail|dear|to)\\s+(${PERSON})(?:\\s+(${PERSON}))?\\b`, "u").exec(ownWords);
   const toldName = takeName(told);
   if (toldName) {
     return toldName;
@@ -236,12 +236,17 @@ export function contactNameForAddress(email: string): string | undefined {
   return undefined;
 }
 
-export function recipientGrounding(ownWords: string, toEmail: string): { allowedName?: string; line: string } {
+export function recipientGrounding(
+  ownWords: string,
+  toEmail: string,
+  knownName?: string,
+): { allowedName?: string; line: string } {
   const ocr = ocrTextForAddress(toEmail);
   const allowedName =
     nameTypedForRecipient(ownWords, toEmail) ||
     nameBesideAddress(ocr, toEmail) ||
-    usableContactName(contactNameForAddress(toEmail), toEmail);
+    usableContactName(contactNameForAddress(toEmail), toEmail) ||
+    usableContactName(knownName, toEmail);
   const line = allowedName ? `Hi ${allowedName},` : neutralGreeting(toEmail, ocr);
   return { ...(allowedName ? { allowedName } : {}), line };
 }

@@ -28,7 +28,7 @@ import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
-import { groundGreeting, mailDomainRefusal, recipientGrounding } from "./email_grounding.js";
+import { mailDomainRefusal } from "./email_grounding.js";
 import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
 import {
@@ -285,8 +285,6 @@ export async function writeAndSend(
       result: "write_failed",
     };
   }
-  const ground = recipientGrounding(request.ownWords, to[0]?.email ?? "");
-  written = { ...written, body: groundGreeting(written.body, ground.allowedName, ground.line) };
 
   const explicit = options.explicitSubject?.trim();
   // Gmail keeps a reply in its thread only while the subject matches, so a changed subject
