@@ -1,3 +1,4 @@
+import { hasOtpCode } from "./otp_redaction.js";
 import type {
   ItemTag,
   MemoryCategory,
@@ -98,7 +99,7 @@ export function isMemoryCategory(value: string): value is MemoryCategory {
 }
 
 export function isSensitiveMemoryText(text: string): boolean {
-  return SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
+  return SENSITIVE_PATTERNS.some((pattern) => pattern.test(text)) || hasOtpCode(text);
 }
 
 const PHONE_RE = /(?:\+?\d[\d\s().-]{7,}\d)/;

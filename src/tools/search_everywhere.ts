@@ -84,19 +84,6 @@ export function setSearchEverywhereForTests(next: Seams | undefined): void {
   seams = next ?? {};
 }
 
-// ---------------------------------------------------------------- redaction
-
-/** What redactAllSecrets leaves: "your OTP is 482913", "verification code 551204", "PIN is 4821". */
-function redactCodes(text: string): string {
-  return text
-    .replace(/\b(otp|code|pin|passcode|security code|verification(?: code)?|login code)\b([^\d\n]{0,20})\d{4,8}\b/gi, "$1$2[redacted]")
-    .replace(/\b\d{4,8}\b(?=[^.\n]{0,40}\b(?:code|pin|verify|verification)\b)/gi, "[redacted]");
-}
-
-export function redactForLookup(text: string): string {
-  return redactCodes(redactAllSecrets(text));
-}
-
 function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
@@ -402,7 +389,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   const header = `Looked up "${query}"${person ? ` with ${person}` : ""}.`;
   let text = "";
   for (const [snippetChars, hitsPerSource] of [[SNIPPET_CHARS, 3], [120, 3], [80, 2], [0, 2]] as const) {
-    text = redactForLookup(render(header, results, snippetChars, hitsPerSource));
+    text = redactAllSecrets(render(header, results, snippetChars, hitsPerSource));
     if (text.length <= SEARCH_EVERYWHERE_MAX_CHARS) {
       break;
     }
