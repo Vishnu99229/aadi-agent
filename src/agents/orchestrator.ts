@@ -306,6 +306,17 @@ async function postCards(summary: WorkflowSummary, postCard: CardPoster | undefi
   return posted;
 }
 
+/** The laptop model that completed a step of this job. A step that fell back to cloud is recorded with its cloud model. */
+function localStepModel(workflowId: string): string | undefined {
+  const run = listGoalRuns(workflowId).find((item) => item.outcome === "completed" && item.backend.startsWith("local:"));
+  return run ? run.backend.slice("local:".length) : undefined;
+}
+
+/** Added by code under Aadi's reply, once however many steps ran on the laptop. Never saved to history. */
+export function withLocalStepLine(reply: string, model: string | undefined): string {
+  return model && reply.trim() ? `${reply}\n\n(includes a step answered by ${model}, local)` : reply;
+}
+
 function logGoalTotals(summary: WorkflowSummary): void {
   const runs = listGoalRuns(summary.workflowId);
   if (runs.length === 0) {
@@ -500,7 +511,7 @@ function delegateTool(
             logGoalTotals(late);
             recordLateWorkflow(turnRef?.id, workflowMeasure(late, workflowStartedAt, true));
             await postCards(late, postCard);
-            await lateNotifier?.(`That job finished.\n${summaryForOwner(late)}`);
+            await lateNotifier?.(withLocalStepLine(`That job finished.\n${summaryForOwner(late)}`, localStepModel(late.workflowId)));
           })
           .catch((error: unknown) => {
             const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -515,6 +526,10 @@ function delegateTool(
       rememberOwnerWords(finished, grant);
       logGoalTotals(finished);
       meter?.workflows.push(workflowMeasure(finished, workflowStartedAt));
+      const localModel = localStepModel(finished.workflowId);
+      if (meter && localModel) {
+        meter.localModel ??= localModel;
+      }
       const cards = await postCards(finished, postCard);
       return {
         content: `${summaryForModel(finished)}${cards > 0 ? `\n${cards} card(s) with buttons were posted to Vishnu.` : ""}`,
@@ -751,6 +766,8 @@ export async function runOwnerTurn(modelText: string, options: OwnerTurnOptions)
     routeOut.value = route;
     routeOut.report = report;
   }
+  // After the loop saved its reply, so the line reaches Vishnu and not the history.
+  reply = withLocalStepLine(reply, meter.localModel);
   console.log(
     `agent routing: route=${route.kind === "specialist" ? route.agentId : `aadi (${route.reason})`} handed_back=${report.widened} llm_calls=${report.llmCalls} first_input_tokens=${report.inputTokens} cost_usd=${report.costUsd.toFixed(6)} tools=[${report.tools.map((entry) => `${entry.owner}.${entry.tool}`).join(", ")}] ms=${Date.now() - startedAt}`,
   );

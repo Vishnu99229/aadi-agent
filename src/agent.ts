@@ -1,6 +1,8 @@
 import { config } from "./config.js";
 import type { LlmBackend, LlmMessage, LlmTool, ModelRoute, ToolCall, ToolChoice } from "./llm.js";
 import { resolveAgentModel, type ReasoningTier, type ResolvedAgentModel } from "./models/agent_models.js";
+import type { LocalAgentModel } from "./models/local_agent_models.js";
+import { completeOnLocalModel, LocalModelUnavailable } from "./local_agent_backend.js";
 import { historyForSpecialist, type ContextMeasure } from "./agents/context.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
@@ -473,9 +475,137 @@ function usageTaskForAgent(task: ModelTask | undefined): UsageTask {
   }
 }
 
+/** Lines added under a reply that the laptop model was meant to answer but didn't. */
+const LOCAL_NOTES = {
+  unreachable: "(answered by cloud: laptop unreachable)",
+  slow: "(answered by cloud: laptop too slow)",
+  error: "(answered by cloud: laptop model error)",
+  memory: "(answered by cloud: needed a memory write)",
+  tool: "(answered by cloud: needed a tool the laptop model can't use)",
+} as const;
+type LocalNote = keyof typeof LOCAL_NOTES;
+
+/** A specialist's run on the laptop model: its own read tools only, one deadline for the whole run. */
+interface LocalRun {
+  model: LocalAgentModel;
+  readTools: ReadonlySet<string>;
+  deadline: number;
+}
+
+/** The local run asked for a tool it isn't given, so the turn is rerun on cloud. */
+class LocalRunAbort extends Error {
+  constructor(
+    readonly reason: "memory" | "tool",
+    tool: string,
+  ) {
+    super(`the local run called ${tool}`);
+    this.name = "LocalRunAbort";
+  }
+}
+
+const MEMORY_WRITE_WORDS =
+  /\b(?:remember|forget|memori[sz]e|keep\s+in\s+mind|note\s+(?:that|this|it|down)|(?:save|store)\s+(?:this|that|it))\b|\bupdate\b[^.?!\n]{0,20}\bmemor(?:y|ies)\b|\b(?:learn|add|save|import)\b[^.?!\n]{0,40}?\b(?:q\s*&\s*a|q\s+and\s+a|qa\s+bank)\b/i;
+/** "What do you remember about Jeff?" reads a memory; it doesn't write one. */
+const RECALL_QUESTION = /\b(?:what|who|when|where|how|which|why)\b[^.?!\n]{0,30}\bremember\b|\b(?:do|did)\s+(?:you|i)\s+remember\b/i;
+
+/** The request asks to save, change or drop a memory or a Q&A bank entry. Errs towards yes. */
+export function asksForMemoryWrite(text: string): boolean {
+  const kinds = commandIntents(text);
+  return (
+    kinds.includes("memory") ||
+    kinds.includes("qa_bank") ||
+    (MEMORY_WRITE_WORDS.test(text) && !RECALL_QUESTION.test(text))
+  );
+}
+
+function withLine(reply: string, line: string): string {
+  return reply.trim() ? `${reply}\n\n${line}` : reply;
+}
+
+/** A run that starts on the laptop model, one that must go to cloud with a note, or an ordinary run. */
+function localPlan(
+  userText: string,
+  options: RunAgentOptions,
+): { model: LocalAgentModel; readTools: Set<string> } | { note: LocalNote } | undefined {
+  if (options.backend || options.toolNames || !options.modelAgent || options.agentId !== options.modelAgent) {
+    return undefined;
+  }
+  const model = resolveAgentModel(options.modelAgent, { tier: options.modelTier }).local;
+  const specialist = model ? specialistFor(options.modelAgent) : undefined;
+  if (!model || !specialist) {
+    return undefined;
+  }
+  // A delegated task's request is its goal line; a chat turn's is his own words.
+  const request = options.delegation ? (userText.split("\n")[0] ?? "") : (options.guardText ?? userText);
+  if (asksForMemoryWrite(request)) {
+    return { note: "memory" };
+  }
+  // An explicit command makes the loop force a tool, which the laptop model can't take.
+  if (!options.delegation && options.sendConfirmation && commandIntents(request).length > 0) {
+    return { note: "tool" };
+  }
+  return {
+    model,
+    readTools: new Set(specialist.definition.tools.filter((tool) => tool.effect === "read").map((tool) => tool.name)),
+  };
+}
+
+/**
+ * One agent turn. An agent switched to the laptop model (Knowledge only; see
+ * local_agent_models.ts) answers there first with its read tools. If the laptop
+ * can't be reached, is too slow, or the turn needs anything else, the same turn
+ * runs on the agent's cloud models with its normal tools, and the reply says why.
+ */
 export async function runAgent(
   userText: string,
   options: RunAgentOptions = {},
+): Promise<string> {
+  const plan = localPlan(userText, options);
+  if (!plan) {
+    return runAgentLoop(userText, options);
+  }
+  if ("note" in plan) {
+    console.log(`local model: agent=${options.modelAgent} cloud reason=${plan.note}`);
+    return withLine(await runAgentLoop(userText, options), LOCAL_NOTES[plan.note]);
+  }
+  const startedAt = Date.now();
+  const localReport = options.report ? newRunReport() : undefined;
+  try {
+    const reply = await runAgentLoop(
+      userText,
+      // Nothing is saved until the laptop has answered: a fallback saves its own turn.
+      { ...options, saveUserMessage: false, saveAssistantMessage: false, report: localReport },
+      { model: plan.model, readTools: plan.readTools, deadline: startedAt + plan.model.totalTimeoutMs },
+    );
+    if (options.saveUserMessage ?? true) {
+      saveMessage("user", userText);
+    }
+    if (options.saveAssistantMessage ?? true) {
+      saveMessage("assistant", reply);
+    }
+    if (options.report && localReport) {
+      Object.assign(options.report, localReport);
+    }
+    const ms = Date.now() - startedAt;
+    console.log(`local model: agent=${options.modelAgent} model=${plan.model.model} answered ms=${ms}`);
+    return withLine(reply, `(${plan.model.model}, local, ${Math.round(ms / 1000)}s)`);
+  } catch (error) {
+    const note: LocalNote | undefined =
+      error instanceof LocalModelUnavailable || error instanceof LocalRunAbort ? error.reason : undefined;
+    if (!note) {
+      throw error;
+    }
+    console.log(
+      `local model: agent=${options.modelAgent} model=${plan.model.model} fell back to cloud reason=${note} ms=${Date.now() - startedAt}`,
+    );
+    return withLine(await runAgentLoop(userText, options), LOCAL_NOTES[note]);
+  }
+}
+
+async function runAgentLoop(
+  userText: string,
+  options: RunAgentOptions,
+  local?: LocalRun,
 ): Promise<string> {
   const saveUserMessage = options.saveUserMessage ?? true;
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
@@ -565,7 +695,7 @@ export async function runAgent(
     value && value.models.length > 0 ? { agentId: value.agentId, models: value.models } : undefined;
   let route = routeFor(resolved);
   /** What the run asked for first: a backend name, or the route's first model key. */
-  let primaryKey: string = route?.models[0]?.key ?? legacyBackend;
+  let primaryKey: string = local ? `local:${local.model.model}` : (route?.models[0]?.key ?? legacyBackend);
   const backend = legacyBackend;
   if (report) {
     report.backend = primaryKey;
@@ -574,7 +704,7 @@ export async function runAgent(
   }
   if (resolved) {
     console.log(
-      `agent model: agent=${resolved.agentId} mode=${resolved.mode} tier=${resolved.tier} route=[${resolved.models.map((spec) => spec.key).join(", ")}]${resolved.skipped.length > 0 ? ` skipped=[${resolved.skipped.map((item) => `${item.key}:${item.reason}`).join("; ")}]` : ""}${resolved.safetyNet ? " safety_net=true" : ""}`,
+      `agent model: agent=${resolved.agentId} mode=${resolved.mode} tier=${resolved.tier} route=[${resolved.models.map((spec) => spec.key).join(", ")}]${resolved.skipped.length > 0 ? ` skipped=[${resolved.skipped.map((item) => `${item.key}:${item.reason}`).join("; ")}]` : ""}${resolved.safetyNet ? " safety_net=true" : ""}${local ? ` local=${local.model.model}` : ""}`,
     );
   }
   let effort =
@@ -594,7 +724,7 @@ export async function runAgent(
   // The nudges below read Vishnu's message. A delegated task isn't his message.
   const nudgeText = options.delegation ? "" : guardText;
   const defaults = defaultToolNames(config.sendOnCommandEnabled);
-  const scopedNames: readonly string[] | undefined =
+  const ownScope: readonly string[] | undefined =
     options.toolNames ??
     (specialist
       ? [
@@ -603,8 +733,16 @@ export async function runAgent(
           ...SPECIALIST_ONLY_TOOLS.filter((name) => specialist.toolNames().includes(name)),
         ]
       : undefined);
+  // On the laptop model only the agent's own read tools are offered or run.
+  const scopedNames: readonly string[] | undefined =
+    local && ownScope ? ownScope.filter((name) => local.readTools.has(name)) : ownScope;
   const metaTools = new Map((options.metaTools ?? []).map((tool) => [tool.definition.name, tool]));
   const metaDefinitions: LlmTool[] = (options.metaTools ?? []).map((tool) => tool.definition);
+  // What a local run may call: its read tools, and the task plumbing (report_result,
+  // request_input). Handing the turn back to Aadi, or anything else, reruns it on cloud.
+  const localAllowed = local
+    ? new Set([...(scopedNames ?? []), ...[...metaTools.keys()].filter((name) => name !== "escalate_to_aadi")])
+    : undefined;
   let activeTools: LlmTool[] = [
     ...(scopedNames
       ? scopedNames.map((name) => {
@@ -738,7 +876,8 @@ export async function runAgent(
   const isActionTool = (name: string): boolean =>
     intents.some((kind) => COMMAND_TOOLS[kind].includes(name));
   const forcing = (kinds: readonly CommandKind[]): { name: string } | undefined => {
-    const forces = route ? routeForcesTools() : backendForcesTools(backend);
+    // Ollama takes no forced tool choice.
+    const forces = local ? false : route ? routeForcesTools() : backendForcesTools(backend);
     const name = forces ? forcedCommandTool(kinds) : undefined;
     return name ? { name } : undefined;
   };
@@ -775,15 +914,32 @@ export async function runAgent(
         uncertain: turnContext.trace.some((entry) => entry.ok),
       });
     }
-    const response = await complete({
-      system,
-      tools: activeTools,
-      messages,
-      ...(route ? { route } : { backend }),
-      task: options.usageTask ?? usageTaskForAgent(options.task),
-      effort,
-      ...(toolChoice ? { toolChoice } : {}),
-    });
+    const response = local
+      ? await completeOnLocalModel({
+          system,
+          tools: activeTools,
+          messages,
+          local: local.model,
+          deadline: local.deadline,
+          signal: options.delegation?.signal,
+        })
+      : await complete({
+          system,
+          tools: activeTools,
+          messages,
+          ...(route ? { route } : { backend }),
+          task: options.usageTask ?? usageTaskForAgent(options.task),
+          effort,
+          ...(toolChoice ? { toolChoice } : {}),
+        });
+    if (localAllowed) {
+      // Checked before anything runs: a write the laptop model reaches for is never made by it.
+      const outside = response.toolCalls.find((call) => !localAllowed.has(call.name));
+      if (outside) {
+        const ownWrite = specialist?.definition.tools.some((tool) => tool.name === outside.name && tool.effect !== "read");
+        throw new LocalRunAbort(ownWrite ? "memory" : "tool", outside.name);
+      }
+    }
     toolChoice = undefined;
     // A fallback sees the tool results of the provider that failed. Repeating
     // those calls would run the side effect twice, so identical calls are replayed.

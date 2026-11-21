@@ -282,6 +282,8 @@ export interface TurnMeter {
   workflows: TurnWorkflow[];
   /** Workflows still running when the turn answered. They are added when they end. */
   pending: number;
+  /** The laptop model that answered a delegated step of this turn's job, if one did. */
+  localModel?: string;
 }
 
 export function newTurnMeter(): TurnMeter {
