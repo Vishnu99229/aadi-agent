@@ -1,4 +1,5 @@
 import type { StoredMessage } from "./db.js";
+import { redactOtpCodes } from "./otp_redaction.js";
 import { redactSecrets as redactApiKeys } from "./security/env_guard.js";
 import { assertTestSeam } from "./test_seam.js";
 
@@ -34,9 +35,8 @@ export function estimateTokens(text: string): number {
 }
 
 export function redactSecrets(text: string): string {
-  return text
-    .replace(/\b(otp|one[-\s]?time (?:password|pin|code))\b[:\s-]*\d{4,8}\b/gi, "$1 [redacted]")
-    .replace(/\b\d{4,8}\b(?=[^.]*\b(?:otp|one[-\s]?time)\b)/gi, "[redacted]")
+  // One-time codes next to a code word (otp_redaction.ts is the one place they are recognised).
+  return redactOtpCodes(text)
     .replace(/\b(password|passwd|passcode)\b[:\s=]*\S+/gi, "$1 [redacted]")
     .replace(/\b(account(?:\s+number)?|a\/c|acct)[:\s#.-]*\d{6,}\b/gi, "$1 [redacted]")
     .replace(/\b(?:\d[ -]*){12,19}\b/g, "[redacted]");
