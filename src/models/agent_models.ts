@@ -2,6 +2,7 @@ import { getTaskBackend } from "../chat_backend.js";
 import { getSetting, setSetting } from "../db.js";
 import { modelUnavailableReason } from "../llm_fallback.js";
 import type { EffortLevel } from "../usage.js";
+import { localModelForAgent, type LocalAgentModel } from "./local_agent_models.js";
 import {
   availableModels,
   getModel,
@@ -247,6 +248,12 @@ export interface ResolvedAgentModel {
   skipped: Array<{ key: string; reason: string }>;
   /** True when nothing the agent asked for is usable and the system model stands in. */
   safetyNet: boolean;
+  /**
+   * The laptop model to try before the cloud models above. Only an agent that is
+   * allowed one (Knowledge) and picked it gets this; a locked agent never does,
+   * whatever is stored. Text-only, so a run that needs vision or PDFs stays on cloud.
+   */
+  local?: LocalAgentModel;
 }
 
 /**
@@ -324,6 +331,7 @@ export function resolveAgentModel(
       models.push(spec);
     }
   }
+  const local = needs.vision || needs.pdf || needs.structuredOutput ? undefined : localModelForAgent(agentId);
   return {
     agentId,
     mode: auto ? "auto" : "fixed",
@@ -333,6 +341,7 @@ export function resolveAgentModel(
     models,
     skipped,
     safetyNet,
+    ...(local ? { local } : {}),
   };
 }
 

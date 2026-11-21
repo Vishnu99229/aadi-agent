@@ -21,6 +21,18 @@ import {
   providerConfigured,
   type ProviderId,
 } from "./models/registry.js";
+import {
+  LOCAL_ALLOWED_AGENTS,
+  LOCAL_LOCKED_TEXT,
+  LOCAL_MODEL_LABEL,
+  LOCAL_SEARCH_MODEL,
+  LOCAL_SEARCH_MODEL_TEXT,
+  LOCAL_SECTION_TITLE,
+  localModelAllowed,
+  localModelOn,
+  selectableLocalModel,
+  toggleLocalModel,
+} from "./models/local_agent_models.js";
 
 /**
  * /settings -> Agent models. One screen per agent: primary model, fallback,
@@ -73,8 +85,39 @@ export function agentBlock(agent: ModelAgentId): string {
     .join("\n");
 }
 
+/** The laptop models on one agent's screen. bge-m3 is a line of text, never a button. */
+function localSection(agent: ModelAgentId): string {
+  const model = selectableLocalModel();
+  const gemma = !localModelAllowed(agent)
+    ? `${model}: ${LOCAL_LOCKED_TEXT}`
+    : localModelOn(agent)
+      ? `${model} (${LOCAL_MODEL_LABEL}): on. It answers first with read tools only; the models above answer when the laptop can't.`
+      : `${model} (${LOCAL_MODEL_LABEL}): off.`;
+  return [LOCAL_SECTION_TITLE, gemma, `${LOCAL_SEARCH_MODEL}: ${LOCAL_SEARCH_MODEL_TEXT}`].join("\n");
+}
+
+function agentScreen(agent: ModelAgentId, suffix = ""): string {
+  return `${agentBlock(agent)}\n\n${localSection(agent)}${suffix}`;
+}
+
+function homeLocalSection(): string {
+  const allowed = MODEL_AGENT_IDS.filter((agent) => LOCAL_ALLOWED_AGENTS.has(agent));
+  const on = allowed.filter((agent) => localModelOn(agent)).map((agent) => AGENT_MODEL_LABELS[agent]);
+  return [
+    LOCAL_SECTION_TITLE,
+    `${selectableLocalModel()} (${LOCAL_MODEL_LABEL}): ${allowed.map((agent) => AGENT_MODEL_LABELS[agent]).join(", ")} only. ${on.length > 0 ? `On for ${on.join(", ")}.` : "Off."}`,
+    `${LOCAL_SEARCH_MODEL}: ${LOCAL_SEARCH_MODEL_TEXT}`,
+  ].join("\n");
+}
+
 export function agentModelsText(): string {
-  return ["Agent Models", "", ...MODEL_AGENT_IDS.map((agent) => agentBlock(agent)).join("\n\n").split("\n")].join("\n");
+  return [
+    "Agent Models",
+    "",
+    ...MODEL_AGENT_IDS.map((agent) => agentBlock(agent)).join("\n\n").split("\n"),
+    "",
+    homeLocalSection(),
+  ].join("\n");
 }
 
 function homeKeyboard(): InlineKeyboard {
@@ -92,14 +135,19 @@ function homeKeyboard(): InlineKeyboard {
 function agentKeyboard(agent: ModelAgentId): InlineKeyboard {
   const i = indexOf(agent);
   const setting = getAgentModelSetting(agent);
-  return new InlineKeyboard()
+  const keyboard = new InlineKeyboard()
     .text("Primary model", `am:p:${i}:p`)
     .text("Fallback model", `am:p:${i}:f`)
     .row()
     .text(setting.primary === AUTO ? "✅ Auto" : "Auto", `am:auto:${i}`)
     .text("Reasoning tier", `am:t:${i}`)
-    .row()
-    .text("‹ Back", "am:h");
+    .row();
+  if (localModelAllowed(agent)) {
+    keyboard.text(`${localModelOn(agent) ? "✅ " : ""}${selectableLocalModel()} (${LOCAL_MODEL_LABEL})`, `am:lm:${i}`).row();
+  } else {
+    keyboard.text(`🔒 ${LOCAL_LOCKED_TEXT}`, `am:ll:${i}`).row();
+  }
+  return keyboard.text("‹ Back", "am:h");
 }
 
 function providerKeyboard(agent: ModelAgentId, role: Role): InlineKeyboard {
@@ -196,7 +244,22 @@ export async function handleAgentModelCallback(
   }
   if (action === "a") {
     await ctx.answerCallbackQuery();
-    await editPanel(ctx, agentBlock(agent), agentKeyboard(agent));
+    await editPanel(ctx, agentScreen(agent), agentKeyboard(agent));
+    return true;
+  }
+  if (action === "ll") {
+    await ctx.answerCallbackQuery(LOCAL_LOCKED_TEXT);
+    return true;
+  }
+  if (action === "lm") {
+    // The button carries no model name; one in the data is checked like any other.
+    const result = toggleLocalModel(agent, parts.slice(3).join(":") || undefined);
+    if ("refused" in result) {
+      await ctx.answerCallbackQuery(result.refused);
+      return true;
+    }
+    await ctx.answerCallbackQuery(result.on ? `${selectableLocalModel()} on` : "Back to the cloud models");
+    await editPanel(ctx, agentScreen(agent, "\n✅ updated"), agentKeyboard(agent));
     return true;
   }
   if (action === "p") {
@@ -238,7 +301,7 @@ export async function handleAgentModelCallback(
     }
     setAgentModelSetting(agent, role === "p" ? { primary: key } : { fallbacks: [key] });
     await ctx.answerCallbackQuery("Saved");
-    await editPanel(ctx, `${agentBlock(agent)}\n✅ updated`, agentKeyboard(agent));
+    await editPanel(ctx, agentScreen(agent, "\n✅ updated"), agentKeyboard(agent));
     return true;
   }
   if (action === "auto") {
@@ -247,13 +310,13 @@ export async function handleAgentModelCallback(
     // Auto is about the model only. Tools, prompt and permissions don't change.
     setAgentModelSetting(agent, turningOn ? { primary: AUTO, fallbacks: AUTO } : { primary: resolveAgentModel(agent).models[0]?.key ?? setting.primary });
     await ctx.answerCallbackQuery(turningOn ? "Auto on" : "Auto off");
-    await editPanel(ctx, `${agentBlock(agent)}\n✅ updated`, agentKeyboard(agent));
+    await editPanel(ctx, agentScreen(agent, "\n✅ updated"), agentKeyboard(agent));
     return true;
   }
   if (action === "fa" || action === "fn") {
     setAgentModelSetting(agent, { fallbacks: action === "fa" ? AUTO : [] });
     await ctx.answerCallbackQuery("Saved");
-    await editPanel(ctx, `${agentBlock(agent)}\n✅ updated`, agentKeyboard(agent));
+    await editPanel(ctx, agentScreen(agent, "\n✅ updated"), agentKeyboard(agent));
     return true;
   }
   if (action === "t") {
@@ -269,7 +332,7 @@ export async function handleAgentModelCallback(
     }
     setAgentModelSetting(agent, { tier });
     await ctx.answerCallbackQuery("Saved");
-    await editPanel(ctx, `${agentBlock(agent)}\n✅ updated`, agentKeyboard(agent));
+    await editPanel(ctx, agentScreen(agent, "\n✅ updated"), agentKeyboard(agent));
     return true;
   }
   await ctx.answerCallbackQuery();
