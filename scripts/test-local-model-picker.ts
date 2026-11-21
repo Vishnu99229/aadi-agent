@@ -25,7 +25,7 @@ import { setGoalLimitsForTests } from "../src/agents/goal_policy.ts";
 import { specialistFor } from "../src/agents/index.ts";
 import { pickRoute, runOwnerTurn, type Route } from "../src/agents/orchestrator.ts";
 import { getRecentMessages, getSetting, setSetting } from "../src/db.ts";
-import { setCompleteForTests, type CompleteParams } from "../src/llm.ts";
+import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
 import { initMetrics } from "../src/metrics.ts";
 import { MODEL_AGENT_IDS, resolveAgentModel } from "../src/models/agent_models.ts";
 import {
@@ -143,12 +143,14 @@ function toolNames(params: CompleteParams): string[] {
 }
 
 let cloudCalls: Array<{ agent: string; tools: string[] }> = [];
+/** Plays a cloud agent for one test; undefined falls through to "Cloud answer.". */
+let cloudPlay: ((params: CompleteParams) => CompleteResult | undefined) | undefined;
 setCompleteForTests(async (params) => {
   if (params.tools.length === 0) {
     return modelReply({ text: '{"facts":[]}' });
   }
   cloudCalls.push({ agent: params.route?.agentId ?? `backend:${params.backend ?? "chat"}`, tools: toolNames(params) });
-  return modelReply({ text: "Cloud answer." });
+  return cloudPlay?.(params) ?? modelReply({ text: "Cloud answer." });
 });
 
 const toolLog: string[] = [];
@@ -383,6 +385,71 @@ passed.push("delegated goal: Knowledge's read goal runs on the laptop with only 
   });
 }
 passed.push("escalate_to_aadi from a local run: the turn reruns on Knowledge's cloud model, which can hand back to Aadi");
+
+// ---------------------------------------------------------------- a job with a local step: one line, in code
+{
+  const LINE = `(includes a step answered by ${MODEL}, local)`;
+  const text = "Find what we know about Jeff's call times and judge whether Northwind is worth a first conversation.";
+  const knowledgeStep = (key: string, goal: string) => ({ key, agent: "knowledge", capability: "goal", goal, complexity: "light" });
+  const salesStep = { key: "northwind", agent: "sales", capability: "goal", goal: "Judge whether Northwind is worth a first conversation.", complexity: "light" };
+  /** Aadi hands out the job, then answers from its results; Sales answers on cloud. */
+  const playJob = (tasks: unknown[]) => (params: CompleteParams): CompleteResult | undefined => {
+    if (params.route?.agentId === "aadi") {
+      return params.messages.some((message) => message.role === "tool")
+        ? modelReply({ text: "Summary for Vishnu." })
+        : modelReply({ tools: [{ name: "delegate_tasks", input: { title: "Jeff and Northwind", tasks } }] });
+    }
+    return params.route?.agentId === "sales" ? modelReply({ text: "Sales finding: Northwind is worth a call." }) : undefined;
+  };
+  const job = async (): Promise<string> => {
+    const out: { value?: Route } = {};
+    const reply = await runOwnerTurn(text, {
+      ownerText: text,
+      guardText: text,
+      chatId: CHAT,
+      sendConfirmation: { chatId: CHAT, messageId: nextMessageId() },
+      postCard: async () => undefined,
+      route: out,
+    });
+    assert(out.value?.kind === "aadi", `the job goes to Aadi (${JSON.stringify(out.value)})`);
+    return reply;
+  };
+  const occurrences = (reply: string) => reply.split(LINE).length - 1;
+
+  // Two steps: Knowledge on the laptop, Sales on cloud.
+  await withOllama([{ content: "Jeff prefers morning calls." }], async (url, bodies) => {
+    setLocalAgentModelConfigForTests({ model: MODEL, url });
+    cloudCalls = [];
+    cloudPlay = playJob([knowledgeStep("jeff", "Find what we know about Jeff's call times."), salesStep]);
+    const reply = await job();
+    assert(bodies.length === 1, `the Knowledge step went to the laptop (${bodies.length})`);
+    assert(cloudCalls.some((call) => call.agent === "sales") && !cloudCalls.some((call) => call.agent === "knowledge"), "Sales ran on cloud, Knowledge did not");
+    assert(reply === `Summary for Vishnu.\n\n${LINE}` && occurrences(reply) === 1, `the final reply ends with the line once (${JSON.stringify(reply)})`);
+    assert(!getRecentMessages(20).some((message) => message.content.includes("(includes a step")), "the line is not saved to history");
+  });
+
+  // Two Knowledge steps on the laptop: still one line.
+  await withOllama([{ content: "Jeff prefers morning calls." }, { content: "Northwind's last call notes are from May." }], async (url, bodies) => {
+    setLocalAgentModelConfigForTests({ model: MODEL, url });
+    cloudPlay = playJob([
+      knowledgeStep("jeff", "Find what we know about Jeff's call times."),
+      knowledgeStep("notes", "Find our call notes on Northwind."),
+      salesStep,
+    ]);
+    const reply = await job();
+    assert(bodies.length === 2 && occurrences(reply) === 1, `two local steps, one line (${bodies.length} ${JSON.stringify(reply)})`);
+  });
+
+  // The same two-step job with the laptop unreachable: Knowledge falls back, no line.
+  setLocalAgentModelConfigForTests({ model: MODEL, url: await closedPortUrl() });
+  cloudCalls = [];
+  cloudPlay = playJob([knowledgeStep("jeff", "Find what we know about Jeff's call times."), salesStep]);
+  const fellBack = await job();
+  assert(cloudCalls.some((call) => call.agent === "knowledge") && cloudCalls.some((call) => call.agent === "sales"), "both steps ran on cloud");
+  assert(fellBack === "Summary for Vishnu." && occurrences(fellBack) === 0, `no line when every local attempt fell back (${JSON.stringify(fellBack)})`);
+  cloudPlay = undefined;
+}
+passed.push("job: a Knowledge step answered locally adds '(includes a step answered by gemma4:e2b, local)' once to Aadi's final reply, not to history; a fallback adds nothing");
 
 // ---------------------------------------------------------------- the choice survives a restart
 {
