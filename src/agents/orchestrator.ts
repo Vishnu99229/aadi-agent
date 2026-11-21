@@ -30,6 +30,7 @@ import {
 } from "./store.js";
 import type { AgentTaskResult } from "./types.js";
 import { newTurnMeter, recordLateWorkflow, recordTurn, type TurnMeter, type TurnWorkflow } from "../metrics.js";
+import { localModelOn } from "../models/local_agent_models.js";
 import { toAgentResult } from "./protocol.js";
 import { parseRef } from "./refs.js";
 import { formatPendingAction, getPendingAction } from "../action_context.js";
@@ -55,6 +56,14 @@ const OWNER_WORDS = "owner_words";
 function agentForCommandKind(kind: string): string | undefined {
   return listAgentIds().find((id) => routingHints(id)?.commandKinds.includes(kind));
 }
+
+/** A second request in the same message ("... and is he free Thursday?") is Aadi's to split up. */
+const SECOND_REQUEST =
+  /\b(?:and|also|then|plus)\s+(?:is|are|was|were|can|could|will|would|do|does|did|has|have|what|when|where|who|which|how|book|schedule|send|email|mail|draft|reply|remind|add|create|set|move|cancel|check)\b/i;
+
+/** A question, not a request to do something: "what did...", "who is...", "is there...?". */
+const PLAIN_QUESTION =
+  /^\s*(?:what|who|whom|whose|when|where|which|why|how|is|are|was|were|do|does|did|have|has|had|any)\b|\?\s*$/i;
 
 /** Decides who handles Vishnu's message. No model call: registry data only. */
 export function pickRoute(
@@ -102,6 +111,20 @@ export function pickRoute(
     if (routingHints(id)?.patterns.some((pattern) => pattern.test(text))) {
       candidates.add(id);
     }
+  }
+  // Lookup phrasing ("find my notes on X", "what did Munil say") only places a
+  // message that no command and no other domain placed: those still win.
+  const oneRequest = !SECOND_REQUEST.test(text);
+  if (candidates.size === 0 && oneRequest) {
+    for (const id of listAgentIds()) {
+      if (routingHints(id)?.lookupPatterns?.some((pattern) => pattern.test(text))) {
+        candidates.add(id);
+      }
+    }
+  }
+  // With Knowledge on the laptop model, a plain question nobody claimed is its to answer.
+  if (candidates.size === 0 && oneRequest && localModelOn("knowledge") && PLAIN_QUESTION.test(text)) {
+    candidates.add("knowledge");
   }
   if (candidates.size !== 1) {
     return { kind: "aadi", reason: candidates.size === 0 ? "no single domain" : "several domains" };

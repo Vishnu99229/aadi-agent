@@ -62,6 +62,7 @@ import * as readSheet from "./read_sheet.js";
 import * as searchDrive from "./search_drive.js";
 import * as searchHistory from "./search_history.js";
 import * as searchEmails from "./search_emails.js";
+import * as searchEverywhere from "./search_everywhere.js";
 import * as searchNotes from "./search_notes.js";
 import * as sendEmail from "./send_email.js";
 import * as setReminder from "./set_reminder.js";
@@ -152,6 +153,7 @@ const modules = {
   search_drive: searchDrive,
   search_history: searchHistory,
   search_emails: searchEmails,
+  search_everywhere: searchEverywhere,
   search_memories: searchMemories,
   search_notes: searchNotes,
   search_qa_bank: searchQa,
@@ -213,6 +215,7 @@ export const TOOL_ORDER = [
   "read_sheet",
   "search_drive",
   "search_emails",
+  "search_everywhere",
   "search_memories",
   "search_notes",
   "search_qa_bank",

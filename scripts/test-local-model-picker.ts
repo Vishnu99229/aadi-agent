@@ -177,14 +177,14 @@ setGoalLimitsForTests({ enabled: true, maxConcurrent: 2, goalBudgetUsd: 1, workf
 
 // ---------------------------------------------------------------- the rules
 assert(LOCAL_AGENT_CONNECT_TIMEOUT_MS === 3_000 && LOCAL_AGENT_TOTAL_TIMEOUT_MS === 120_000, "3 s to connect, 120 s for the whole local run");
-assert(READ_TOOLS.length === 14, `Knowledge has 14 read tools (${READ_TOOLS.length})`);
+assert(READ_TOOLS.length === 15 && READ_TOOLS.includes("search_everywhere"), `Knowledge has 15 read tools, search_everywhere included (${READ_TOOLS.length})`);
 for (const text of ["Remember that Jeff prefers morning calls.", "Forget Jeff's old number", "Update the memory about Northwind", "Add this to the Q&A bank"]) {
   assert(asksForMemoryWrite(text), `"${text}" asks for a memory write`);
 }
 for (const text of ["What do you remember about Jeff?", "Find the pricing deck in my Drive", "Do you remember the Northwind call?"]) {
   assert(!asksForMemoryWrite(text), `"${text}" only reads`);
 }
-passed.push("rules: 3 s connect, 120 s total, 14 read tools, memory-write requests recognised");
+passed.push("rules: 3 s connect, 120 s total, 15 read tools, memory-write requests recognised");
 
 // ---------------------------------------------------------------- the picker
 const edits: string[] = [];
@@ -292,7 +292,7 @@ await withOllama(
     const first = bodies[0]!;
     assert(first.model === MODEL && first.stream === false && first.think === false, "Ollama chat: the model, no streaming, thinking off");
     const offered = (first.tools ?? []).map((tool) => tool.function.name).sort();
-    assert(offered.join(",") === READ_TOOLS.join(","), `only Knowledge's 14 read tools are offered (${offered.join(",")})`);
+    assert(offered.join(",") === READ_TOOLS.join(","), `only Knowledge's read tools are offered (${offered.join(",")})`);
     assert(first.messages[0]?.role === "system", "the agent's prompt goes as the system message");
     const second = bodies[1]!.messages;
     assert(second.some((message) => message.role === "assistant" && message.tool_calls?.[0]?.function.name === "search_memories"), "the tool call is sent back");
