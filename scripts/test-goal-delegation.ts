@@ -382,7 +382,8 @@ passed.push("AGENT_GOAL_DELEGATION=false stops goal loops and leaves named capab
 // ---- one goal is not a workflow ----
 mode = "single";
 setGoalLimitsForTests(limits);
-const single = await ask("Look up the A2A release.");
+// "Look up the ..." now routes to Knowledge (a lookup); this checks Aadi refusing a one-goal job.
+const single = await ask("Check the A2A release.");
 assert(/isn't worth a second model loop/.test(single.reply), `a single goal is refused (${single.reply.slice(0, 160)})`);
 assert(!single.calls.some(isGoal), "the refused goal made no specialist call");
 passed.push("one goal for one agent stays on Aadi's own tools");

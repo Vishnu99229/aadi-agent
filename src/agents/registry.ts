@@ -26,6 +26,8 @@ export interface RoutingHints {
   patterns: readonly RegExp[];
   /** Command families (command_intent.ts) this agent carries out. */
   commandKinds: readonly string[];
+  /** Weaker phrasing ("find my notes on X"): counts only when no command and no other pattern placed the message. */
+  lookupPatterns?: readonly RegExp[];
 }
 
 interface Registration {

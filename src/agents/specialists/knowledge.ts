@@ -30,6 +30,8 @@ export const knowledgeAgent: SpecialistDefinition = {
     { name: "list_memories", effect: "read", retry: "safe" },
     { name: "search_history", effect: "read", retry: "safe" },
     { name: "search_notes", effect: "read", retry: "safe" },
+    // Notes, past chat, memories, documents, Drive and Gmail in one read: a local run gets mail search through it.
+    { name: "search_everywhere", effect: "read", retry: "safe" },
     { name: "learn_qa_bank", effect: "write", retry: "never" },
     { name: "remember", effect: "write", retry: "never" },
     { name: "update_memory", effect: "write", retry: "never" },
@@ -50,6 +52,15 @@ export const knowledgeAgent: SpecialistDefinition = {
       RELEASE_QUESTION,
     ],
     commandKinds: ["memory", "qa_bank"],
+    // Lookups: "find my notes on the Shriram BRD", "what did Munil say about pricing",
+    // "where is the SOW doc". They decide only when no command and no other domain did.
+    lookupPatterns: [
+      /\bnotes?\b/i,
+      /\b(?:brds?|prds?|sows?|specs?|proposals?|docs?|documents?)\b/i,
+      /\bwhat\s+did\s+[\p{L}][\p{L}'’.-]*(?:\s+[\p{L}][\p{L}'’.-]*)?\s+(?:say|mention|write|tell)\b/iu,
+      /\bdid\s+[\p{L}][\p{L}'’.-]*(?:\s+[\p{L}][\p{L}'’.-]*)?\s+(?:say|mention)\b/iu,
+      /\b(?:find|look\s*up|search(?:\s+for)?)\s+(?:my|the)\b/i,
+    ],
   },
   capabilities: [
     {
