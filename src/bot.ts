@@ -80,8 +80,10 @@ import {
   getMeetingBrief,
   getSetting,
   pruneProcessedMessages,
+  saveMessage,
   setSetting,
 } from "./db.js";
+import { answerPendingIgnore } from "./ignore_pending.js";
 import { formatCostReport } from "./usage.js";
 import { handler as listBills } from "./tools/list_bills.js";
 import { handler as ignoreItem } from "./tools/ignore_item.js";
@@ -1353,6 +1355,33 @@ async function handleUserText(
     const answer = await whileTyping(ctx, () => answerContactQuestion(chatId, userText));
     if (answer.kind !== "none") {
       await continueAfterContactAnswer(ctx, userId, answer, { voiceReply: options.voiceReply });
+      return;
+    }
+  }
+
+  // His next message after Aadi's "which one should I ignore?" is the answer, so he
+  // never has to repeat the biller. Only his own typed or voice words count: a
+  // forward, a Retry tap or quoted text can't answer it, and a reply binds only to
+  // Aadi's question or later. The question is used up by this message either way.
+  if (
+    ctx.chat &&
+    ctx.message &&
+    options.contactNote === undefined &&
+    options.forwarded !== true &&
+    options.retried !== true &&
+    !isForwardedMessage(ctx.message)
+  ) {
+    const replied = ctx.message.reply_to_message;
+    const answered = answerPendingIgnore({
+      chatId: ctx.chat.id,
+      messageId: ctx.message.message_id,
+      ownWords: userText,
+      replyTo: replied ? { fromBot: replied.from?.is_bot === true, dateMs: replied.date * 1000 } : undefined,
+    });
+    if (answered) {
+      saveMessage("user", userText);
+      saveMessage("assistant", answered.text);
+      await ctx.reply(answered.text);
       return;
     }
   }

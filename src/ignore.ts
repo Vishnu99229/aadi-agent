@@ -68,9 +68,20 @@ export type IgnoreApplyResult =
   | { kind: "created"; rule: IgnoreRuleRecord; duplicate: false }
   | { kind: "duplicate"; rule: IgnoreRuleRecord; duplicate: true };
 
+/** One item a clarifying "which one?" question listed, ready to ignore as shown. */
+export type IgnoreCandidate = {
+  /** The line as he saw it. */
+  label: string;
+  /** The words his answer can name it by ("LinkedIn", "Facebook"). */
+  names: string;
+  /** How the confirmation names it. */
+  confirmLabel: string;
+  input: Omit<IgnoreApplyInput, "instruction" | "authRef">;
+};
+
 export type IgnoreResolveResult =
   | { kind: "apply"; input: Omit<IgnoreApplyInput, "instruction" | "authRef">; label: string }
-  | { kind: "clarify"; question: string }
+  | { kind: "clarify"; question: string; candidates?: IgnoreCandidate[] }
   | { kind: "none"; message: string };
 
 const SOURCE_ALIASES: Record<string, readonly string[]> = {
@@ -152,7 +163,36 @@ function phraseMatches(ruleKey: string, candidate: string): boolean {
   return candidate.startsWith(`${ruleKey} `) || candidate.endsWith(` ${ruleKey}`);
 }
 
-function keysOverlap(ruleKey: string, candidate: string, aliases: readonly string[] = []): boolean {
+/** Words that name nothing: a rule "three linkedin" or "axis bank alerts" still means that source. */
+const RULE_NOISE = new Set([
+  "a", "an", "the", "my", "all", "both", "every", "each", "these", "those", "this", "that", "of", "and", "for",
+  "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "first", "second", "third",
+  "bill", "bills", "payment", "payments", "charge", "charges", "invoice", "invoices", "subscription", "subscriptions",
+  "renewal", "renewals", "reminder", "reminders", "alert", "alerts", "notification", "notifications",
+  "email", "emails", "mail", "mails", "monthly", "yearly", "annual", "recurring",
+]);
+
+/** The longer key adds only noise to the shorter one ("three linkedin" over "linkedin"). */
+function addsOnlyNoise(longer: string, shorter: string): boolean {
+  const base = new Set(shorter.split(" "));
+  return longer.split(" ").every((word) => base.has(word) || RULE_NOISE.has(word) || /^\d+$/.test(word));
+}
+
+/**
+ * "lookup" (finding a rule or an item by his words) matches a part of a name either
+ * way, so "resume linkedin bills" finds a rule for "google play linkedin ...".
+ * "suppress" (does this rule hide this item) is directional: the item names the
+ * rule's source, or the rule is the item plus noise words. A rule for
+ * "google play linkedin ..." does not hide every "google play" bill.
+ */
+type OverlapMode = "lookup" | "suppress";
+
+function keysOverlap(
+  ruleKey: string,
+  candidate: string,
+  aliases: readonly string[] = [],
+  mode: OverlapMode = "lookup",
+): boolean {
   const ruleKeys = expandAliases(ruleKey);
   const candidateKeys = [
     candidate,
@@ -161,7 +201,7 @@ function keysOverlap(ruleKey: string, candidate: string, aliases: readonly strin
   ];
   for (const left of ruleKeys) {
     for (const right of candidateKeys) {
-      if (phraseMatches(left, right) || phraseMatches(right, left)) {
+      if (phraseMatches(left, right) || (phraseMatches(right, left) && (mode === "lookup" || addsOnlyNoise(left, right)))) {
         return true;
       }
     }
@@ -268,7 +308,22 @@ function ruleCoversSubject(rule: IgnoreRuleRecord, prepared: PreparedSubject): b
       recordRuleSeriesId(rule) === subject.seriesId
     );
   }
-  return keysOverlap(rule.match_key, matchKey, aliases);
+  return keysOverlap(rule.match_key, matchKey, aliases, "suppress");
+}
+
+/**
+ * Would a rule made for `rule` also hide `other`? The suppression matcher, on
+ * two items of a shown list: a "Google Play" rule also hides "Google Play
+ * (LinkedIn ...)".
+ */
+export function ignoreInputCovers(rule: IgnoreCandidate["input"], other: IgnoreCandidate): boolean {
+  if (rule.entityType !== other.input.entityType) {
+    return false;
+  }
+  if (rule.matchScope === "record") {
+    return rule.entityId != null && String(rule.entityId) === String(other.input.entityId ?? "");
+  }
+  return keysOverlap(normalizeIgnoreKey(rule.matchKey), normalizeIgnoreKey(other.input.matchKey), [other.names], "suppress");
 }
 
 export function matchingIgnoreRule(
@@ -818,10 +873,12 @@ function settleSeries(group: readonly ReminderRecord[], now: Date): void {
   });
 }
 
+/** `all` resumes every match at once; resume_item sets it from his own words, not the model's query. */
 export function resumeIgnoreByQuery(
   query: string,
   authRef: string,
   instruction: string,
+  all = /\ball\b/i.test(query),
 ):
   | { kind: "resumed"; rules: IgnoreRuleRecord[] }
   | { kind: "clarify"; question: string }
@@ -830,7 +887,7 @@ export function resumeIgnoreByQuery(
   if (matches.length === 0) {
     return { kind: "none", message: "Nothing matching that is currently ignored." };
   }
-  if (matches.length > 1 && !/\ball\b/i.test(query)) {
+  if (matches.length > 1 && !all) {
     return {
       kind: "clarify",
       question:
@@ -962,12 +1019,69 @@ export function looksLikeListIgnoredInstruction(text: string): boolean {
   );
 }
 
+/**
+ * Negation, the one check every ignore, skip and resume path uses. It counts only
+ * when it governs the action verb: "don't / do not / never / not ignore",
+ * "don't skip", "don't resume". A "-n't" or "not" elsewhere in the sentence does
+ * not: "ignore the AWS alerts, I don't need them" and "can't you ignore them"
+ * are requests to ignore. "Stop ignoring" means resume, so it negates ignoring.
+ */
+const NEGATOR = String.raw`\b(?:don['\u2019]?t|do\s+not|never|(?<!\bwhy\s)not)(?:\s+(?:ever|even|just|really|actually|please|yet))*\s+`;
+const IGNORE_VERBS = String.raw`(?:ignor(?:e|ing)|skip(?:ping)?|mut(?:e|ing)|dismiss(?:ing)?)\b`;
+const SKIP_VERBS = String.raw`skip(?:ping)?\b`;
+const RESUME_VERBS = String.raw`(?:resum(?:e|ing)|unignor(?:e|ing)|start\s+(?:tracking|reminding)|stop\s+ignoring)\b`;
+const NEGATED_IGNORE = new RegExp(`${NEGATOR}${IGNORE_VERBS}|\\bstop\\s+ignoring\\b`, "i");
+const NEGATED_SKIP = new RegExp(`${NEGATOR}${SKIP_VERBS}`, "i");
+const NEGATED_RESUME = new RegExp(`${NEGATOR}${RESUME_VERBS}`, "i");
+
+/** His words say not to ignore (or skip, mute, dismiss). */
+export function negatesIgnore(text: string): boolean {
+  return NEGATED_IGNORE.test(text);
+}
+
+/** His words say not to skip this cycle. */
+export function negatesSkip(text: string): boolean {
+  return NEGATED_SKIP.test(text);
+}
+
+/** His words say not to resume. */
+export function negatesResume(text: string): boolean {
+  return NEGATED_RESUME.test(text);
+}
+
+/** His words cover every match: all, every, everything, each, both. */
+export function saysAll(text: string): boolean {
+  return /\b(?:all|every|everything|each|both)\b/i.test(text);
+}
+
+export const NOTHING_IGNORED = "OK, I won't ignore anything. Nothing changed.";
+export const NOTHING_SKIPPED = "OK, I won't skip it. Nothing changed.";
+export const NOTHING_RESUMED = "OK, I won't resume anything. Nothing changed.";
+
+/**
+ * The clause that asks, without the reasons around it: "ignore the AWS alerts,
+ * I don't need them" asks about "ignore the AWS alerts". A plain list of names
+ * ("ignore linkedin, facebook and netflix") stays whole.
+ */
+const CLAUSE_BREAK =
+  /\s*(?:[.;!?]+\s+|,\s*(?=(?:i|i['\u2019]m|im|it|it['\u2019]s|its|they|we|he|she|that['\u2019]s|thats|because|since|cause|coz|cuz|so|as)\b)|\s+(?:because|since|cause|coz|cuz)\s+)/i;
+
+export function askingClause(text: string): string {
+  const clauses = text.split(CLAUSE_BREAK).filter((clause) => clause.trim());
+  if (clauses.length < 2) {
+    return text;
+  }
+  return clauses.find((clause) => IGNORE_FILLER.test(clause)) ?? clauses[0]!;
+}
+
 const IGNORE_FILLER =
   /\b(?:aadi,?\s+|please\s+|pls\s+|kindly\s+|now\s+|just\s+)?(?:ignore|stop bothering me about|stop tracking|stop reminding me about|forget about|don'?t remind me about|do not remind me about|i don'?t want to see)\b/i;
 
 export function stripIgnoreWords(text: string): string {
   return text
+    .replace(/\b(?:can|ca|could|would|will|wo)(?:n['\u2019]?t)?\s+you\b/gi, " ")
     .replace(IGNORE_FILLER, " ")
+    .replace(/\bthem\b/gi, " ")
     .replace(
       /\b(?:the|my|this|that|these|those|a|an|all|future|again|permanently|please|pls)\b/gi,
       " ",
@@ -1099,9 +1213,10 @@ function entityHint(text: string): IgnoreEntityType | "ambiguous" | undefined {
   return undefined;
 }
 
-export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
-  const duration = parseIgnoreDuration(text);
-  const tagHint = parseTagHint(text);
+export function resolveIgnoreTarget(words: string): IgnoreResolveResult {
+  const duration = parseIgnoreDuration(words);
+  const tagHint = parseTagHint(words);
+  const text = askingClause(words);
   const hint = entityHint(text);
   const target = stripIgnoreWords(text);
   const key = normalizeIgnoreKey(target);
@@ -1141,33 +1256,34 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
     };
   }
 
+  const taskInput = (task: TaskRecord): IgnoreCandidate["input"] => ({
+    entityType: "task",
+    matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
+    matchScope: "source",
+    tag: tagHint ?? task.tag,
+    entityId: String(task.id),
+    duration: duration.duration,
+    expiresAt: duration.expiresAt,
+  });
+  const whichTask = (tasks: TaskRecord[]): IgnoreResolveResult => ({
+    kind: "clarify",
+    question: "Which task should I ignore?\n" + tasks.map((task) => `- #${task.id} ${task.text} (${task.tag})`).join("\n"),
+    candidates: tasks.map((task) => ({
+      label: `#${task.id} ${task.text} (${task.tag})`,
+      names: task.text,
+      confirmLabel: task.text,
+      input: taskInput(task),
+    })),
+  });
+
   if (hint === "task" || (!hint && matchingTasks(key).length === 1)) {
     const matches = matchingTasks(key);
     if (matches.length > 1) {
-      return {
-        kind: "clarify",
-        question:
-          "Which task should I ignore?\n" +
-          matches
-            .map((task) => `- #${task.id} ${task.text} (${task.tag})`)
-            .join("\n"),
-      };
+      return whichTask(matches);
     }
     if (matches.length === 1) {
       const task = matches[0]!;
-      return {
-        kind: "apply",
-        label: task.text,
-        input: {
-          entityType: "task",
-          matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
-          matchScope: "source",
-          tag: tagHint ?? task.tag,
-          entityId: String(task.id),
-          duration: duration.duration,
-          expiresAt: duration.expiresAt,
-        },
-      };
+      return { kind: "apply", label: task.text, input: taskInput(task) };
     }
     if (hint === "task" && keyIsSpecific(key)) {
       return {
@@ -1187,6 +1303,15 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
 
   if (hint === "reminder") {
     const matches = matchingReminders(key);
+    const reminderInput = (reminder: ReminderRecord): IgnoreCandidate["input"] => ({
+      entityType: "reminder",
+      matchKey: normalizeIgnoreKey(reminder.text),
+      matchScope: "record",
+      tag: tagHint ?? reminder.tag ?? "personal",
+      entityId: String(reminder.id),
+      duration: duration.duration,
+      expiresAt: duration.expiresAt,
+    });
     if (matches.length > 1) {
       return {
         kind: "clarify",
@@ -1195,6 +1320,12 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
           matches
             .map((reminder) => `- #${reminder.id} ${reminder.text}`)
             .join("\n"),
+        candidates: matches.map((reminder) => ({
+          label: `#${reminder.id} ${reminder.text}`,
+          names: reminder.text,
+          confirmLabel: reminder.text,
+          input: reminderInput(reminder),
+        })),
       };
     }
     const reminder = matches[0];
@@ -1257,6 +1388,20 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
         question:
           "Which date reminders should I ignore?\n" +
           matches.map((record) => `- ${record.person} (${record.type})`).join("\n"),
+        candidates: matches.map((record) => ({
+          label: `${record.person} (${record.type})`,
+          names: `${record.person} ${record.type}`,
+          confirmLabel: `${record.person} (${record.type})`,
+          input: {
+            entityType: "date",
+            matchKey: `${record.person} ${record.type}`,
+            matchScope: "record",
+            tag: tagHint ?? "personal",
+            entityId: String(record.id),
+            duration: duration.duration,
+            expiresAt: duration.expiresAt,
+          },
+        })),
       };
     }
     const record = matches[0];
@@ -1283,6 +1428,20 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
         question:
           "Which account follow-ups should I ignore?\n" +
           matches.map((account) => `- ${account.name}`).join("\n"),
+        candidates: matches.map((account) => ({
+          label: account.name,
+          names: account.name,
+          confirmLabel: `${account.name} follow-ups`,
+          input: {
+            entityType: "account",
+            matchKey: account.name,
+            matchScope: "source",
+            tag: "work",
+            entityId: String(account.id),
+            duration: duration.duration,
+            expiresAt: duration.expiresAt,
+          },
+        })),
       };
     }
     const account = matches[0];
@@ -1364,14 +1523,7 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
   }
 
   if (matchingTasks(key).length > 1 && matchingBills(key).length === 0) {
-    return {
-      kind: "clarify",
-      question:
-        "Which task should I ignore?\n" +
-        matchingTasks(key)
-          .map((task) => `- #${task.id} ${task.text} (${task.tag})`)
-          .join("\n"),
-    };
+    return whichTask(matchingTasks(key));
   }
 
   if (keyIsSpecific(key)) {

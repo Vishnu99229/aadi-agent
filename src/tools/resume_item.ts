@@ -3,6 +3,8 @@ import {
   confirmationForResume,
   findActiveRulesForQuery,
   looksLikeResumeInstruction,
+  negatesResume,
+  NOTHING_RESUMED,
   ownerMayChangeIgnore,
   resumeAllIgnoreRules,
   resumeIgnore,
@@ -45,6 +47,10 @@ export function handler(input: unknown, turn: ToolTurn): string {
     ? `owner_chat:${turn.confirmation.chatId}:${turn.confirmation.messageId}`
     : "owner_chat";
   const instruction = ownWords || (typeof values.query === "string" ? values.query : "resume");
+  // The one shared check: "don't resume …" changes nothing, by id, by name or all.
+  if (negatesResume(ownWords || (typeof values.query === "string" ? values.query : ""))) {
+    return NOTHING_RESUMED;
+  }
 
   if (typeof values.id === "number" && Number.isSafeInteger(values.id) && values.id > 0) {
     const rule = resumeIgnore(values.id, authRef, instruction);
@@ -62,12 +68,15 @@ export function handler(input: unknown, turn: ToolTurn): string {
     throw new Error("Provide query or id for the ignored item to resume.");
   }
 
+  // "All" comes from his own words, not the model's query.
+  const all = /\ball\b/i.test(ownWords || query);
+
   if (/^all$/i.test(query) || /\ball ignored\b/i.test(query)) {
     const active = findActiveRulesForQuery("");
     if (active.length === 0) {
       return "Nothing is currently ignored.";
     }
-    if (active.length > 1 && !/\ball\b/i.test(ownWords || query)) {
+    if (active.length > 1 && !all) {
       return (
         "Resume all of these ignored items?\n" +
         active.map((rule) => `- ${rule.id}: ${rule.match_key}`).join("\n") +
@@ -78,7 +87,7 @@ export function handler(input: unknown, turn: ToolTurn): string {
     return confirmationForResume(resumed);
   }
 
-  const result = resumeIgnoreByQuery(query, authRef, instruction);
+  const result = resumeIgnoreByQuery(query, authRef, instruction, all);
   if (result.kind === "clarify") {
     return result.question;
   }

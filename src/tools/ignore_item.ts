@@ -3,11 +3,14 @@ import {
   applyIgnore,
   confirmationForIgnore,
   looksLikeIgnoreInstruction,
+  negatesIgnore,
+  NOTHING_IGNORED,
   ownerMayChangeIgnore,
   parseIgnoreDuration,
   resolveIgnoreTarget,
 } from "../ignore.js";
 import { resolveReferentPhrase, type ReferentEntity } from "../referents.js";
+import { leavesSomeOut, savePendingIgnoreQuestion } from "../ignore_pending.js";
 import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
@@ -70,6 +73,16 @@ export function handler(input: unknown, turn: ToolTurn): string {
   if (ownWords && !looksLikeIgnoreInstruction(ownWords) && !fromReferents) {
     return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
   }
+  // The one shared check: a negation counts only when it governs the verb, so
+  // "don't ignore the netflix bill" changes nothing and "ignore the AWS alerts,
+  // I don't need them" goes ahead.
+  if (negatesIgnore(ownWords)) {
+    return NOTHING_IGNORED;
+  }
+  // "all of them except the 2nd": the whole list would be too much. Ask.
+  if (referents.kind === "collection" && leavesSomeOut(ownWords)) {
+    return "Which of them should I ignore? Nothing changed. Name them or give their numbers.";
+  }
   const values = input as {
     query?: unknown;
     entity_type?: unknown;
@@ -93,6 +106,10 @@ export function handler(input: unknown, turn: ToolTurn): string {
   const query = values.query.trim();
   const resolved = resolveIgnoreTarget(ownWords || query);
   if (resolved.kind === "clarify") {
+    // A "which one?" list is remembered as shown, so his next message can answer it.
+    if (resolved.candidates && turn.confirmation) {
+      savePendingIgnoreQuestion(turn.confirmation.chatId, ownWords || query, resolved.candidates);
+    }
     return resolved.question;
   }
   if (resolved.kind === "none") {
