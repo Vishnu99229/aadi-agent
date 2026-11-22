@@ -12,6 +12,8 @@ import {
   ownerMayChangeIgnore,
 } from "../ignore.js";
 import { canonicalBiller, normalizeBillerKey } from "../bill_aliases.js";
+import type { IgnoreCandidate } from "../ignore.js";
+import { ignoreCandidates, savePendingIgnoreQuestion } from "../ignore_pending.js";
 import { addOneMonthYmd } from "../bill_cycle.js";
 import type { ToolTurn } from "./index.js";
 
@@ -33,6 +35,15 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
         description:
           "True only when he asked to skip this month or this cycle, not to ignore the biller going forward.",
       },
+      all_matches: {
+        type: "boolean",
+        description: "Ignore every biller the query matches in one go. Honoured only when his own words say all, every or both.",
+      },
+      bill_ids: {
+        type: "array",
+        items: { type: "number" },
+        description: "Ids from a list you showed him, when he picked some of them: those billers are ignored in one go.",
+      },
     },
     required: ["query"],
   },
@@ -49,6 +60,17 @@ function formatMatchList(bills: BillRecord[]): string {
     .join("\n");
 }
 
+/** A shown bill, ready to ignore by its biller. */
+function billCandidate(bill: BillRecord): IgnoreCandidate {
+  const amount = bill.amount == null ? "" : ` ${bill.currency} ${bill.amount}`;
+  return {
+    label: `${bill.biller}${amount}, due ${bill.due_date} (id ${bill.id})`,
+    names: bill.biller,
+    confirmLabel: `${canonicalBiller(bill.biller)} bills`,
+    input: { entityType: "bill", matchKey: normalizeBillerKey(canonicalBiller(bill.biller)), matchScope: "source", tag: "personal" },
+  };
+}
+
 function wantsCycleSkip(query: string, skipCycle: boolean, userText: string): boolean {
   if (skipCycle) {
     return true;
@@ -62,7 +84,7 @@ function wantsCycleSkip(query: string, skipCycle: boolean, userText: string): bo
 
 export function handler(input: unknown, turn: ToolTurn = { iteration: 1, calledTools: [] }): string {
   try {
-    const values = input as { query?: unknown; skip_cycle?: unknown };
+    const values = input as { query?: unknown; skip_cycle?: unknown; all_matches?: unknown; bill_ids?: unknown };
     if (typeof values.query !== "string" || !values.query.trim()) {
       throw new Error("query must be a non-empty string.");
     }
@@ -85,6 +107,25 @@ export function handler(input: unknown, turn: ToolTurn = { iteration: 1, calledT
     if (matches.length > 1) {
       const billers = new Set(matches.map((bill) => normalizeBillerKey(canonicalBiller(bill.biller))));
       if (billers.size > 1) {
+        const authRef = turn.confirmation
+          ? `owner_chat:${turn.confirmation.chatId}:${turn.confirmation.messageId}`
+          : "owner_chat";
+        const ids = Array.isArray(values.bill_ids) ? values.bill_ids.filter((id): id is number => typeof id === "number") : [];
+        if (ids.length > 0) {
+          const picked = matches.filter((bill) => ids.includes(bill.id));
+          if (picked.length === 0) {
+            return `None of those ids is in the matching bills. Which one should I ignore?\n${formatMatchList(matches)}`;
+          }
+          return ignoreCandidates(picked.map(billCandidate), userText || query, authRef, matches.length);
+        }
+        // Every matching biller at once, only when his own words say so.
+        if (/\b(?:all|every|everything|both)\b/i.test(userText)) {
+          return ignoreCandidates(matches.map(billCandidate), userText, authRef, matches.length);
+        }
+        // Ask, and remember exactly what was shown: his next message answers it.
+        if (turn.confirmation) {
+          savePendingIgnoreQuestion(turn.confirmation.chatId, userText || query, matches.map(billCandidate));
+        }
         return (
           `Found ${matches.length} matching bills — which one should I ignore?\n` +
           formatMatchList(matches)

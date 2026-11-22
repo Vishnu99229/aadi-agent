@@ -8,6 +8,7 @@ import {
   resolveIgnoreTarget,
 } from "../ignore.js";
 import { resolveReferentPhrase, type ReferentEntity } from "../referents.js";
+import { savePendingIgnoreQuestion } from "../ignore_pending.js";
 import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
@@ -93,6 +94,10 @@ export function handler(input: unknown, turn: ToolTurn): string {
   const query = values.query.trim();
   const resolved = resolveIgnoreTarget(ownWords || query);
   if (resolved.kind === "clarify") {
+    // A "which one?" list is remembered as shown, so his next message can answer it.
+    if (resolved.candidates && turn.confirmation) {
+      savePendingIgnoreQuestion(turn.confirmation.chatId, ownWords || query, resolved.candidates);
+    }
     return resolved.question;
   }
   if (resolved.kind === "none") {

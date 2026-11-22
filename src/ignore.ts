@@ -68,9 +68,20 @@ export type IgnoreApplyResult =
   | { kind: "created"; rule: IgnoreRuleRecord; duplicate: false }
   | { kind: "duplicate"; rule: IgnoreRuleRecord; duplicate: true };
 
+/** One item a clarifying "which one?" question listed, ready to ignore as shown. */
+export type IgnoreCandidate = {
+  /** The line as he saw it. */
+  label: string;
+  /** The words his answer can name it by ("LinkedIn", "Facebook"). */
+  names: string;
+  /** How the confirmation names it. */
+  confirmLabel: string;
+  input: Omit<IgnoreApplyInput, "instruction" | "authRef">;
+};
+
 export type IgnoreResolveResult =
   | { kind: "apply"; input: Omit<IgnoreApplyInput, "instruction" | "authRef">; label: string }
-  | { kind: "clarify"; question: string }
+  | { kind: "clarify"; question: string; candidates?: IgnoreCandidate[] }
   | { kind: "none"; message: string };
 
 const SOURCE_ALIASES: Record<string, readonly string[]> = {
@@ -152,6 +163,21 @@ function phraseMatches(ruleKey: string, candidate: string): boolean {
   return candidate.startsWith(`${ruleKey} `) || candidate.endsWith(` ${ruleKey}`);
 }
 
+/** Words that name nothing: a rule "three linkedin" or "axis bank alerts" still means that source. */
+const RULE_NOISE = new Set([
+  "a", "an", "the", "my", "all", "both", "every", "each", "these", "those", "this", "that", "of", "and", "for",
+  "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "first", "second", "third",
+  "bill", "bills", "payment", "payments", "charge", "charges", "invoice", "invoices", "subscription", "subscriptions",
+  "renewal", "renewals", "reminder", "reminders", "alert", "alerts", "notification", "notifications",
+  "email", "emails", "mail", "mails", "monthly", "yearly", "annual", "recurring",
+]);
+
+/** The longer key adds only noise to the shorter one ("three linkedin" over "linkedin"). */
+function addsOnlyNoise(longer: string, shorter: string): boolean {
+  const base = new Set(shorter.split(" "));
+  return longer.split(" ").every((word) => base.has(word) || RULE_NOISE.has(word) || /^\d+$/.test(word));
+}
+
 function keysOverlap(ruleKey: string, candidate: string, aliases: readonly string[] = []): boolean {
   const ruleKeys = expandAliases(ruleKey);
   const candidateKeys = [
@@ -161,7 +187,9 @@ function keysOverlap(ruleKey: string, candidate: string, aliases: readonly strin
   ];
   for (const left of ruleKeys) {
     for (const right of candidateKeys) {
-      if (phraseMatches(left, right) || phraseMatches(right, left)) {
+      // The candidate names the rule's source, or the rule is the candidate plus noise words.
+      // A rule for "google play linkedin ..." is not a rule for every "google play" bill.
+      if (phraseMatches(left, right) || (phraseMatches(right, left) && addsOnlyNoise(left, right))) {
         return true;
       }
     }
@@ -1141,33 +1169,34 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
     };
   }
 
+  const taskInput = (task: TaskRecord): IgnoreCandidate["input"] => ({
+    entityType: "task",
+    matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
+    matchScope: "source",
+    tag: tagHint ?? task.tag,
+    entityId: String(task.id),
+    duration: duration.duration,
+    expiresAt: duration.expiresAt,
+  });
+  const whichTask = (tasks: TaskRecord[]): IgnoreResolveResult => ({
+    kind: "clarify",
+    question: "Which task should I ignore?\n" + tasks.map((task) => `- #${task.id} ${task.text} (${task.tag})`).join("\n"),
+    candidates: tasks.map((task) => ({
+      label: `#${task.id} ${task.text} (${task.tag})`,
+      names: task.text,
+      confirmLabel: task.text,
+      input: taskInput(task),
+    })),
+  });
+
   if (hint === "task" || (!hint && matchingTasks(key).length === 1)) {
     const matches = matchingTasks(key);
     if (matches.length > 1) {
-      return {
-        kind: "clarify",
-        question:
-          "Which task should I ignore?\n" +
-          matches
-            .map((task) => `- #${task.id} ${task.text} (${task.tag})`)
-            .join("\n"),
-      };
+      return whichTask(matches);
     }
     if (matches.length === 1) {
       const task = matches[0]!;
-      return {
-        kind: "apply",
-        label: task.text,
-        input: {
-          entityType: "task",
-          matchKey: normalizeIgnoreKey(task.text.replace(/^promise:\s*/i, "")),
-          matchScope: "source",
-          tag: tagHint ?? task.tag,
-          entityId: String(task.id),
-          duration: duration.duration,
-          expiresAt: duration.expiresAt,
-        },
-      };
+      return { kind: "apply", label: task.text, input: taskInput(task) };
     }
     if (hint === "task" && keyIsSpecific(key)) {
       return {
@@ -1187,6 +1216,15 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
 
   if (hint === "reminder") {
     const matches = matchingReminders(key);
+    const reminderInput = (reminder: ReminderRecord): IgnoreCandidate["input"] => ({
+      entityType: "reminder",
+      matchKey: normalizeIgnoreKey(reminder.text),
+      matchScope: "record",
+      tag: tagHint ?? reminder.tag ?? "personal",
+      entityId: String(reminder.id),
+      duration: duration.duration,
+      expiresAt: duration.expiresAt,
+    });
     if (matches.length > 1) {
       return {
         kind: "clarify",
@@ -1195,6 +1233,12 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
           matches
             .map((reminder) => `- #${reminder.id} ${reminder.text}`)
             .join("\n"),
+        candidates: matches.map((reminder) => ({
+          label: `#${reminder.id} ${reminder.text}`,
+          names: reminder.text,
+          confirmLabel: reminder.text,
+          input: reminderInput(reminder),
+        })),
       };
     }
     const reminder = matches[0];
@@ -1257,6 +1301,20 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
         question:
           "Which date reminders should I ignore?\n" +
           matches.map((record) => `- ${record.person} (${record.type})`).join("\n"),
+        candidates: matches.map((record) => ({
+          label: `${record.person} (${record.type})`,
+          names: `${record.person} ${record.type}`,
+          confirmLabel: `${record.person} (${record.type})`,
+          input: {
+            entityType: "date",
+            matchKey: `${record.person} ${record.type}`,
+            matchScope: "record",
+            tag: tagHint ?? "personal",
+            entityId: String(record.id),
+            duration: duration.duration,
+            expiresAt: duration.expiresAt,
+          },
+        })),
       };
     }
     const record = matches[0];
@@ -1283,6 +1341,20 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
         question:
           "Which account follow-ups should I ignore?\n" +
           matches.map((account) => `- ${account.name}`).join("\n"),
+        candidates: matches.map((account) => ({
+          label: account.name,
+          names: account.name,
+          confirmLabel: `${account.name} follow-ups`,
+          input: {
+            entityType: "account",
+            matchKey: account.name,
+            matchScope: "source",
+            tag: "work",
+            entityId: String(account.id),
+            duration: duration.duration,
+            expiresAt: duration.expiresAt,
+          },
+        })),
       };
     }
     const account = matches[0];
@@ -1364,14 +1436,7 @@ export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
   }
 
   if (matchingTasks(key).length > 1 && matchingBills(key).length === 0) {
-    return {
-      kind: "clarify",
-      question:
-        "Which task should I ignore?\n" +
-        matchingTasks(key)
-          .map((task) => `- #${task.id} ${task.text} (${task.tag})`)
-          .join("\n"),
-    };
+    return whichTask(matchingTasks(key));
   }
 
   if (keyIsSpecific(key)) {
