@@ -38,7 +38,7 @@ export interface VoicePersona {
 export const VOICE_PERSONAS: Record<VoiceReplyLang, VoicePersona> = {
   en: {
     model: "bulbul:v4-flash",
-    speaker: "ashwin_en_sports_energetic",
+    speaker: "sanchita_en_companion",
     language_code: "en-IN",
     pace: TTS_PACE,
   },

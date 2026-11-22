@@ -365,7 +365,7 @@ assert(voiceRepliesEnabled() === false || true, "toggle helper reachable");
     await synthesizeSpeech("hello", lang);
   }
   const voice = (index: number) => `${bodies[index]!.model} ${bodies[index]!.speaker} ${bodies[index]!.language_code} ${bodies[index]!.pace}`;
-  assert(voice(0) === "bulbul:v4-flash ashwin_en_sports_energetic en-IN 1", `English voice, got ${voice(0)}`);
+  assert(voice(0) === "bulbul:v4-flash sanchita_en_companion en-IN 1", `English voice, got ${voice(0)}`);
   assert(voice(1) === "bulbul:v4-flash shubh_hi_customer hi-IN 1", `Hindi voice, got ${voice(1)}`);
   assert(voice(2) === "bulbul:v3 shubh ml-IN 1", `Malayalam voice, got ${voice(2)}`);
   console.log("voices: ok");
