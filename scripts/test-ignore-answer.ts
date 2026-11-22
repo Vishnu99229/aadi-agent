@@ -11,7 +11,7 @@
 import { bot } from "../src/bot.ts";
 import { canonicalBiller } from "../src/bill_aliases.ts";
 import { createBill, db, getBill } from "../src/db.ts";
-import { billIsIgnored, findActiveRulesForQuery, invalidateIgnoreCache } from "../src/ignore.ts";
+import { billIsIgnored, emailSourceIsIgnored, findActiveRulesForQuery, invalidateIgnoreCache, negatesIgnore } from "../src/ignore.ts";
 import {
   answerPendingIgnore,
   clearPendingIgnoreQuestion,
@@ -251,7 +251,7 @@ passed.push("never: a forward, no open question, an expired question, a reply to
   ];
   assert(parseIgnoreAnswer("Did Google send the invoice?", candidates).kind === "unrelated", "a question that mentions a name is not an answer");
   assert(parseIgnoreAnswer("yes", candidates).kind === "unrelated", "a bare yes is not read as all");
-  assert(parseIgnoreAnswer("not the linkedin one", candidates).kind === "cancel", "any negation cancels");
+  assert(parseIgnoreAnswer("don't ignore the linkedin one", candidates).kind === "cancel", "a negated \"ignore\" cancels");
   assert(PENDING_IGNORE_TTL_MS === 30 * 60_000, "questions expire after 30 minutes");
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(
     `ignore_pending_question:${CHAT}`,
@@ -368,6 +368,8 @@ await check("4b. ignore_item: \"don't ignore all of them\" after a shown list ig
   const out = ignoreItem({ query: "all of them" }, turnFor("ignore_item", "don't ignore all of them"));
   assert(activeRules() === 0, `no rule is made (${activeRules()}; ${JSON.stringify(out)})`);
   assert(/Nothing changed/.test(out), `and it says so (${JSON.stringify(out)})`);
+  const except = ignoreItem({ query: "all of them" }, turnFor("ignore_item", "ignore all of them except the 2nd"));
+  assert(activeRules() === 0 && /Which of them should I ignore\?/.test(except), `"ignore all of them except the 2nd" asks instead of ignoring all three (${activeRules()}; ${JSON.stringify(except)})`);
   const yes = ignoreItem({ query: "all of them" }, turnFor("ignore_item", "ignore all of them"));
   assert(activeRules() === 3, `"ignore all of them" still ignores the three shown (${activeRules()}; ${JSON.stringify(yes)})`);
 });
@@ -393,6 +395,88 @@ await check("4d. skip this month has no bulk path: \"skip all google play bills 
   const out = ignoreBill({ query: "google play" }, turnFor("ignore_bill", "skip all google play bills this month"));
   assert(/which one should I skip\?/.test(out), `it asks (${JSON.stringify(out)})`);
   assert(ids.every((id) => getBill(id)!.status === "upcoming"), "and skips nothing");
+});
+
+// ---------------------------------------------------------------- precise negation: only on the action verb
+const billNamed = (biller: string) => createBill(biller, null, "INR", ymd(9), `thread-${biller}-${Date.now()}`)!;
+
+await check("5a. \"don't ignore the netflix bill\" (one match) changes nothing", () => {
+  seed();
+  const netflix = billNamed("Netflix");
+  const out = ignoreBill({ query: "netflix" }, turnFor("ignore_bill", "don't ignore the netflix bill"));
+  assert(activeRules() === 0 && !billIsIgnored(getBill(netflix.id)!), `no rule is made (${activeRules()}; ${JSON.stringify(out)})`);
+  assert(/Nothing changed/.test(out), `and it says so (${JSON.stringify(out)})`);
+  const viaItem = ignoreItem({ query: "netflix bill" }, turnFor("ignore_item", "don't ignore the netflix bill"));
+  assert(activeRules() === 0 && /Nothing changed/.test(viaItem), `ignore_item agrees (${activeRules()}; ${JSON.stringify(viaItem)})`);
+});
+
+await check("5b. \"don't skip netflix this month\" skips nothing", () => {
+  seed();
+  const netflix = billNamed("Netflix");
+  const out = ignoreBill({ query: "netflix", skip_cycle: true }, turnFor("ignore_bill", "don't skip netflix this month"));
+  assert(getBill(netflix.id)!.status === "upcoming", `the bill is not skipped (${getBill(netflix.id)!.status}; ${JSON.stringify(out)})`);
+  assert(/Nothing changed/.test(out), `and it says so (${JSON.stringify(out)})`);
+  const skip = ignoreBill({ query: "netflix", skip_cycle: true }, turnFor("ignore_bill", "don't ignore netflix, just skip it this month"));
+  assert(getBill(netflix.id)!.status === "ignored", `"don't ignore netflix, just skip it this month" still skips (${JSON.stringify(skip)})`);
+});
+
+await check("5c. \"ignore the AWS alerts, I don't need them\" ignores AWS alerts", () => {
+  seed();
+  const out = ignoreItem({ query: "AWS alerts" }, turnFor("ignore_item", "ignore the AWS alerts, I don't need them"));
+  const aws = emailSourceIsIgnored({ fromHeader: "AWS Notifications <no-reply@aws.amazon.com>", subject: "AWS Billing alert", tag: "work" });
+  assert(aws, `an AWS alert is now ignored (${JSON.stringify(out)})`);
+  assert(!/Nothing changed/.test(out) && !/need them/i.test(out), `and the rule is for AWS, not the whole sentence (${JSON.stringify(out)})`);
+});
+
+await check("5d. \"ignore all, not the LinkedIn one\" never ignores the LinkedIn one", async () => {
+  // Three billers that don't overlap: every shown item except LinkedIn.
+  seed();
+  const others = [billNamed("Netflix Premium"), billNamed("Spotify Premium")];
+  const linkedin = billNamed("LinkedIn Premium");
+  ignoreBill({ query: "premium" }, turnFor("ignore_bill", "ignore my premium bills"));
+  assert(pendingIgnoreQuestion(CHAT)?.candidates.length === 3, "set up: Aadi asked which of the three");
+  const out = await say("ignore all, not the LinkedIn one");
+  assert(!billIsIgnored(getBill(linkedin.id)!), `the LinkedIn one is not ignored (${JSON.stringify(out)})`);
+  assert(others.every((bill) => billIsIgnored(getBill(bill.id)!)), `every other shown item is (${JSON.stringify(out)})`);
+  // The seven Google Play bills: a "Google Play" rule would also hide the LinkedIn one, so Aadi asks.
+  await ask();
+  const gp = await say("ignore all, not the LinkedIn one");
+  assert(!ignored().includes(linkedinId()), `the LinkedIn Google Play bill is not ignored (${JSON.stringify(gp)})`);
+  assert(ignored().length === 0 && pendingIgnoreQuestion(CHAT) !== undefined && /Nothing changed/.test(gp.join("\n")), `it asks instead and keeps the question open (${ignored().length}; ${JSON.stringify(gp)})`);
+  await say("all except 1, 2 and 5");
+  assert(ignored().sort().join(",") === [ids[2], ids[3], ids[5], ids[6]].sort().join(","), `"all except 1, 2 and 5" ignores the other four (${ignored().join(",")})`);
+  await ask();
+  const shown = pendingIgnoreQuestion(CHAT)!.candidates;
+  const bare = parseIgnoreAnswer("not the linkedin one", shown);
+  assert(bare.kind === "unclear", `"not the linkedin one" alone (nothing to exclude from) asks again (${JSON.stringify(bare)})`);
+  // Said directly, with no question open.
+  seed();
+  const direct = ignoreBill({ query: "google play" }, turnFor("ignore_bill", "ignore all google play bills, not the linkedin one"));
+  assert(!ignored().includes(linkedinId()) && ignored().length === 0, `directly: the LinkedIn one is not ignored (${JSON.stringify(direct)})`);
+  assert(pendingIgnoreQuestion(CHAT) !== undefined, `directly: it asks which (${JSON.stringify(direct)})`);
+  clearPendingIgnoreQuestion(CHAT);
+});
+
+await check("5e. \"can't you ignore them\" is a request to ignore (the n't is not on ignore)", async () => {
+  assert(!negatesIgnore("can't you ignore them"), "negatesIgnore says no");
+  seed();
+  const out = ignoreBill({ query: "google play" }, turnFor("ignore_bill", "can't you ignore them"));
+  assert(/which one should I ignore\?/.test(out) && pendingIgnoreQuestion(CHAT) !== undefined, `ignore_bill goes on to ask which of the 7 (${JSON.stringify(out)})`);
+  clearPendingIgnoreQuestion(CHAT);
+  const item = ignoreItem({ query: "them" }, turnFor("ignore_item", "can't you ignore them"));
+  assert(activeRules() === 0 && !/Nothing changed/.test(item), `ignore_item asks what, and makes no rule out of the sentence (${activeRules()}; ${JSON.stringify(item)})`);
+  await ask();
+  const answer = parseIgnoreAnswer("can't you ignore them", pendingIgnoreQuestion(CHAT)!.candidates);
+  assert(answer.kind !== "cancel", `as an answer it is not a cancel (${JSON.stringify(answer)})`);
+  clearPendingIgnoreQuestion(CHAT);
+});
+
+await check("5f. picking a subset never hides an unpicked item on the list", async () => {
+  await ask();
+  const out = await say("the first one");
+  assert(ignored().length === 0, `"the first one" (plain Google Play) doesn't hide the other six with it (${ignored().length}; ${JSON.stringify(out)})`);
+  assert(pendingIgnoreQuestion(CHAT) !== undefined && /Nothing changed/.test(out.join("\n")), `it says why and keeps the question open (${JSON.stringify(out)})`);
+  clearPendingIgnoreQuestion(CHAT);
 });
 
 if (failures.length > 0) {

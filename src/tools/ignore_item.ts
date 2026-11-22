@@ -8,10 +8,9 @@ import {
   ownerMayChangeIgnore,
   parseIgnoreDuration,
   resolveIgnoreTarget,
-  saysAll,
 } from "../ignore.js";
 import { resolveReferentPhrase, type ReferentEntity } from "../referents.js";
-import { savePendingIgnoreQuestion } from "../ignore_pending.js";
+import { leavesSomeOut, savePendingIgnoreQuestion } from "../ignore_pending.js";
 import type { ToolTurn } from "./index.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
@@ -74,11 +73,15 @@ export function handler(input: unknown, turn: ToolTurn): string {
   if (ownWords && !looksLikeIgnoreInstruction(ownWords) && !fromReferents) {
     return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
   }
-  // The same negation check as an answer to "which one?": a negated reply to a
-  // shown list ignores nothing, and a negated "all" never ignores anything.
-  const negated = negatesIgnore(ownWords);
-  if (negated && (fromReferents || saysAll(ownWords))) {
+  // The one shared check: a negation counts only when it governs the verb, so
+  // "don't ignore the netflix bill" changes nothing and "ignore the AWS alerts,
+  // I don't need them" goes ahead.
+  if (negatesIgnore(ownWords)) {
     return NOTHING_IGNORED;
+  }
+  // "all of them except the 2nd": the whole list would be too much. Ask.
+  if (referents.kind === "collection" && leavesSomeOut(ownWords)) {
+    return "Which of them should I ignore? Nothing changed. Name them or give their numbers.";
   }
   const values = input as {
     query?: unknown;
@@ -103,10 +106,6 @@ export function handler(input: unknown, turn: ToolTurn): string {
   const query = values.query.trim();
   const resolved = resolveIgnoreTarget(ownWords || query);
   if (resolved.kind === "clarify") {
-    // A negated message never opens a "which one?" question.
-    if (negated) {
-      return NOTHING_IGNORED;
-    }
     // A "which one?" list is remembered as shown, so his next message can answer it.
     if (resolved.candidates && turn.confirmation) {
       savePendingIgnoreQuestion(turn.confirmation.chatId, ownWords || query, resolved.candidates);

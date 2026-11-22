@@ -311,6 +311,21 @@ function ruleCoversSubject(rule: IgnoreRuleRecord, prepared: PreparedSubject): b
   return keysOverlap(rule.match_key, matchKey, aliases, "suppress");
 }
 
+/**
+ * Would a rule made for `rule` also hide `other`? The suppression matcher, on
+ * two items of a shown list: a "Google Play" rule also hides "Google Play
+ * (LinkedIn ...)".
+ */
+export function ignoreInputCovers(rule: IgnoreCandidate["input"], other: IgnoreCandidate): boolean {
+  if (rule.entityType !== other.input.entityType) {
+    return false;
+  }
+  if (rule.matchScope === "record") {
+    return rule.entityId != null && String(rule.entityId) === String(other.input.entityId ?? "");
+  }
+  return keysOverlap(normalizeIgnoreKey(rule.matchKey), normalizeIgnoreKey(other.input.matchKey), [other.names], "suppress");
+}
+
 export function matchingIgnoreRule(
   subject: IgnoreSubject,
   now = new Date(),
@@ -1005,27 +1020,33 @@ export function looksLikeListIgnoredInstruction(text: string): boolean {
 }
 
 /**
- * Negation, the one check every ignore and resume path uses: an answer to
- * "which one?", a direct "ignore all ...", a reply to a shown list. "No",
- * "cancel", "don't", "do not", "never", "not", "stop" or any "-n't" means not
- * to, wherever it is. Ways of asking that carry such a word are taken out first:
- * "don't remind me about", "stop tracking" ask to ignore; "stop ignoring" asks
- * to resume.
+ * Negation, the one check every ignore, skip and resume path uses. It counts only
+ * when it governs the action verb: "don't / do not / never / not ignore",
+ * "don't skip", "don't resume". A "-n't" or "not" elsewhere in the sentence does
+ * not: "ignore the AWS alerts, I don't need them" and "can't you ignore them"
+ * are requests to ignore. "Stop ignoring" means resume, so it negates ignoring.
  */
-const NEGATION =
-  /^\s*(?:no|nope|nah|none|neither|cancel|never\s*mind|nvm|forget\s+it|leave\s+(?:it|them|those)|not\s+now)\b|\b(?:dont|do\s+not|never|not|none|nothing|neither|cancel|cannot|stop)\b|n['\u2019]t\b/i;
-const IGNORE_ASKS =
-  /\b(?:don['\u2019]?t|do\s+not)\s+(?:remind|ping|bother|track)\b|\bi\s+don['\u2019]?t\s+want\s+to\s+see\b|\bstop\s+(?:tracking|reminding|bothering)\b/gi;
-const RESUME_ASKS = /\bstop\s+ignoring\b/gi;
+const NEGATOR = String.raw`\b(?:don['\u2019]?t|do\s+not|never|(?<!\bwhy\s)not)(?:\s+(?:ever|even|just|really|actually|please|yet))*\s+`;
+const IGNORE_VERBS = String.raw`(?:ignor(?:e|ing)|skip(?:ping)?|mut(?:e|ing)|dismiss(?:ing)?)\b`;
+const SKIP_VERBS = String.raw`skip(?:ping)?\b`;
+const RESUME_VERBS = String.raw`(?:resum(?:e|ing)|unignor(?:e|ing)|start\s+(?:tracking|reminding)|stop\s+ignoring)\b`;
+const NEGATED_IGNORE = new RegExp(`${NEGATOR}${IGNORE_VERBS}|\\bstop\\s+ignoring\\b`, "i");
+const NEGATED_SKIP = new RegExp(`${NEGATOR}${SKIP_VERBS}`, "i");
+const NEGATED_RESUME = new RegExp(`${NEGATOR}${RESUME_VERBS}`, "i");
 
-/** His words say not to ignore. */
+/** His words say not to ignore (or skip, mute, dismiss). */
 export function negatesIgnore(text: string): boolean {
-  return NEGATION.test(text.replace(IGNORE_ASKS, " "));
+  return NEGATED_IGNORE.test(text);
+}
+
+/** His words say not to skip this cycle. */
+export function negatesSkip(text: string): boolean {
+  return NEGATED_SKIP.test(text);
 }
 
 /** His words say not to resume. */
 export function negatesResume(text: string): boolean {
-  return NEGATION.test(text.replace(RESUME_ASKS, " "));
+  return NEGATED_RESUME.test(text);
 }
 
 /** His words cover every match: all, every, everything, each, both. */
@@ -1033,15 +1054,34 @@ export function saysAll(text: string): boolean {
   return /\b(?:all|every|everything|each|both)\b/i.test(text);
 }
 
-export const NOTHING_IGNORED = "OK, I won't ignore any of them. Nothing changed.";
+export const NOTHING_IGNORED = "OK, I won't ignore anything. Nothing changed.";
+export const NOTHING_SKIPPED = "OK, I won't skip it. Nothing changed.";
 export const NOTHING_RESUMED = "OK, I won't resume anything. Nothing changed.";
+
+/**
+ * The clause that asks, without the reasons around it: "ignore the AWS alerts,
+ * I don't need them" asks about "ignore the AWS alerts". A plain list of names
+ * ("ignore linkedin, facebook and netflix") stays whole.
+ */
+const CLAUSE_BREAK =
+  /\s*(?:[.;!?]+\s+|,\s*(?=(?:i|i['\u2019]m|im|it|it['\u2019]s|its|they|we|he|she|that['\u2019]s|thats|because|since|cause|coz|cuz|so|as)\b)|\s+(?:because|since|cause|coz|cuz)\s+)/i;
+
+export function askingClause(text: string): string {
+  const clauses = text.split(CLAUSE_BREAK).filter((clause) => clause.trim());
+  if (clauses.length < 2) {
+    return text;
+  }
+  return clauses.find((clause) => IGNORE_FILLER.test(clause)) ?? clauses[0]!;
+}
 
 const IGNORE_FILLER =
   /\b(?:aadi,?\s+|please\s+|pls\s+|kindly\s+|now\s+|just\s+)?(?:ignore|stop bothering me about|stop tracking|stop reminding me about|forget about|don'?t remind me about|do not remind me about|i don'?t want to see)\b/i;
 
 export function stripIgnoreWords(text: string): string {
   return text
+    .replace(/\b(?:can|ca|could|would|will|wo)(?:n['\u2019]?t)?\s+you\b/gi, " ")
     .replace(IGNORE_FILLER, " ")
+    .replace(/\bthem\b/gi, " ")
     .replace(
       /\b(?:the|my|this|that|these|those|a|an|all|future|again|permanently|please|pls)\b/gi,
       " ",
@@ -1173,9 +1213,10 @@ function entityHint(text: string): IgnoreEntityType | "ambiguous" | undefined {
   return undefined;
 }
 
-export function resolveIgnoreTarget(text: string): IgnoreResolveResult {
-  const duration = parseIgnoreDuration(text);
-  const tagHint = parseTagHint(text);
+export function resolveIgnoreTarget(words: string): IgnoreResolveResult {
+  const duration = parseIgnoreDuration(words);
+  const tagHint = parseTagHint(words);
+  const text = askingClause(words);
   const hint = entityHint(text);
   const target = stripIgnoreWords(text);
   const key = normalizeIgnoreKey(target);

@@ -47,6 +47,10 @@ export function handler(input: unknown, turn: ToolTurn): string {
     ? `owner_chat:${turn.confirmation.chatId}:${turn.confirmation.messageId}`
     : "owner_chat";
   const instruction = ownWords || (typeof values.query === "string" ? values.query : "resume");
+  // The one shared check: "don't resume …" changes nothing, by id, by name or all.
+  if (negatesResume(ownWords || (typeof values.query === "string" ? values.query : ""))) {
+    return NOTHING_RESUMED;
+  }
 
   if (typeof values.id === "number" && Number.isSafeInteger(values.id) && values.id > 0) {
     const rule = resumeIgnore(values.id, authRef, instruction);
@@ -64,13 +68,8 @@ export function handler(input: unknown, turn: ToolTurn): string {
     throw new Error("Provide query or id for the ignored item to resume.");
   }
 
-  // "All" comes from his own words, and a negation there means resume nothing at all.
-  const theirWords = ownWords || query;
-  const negated = negatesResume(theirWords);
-  const all = /\ball\b/i.test(theirWords);
-  if (negated && (all || /^all$/i.test(query) || /\ball\b/i.test(query))) {
-    return NOTHING_RESUMED;
-  }
+  // "All" comes from his own words, not the model's query.
+  const all = /\ball\b/i.test(ownWords || query);
 
   if (/^all$/i.test(query) || /\ball ignored\b/i.test(query)) {
     const active = findActiveRulesForQuery("");
@@ -90,8 +89,7 @@ export function handler(input: unknown, turn: ToolTurn): string {
 
   const result = resumeIgnoreByQuery(query, authRef, instruction, all);
   if (result.kind === "clarify") {
-    // A negated message never opens a "which one?" question.
-    return negated ? NOTHING_RESUMED : result.question;
+    return result.question;
   }
   if (result.kind === "none") {
     return result.message;

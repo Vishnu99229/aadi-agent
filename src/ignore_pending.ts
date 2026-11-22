@@ -1,5 +1,12 @@
 import { deleteSetting, getSetting, setSetting } from "./db.js";
-import { applyIgnore, confirmationForIgnore, negatesIgnore, NOTHING_IGNORED, type IgnoreCandidate } from "./ignore.js";
+import {
+  applyIgnore,
+  confirmationForIgnore,
+  ignoreInputCovers,
+  negatesIgnore,
+  NOTHING_IGNORED,
+  type IgnoreCandidate,
+} from "./ignore.js";
 
 /**
  * Aadi's own latest "which one should I ignore?" question, and the exact list it
@@ -61,12 +68,24 @@ export function pendingIgnoreQuestion(chatId: number, now = Date.now()): Pending
 
 export type IgnoreAnswer =
   | { kind: "all" }
-  | { kind: "some"; indexes: number[] }
+  /** `excluded`: the items he explicitly left out ("all, not the LinkedIn one"). */
+  | { kind: "some"; indexes: number[]; excluded?: number[] }
   | { kind: "cancel" }
   /** A position with a name the shown item doesn't carry ("the 6th Facebook one"): not an answer. */
   | { kind: "mismatch"; index: number }
+  /** He left something out but the rest can't be read ("not the LinkedIn one" alone): ask again. */
+  | { kind: "unclear" }
   | { kind: "unrelated" };
 
+/**
+ * An answer that picks none: "no", "none of them", "cancel", "never mind", a bare
+ * "don't". A negated verb ("don't ignore them") is negatesIgnore, shared with
+ * every other path.
+ */
+const ANSWER_CANCEL =
+  /^\s*(?:no|nope|nah|none|neither|cancel|never\s*mind|nvm|forget\s+it|leave\s+(?:it|them|those)|not\s+now)\b|^\s*(?:don['\u2019]?t|do\s+not)\s*[.!]*\s*$|\b(?:none|nothing|neither|cancel)\b/i;
+/** "all, not the LinkedIn one", "all except 1 and 2": what follows is left out. */
+const EXCEPT = /\b(?:except(?:\s+for)?|but\s+not|other\s+than|apart\s+from|excluding|besides|but|not)\b/i;
 const ALL_WORDS = new Set(["all", "every", "everything", "each", "both", "everyone"]);
 /** Words that carry no choice: politeness, "ignore", "the one", "bills". */
 const FILLER = new Set([
@@ -89,28 +108,25 @@ function words(text: string): string[] {
   return text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
 }
 
+/** His words say to leave some of the shown items out. */
+export function leavesSomeOut(text: string): boolean {
+  return EXCEPT.test(text);
+}
+
+type Picked = { indexes: Set<number>; sawAll: boolean };
+
 /**
- * How his answer maps onto the shown list. Anything with words that name nothing
- * shown is unrelated. Within one part, a position ("the 6th", "id 36") picks the
- * item and a name only narrows it: "the 6th Google Play one" is the 6th, never
- * every Google Play bill. A name alone picks every item carrying it.
+ * The items one stretch of his answer names. Within one part, a position
+ * ("the 6th", "id 36") picks the item and a name only narrows it: "the 6th
+ * Google Play one" is the 6th, never every Google Play bill. A name alone picks
+ * every item carrying it. A word that names nothing shown makes it unrelated.
  */
-export function parseIgnoreAnswer(text: string, candidates: readonly IgnoreCandidate[]): IgnoreAnswer {
-  const clean = text.trim();
-  if (!clean) {
-    return { kind: "unrelated" };
-  }
-  if (negatesIgnore(clean)) {
-    return { kind: "cancel" };
-  }
-  if (words(clean).length > 12) {
-    return { kind: "unrelated" };
-  }
+function pick(text: string, candidates: readonly IgnoreCandidate[]): Picked | { kind: "unrelated" } | { kind: "mismatch"; index: number } {
   const vocabulary = new Set(candidates.flatMap((candidate) => words(candidate.names)));
   const own = candidates.map((candidate) => new Set(words(candidate.names)));
   const indexes = new Set<number>();
   let sawAll = false;
-  for (const part of clean.split(PARTS)) {
+  for (const part of text.split(PARTS)) {
     const positions = new Set<number>();
     const names: string[] = [];
     for (const match of part.matchAll(ID_RE)) {
@@ -139,7 +155,6 @@ export function parseIgnoreAnswer(text: string, candidates: readonly IgnoreCandi
         }
         positions.add(index);
       } else {
-        // A word that names nothing shown: this message is about something else.
         return { kind: "unrelated" };
       }
     }
@@ -159,10 +174,48 @@ export function parseIgnoreAnswer(text: string, candidates: readonly IgnoreCandi
       }
     }
   }
-  if (indexes.size > 0) {
-    return indexes.size === candidates.length ? { kind: "all" } : { kind: "some", indexes: [...indexes].sort((a, b) => a - b) };
+  return { indexes, sawAll };
+}
+
+/**
+ * How his answer maps onto the shown list. "all, not the LinkedIn one" or "all
+ * except 1 and 2" is everything picked before the exception minus what follows
+ * it; if the exception can't be read, or there's nothing to leave it out of, it
+ * asks again rather than guess.
+ */
+export function parseIgnoreAnswer(text: string, candidates: readonly IgnoreCandidate[]): IgnoreAnswer {
+  const clean = text.trim();
+  if (!clean) {
+    return { kind: "unrelated" };
   }
-  return sawAll ? { kind: "all" } : { kind: "unrelated" };
+  if (negatesIgnore(clean) || ANSWER_CANCEL.test(clean)) {
+    return { kind: "cancel" };
+  }
+  if (words(clean).length > 12) {
+    return { kind: "unrelated" };
+  }
+  const exception = EXCEPT.exec(clean);
+  const included = pick(exception ? clean.slice(0, exception.index) : clean, candidates);
+  if ("kind" in included) {
+    return included;
+  }
+  const base = included.indexes.size > 0
+    ? included.indexes
+    : included.sawAll
+      ? new Set(candidates.map((_, index) => index))
+      : undefined;
+  if (!exception) {
+    if (!base) {
+      return { kind: "unrelated" };
+    }
+    return base.size === candidates.length ? { kind: "all" } : { kind: "some", indexes: [...base].sort((a, b) => a - b) };
+  }
+  const left = pick(clean.slice(exception.index + exception[0].length), candidates);
+  if (!base || "kind" in left || left.indexes.size === 0) {
+    return { kind: "unclear" };
+  }
+  const kept = [...base].filter((index) => !left.indexes.has(index)).sort((a, b) => a - b);
+  return kept.length === 0 ? { kind: "unclear" } : { kind: "some", indexes: kept, excluded: [...left.indexes].sort((a, b) => a - b) };
 }
 
 // ---------------------------------------------------------------- answering
@@ -203,8 +256,8 @@ export function answerPendingIgnore(input: IgnoreAnswerInput): { text: string } 
   if (answer.kind === "cancel") {
     return { text: NOTHING_IGNORED };
   }
+  // Not an answer yet: say so, and keep the question open as it was for the real one.
   if (answer.kind === "mismatch") {
-    // Not an answer: say so, and keep the question open as it was for the real one.
     storePending(input.chatId, pending);
     return {
       text:
@@ -212,10 +265,70 @@ export function answerPendingIgnore(input: IgnoreAnswerInput): { text: string } 
         "Nothing changed. Which one should I ignore?",
     };
   }
+  if (answer.kind === "unclear") {
+    storePending(input.chatId, pending);
+    return { text: 'Nothing changed. Which ones should I ignore? Name them, give their numbers, or say "all except …".' };
+  }
   const chosen = answer.kind === "all" ? pending.candidates : answer.indexes.map((index) => pending.candidates[index]!);
-  return {
-    text: ignoreCandidates(chosen, `${pending.instruction} → ${input.ownWords}`, `owner_chat:${input.chatId}:${input.messageId}`, pending.candidates.length),
-  };
+  const excluded = answer.kind === "some" ? (answer.excluded ?? []).map((index) => pending.candidates[index]!) : [];
+  const result = ignoreChosen(chosen, pending.candidates, `${pending.instruction} → ${input.ownWords}`, `owner_chat:${input.chatId}:${input.messageId}`, excluded);
+  if (!result.applied) {
+    storePending(input.chatId, pending);
+  }
+  return { text: result.text };
+}
+
+/** The rule an item is ignored by: several bills of one biller share one. */
+function ruleOf(candidate: IgnoreCandidate): string {
+  const input = candidate.input;
+  return `${input.entityType}|${input.matchScope}|${input.matchKey}|${input.entityId ?? ""}`;
+}
+
+/**
+ * Shown items he didn't pick that a rule for one he did would also hide: an item
+ * with a different rule (a "Google Play" rule hides "Google Play (LinkedIn ...)"),
+ * or one he explicitly left out. Another bill of a picked biller is not spill:
+ * ignoring is by biller, and it is the same rule.
+ */
+export function spillover(
+  chosen: readonly IgnoreCandidate[],
+  shown: readonly IgnoreCandidate[],
+  excluded: readonly IgnoreCandidate[] = [],
+): IgnoreCandidate[] {
+  const picked = new Set(chosen.map(ruleOf));
+  const leftOut = new Set(excluded.map((item) => item.label));
+  return shown.filter(
+    (other) =>
+      !chosen.some((item) => item.label === other.label) &&
+      (leftOut.has(other.label) || !picked.has(ruleOf(other))) &&
+      chosen.some((item) => ignoreInputCovers(item.input, other)),
+  );
+}
+
+/**
+ * Ignores exactly the chosen shown items. When a rule for one of them would also
+ * hide an item he didn't pick (a "Google Play" rule hides "Google Play (LinkedIn
+ * ...)" too), nothing changes and it says why.
+ */
+export function ignoreChosen(
+  chosen: readonly IgnoreCandidate[],
+  shown: readonly IgnoreCandidate[],
+  instruction: string,
+  authRef: string,
+  excluded: readonly IgnoreCandidate[] = [],
+): { text: string; applied: boolean } {
+  const spill = spillover(chosen, shown, excluded);
+  if (spill.length > 0) {
+    const wide = [...new Set(chosen.filter((item) => spill.some((other) => ignoreInputCovers(item.input, other))).map((item) => item.confirmLabel))];
+    return {
+      applied: false,
+      text:
+        `Ignoring ${wide.join(" and ")} would also hide ${spill.length === 1 ? "this one" : `these ${spill.length}`} on the list:\n` +
+        spill.map((other) => `- ${other.label}`).join("\n") +
+        `\nNothing changed. Say "all of them" to ignore all ${shown.length}, or pick others.`,
+    };
+  }
+  return { applied: true, text: ignoreCandidates(chosen, instruction, authRef, shown.length) };
 }
 
 /** Ignores each chosen item once (several bills of one biller are one rule) and says what changed. */
@@ -223,7 +336,7 @@ export function ignoreCandidates(chosen: readonly IgnoreCandidate[], instruction
   const seen = new Set<string>();
   const lines: string[] = [];
   for (const candidate of chosen) {
-    const rule = `${candidate.input.entityType}|${candidate.input.matchScope}|${candidate.input.matchKey}|${candidate.input.entityId ?? ""}`;
+    const rule = ruleOf(candidate);
     if (seen.has(rule)) {
       continue;
     }
