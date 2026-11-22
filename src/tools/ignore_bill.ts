@@ -9,7 +9,10 @@ import {
   applyIgnore,
   confirmationForIgnore,
   looksLikeIgnoreInstruction,
+  negatesIgnore,
+  NOTHING_IGNORED,
   ownerMayChangeIgnore,
+  saysAll,
 } from "../ignore.js";
 import { canonicalBiller, normalizeBillerKey } from "../bill_aliases.js";
 import type { IgnoreCandidate } from "../ignore.js";
@@ -103,14 +106,24 @@ export function handler(input: unknown, turn: ToolTurn = { iteration: 1, calledT
     ) {
       return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
     }
+    // A negation in his words stops any bulk change, whatever the query matches:
+    // "don't ignore all Google Play bills" ignores nothing (the same check as an answer).
+    const negated = negatesIgnore(userText);
+    const ids = Array.isArray(values.bill_ids) ? values.bill_ids.filter((id): id is number => typeof id === "number") : [];
+    if (negated && (saysAll(userText) || values.all_matches === true || ids.length > 0)) {
+      return NOTHING_IGNORED;
+    }
     const matches = searchUpcomingBills(query);
     if (matches.length > 1) {
       const billers = new Set(matches.map((bill) => normalizeBillerKey(canonicalBiller(bill.biller))));
       if (billers.size > 1) {
+        // Several billers: never a bulk ignore or a "which one?" question on a negated message.
+        if (negated) {
+          return NOTHING_IGNORED;
+        }
         const authRef = turn.confirmation
           ? `owner_chat:${turn.confirmation.chatId}:${turn.confirmation.messageId}`
           : "owner_chat";
-        const ids = Array.isArray(values.bill_ids) ? values.bill_ids.filter((id): id is number => typeof id === "number") : [];
         if (ids.length > 0) {
           const picked = matches.filter((bill) => ids.includes(bill.id));
           if (picked.length === 0) {
@@ -119,7 +132,7 @@ export function handler(input: unknown, turn: ToolTurn = { iteration: 1, calledT
           return ignoreCandidates(picked.map(billCandidate), userText || query, authRef, matches.length);
         }
         // Every matching biller at once, only when his own words say so.
-        if (/\b(?:all|every|everything|both)\b/i.test(userText)) {
+        if (saysAll(userText)) {
           return ignoreCandidates(matches.map(billCandidate), userText, authRef, matches.length);
         }
         // Ask, and remember exactly what was shown: his next message answers it.

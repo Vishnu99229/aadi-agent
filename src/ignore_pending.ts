@@ -1,12 +1,13 @@
 import { deleteSetting, getSetting, setSetting } from "./db.js";
-import { applyIgnore, confirmationForIgnore, type IgnoreCandidate } from "./ignore.js";
+import { applyIgnore, confirmationForIgnore, negatesIgnore, NOTHING_IGNORED, type IgnoreCandidate } from "./ignore.js";
 
 /**
  * Aadi's own latest "which one should I ignore?" question, and the exact list it
  * showed. His next message is read as the answer: "all of them" ignores every
  * item shown, "the LinkedIn one" or "2" ignores that subset, and "no" or
  * "cancel" ignores nothing. The question binds once: the next message of his
- * consumes it whatever it says, and it expires. Only his own typed or voice
+ * consumes it whatever it says (except a position that contradicts the name he
+ * gave, which changes nothing and leaves it open), and it expires. Only his own typed or voice
  * words count (bot.ts never passes a forward, a retry or quoted text here).
  */
 export const PENDING_IGNORE_TTL_MS = 30 * 60_000;
@@ -26,7 +27,10 @@ export function savePendingIgnoreQuestion(chatId: number, instruction: string, c
   if (candidates.length < 2) {
     return;
   }
-  const pending: PendingIgnoreQuestion = { askedAt: now, expiresAt: now + PENDING_IGNORE_TTL_MS, instruction, candidates };
+  storePending(chatId, { askedAt: now, expiresAt: now + PENDING_IGNORE_TTL_MS, instruction, candidates });
+}
+
+function storePending(chatId: number, pending: PendingIgnoreQuestion): void {
   setSetting(key(chatId), JSON.stringify(pending));
 }
 
@@ -55,11 +59,14 @@ export function pendingIgnoreQuestion(chatId: number, now = Date.now()): Pending
 
 // ---------------------------------------------------------------- reading the answer
 
-export type IgnoreAnswer = { kind: "all" } | { kind: "some"; indexes: number[] } | { kind: "cancel" } | { kind: "unrelated" };
+export type IgnoreAnswer =
+  | { kind: "all" }
+  | { kind: "some"; indexes: number[] }
+  | { kind: "cancel" }
+  /** A position with a name the shown item doesn't carry ("the 6th Facebook one"): not an answer. */
+  | { kind: "mismatch"; index: number }
+  | { kind: "unrelated" };
 
-/** Checked first: any of these, anywhere, means ignore nothing. Never a bulk ignore. */
-const CANCEL =
-  /^\s*(?:no|nope|nah|none|neither|cancel|never\s*mind|nvm|forget\s+it|leave\s+(?:it|them|those)|not\s+now)\b|\b(?:don'?t|dont|do\s+not|not|none|nothing|neither|cancel)\b/i;
 const ALL_WORDS = new Set(["all", "every", "everything", "each", "both", "everyone"]);
 /** Words that carry no choice: politeness, "ignore", "the one", "bills". */
 const FILLER = new Set([
@@ -73,70 +80,82 @@ const FILLER = new Set([
 const ORDINALS: Record<string, number> = {
   first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10, last: -1,
 };
+/** "id 36" / "#36": the id printed on the shown line. */
+const ID_RE = /(?:\bid\s*|#)(\d+)\b/gi;
+/** "the 2nd and the LinkedIn one": each part picks on its own and the picks add up. */
+const PARTS = /\s*(?:,|&|\+|\band\b|\bor\b|\bplus\b)\s*/i;
 
 function words(text: string): string[] {
   return text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
 }
 
-/** How his answer maps onto the shown list. Anything with words that name nothing shown is unrelated. */
+/**
+ * How his answer maps onto the shown list. Anything with words that name nothing
+ * shown is unrelated. Within one part, a position ("the 6th", "id 36") picks the
+ * item and a name only narrows it: "the 6th Google Play one" is the 6th, never
+ * every Google Play bill. A name alone picks every item carrying it.
+ */
 export function parseIgnoreAnswer(text: string, candidates: readonly IgnoreCandidate[]): IgnoreAnswer {
   const clean = text.trim();
   if (!clean) {
     return { kind: "unrelated" };
   }
-  if (CANCEL.test(clean)) {
+  if (negatesIgnore(clean)) {
     return { kind: "cancel" };
   }
-  const tokens = words(clean);
-  if (tokens.length > 12) {
+  if (words(clean).length > 12) {
     return { kind: "unrelated" };
   }
   const vocabulary = new Set(candidates.flatMap((candidate) => words(candidate.names)));
+  const own = candidates.map((candidate) => new Set(words(candidate.names)));
   const indexes = new Set<number>();
   let sawAll = false;
-  let named = false;
-  // "id 36" / "#36": the id printed on the shown line.
-  for (const match of clean.matchAll(/(?:\bid\s*|#)(\d+)\b/gi)) {
-    const id = match[1]!;
-    candidates.forEach((candidate, index) => {
-      if (candidate.input.entityId === id || new RegExp(`(?:\\(id ${id}\\)|#${id}\\b)`).test(candidate.label)) {
-        indexes.add(index);
-      }
-    });
-  }
-  const withoutIds = clean.replace(/(?:\bid\s*|#)\d+\b/gi, " ");
-  for (const token of words(withoutIds)) {
-    if (ALL_WORDS.has(token)) {
-      sawAll = true;
-    } else if (FILLER.has(token) || vocabulary.has(token)) {
-      named ||= vocabulary.has(token) && !FILLER.has(token);
-    } else if (token in ORDINALS || /^\d+(?:st|nd|rd|th)?$/.test(token)) {
-      const n = token in ORDINALS ? ORDINALS[token]! : Number.parseInt(token, 10);
-      if (sawAll && n === candidates.length) {
-        continue; // "all 7"
-      }
-      const index = n === -1 ? candidates.length - 1 : n - 1;
-      if (index < 0 || index >= candidates.length) {
+  for (const part of clean.split(PARTS)) {
+    const positions = new Set<number>();
+    const names: string[] = [];
+    for (const match of part.matchAll(ID_RE)) {
+      const id = match[1]!;
+      candidates.forEach((candidate, index) => {
+        if (candidate.input.entityId === id || new RegExp(`(?:\\(id ${id}\\)|#${id}\\b)`).test(candidate.label)) {
+          positions.add(index);
+        }
+      });
+    }
+    for (const token of words(part.replace(ID_RE, " "))) {
+      if (ALL_WORDS.has(token)) {
+        sawAll = true;
+      } else if (FILLER.has(token)) {
+        continue;
+      } else if (vocabulary.has(token)) {
+        names.push(token);
+      } else if (token in ORDINALS || /^\d+(?:st|nd|rd|th)?$/.test(token)) {
+        const n = token in ORDINALS ? ORDINALS[token]! : Number.parseInt(token, 10);
+        if (sawAll && n === candidates.length) {
+          continue; // "all 7"
+        }
+        const index = n === -1 ? candidates.length - 1 : n - 1;
+        if (index < 0 || index >= candidates.length) {
+          return { kind: "unrelated" };
+        }
+        positions.add(index);
+      } else {
+        // A word that names nothing shown: this message is about something else.
         return { kind: "unrelated" };
       }
-      indexes.add(index);
-    } else {
-      // A word that names nothing shown: this message is about something else.
-      return { kind: "unrelated" };
     }
-  }
-  if (named) {
-    // "linkedin and facebook": each part picks the items carrying all of its names.
-    for (const part of withoutIds.split(/\s*(?:,|&|\+|\band\b|\bor\b|\bplus\b)\s*/i)) {
-      const names = words(part).filter((token) => vocabulary.has(token) && !FILLER.has(token) && !ALL_WORDS.has(token));
-      if (names.length === 0) {
-        continue;
+    if (positions.size > 0) {
+      for (const index of positions) {
+        if (!names.every((name) => own[index]!.has(name))) {
+          return { kind: "mismatch", index };
+        }
+        indexes.add(index);
       }
-      const hits = candidates
-        .map((candidate, index) => ({ index, own: new Set(words(candidate.names)) }))
-        .filter((entry) => names.every((name) => entry.own.has(name)));
-      for (const hit of hits.length > 0 ? hits : candidates.map((candidate, index) => ({ index, own: new Set(words(candidate.names)) })).filter((entry) => names.some((name) => entry.own.has(name)))) {
-        indexes.add(hit.index);
+    } else if (names.length > 0) {
+      // "linkedin and facebook": the items carrying all of a part's names, else any of them.
+      const every = own.flatMap((set, index) => (names.every((name) => set.has(name)) ? [index] : []));
+      const hits = every.length > 0 ? every : own.flatMap((set, index) => (names.some((name) => set.has(name)) ? [index] : []));
+      for (const index of hits) {
+        indexes.add(index);
       }
     }
   }
@@ -162,7 +181,9 @@ export interface IgnoreAnswerInput {
  * Reads his message as the answer to Aadi's open ignore question. Returns the
  * reply to send when it was one (applied or cancelled), or undefined when there
  * was no open question or the message was about something else. Either way an
- * open question is used up: it binds to this one message only.
+ * open question is used up: it binds to this one message only. The exception is
+ * a mismatch ("the 6th Facebook one" when the 6th isn't Facebook): nothing
+ * changes and the same question stays open, unchanged, for the real answer.
  */
 export function answerPendingIgnore(input: IgnoreAnswerInput): { text: string } | undefined {
   const now = input.now ?? Date.now();
@@ -180,7 +201,16 @@ export function answerPendingIgnore(input: IgnoreAnswerInput): { text: string } 
     return undefined;
   }
   if (answer.kind === "cancel") {
-    return { text: "OK, I won't ignore any of them. Nothing changed." };
+    return { text: NOTHING_IGNORED };
+  }
+  if (answer.kind === "mismatch") {
+    // Not an answer: say so, and keep the question open as it was for the real one.
+    storePending(input.chatId, pending);
+    return {
+      text:
+        `Number ${answer.index + 1} on my list is ${pending.candidates[answer.index]!.label}, which isn't what you named. ` +
+        "Nothing changed. Which one should I ignore?",
+    };
   }
   const chosen = answer.kind === "all" ? pending.candidates : answer.indexes.map((index) => pending.candidates[index]!);
   return {

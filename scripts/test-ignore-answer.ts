@@ -11,7 +11,7 @@
 import { bot } from "../src/bot.ts";
 import { canonicalBiller } from "../src/bill_aliases.ts";
 import { createBill, db, getBill } from "../src/db.ts";
-import { billIsIgnored, invalidateIgnoreCache } from "../src/ignore.ts";
+import { billIsIgnored, findActiveRulesForQuery, invalidateIgnoreCache } from "../src/ignore.ts";
 import {
   answerPendingIgnore,
   clearPendingIgnoreQuestion,
@@ -20,7 +20,10 @@ import {
   pendingIgnoreQuestion,
 } from "../src/ignore_pending.ts";
 import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
+import { recordPresentedEntities } from "../src/referents.ts";
 import { handler as ignoreBill } from "../src/tools/ignore_bill.ts";
+import { handler as ignoreItem } from "../src/tools/ignore_item.ts";
+import { handler as resumeItem } from "../src/tools/resume_item.ts";
 import { modelReply, nextMessageId } from "./fakes.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -272,6 +275,133 @@ passed.push("never: a forward, no open question, an expired question, a reply to
   assert(ignored().length === 0 && pendingIgnoreQuestion(CHAT) !== undefined, "all_matches alone, without his \"all\", still asks");
 }
 passed.push("rules: unrelated, bare yes and negations; 30-minute expiry; the tool ignores several shown billers in one go only on his words");
+
+// ---------------------------------------------------------------- review fixes on #33
+// Each case runs on its own so every failure shows, not just the first.
+const failures: string[] = [];
+async function check(name: string, run: () => Promise<void> | void): Promise<void> {
+  try {
+    await run();
+    passed.push(name);
+  } catch (error) {
+    failures.push(`${name}\n        ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+const turnFor = (tool: string, userText: string) => ({
+  iteration: 1,
+  calledTools: [tool],
+  userText,
+  confirmation: { chatId: CHAT, messageId: nextMessageId() },
+});
+const activeRules = () => (db.prepare("SELECT COUNT(*) AS n FROM ignore_rules WHERE status = 'active'").get() as { n: number }).n;
+
+await check("1. resume keeps partial-name matching: \"resume linkedin bills\" restores the LinkedIn Google Play bill", async () => {
+  await ask();
+  await say("the LinkedIn one");
+  assert(ignored().join(",") === String(linkedinId()), `only the LinkedIn bill is ignored (${ignored().join(",")})`);
+  const found = findActiveRulesForQuery("linkedin bills").length;
+  assert(found === 1, `findActiveRulesForQuery("linkedin bills") finds the rule (${found})`);
+  const out = resumeItem({ query: "linkedin bills" }, turnFor("resume_item", "resume linkedin bills"));
+  assert(ignored().length === 0 && activeRules() === 0, `"resume linkedin bills" restores it (${JSON.stringify(out)})`);
+});
+
+await check("2. a name narrows an ordinal, never widens it: \"the 6th Google Play one\" and \"the 6th one\" ignore only the 6th", async () => {
+  await ask();
+  await say("the 6th Google Play one");
+  assert(ignored().join(",") === String(linkedinId()), `"the 6th Google Play one" ignores only the 6th (ignored ${ignored().length}: ${ignored().join(",")})`);
+  await ask();
+  await say("the 6th one");
+  assert(ignored().join(",") === String(linkedinId()), `"the 6th one" ignores only the 6th (ignored ${ignored().length})`);
+  await ask();
+  const out = await say("the 6th Facebook one");
+  assert(ignored().length === 0, `a name that contradicts the position ignores nothing (ignored ${ignored().length})`);
+  assert(/Nothing changed/.test(out.join("\n")), `and says so (${JSON.stringify(out)})`);
+  assert(pendingIgnoreQuestion(CHAT) !== undefined, "and the question stays open for the real answer");
+  await say("the 6th one");
+  assert(ignored().join(",") === String(linkedinId()), "which still works");
+  await ask();
+  const parts = parseIgnoreAnswer("the 2nd and the LinkedIn one", pendingIgnoreQuestion(CHAT)!.candidates);
+  assert(parts.kind === "some" && parts.indexes.join(",") === "1,5", `separate parts still add up (${JSON.stringify(parts)})`);
+  clearPendingIgnoreQuestion(CHAT);
+});
+
+await check("3. a negation stops a bulk ignore on the direct ignore_bill path, the same as in an answer", async () => {
+  const negated: Array<[string, string, boolean]> = [
+    ["don't ignore all Google Play bills", "google play", false],
+    ["do not ignore every bill", "bill", false],
+    ["do not ignore every bill", "google play", true],
+    ["don\u2019t ignore all google play bills", "google play", true],
+    ["never ignore all the google play bills", "google play", false],
+    ["don't ignore both of the facebook ones", "google play facebook", false],
+  ];
+  for (const [userText, query, allMatches] of negated) {
+    seed();
+    const out = ignoreBill({ query, all_matches: allMatches }, turnFor("ignore_bill", userText));
+    assert(activeRules() === 0 && ignored().length === 0, `"${userText}" (query "${query}") ignores nothing (${activeRules()} rules; ${JSON.stringify(out)})`);
+    assert(/Nothing changed/.test(out), `"${userText}" says nothing changed (${JSON.stringify(out)})`);
+    assert(pendingIgnoreQuestion(CHAT) === undefined, `"${userText}" opens no which-one question`);
+  }
+  seed();
+  const picked = ignoreBill({ query: "google play", bill_ids: [linkedinId()] }, turnFor("ignore_bill", "don't ignore the linkedin google play bill"));
+  assert(activeRules() === 0, `picked ids with a negation ignore nothing (${JSON.stringify(picked)})`);
+  seed();
+  ignoreBill({ query: "google play" }, turnFor("ignore_bill", "ignore all google play bills"));
+  assert(ignored().length === 7, `"ignore all google play bills" still ignores all 7 (${ignored().length})`);
+  for (const phrasing of ["don\u2019t ignore them", "never ignore them", "stop ignoring them"]) {
+    await ask();
+    const out = await say(phrasing);
+    assert(ignored().length === 0 && /Nothing changed/.test(out.join("\n")), `answer "${phrasing}" cancels (${JSON.stringify(out)})`);
+  }
+});
+
+await check("4a. ignore_item: \"don't ignore all linkedin bills\" ignores nothing", () => {
+  seed();
+  const out = ignoreItem({ query: "linkedin bills" }, turnFor("ignore_item", "don't ignore all linkedin bills"));
+  assert(activeRules() === 0, `no rule is made (${activeRules()}; ${JSON.stringify(out)})`);
+  assert(/Nothing changed/.test(out), `and it says so (${JSON.stringify(out)})`);
+});
+
+await check("4b. ignore_item: \"don't ignore all of them\" after a shown list ignores nothing", () => {
+  seed();
+  const shown = ids.slice(0, 3).map((id) => ({ type: "bill" as const, id: String(id), label: getBill(id)!.biller, matchKey: getBill(id)!.biller }));
+  recordPresentedEntities(CHAT, shown, "ignore_which");
+  const out = ignoreItem({ query: "all of them" }, turnFor("ignore_item", "don't ignore all of them"));
+  assert(activeRules() === 0, `no rule is made (${activeRules()}; ${JSON.stringify(out)})`);
+  assert(/Nothing changed/.test(out), `and it says so (${JSON.stringify(out)})`);
+  const yes = ignoreItem({ query: "all of them" }, turnFor("ignore_item", "ignore all of them"));
+  assert(activeRules() === 3, `"ignore all of them" still ignores the three shown (${activeRules()}; ${JSON.stringify(yes)})`);
+});
+
+await check("4c. resume_item: a negated \"all\" resumes nothing, and only his words authorise all", async () => {
+  await ask();
+  await say("All of them");
+  const before = activeRules();
+  assert(before > 1 && ignored().length === 7, `set up: every Google Play biller ignored (${before} rules)`);
+  const no = resumeItem({ query: "all" }, turnFor("resume_item", "don't resume all ignored items"));
+  assert(activeRules() === before, `"don't resume all ignored items" resumes nothing (${activeRules()}; ${JSON.stringify(no)})`);
+  assert(/Nothing changed/.test(no), `and says so (${JSON.stringify(no)})`);
+  const no2 = resumeItem({ query: "all google play" }, turnFor("resume_item", "don't resume all google play bills"));
+  assert(activeRules() === before, `"don't resume all google play bills" resumes nothing (${activeRules()}; ${JSON.stringify(no2)})`);
+  const which = resumeItem({ query: "all google play" }, turnFor("resume_item", "resume the google play bills"));
+  assert(activeRules() === before && /Which ignored item should I resume\?/.test(which), `the model's "all" without his asks which (${activeRules()}; ${JSON.stringify(which)})`);
+  const yes = resumeItem({ query: "all" }, turnFor("resume_item", "stop ignoring all of them"));
+  assert(activeRules() === 0 && ignored().length === 0, `"stop ignoring all of them" resumes all (${activeRules()}; ${JSON.stringify(yes)})`);
+});
+
+await check("4d. skip this month has no bulk path: \"skip all google play bills this month\" asks which", () => {
+  seed();
+  const out = ignoreBill({ query: "google play" }, turnFor("ignore_bill", "skip all google play bills this month"));
+  assert(/which one should I skip\?/.test(out), `it asks (${JSON.stringify(out)})`);
+  assert(ids.every((id) => getBill(id)!.status === "upcoming"), "and skips nothing");
+});
+
+if (failures.length > 0) {
+  setCompleteForTests(undefined);
+  log(passed.map((line) => `  ok  ${line}`).join("\n"));
+  log(failures.map((line) => `  FAIL ${line}`).join("\n"));
+  log(`test-ignore-answer: ${failures.length} failed`);
+  process.exit(1);
+}
 
 setCompleteForTests(undefined);
 log(passed.map((line) => `  ok  ${line}`).join("\n"));

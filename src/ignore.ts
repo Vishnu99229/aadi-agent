@@ -178,7 +178,21 @@ function addsOnlyNoise(longer: string, shorter: string): boolean {
   return longer.split(" ").every((word) => base.has(word) || RULE_NOISE.has(word) || /^\d+$/.test(word));
 }
 
-function keysOverlap(ruleKey: string, candidate: string, aliases: readonly string[] = []): boolean {
+/**
+ * "lookup" (finding a rule or an item by his words) matches a part of a name either
+ * way, so "resume linkedin bills" finds a rule for "google play linkedin ...".
+ * "suppress" (does this rule hide this item) is directional: the item names the
+ * rule's source, or the rule is the item plus noise words. A rule for
+ * "google play linkedin ..." does not hide every "google play" bill.
+ */
+type OverlapMode = "lookup" | "suppress";
+
+function keysOverlap(
+  ruleKey: string,
+  candidate: string,
+  aliases: readonly string[] = [],
+  mode: OverlapMode = "lookup",
+): boolean {
   const ruleKeys = expandAliases(ruleKey);
   const candidateKeys = [
     candidate,
@@ -187,9 +201,7 @@ function keysOverlap(ruleKey: string, candidate: string, aliases: readonly strin
   ];
   for (const left of ruleKeys) {
     for (const right of candidateKeys) {
-      // The candidate names the rule's source, or the rule is the candidate plus noise words.
-      // A rule for "google play linkedin ..." is not a rule for every "google play" bill.
-      if (phraseMatches(left, right) || (phraseMatches(right, left) && addsOnlyNoise(left, right))) {
+      if (phraseMatches(left, right) || (phraseMatches(right, left) && (mode === "lookup" || addsOnlyNoise(left, right)))) {
         return true;
       }
     }
@@ -296,7 +308,7 @@ function ruleCoversSubject(rule: IgnoreRuleRecord, prepared: PreparedSubject): b
       recordRuleSeriesId(rule) === subject.seriesId
     );
   }
-  return keysOverlap(rule.match_key, matchKey, aliases);
+  return keysOverlap(rule.match_key, matchKey, aliases, "suppress");
 }
 
 export function matchingIgnoreRule(
@@ -846,10 +858,12 @@ function settleSeries(group: readonly ReminderRecord[], now: Date): void {
   });
 }
 
+/** `all` resumes every match at once; resume_item sets it from his own words, not the model's query. */
 export function resumeIgnoreByQuery(
   query: string,
   authRef: string,
   instruction: string,
+  all = /\ball\b/i.test(query),
 ):
   | { kind: "resumed"; rules: IgnoreRuleRecord[] }
   | { kind: "clarify"; question: string }
@@ -858,7 +872,7 @@ export function resumeIgnoreByQuery(
   if (matches.length === 0) {
     return { kind: "none", message: "Nothing matching that is currently ignored." };
   }
-  if (matches.length > 1 && !/\ball\b/i.test(query)) {
+  if (matches.length > 1 && !all) {
     return {
       kind: "clarify",
       question:
@@ -989,6 +1003,38 @@ export function looksLikeListIgnoredInstruction(text: string): boolean {
     /\b(?:show|list|open)\b[^.?\n]{0,20}\bignored(?:\s+items)?\b/i.test(text)
   );
 }
+
+/**
+ * Negation, the one check every ignore and resume path uses: an answer to
+ * "which one?", a direct "ignore all ...", a reply to a shown list. "No",
+ * "cancel", "don't", "do not", "never", "not", "stop" or any "-n't" means not
+ * to, wherever it is. Ways of asking that carry such a word are taken out first:
+ * "don't remind me about", "stop tracking" ask to ignore; "stop ignoring" asks
+ * to resume.
+ */
+const NEGATION =
+  /^\s*(?:no|nope|nah|none|neither|cancel|never\s*mind|nvm|forget\s+it|leave\s+(?:it|them|those)|not\s+now)\b|\b(?:dont|do\s+not|never|not|none|nothing|neither|cancel|cannot|stop)\b|n['\u2019]t\b/i;
+const IGNORE_ASKS =
+  /\b(?:don['\u2019]?t|do\s+not)\s+(?:remind|ping|bother|track)\b|\bi\s+don['\u2019]?t\s+want\s+to\s+see\b|\bstop\s+(?:tracking|reminding|bothering)\b/gi;
+const RESUME_ASKS = /\bstop\s+ignoring\b/gi;
+
+/** His words say not to ignore. */
+export function negatesIgnore(text: string): boolean {
+  return NEGATION.test(text.replace(IGNORE_ASKS, " "));
+}
+
+/** His words say not to resume. */
+export function negatesResume(text: string): boolean {
+  return NEGATION.test(text.replace(RESUME_ASKS, " "));
+}
+
+/** His words cover every match: all, every, everything, each, both. */
+export function saysAll(text: string): boolean {
+  return /\b(?:all|every|everything|each|both)\b/i.test(text);
+}
+
+export const NOTHING_IGNORED = "OK, I won't ignore any of them. Nothing changed.";
+export const NOTHING_RESUMED = "OK, I won't resume anything. Nothing changed.";
 
 const IGNORE_FILLER =
   /\b(?:aadi,?\s+|please\s+|pls\s+|kindly\s+|now\s+|just\s+)?(?:ignore|stop bothering me about|stop tracking|stop reminding me about|forget about|don'?t remind me about|do not remind me about|i don'?t want to see)\b/i;

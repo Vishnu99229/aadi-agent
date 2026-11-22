@@ -3,9 +3,12 @@ import {
   applyIgnore,
   confirmationForIgnore,
   looksLikeIgnoreInstruction,
+  negatesIgnore,
+  NOTHING_IGNORED,
   ownerMayChangeIgnore,
   parseIgnoreDuration,
   resolveIgnoreTarget,
+  saysAll,
 } from "../ignore.js";
 import { resolveReferentPhrase, type ReferentEntity } from "../referents.js";
 import { savePendingIgnoreQuestion } from "../ignore_pending.js";
@@ -71,6 +74,12 @@ export function handler(input: unknown, turn: ToolTurn): string {
   if (ownWords && !looksLikeIgnoreInstruction(ownWords) && !fromReferents) {
     return "Ignore preferences can only be changed from Vishnu's own instruction in this turn.";
   }
+  // The same negation check as an answer to "which one?": a negated reply to a
+  // shown list ignores nothing, and a negated "all" never ignores anything.
+  const negated = negatesIgnore(ownWords);
+  if (negated && (fromReferents || saysAll(ownWords))) {
+    return NOTHING_IGNORED;
+  }
   const values = input as {
     query?: unknown;
     entity_type?: unknown;
@@ -94,6 +103,10 @@ export function handler(input: unknown, turn: ToolTurn): string {
   const query = values.query.trim();
   const resolved = resolveIgnoreTarget(ownWords || query);
   if (resolved.kind === "clarify") {
+    // A negated message never opens a "which one?" question.
+    if (negated) {
+      return NOTHING_IGNORED;
+    }
     // A "which one?" list is remembered as shown, so his next message can answer it.
     if (resolved.candidates && turn.confirmation) {
       savePendingIgnoreQuestion(turn.confirmation.chatId, ownWords || query, resolved.candidates);

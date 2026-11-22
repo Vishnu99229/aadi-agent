@@ -3,6 +3,8 @@ import {
   confirmationForResume,
   findActiveRulesForQuery,
   looksLikeResumeInstruction,
+  negatesResume,
+  NOTHING_RESUMED,
   ownerMayChangeIgnore,
   resumeAllIgnoreRules,
   resumeIgnore,
@@ -62,12 +64,20 @@ export function handler(input: unknown, turn: ToolTurn): string {
     throw new Error("Provide query or id for the ignored item to resume.");
   }
 
+  // "All" comes from his own words, and a negation there means resume nothing at all.
+  const theirWords = ownWords || query;
+  const negated = negatesResume(theirWords);
+  const all = /\ball\b/i.test(theirWords);
+  if (negated && (all || /^all$/i.test(query) || /\ball\b/i.test(query))) {
+    return NOTHING_RESUMED;
+  }
+
   if (/^all$/i.test(query) || /\ball ignored\b/i.test(query)) {
     const active = findActiveRulesForQuery("");
     if (active.length === 0) {
       return "Nothing is currently ignored.";
     }
-    if (active.length > 1 && !/\ball\b/i.test(ownWords || query)) {
+    if (active.length > 1 && !all) {
       return (
         "Resume all of these ignored items?\n" +
         active.map((rule) => `- ${rule.id}: ${rule.match_key}`).join("\n") +
@@ -78,9 +88,10 @@ export function handler(input: unknown, turn: ToolTurn): string {
     return confirmationForResume(resumed);
   }
 
-  const result = resumeIgnoreByQuery(query, authRef, instruction);
+  const result = resumeIgnoreByQuery(query, authRef, instruction, all);
   if (result.kind === "clarify") {
-    return result.question;
+    // A negated message never opens a "which one?" question.
+    return negated ? NOTHING_RESUMED : result.question;
   }
   if (result.kind === "none") {
     return result.message;
