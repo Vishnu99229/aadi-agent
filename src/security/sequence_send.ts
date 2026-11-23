@@ -81,6 +81,8 @@ export interface SequenceSendGateInput {
         status: string;
         draft_text: string | null;
         sent_message_id: string | null;
+        /** Own-team Cc stored at Start. Only step 1 ever has one. */
+        cc?: string | null;
       }
     | undefined;
   to: string;
@@ -106,6 +108,44 @@ function addressesIn(header: string): string[] {
   return (header.match(ADDRESS) ?? []).map((item) => item.toLowerCase());
 }
 
+function sameAddresses(left: string[], right: string[]): boolean {
+  const a = [...new Set(left)].sort();
+  const b = [...new Set(right)].sort();
+  return a.length === b.length && a.every((item, index) => item === b[index]);
+}
+
+/** Follow-up 1 may Cc exactly the own-team addresses stored at Start: epicode.in
+ *  colleagues and his own addresses, never the prospect or a partner. Every later
+ *  step, and any step with nothing stored, has no Cc at all. */
+function ccAllowed(input: SequenceSendGateInput, enrolled: string): boolean {
+  const given = input.cc?.trim() ?? "";
+  const stored = input.step?.cc?.trim() ?? "";
+  if (!given && !stored) {
+    return true;
+  }
+  const addresses = addressesIn(given);
+  if (
+    input.stepNo !== 1 ||
+    addresses.length === 0 ||
+    !sameAddresses(addresses, addressesIn(stored))
+  ) {
+    return false;
+  }
+  return addresses.every((address) => {
+    const domain = domainOf(address);
+    if (address === enrolled) {
+      return false;
+    }
+    if (domainInSet(domain, new Set([OWN_DOMAIN]))) {
+      return true;
+    }
+    return (
+      (isSelfEmail(address) || input.selfAddresses.has(address)) &&
+      !domainInSet(domain, input.blockedDomains)
+    );
+  });
+}
+
 export function evaluateSequenceSendGate(
   input: SequenceSendGateInput,
 ): { ok: true } | { ok: false; reason: string } {
@@ -129,14 +169,14 @@ export function evaluateSequenceSendGate(
   if (input.openSequenceId !== sequence.id) {
     return refuse("prospect_has_other_sequence");
   }
-  if (input.cc?.trim()) {
+  const enrolled = sequence.prospect_email.trim().toLowerCase();
+  if (!ccAllowed(input, enrolled)) {
     return refuse("cc_not_allowed");
   }
   if (input.bcc?.trim()) {
     return refuse("bcc_not_allowed");
   }
   const recipients = addressesIn(input.to);
-  const enrolled = sequence.prospect_email.trim().toLowerCase();
   if (recipients.length !== 1 || recipients[0] !== enrolled) {
     return refuse("recipient_mismatch");
   }
@@ -258,6 +298,7 @@ export async function sendSequenceStep(
   }
   const raw = buildThreadReplyMime({
     to: params.to,
+    cc: params.cc,
     subject: params.subject,
     inReplyTo: params.inReplyTo,
     references: params.references,
@@ -267,7 +308,13 @@ export async function sendSequenceStep(
       ? htmlFromSequenceBody(params.body, params.signatureHtml)
       : undefined,
   });
-  if (/^(?:cc|bcc):/im.test(mimeHeaderBlock(raw))) {
+  const headerBlock = mimeHeaderBlock(raw);
+  const ccLines = headerBlock.match(/^cc:.*$/gim) ?? [];
+  if (
+    /^bcc:/im.test(headerBlock) ||
+    ccLines.length > 1 ||
+    !sameAddresses(addressesIn(ccLines[0] ?? ""), addressesIn(params.cc ?? ""))
+  ) {
     throw new SequenceSendRefusedError("cc_not_allowed");
   }
   if (!claimSalesStepSending(params.sequenceId, params.stepNo, now.toISOString())) {

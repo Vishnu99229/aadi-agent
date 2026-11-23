@@ -969,6 +969,10 @@ db.exec(`
 if (!tableHasColumn("sales_sequences", "prospect_timezone_source")) {
   db.exec(`ALTER TABLE sales_sequences ADD COLUMN prospect_timezone_source TEXT`);
 }
+// Follow-up 1 may copy his own team from the pitch's Cc. Later steps never do.
+if (!tableHasColumn("sales_sequence_steps", "cc")) {
+  db.exec(`ALTER TABLE sales_sequence_steps ADD COLUMN cc TEXT`);
+}
 // One open sequence per person, not per company: the key is the address itself.
 if (tableHasColumn("sales_sequences", "prospect_key")) {
   db.exec(`
@@ -4751,6 +4755,8 @@ export interface SalesSequenceStepRecord {
   blocked_at: string | null;
   waiting_ping_at: string | null;
   slot_lines: string | null;
+  /** Own-team Cc set at Start, on step 1 only. */
+  cc: string | null;
 }
 
 export interface SalesPitchScanRecord {
@@ -4877,7 +4883,14 @@ export function reproposeDeclinedSalesSequence(
  *  when Vishnu taps Start. */
 export function activateSalesSequence(
   id: number,
-  input: { nextStepAt: string; enrolledAt: string; manualFollowups: number },
+  input: {
+    nextStepAt: string;
+    enrolledAt: string;
+    manualFollowups: number;
+    /** His own team from the pitch's Cc. Kept on step 1 only when step 1 is a
+     *  sequence send; every later step has no Cc. */
+    stepOneCc?: readonly string[];
+  },
 ): boolean {
   return db.transaction(() => {
     const updated = db
@@ -4899,9 +4912,10 @@ export function activateSalesSequence(
       return false;
     }
     const insertStep = db.prepare(
-      `INSERT INTO sales_sequence_steps (sequence_id, step_no, scheduled_at, status, reason)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO sales_sequence_steps (sequence_id, step_no, scheduled_at, status, reason, cc)
+       VALUES (?, ?, ?, ?, ?, ?)`,
     );
+    const stepOneCc = (input.stepOneCc ?? []).join(", ");
     for (let step = 1; step <= SALES_SEQUENCE_STEP_COUNT; step += 1) {
       const manual = step <= input.manualFollowups;
       insertStep.run(
@@ -4910,6 +4924,7 @@ export function activateSalesSequence(
         step === input.manualFollowups + 1 ? input.nextStepAt : null,
         manual ? "skipped" : "planned",
         manual ? "manual_followup" : null,
+        step === 1 && !manual && stepOneCc ? stepOneCc : null,
       );
     }
     return true;

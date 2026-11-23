@@ -51,6 +51,7 @@ import {
   firstStepAt,
   hasOriginalOutreach,
   isExplicitSequenceRequest,
+  ownTeamCc,
   prospectDisplay,
   parsePitchClassification,
   PITCH_SCHEMA,
@@ -150,14 +151,12 @@ function assessThread(
       parseAddressList(messageHeader(message, "From")).map((item) => item.email),
     )
     .filter(notSelf);
-  const earlierRecipients = sent
-    .slice(0, -1)
-    .flatMap((message) => [
-      ...parseAddressList(messageHeader(message, "To")),
-      ...parseAddressList(messageHeader(message, "Cc")),
-    ])
-    .map((item) => item.email)
-    .filter(notSelf);
+  const earlier = (header: "To" | "Cc"): string[] =>
+    sent
+      .slice(0, -1)
+      .flatMap((message) => parseAddressList(messageHeader(message, header)))
+      .map((item) => item.email)
+      .filter(notSelf);
 
   const candidate = soleProspect({ to }, { selfAddresses });
   const manualFollowups = candidate
@@ -181,7 +180,8 @@ function assessThread(
     cc,
     manualFollowups,
     threadSenders: [...new Set(threadSenders)],
-    earlierRecipients: [...new Set(earlierRecipients)],
+    earlierTo: [...new Set(earlier("To"))],
+    earlierCc: [...new Set(earlier("Cc"))],
     isCalendarOrAutomated: isAutomated(latest, subject),
     noReplyOrIgnored: isAlgorithmicallyExcluded(
       toHeader,
@@ -538,11 +538,13 @@ export async function handleSequenceCallback(ctx: Context): Promise<void> {
 
   let assessed: ThreadAssessment | undefined;
   let liveGmail: gmail_v1.Gmail;
+  let ownAddress: string;
+  let selfAddresses: Set<string>;
   try {
     const { gmail } = await workGmail();
     liveGmail = gmail;
-    const ownAddress = await ownAddressOf(gmail);
-    const selfAddresses = await loadFollowupSelfAddresses();
+    ownAddress = await ownAddressOf(gmail);
+    selfAddresses = await loadFollowupSelfAddresses();
     assessed = await assessLive(gmail, row.thread_id, selfAddresses, ownAddress, {
       ignoreSequence: (other) => other.id === id,
     });
@@ -564,6 +566,7 @@ export async function handleSequenceCallback(ctx: Context): Promise<void> {
     nextStepAt: firstAt.toISOString(),
     enrolledAt: now.toISOString(),
     manualFollowups: assessed.facts.manualFollowups,
+    stepOneCc: ownTeamCc(assessed.facts.cc, selfAddresses, ownAddress),
   });
   if (!activated) {
     await ctx.editMessageReplyMarkup().catch(() => undefined);

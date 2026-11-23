@@ -23,6 +23,7 @@ import {
   hasOriginalOutreach,
   isExplicitSequenceRequest,
   matchesProspect,
+  ownTeamCc,
   parsePitchClassification,
   pitchCardText,
   pitchClassifierInput,
@@ -64,7 +65,8 @@ function facts(overrides: Partial<PitchFacts> = {}): PitchFacts {
     to: [mailbox("priya@acme.com")],
     cc: [],
     threadSenders: [],
-    earlierRecipients: [],
+    earlierTo: [],
+    earlierCc: [],
     manualFollowups: 0,
     isCalendarOrAutomated: false,
     noReplyOrIgnored: false,
@@ -92,7 +94,14 @@ const cases: Array<[string, PitchFacts, PitchEnvironment, string]> = [
   ["self only", facts({ to: [mailbox(ME)] }), env(), "no_external_recipient"],
   ["colleagues only", facts({ to: [mailbox("sam@epicode.in")] }), env(), "no_external_recipient"],
   ["colleague in To", facts({ to: [mailbox("priya@acme.com"), mailbox("sam@epicode.in")] }), env(), "colleague_on_email"],
-  ["colleague in Cc", facts({ cc: [mailbox("sam@epicode.in")] }), env(), "colleague_on_email"],
+  ["only a colleague in To, prospect on Cc", facts({ to: [mailbox("sam@epicode.in")], cc: [mailbox("priya@acme.com")] }), env(), "colleague_on_email"],
+  ["colleague in To, another colleague on Cc", facts({ to: [mailbox("priya@acme.com"), mailbox("sam@epicode.in")], cc: [mailbox("lee@epicode.in")] }), env(), "colleague_on_email"],
+  ["colleagues only, To and Cc", facts({ to: [mailbox("sam@epicode.in")], cc: [mailbox("lee@epicode.in")] }), env(), "no_external_recipient"],
+  ["partner in To, colleague on Cc", facts({ to: [mailbox("a@pinnacle.in")], cc: [mailbox("sam@epicode.in")] }), env(), "partner_or_self_domain"],
+  ["partner on Cc", facts({ cc: [mailbox("pia@pinnacle.in")] }), env(), "external_cc"],
+  ["supertron partner on Cc", facts({ cc: [mailbox("ravi@supertroninfotech.com")] }), env(), "external_cc"],
+  ["colleague and partner on Cc", facts({ cc: [mailbox("sam@epicode.in"), mailbox("pia@pinnacle.in")] }), env(), "external_cc"],
+  ["colleague on Cc wrote on the thread", facts({ cc: [mailbox("sam@epicode.in")], threadSenders: ["sam@epicode.in"] }), env(), "other_sender"],
   ["two recipients", facts({ to: [mailbox("priya@acme.com"), mailbox("raj@acme.com")] }), env(), "multiple_recipients"],
   ["external Cc", facts({ cc: [mailbox("raj@acme.com")] }), env(), "external_cc"],
   ["Cc only", facts({ to: [mailbox(ME)], cc: [mailbox("raj@acme.com")] }), env(), "external_cc"],
@@ -105,8 +114,11 @@ const cases: Array<[string, PitchFacts, PitchEnvironment, string]> = [
   ["colleague of prospect replied", facts({ threadSenders: ["raj@acme.com"] }), env(), "replied"],
   ["bounce", facts({ threadSenders: ["mailer-daemon@googlemail.com"] }), env(), "bounced"],
   ["stranger", facts({ threadSenders: ["x@other.com"] }), env(), "other_sender"],
-  ["earlier others", facts({ earlierRecipients: ["raj@acme.com"] }), env(), "other_recipient_in_thread"],
-  ["colleague on an earlier email", facts({ earlierRecipients: ["sam@epicode.in"] }), env(), "other_recipient_in_thread"],
+  ["earlier others", facts({ earlierTo: ["raj@acme.com"] }), env(), "other_recipient_in_thread"],
+  ["earlier external on Cc", facts({ earlierCc: ["raj@acme.com"] }), env(), "other_recipient_in_thread"],
+  ["partner on Cc of an earlier email", facts({ earlierCc: ["pia@pinnacle.in"] }), env(), "other_recipient_in_thread"],
+  ["colleague in To of an earlier email", facts({ earlierTo: ["sam@epicode.in"] }), env(), "other_recipient_in_thread"],
+  ["colleague in To earlier, Cc later", facts({ earlierTo: ["sam@epicode.in"], earlierCc: ["sam@epicode.in"] }), env(), "other_recipient_in_thread"],
   ["in sequence", facts(), env({ threadHasSequence: true }), "in_sequence"],
   ["open prospect", facts(), env({ prospectHasOpenSequence: () => true }), "prospect_in_sequence"],
   ["meeting flow", facts(), env({ threadInMeetingFlow: true }), "meeting_auto_scheduling"],
@@ -114,6 +126,38 @@ const cases: Array<[string, PitchFacts, PitchEnvironment, string]> = [
 for (const [label, item, environment, expected] of cases) {
   const actual = evaluatePitchExclusion(item, environment);
   assert(actual === expected, `${label}: expected ${expected}, got ${actual}`);
+}
+// His own team on Cc (epicode.in colleagues, his own addresses) never blocks.
+const ownTeamAllowed: Array<[string, PitchFacts]> = [
+  ["colleague on Cc", facts({ cc: [mailbox("sam@epicode.in")] })],
+  ["own address on Cc", facts({ cc: [mailbox("vishnu@gmail.example")] })],
+  ["colleague and own address on Cc", facts({ cc: [mailbox("sam@epicode.in"), mailbox("vishnu@gmail.example")] })],
+  ["two colleagues on Cc", facts({ cc: [mailbox("sam@epicode.in"), mailbox("lee@epicode.in")] })],
+  ["colleague on Cc of an earlier email", facts({ earlierCc: ["sam@epicode.in"] })],
+  ["colleague on Cc earlier and now", facts({ cc: [mailbox("sam@epicode.in")], earlierCc: ["sam@epicode.in"] })],
+  ["prospect on an earlier email, colleague on its Cc", facts({ earlierTo: ["priya@acme.com"], earlierCc: ["sam@epicode.in"] })],
+];
+for (const [label, item] of ownTeamAllowed) {
+  const actual = evaluatePitchExclusion(item, env());
+  assert(actual === null, `${label}: expected it to be offerable, got ${actual}`);
+}
+{
+  const self = new Set([ME, "vishnu@gmail.example"]);
+  const cc = [
+    mailbox("sam@epicode.in", "Sam"),
+    mailbox("Lee@Epicode.in", "Lee"),
+    mailbox("vishnu@gmail.example", "Vishnu"),
+    mailbox(ME, "Vishnu"),
+    mailbox("pia@pinnacle.in", "Pia"),
+    mailbox("raj@acme.com", "Raj"),
+    mailbox("sam@epicode.in", "Sam again"),
+  ];
+  const kept = ownTeamCc(cc, self, ME);
+  assert(
+    JSON.stringify(kept) === JSON.stringify(["sam@epicode.in", "lee@epicode.in", "vishnu@gmail.example"]),
+    `own-team Cc keeps colleagues and his other addresses, drops the sender, externals and repeats: ${JSON.stringify(kept)}`,
+  );
+  assert(ownTeamCc([], self, ME).length === 0, "no Cc means none kept");
 }
 assert(
   evaluatePitchExclusion(
@@ -340,7 +384,8 @@ const api: Api = fakeTelegramApi(telegram);
 // ---- detection never enrols on its own ----
 pitch("t-lone", "Priya Shah <priya@acme.com>", "IraVoice for Acme support");
 pitch("t-partner", "Sonal <sonal@pinnacle.in>", "BotCompose");
-pitch("t-colleague", "Raj <raj@beta.com>", "Dialer demo", 1, "Sam <sam@epicode.in>");
+pitch("t-colleague", "Raj <raj@beta.com>, Sam <sam@epicode.in>", "Dialer demo");
+pitch("t-partner-cc", "Kim <kim@chi.com>", "IraVoice", 1, "Pia <pia@pinnacle.in>");
 pitch("t-internal", "Sam <sam@epicode.in>", "Internal");
 threads.set("t-replied", [
   {
@@ -384,7 +429,8 @@ pitch("t-client", "Zed <zed@zeta.com>", "Dialer");
   const byThread = new Map(rows.map((row) => [row.threadId, row]));
   assert(byThread.get("t-lone")?.exclusion === null, "lone prospect is offerable");
   assert(byThread.get("t-partner")?.exclusion === "partner_or_self_domain", "partner excluded");
-  assert(byThread.get("t-colleague")?.exclusion === "colleague_on_email", "colleague excluded");
+  assert(byThread.get("t-colleague")?.exclusion === "colleague_on_email", "colleague in To excluded");
+  assert(byThread.get("t-partner-cc")?.exclusion === "external_cc", "partner on Cc excluded");
   assert(byThread.get("t-internal")?.exclusion === "no_external_recipient", "internal excluded");
   assert(byThread.get("t-replied")?.exclusion === "replied", "replied excluded");
   assert(byThread.get("t-dnc")?.exclusion === "do_not_contact", "do-not-contact excluded");
@@ -921,6 +967,102 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   });
   assert(first !== undefined && second === undefined, "the database allows one open sequence per person");
   assert(colleague !== undefined, "a colleague at the same company gets their own");
+}
+
+// ---- his own team on Cc: offered, enrolled, kept for follow-up 1 only ----
+{
+  const SELF_ALIAS = "vishnu.self@selftest.example";
+  const previousSelf = process.env.SELF_EMAIL_ADDRESSES;
+  process.env.SELF_EMAIL_ADDRESSES = SELF_ALIAS;
+  const sent = (threadId: string, index: number, to: string, cc: string, daysAgo: number) => ({
+    id: `${threadId}-m${index}`,
+    from: `Vishnu Rajan <${ME}>`,
+    to,
+    cc,
+    subject: index === 0 ? "IraVoice for Sigma" : "Re: IraVoice for Sigma",
+    sentAt: Date.now() - daysAgo * DAY,
+    sent: true,
+  });
+  const propose = (threadId: string, email: string, manual = 0) =>
+    createProposedSalesSequence({
+      threadId,
+      prospectEmail: email,
+      prospectDomain: email.split("@")[1]!,
+      prospectKey: email,
+      prospectName: "Gita Rao",
+      prospectCompany: "Sigma",
+      subject: "IraVoice for Sigma",
+      originalMessageId: `${threadId}-m0`,
+      originalSentAt: new Date().toISOString(),
+      manualFollowups: manual,
+      classifierConfidence: 0.9,
+      classifierReason: "pitch",
+    })!;
+
+  threads.set("t-team-cc", [
+    sent("t-team-cc", 0, "Gita Rao <gita@sigma2.com>", `Sam Iyer <sam@epicode.in>, Vishnu <${SELF_ALIAS}>`, 1),
+  ]);
+  threads.set("t-team-cc-bump", [
+    sent("t-team-cc-bump", 0, "Hana <hana@sigma3.com>", "Sam Iyer <sam@epicode.in>", 3),
+    sent("t-team-cc-bump", 1, "Hana <hana@sigma3.com>", "", 2),
+  ]);
+  threads.set("t-team-to-earlier", [
+    sent("t-team-to-earlier", 0, "Sam Iyer <sam@epicode.in>", "", 3),
+    sent("t-team-to-earlier", 1, "Ivy <ivy@sigma4.com>", "", 2),
+  ]);
+  threads.set("t-partner-cc-earlier", [
+    sent("t-partner-cc-earlier", 0, "Jo <jo@sigma5.com>", "Pia <pia@pinnacle.in>", 3),
+    sent("t-partner-cc-earlier", 1, "Jo <jo@sigma5.com>", "", 2),
+  ]);
+  const rows = await detectPitches({ lookbackDays: 21 });
+  const byThread = new Map(rows.map((row) => [row.threadId, row]));
+  assert(byThread.get("t-team-cc")?.exclusion === null, `a colleague on Cc is offerable, got ${byThread.get("t-team-cc")?.exclusion}`);
+  assert(byThread.get("t-team-cc")?.prospect?.email === "gita@sigma2.com", "the prospect is the one in To");
+  assert(byThread.get("t-team-cc-bump")?.exclusion === null, `a colleague on Cc of an earlier email is offerable, got ${byThread.get("t-team-cc-bump")?.exclusion}`);
+  assert(byThread.get("t-team-to-earlier")?.exclusion === "other_recipient_in_thread", "a colleague in To of an earlier email still blocks");
+  assert(byThread.get("t-partner-cc-earlier")?.exclusion === "other_recipient_in_thread", "a partner on Cc of an earlier email still blocks");
+
+  // Start on the pitch with Sam and his own alias on Cc.
+  const row = propose("t-team-cc", "gita@sigma2.com");
+  const log = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(`seq:start:${row.id}`, log));
+  const active = getSalesSequenceByThread("t-team-cc")!;
+  assert(active.status === "active", `Start enrols with his own team on Cc: ${log.edits[0] ?? log.replies[0]}`);
+  assert(active.prospect_email === "gita@sigma2.com", "the enrolled prospect is unchanged");
+  const steps = listSalesSequenceSteps(row.id);
+  assert(steps.length === 4, "four step rows exist");
+  assert(steps[0]!.cc === `sam@epicode.in, ${SELF_ALIAS}`, `follow-up 1 keeps the colleague and his own address on Cc: ${steps[0]!.cc}`);
+  assert(steps.slice(1).every((step) => step.cc === null), "follow-ups 2-4 have no Cc");
+
+  // He bumped once himself: his bump took follow-up 1, so no sequence step has a Cc.
+  const bumpRow = propose("t-team-cc-bump", "hana@sigma3.com", 1);
+  await handleSequenceCallback(callbackCtx(`seq:start:${bumpRow.id}`, log));
+  const bumped = getSalesSequenceByThread("t-team-cc-bump")!;
+  assert(bumped.status === "active" && bumped.current_step === 2, "an earlier Cc does not block Start");
+  const bumpSteps = listSalesSequenceSteps(bumpRow.id);
+  assert(bumpSteps[0]!.status === "skipped", "his bump is follow-up 1");
+  assert(bumpSteps.every((step) => step.cc === null), "the sequence never copies the colleague from follow-up 2 on");
+
+  // A colleague moved into To before the tap: Start refuses.
+  threads.set("t-team-to-now", [
+    sent("t-team-to-now", 0, "Kai <kai@sigma6.com>", "Sam Iyer <sam@epicode.in>", 1),
+  ]);
+  const toRow = propose("t-team-to-now", "kai@sigma6.com");
+  threads.get("t-team-to-now")!.push(
+    sent("t-team-to-now", 1, "Kai <kai@sigma6.com>, Sam Iyer <sam@epicode.in>", "", 0.5),
+  );
+  const refusedLog = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(`seq:start:${toRow.id}`, refusedLog));
+  const refusedRow = getSalesSequenceByThread("t-team-to-now")!;
+  assert(refusedRow.status === "stopped" && refusedRow.stop_reason === "excluded:colleague_on_email", "a colleague in To still blocks Start");
+  assert(refusedLog.edits[0]?.includes("a colleague is on the email"), "and says why");
+  assert(listSalesSequenceSteps(toRow.id).length === 0, "no steps when Start is refused");
+
+  if (previousSelf === undefined) {
+    delete process.env.SELF_EMAIL_ADDRESSES;
+  } else {
+    process.env.SELF_EMAIL_ADDRESSES = previousSelf;
+  }
 }
 
 // ---- Stage 2 has no send path ----
