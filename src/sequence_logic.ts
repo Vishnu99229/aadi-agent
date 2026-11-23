@@ -58,8 +58,10 @@ export interface PitchFacts {
   cc: ParsedMailbox[];
   /** Addresses that wrote on the thread, self removed. */
   threadSenders: string[];
-  /** To and Cc of every earlier sent message in the thread, self removed. */
-  earlierRecipients: string[];
+  /** To of every earlier sent message in the thread, self removed. */
+  earlierTo: string[];
+  /** Cc of every earlier sent message in the thread, self removed. */
+  earlierCc: string[];
   /** Vishnu's own bumps after the original pitch, from countManualFollowups. */
   manualFollowups: number;
   isCalendarOrAutomated: boolean;
@@ -160,6 +162,38 @@ function isColleague(email: string, env: PitchEnvironment): boolean {
 
 const VALID_ADDRESS = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/;
 
+/** His own team: an epicode.in colleague or one of his own addresses. */
+function isOwnTeam(email: string, selfAddresses: ReadonlySet<string>): boolean {
+  return (
+    selfAddresses.has(email) ||
+    isSelfEmail(email) ||
+    domainInSet(domainOf(email), new Set([OWN_DOMAIN]))
+  );
+}
+
+/** The Cc that follow-up 1 keeps: his own team on the pitch's Cc, in order, without
+ *  the address he sends from. Follow-ups 2 to 4 never carry a Cc. */
+export function ownTeamCc(
+  cc: readonly ParsedMailbox[],
+  selfAddresses: ReadonlySet<string>,
+  sendingAddress: string,
+): string[] {
+  const sender = sendingAddress.trim().toLowerCase();
+  const kept: string[] = [];
+  for (const item of cc) {
+    const email = item.email.trim().toLowerCase();
+    if (
+      VALID_ADDRESS.test(email) &&
+      email !== sender &&
+      isOwnTeam(email, selfAddresses) &&
+      !kept.includes(email)
+    ) {
+      kept.push(email);
+    }
+  }
+  return kept;
+}
+
 /** The one external person this email went to, when there is exactly one. */
 export function soleProspect(
   facts: Pick<PitchFacts, "to">,
@@ -192,7 +226,8 @@ export function evaluatePitchExclusion(
   if (external.length === 0) {
     return "no_external_recipient";
   }
-  if (everyone.some((email) => isColleague(email, env))) {
+  // A colleague on Cc is his own team watching; in To they are a recipient.
+  if (facts.to.some((item) => isColleague(item.email, env))) {
     return "colleague_on_email";
   }
   const prospect = soleProspect(facts, env);
@@ -230,7 +265,12 @@ export function evaluatePitchExclusion(
   if (facts.threadSenders.length > 0) {
     return "other_sender";
   }
-  if (facts.earlierRecipients.some((email) => email !== prospect.email)) {
+  if (
+    facts.earlierTo.some((email) => email !== prospect.email) ||
+    facts.earlierCc.some(
+      (email) => email !== prospect.email && !isOwnTeam(email, env.selfAddresses),
+    )
+  ) {
     return "other_recipient_in_thread";
   }
   if (facts.manualFollowups >= SEQUENCE_STEPS) {

@@ -952,6 +952,61 @@ for (const [label, overrides, reason] of refusals) {
   const gate = evaluateSequenceSendGate(gateInput(overrides));
   assert(!gate.ok && gate.reason === reason, `${label}: expected ${reason}, got ${JSON.stringify(gate)}`);
 }
+// His own team on Cc: only on follow-up 1, only the addresses stored at Start.
+{
+  const teamStep = (cc: string | null, patch: object = {}) => stepWith({ cc, ...patch });
+  assert(
+    evaluateSequenceSendGate(gateInput({ step: teamStep("sam@epicode.in"), cc: "Sam Iyer <sam@epicode.in>" })).ok,
+    "follow-up 1 may Cc the colleague stored at Start",
+  );
+  assert(
+    evaluateSequenceSendGate(gateInput({ step: teamStep("sam@epicode.in, me@gmail.com"), cc: "me@gmail.com, sam@epicode.in" })).ok,
+    "follow-up 1 may Cc the colleague and his own address, in any order",
+  );
+  const ccRefusals: Array<[string, Partial<SequenceSendGateInput>]> = [
+    ["a colleague with nothing stored", { cc: "sam@epicode.in" }],
+    ["an extra external address", { step: teamStep("sam@epicode.in"), cc: "sam@epicode.in, x@acme.com" }],
+    ["a different colleague", { step: teamStep("sam@epicode.in"), cc: "lee@epicode.in" }],
+    ["the stored Cc left off", { step: teamStep("sam@epicode.in"), cc: undefined }],
+    ["one of two stored left off", { step: teamStep("sam@epicode.in, me@gmail.com"), cc: "sam@epicode.in" }],
+    ["an address hidden in a name", { step: teamStep("sam@epicode.in"), cc: '"x@evil.com" <sam@epicode.in>' }],
+    ["text with no address", { cc: "nobody" }],
+    ["a stored external", { step: teamStep("x@acme.com"), cc: "x@acme.com" }],
+    ["a stored partner", { step: teamStep("pia@pinnacle.in"), cc: "pia@pinnacle.in" }],
+    ["a stored supertron partner", { step: teamStep("ravi@supertroninfotech.com"), cc: "ravi@supertroninfotech.com" }],
+    ["the prospect on Cc", { step: teamStep("priya@acme.com"), cc: "priya@acme.com" }],
+    [
+      "follow-up 2",
+      {
+        stepNo: 2,
+        sequence: sequenceWith({ current_step: 2, steps_sent: 1 }),
+        step: teamStep("sam@epicode.in"),
+        cc: "sam@epicode.in",
+      },
+    ],
+    [
+      "follow-up 4",
+      {
+        stepNo: 4,
+        sequence: sequenceWith({ current_step: 4, steps_sent: 3 }),
+        step: teamStep("sam@epicode.in"),
+        cc: "sam@epicode.in",
+      },
+    ],
+  ];
+  for (const [label, overrides] of ccRefusals) {
+    const gate = evaluateSequenceSendGate(gateInput(overrides));
+    assert(!gate.ok && gate.reason === "cc_not_allowed", `${label}: expected cc_not_allowed, got ${JSON.stringify(gate)}`);
+  }
+  const bcc = evaluateSequenceSendGate(gateInput({ step: teamStep("sam@epicode.in"), cc: "sam@epicode.in", bcc: "sam@epicode.in" }));
+  assert(!bcc.ok && bcc.reason === "bcc_not_allowed", "Bcc is never allowed, not even his own team");
+  for (const [label, prospect] of [["partner", "a@pinnacle.in"], ["colleague", "sam@epicode.in"], ["self", "me@gmail.com"]]) {
+    const gate = evaluateSequenceSendGate(
+      gateInput({ sequence: sequenceWith({ prospect_email: prospect }), to: prospect!, step: teamStep("lee@epicode.in"), cc: "lee@epicode.in" }),
+    );
+    assert(!gate.ok && gate.reason === "blocked_recipient", `a ${label} is never the To, own-team Cc or not`);
+  }
+}
 assert(
   evaluateSequenceSendGate(gateInput({ now: ist("2026-11-10T21:00:00"), sequence: sequenceWith({ prospect_timezone: "America/New_York" }) })).ok,
   "21:00 IST passes for New York: their 10:30",
@@ -996,6 +1051,7 @@ assert(
   };
   await refused({ to: "other@elsewhere.example" }, "recipient_mismatch");
   await refused({ cc: "other@elsewhere.example" }, "cc_not_allowed");
+  await refused({ cc: "sam@epicode.in" }, "cc_not_allowed");
   await refused({ bcc: "other@elsewhere.example" }, "bcc_not_allowed");
   await refused({ account: personalAccount }, "not_work_account");
   await refused({ fromAddress: "me@gmail.com" }, "not_work_sender");
@@ -1364,6 +1420,126 @@ function localHour(at: Date, zone: string): number {
   assert(getSalesSequenceStep(item.id, 3)!.status === "sent", "without a card");
 }
 
+// ======== his own team on the pitch's Cc: follow-up 1 keeps them, 2 on drops them ========
+{
+  nextScenario();
+  const SELF_ALIAS = "vishnu.self@selftest.example";
+  const previousSelf = process.env.SELF_EMAIL_ADDRESSES;
+  process.env.SELF_EMAIL_ADDRESSES = SELF_ALIAS;
+  enrolCounter += 1;
+  const threadId = `team-${enrolCounter}`;
+  const email = `gita@team${enrolCounter}.example`;
+  const pitch = push({
+    threadId,
+    from: `Vishnu Rajan <${ME}>`,
+    to: `Gita Rao <${email}>`,
+    cc: `Sam Iyer <sam@epicode.in>, Vishnu <${SELF_ALIAS}>`,
+    subject: "IraVoice for Team",
+    // Start stamps real time, so this thread has to be in the real past.
+    at: Date.now() - 3 * DAY,
+    sent: true,
+    body: "Hi Gita,\n\nEpicode builds IraVoice. Would you be open to a short demo?",
+  });
+  const id = createProposedSalesSequence({
+    threadId,
+    prospectEmail: email,
+    prospectDomain: email.split("@")[1]!,
+    prospectKey: email,
+    prospectName: "Gita Rao",
+    prospectCompany: "Team",
+    subject: "IraVoice for Team",
+    originalMessageId: pitch.id,
+    originalSentAt: new Date(pitch.at).toISOString(),
+    manualFollowups: 0,
+    classifierConfidence: 0.9,
+    classifierReason: "pitch",
+  })!.id;
+  const started = await tapStart(id);
+  assert(getSalesSequence(id)!.status === "active", `Start enrols with his own team on Cc: ${started}`);
+  assert(getSalesSequence(id)!.prospect_email === email, "the enrolled prospect is the one in To");
+  assert(
+    getSalesSequenceStep(id, 1)!.cc === `sam@epicode.in, ${SELF_ALIAS}`,
+    `follow-up 1 stores the colleague and his own address: ${getSalesSequenceStep(id, 1)!.cc}`,
+  );
+  for (const stepNo of [2, 3, 4]) {
+    assert(getSalesSequenceStep(id, stepNo)!.cc === null, `follow-up ${stepNo} stores no Cc`);
+  }
+  setSalesSequenceTimezone(id, IST_ZONE, "email");
+
+  const before = sends.length;
+  assert((await tick(clock)).sent === 1, "follow-up 1 goes out");
+  const one = sends[before]!;
+  assert(one.threadId === threadId, "follow-up 1 stays in the thread");
+  assert(one.parsed.headers.to === `Gita Rao <${email}>`, `follow-up 1 To is the prospect: ${one.parsed.headers.to}`);
+  assert(one.parsed.headers.cc === `sam@epicode.in, ${SELF_ALIAS}`, `follow-up 1 Cc is his own team: ${one.parsed.headers.cc}`);
+  assert(one.parsed.headers.bcc === undefined, "follow-up 1 has no Bcc");
+
+  for (const stepNo of [2, 3, 4]) {
+    assert((await tick(whenDue(id))).sent === 1, `follow-up ${stepNo} goes out`);
+    const later = sends[before + stepNo - 1]!;
+    assert(later.parsed.headers.to === `Gita Rao <${email}>`, `follow-up ${stepNo} To is still the prospect: ${later.parsed.headers.to}`);
+    assert(later.parsed.headers.cc === undefined, `follow-up ${stepNo} has no Cc: ${later.parsed.headers.cc}`);
+    assert(later.parsed.headers.bcc === undefined, `follow-up ${stepNo} has no Bcc`);
+  }
+  assert(getSalesSequence(id)!.status === "completed", "the sequence completes");
+
+  if (previousSelf === undefined) {
+    delete process.env.SELF_EMAIL_ADDRESSES;
+  } else {
+    process.env.SELF_EMAIL_ADDRESSES = previousSelf;
+  }
+}
+
+// A reply-all from the prospect after follow-up 1 still stops it.
+{
+  nextScenario();
+  enrolCounter += 1;
+  const threadId = `team-reply-${enrolCounter}`;
+  const email = `lena@teamreply${enrolCounter}.example`;
+  const pitch = push({
+    threadId,
+    from: `Vishnu Rajan <${ME}>`,
+    to: `Lena Ray <${email}>`,
+    cc: "Sam Iyer <sam@epicode.in>",
+    subject: "IraVoice for Team",
+    at: Date.now() - 3 * DAY,
+    sent: true,
+    body: "Hi Lena,\n\nEpicode builds IraVoice. Would you be open to a short demo?",
+  });
+  const id = createProposedSalesSequence({
+    threadId,
+    prospectEmail: email,
+    prospectDomain: email.split("@")[1]!,
+    prospectKey: email,
+    prospectName: "Lena Ray",
+    prospectCompany: "Team",
+    subject: "IraVoice for Team",
+    originalMessageId: pitch.id,
+    originalSentAt: new Date(pitch.at).toISOString(),
+    manualFollowups: 0,
+    classifierConfidence: 0.9,
+    classifierReason: "pitch",
+  })!.id;
+  await tapStart(id);
+  setSalesSequenceTimezone(id, IST_ZONE, "email");
+  const before = sends.length;
+  assert((await tick(clock)).sent === 1, "follow-up 1 goes out with the colleague on Cc");
+  push({
+    threadId,
+    from: `Lena Ray <${email}>`,
+    to: `Vishnu Rajan <${ME}>`,
+    cc: "Sam Iyer <sam@epicode.in>",
+    subject: "Re: IraVoice for Team",
+    at: clock.getTime() + HOUR,
+    sent: false,
+    body: "Thanks, let me check with the team and come back to you.",
+  });
+  await tick(whenDue(id));
+  const row = getSalesSequence(id)!;
+  assert(row.status === "stopped" && row.stop_reason === "replied", `a reply-all stops it: ${row.status} ${row.stop_reason}`);
+  assert(sends.length === before + 1, "nothing more goes out");
+}
+
 // ======== rolling forward, cap, spacing ========
 {
   nextScenario();
@@ -1425,7 +1601,8 @@ function localHour(at: Date, zone: string): number {
       to: [{ name: "Omar", email: second.email }],
       cc: [],
       threadSenders: [],
-      earlierRecipients: [],
+      earlierTo: [],
+      earlierCc: [],
       manualFollowups: 0,
       isCalendarOrAutomated: false,
       noReplyOrIgnored: false,
