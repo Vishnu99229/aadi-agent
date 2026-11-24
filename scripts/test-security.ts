@@ -1,4 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
+import { isOwnChatTurn } from "../src/agents/dispatch.ts";
+import { allowOwnTurnSequenceEnrollment } from "../src/security/send_approval.ts";
 import { join } from "node:path";
 import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
@@ -669,6 +671,83 @@ assert(
     agentSrc.includes("const result = await runTool(call, turn, allowedTools);"),
     "a start_sequence run in code goes through runTool and the tool's own owner check",
   );
+}
+{
+  // Enrolling with no Start tap needs his own chat turn: not a delegated goal, a
+  // workflow step, a forwarded message, A2A or a background job.
+  const confirmation = { chatId: 1, messageId: 2 };
+  const ownerGrant = { source: "owner_chat" as const, confirmation };
+  assert(isOwnChatTurn({ origin: "chat", depth: 0, grant: ownerGrant as never }, confirmation), "his own chat turn counts");
+  assert(!isOwnChatTurn({ origin: "delegate", depth: 1, grant: ownerGrant as never }, confirmation), "a delegated goal doesn't");
+  assert(!isOwnChatTurn({ origin: "chat", depth: 1, grant: ownerGrant as never }, confirmation), "nor anything below the top level");
+  assert(!isOwnChatTurn({ origin: "background", depth: 0, grant: ownerGrant as never }, confirmation), "nor a background job");
+  assert(!isOwnChatTurn({ origin: "a2a", depth: 0, grant: { source: "remote_agent" } as never }, confirmation), "nor A2A");
+  assert(!isOwnChatTurn({ origin: "chat", depth: 0, grant: { source: "forwarded" } as never }, undefined), "nor a forwarded message");
+  assert(!isOwnChatTurn({ origin: "chat", depth: 0, grant: ownerGrant as never }, undefined), "nor a turn without his confirmation");
+  const refuses = (turn: Parameters<typeof allowOwnTurnSequenceEnrollment>[0]): boolean => {
+    try {
+      allowOwnTurnSequenceEnrollment(turn);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  assert(!refuses({ confirmation, ownTurn: true }), "his own turn may enrol");
+  assert(refuses({ confirmation, ownTurn: false }), "a delegated turn may not");
+  assert(refuses({ confirmation }), "an unmarked turn may not");
+  assert(refuses({ ownTurn: true }), "nor a turn without his confirmation");
+  const dispatchSrc = await readFile(join(root, "src/agents/dispatch.ts"), "utf8");
+  assert(
+    dispatchSrc.includes("ownTurn: isOwnChatTurn(ctx, turn.confirmation)"),
+    "the own-turn mark is set in dispatch from the turn context, never taken from the caller",
+  );
+  const sequencesSrc = await readFile(join(root, "src/sequences.ts"), "utf8");
+  const bodyOf = (signature: string): string => {
+    const at = sequencesSrc.indexOf(signature);
+    assert(at !== -1, `sequences.ts has ${signature}`);
+    const rest = sequencesSrc.slice(at);
+    return rest.slice(0, rest.indexOf("\n}\n"));
+  };
+  // One way in from his command: decideSequenceAction, then the one executor.
+  const carry = bodyOf("async function carryOutSequenceDecision(");
+  assert(
+    carry.includes('decision.action === "enroll"') &&
+      carry.indexOf('decision.action === "enroll"') < carry.indexOf("allowOwnTurnSequenceEnrollment(turn)") &&
+      carry.indexOf("allowOwnTurnSequenceEnrollment(turn)") < carry.indexOf("enrolProposed("),
+    "the executor enrols only on an enroll decision, after his own-turn check",
+  );
+  for (const entry of [
+    "export async function startSequenceFromTool(",
+    "export async function followupsAfterSend(",
+    "export async function handleSequenceCommand(",
+  ]) {
+    const body = bodyOf(entry);
+    assert(body.includes("decideSequenceAction("), `${entry} goes through decideSequenceAction`);
+    assert(!body.includes("enrolProposed(") && !body.includes("activateSalesSequence("), `${entry} never enrols itself`);
+  }
+  assert((sequencesSrc.match(/enrolProposed\(/g) ?? []).length === 3, "enrolProposed: defined, the Start tap, the executor");
+  assert(bodyOf("export async function handleSequenceCallback(").includes("enrolProposed("), "the Start tap enrols");
+  assert(!/export\s+(?:async\s+)?function\s+enrolProposed/.test(sequencesSrc), "enrolProposed is not exported");
+  assert((sequencesSrc.match(/activateSalesSequence\(/g) ?? []).length === 1, "sequences.ts activates in one place");
+  assert(bodyOf("async function enrolProposed(").includes("activateSalesSequence("), "and that place is enrolProposed");
+  // No other source file can enrol: activateSalesSequence lives in db.ts and is called only from sequences.ts.
+  const sourceFiles = (await readdir(join(root, "src"), { recursive: true }))
+    .map(String)
+    .filter((file) => file.endsWith(".ts"));
+  for (const file of sourceFiles) {
+    const src = await readFile(join(root, "src", file), "utf8");
+    const calls = (src.match(/activateSalesSequence\(/g) ?? []).length;
+    if (file === "db.ts") {
+      assert(calls === 1 && src.includes("export function activateSalesSequence("), "db.ts only defines it");
+    } else if (file !== "sequences.ts") {
+      assert(calls === 0, `${file} must not activate a sequence`);
+    }
+  }
+  // Only the model's own tool calls are marked as the model's; the code-run fallback isn't.
+  const agentLoopSrc = await readFile(join(root, "src/agent.ts"), "utf8");
+  assert((agentLoopSrc.match(/modelCalled: true/g) ?? []).length === 1, "one place marks the model's own calls");
+  const codeRun = agentLoopSrc.slice(agentLoopSrc.indexOf("code_start_sequence_"));
+  assert(!codeRun.slice(0, codeRun.indexOf("continue;")).includes("modelCalled"), "the code-run fallback is never marked");
 }
 for (const tool of ["set_sequence_timezone", "add_sales_fact", "list_sales_facts", "remove_sales_fact"]) {
   assert(

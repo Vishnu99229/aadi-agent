@@ -85,6 +85,64 @@ export interface ReminderRecord {
   status_reason: ReminderStatusReason | null;
 }
 
+/** Sales sequence tables. The startup rebuild creates the same tables, so an old
+ *  database ends up exactly like a new one. Up to 9 steps: 3 he sent himself and 6
+ *  from Aadi. */
+const SALES_SEQUENCES_BODY = `
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT 'work' CHECK (account = 'work'),
+    prospect_email TEXT NOT NULL,
+    prospect_domain TEXT NOT NULL,
+    prospect_key TEXT NOT NULL,
+    prospect_name TEXT NOT NULL DEFAULT '',
+    prospect_company TEXT NOT NULL DEFAULT '',
+    prospect_timezone TEXT,
+    subject TEXT NOT NULL DEFAULT '',
+    original_message_id TEXT NOT NULL,
+    original_sent_at TEXT NOT NULL,
+    status TEXT NOT NULL
+      CHECK (status IN ('proposed', 'active', 'stopped', 'completed')),
+    stop_reason TEXT,
+    current_step INTEGER NOT NULL DEFAULT 1 CHECK (current_step BETWEEN 1 AND 9),
+    steps_sent INTEGER NOT NULL DEFAULT 0 CHECK (steps_sent BETWEEN 0 AND 9),
+    manual_followups INTEGER NOT NULL DEFAULT 0 CHECK (manual_followups BETWEEN 0 AND 3),
+    original_ask TEXT CHECK (original_ask IN ('demo', 'partnership_call', 'meeting')),
+    next_step_at TEXT,
+    enrolled_at TEXT,
+    classifier_confidence REAL,
+    classifier_reason TEXT,
+    card_message_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    prospect_timezone_source TEXT,
+    total_steps INTEGER NOT NULL DEFAULT 4 CHECK (total_steps BETWEEN 1 AND 9),
+    step_days INTEGER CHECK (step_days BETWEEN 1 AND 14),
+    cta TEXT,
+    command_key TEXT,
+    UNIQUE (account, thread_id)
+`;
+
+const SALES_SEQUENCE_STEPS_BODY = `
+    sequence_id INTEGER NOT NULL REFERENCES sales_sequences (id),
+    step_no INTEGER NOT NULL CHECK (step_no BETWEEN 1 AND 9),
+    scheduled_at TEXT,
+    draft_text TEXT,
+    check_result TEXT,
+    status TEXT NOT NULL DEFAULT 'planned'
+      CHECK (status IN ('planned', 'sending', 'sent', 'blocked', 'skipped')),
+    sent_message_id TEXT,
+    sent_at TEXT,
+    reason TEXT,
+    draft_id TEXT,
+    claimed_at TEXT,
+    blocked_at TEXT,
+    waiting_ping_at TEXT,
+    slot_lines TEXT,
+    cc TEXT,
+    PRIMARY KEY (sequence_id, step_no)
+`;
+
 export const DB_PATH = process.env.AADI_DB_PATH?.trim() || "./aadi.db";
 
 export const db = new Database(DB_PATH);
@@ -728,58 +786,13 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
-  CREATE TABLE IF NOT EXISTS sales_sequences (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL,
-    account TEXT NOT NULL DEFAULT 'work' CHECK (account = 'work'),
-    prospect_email TEXT NOT NULL,
-    prospect_domain TEXT NOT NULL,
-    prospect_key TEXT NOT NULL,
-    prospect_name TEXT NOT NULL DEFAULT '',
-    prospect_company TEXT NOT NULL DEFAULT '',
-    prospect_timezone TEXT,
-    subject TEXT NOT NULL DEFAULT '',
-    original_message_id TEXT NOT NULL,
-    original_sent_at TEXT NOT NULL,
-    status TEXT NOT NULL
-      CHECK (status IN ('proposed', 'active', 'stopped', 'completed')),
-    stop_reason TEXT,
-    current_step INTEGER NOT NULL DEFAULT 1 CHECK (current_step BETWEEN 1 AND 4),
-    steps_sent INTEGER NOT NULL DEFAULT 0 CHECK (steps_sent BETWEEN 0 AND 4),
-    manual_followups INTEGER NOT NULL DEFAULT 0 CHECK (manual_followups BETWEEN 0 AND 3),
-    original_ask TEXT CHECK (original_ask IN ('demo', 'partnership_call', 'meeting')),
-    next_step_at TEXT,
-    enrolled_at TEXT,
-    classifier_confidence REAL,
-    classifier_reason TEXT,
-    card_message_id INTEGER,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (account, thread_id)
-  );
+  CREATE TABLE IF NOT EXISTS sales_sequences (${SALES_SEQUENCES_BODY});
 
   CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_sequences_open_prospect
     ON sales_sequences (prospect_key)
     WHERE status IN ('proposed', 'active');
 
-  CREATE TABLE IF NOT EXISTS sales_sequence_steps (
-    sequence_id INTEGER NOT NULL REFERENCES sales_sequences (id),
-    step_no INTEGER NOT NULL CHECK (step_no BETWEEN 1 AND 4),
-    scheduled_at TEXT,
-    draft_text TEXT,
-    check_result TEXT,
-    status TEXT NOT NULL DEFAULT 'planned'
-      CHECK (status IN ('planned', 'sending', 'sent', 'blocked', 'skipped')),
-    sent_message_id TEXT,
-    sent_at TEXT,
-    reason TEXT,
-    draft_id TEXT,
-    claimed_at TEXT,
-    blocked_at TEXT,
-    waiting_ping_at TEXT,
-    slot_lines TEXT,
-    PRIMARY KEY (sequence_id, step_no)
-  );
+  CREATE TABLE IF NOT EXISTS sales_sequence_steps (${SALES_SEQUENCE_STEPS_BODY});
 
   CREATE INDEX IF NOT EXISTS idx_sales_sequence_steps_sent_message
     ON sales_sequence_steps (sent_message_id);
@@ -972,6 +985,129 @@ if (!tableHasColumn("sales_sequences", "prospect_timezone_source")) {
 // Follow-up 1 may copy his own team from the pitch's Cc. Later steps never do.
 if (!tableHasColumn("sales_sequence_steps", "cc")) {
   db.exec(`ALTER TABLE sales_sequence_steps ADD COLUMN cc TEXT`);
+}
+// His own count, gap and call-to-action, from a typed or spoken command. A row
+// without them is a Start-tap sequence: 4 steps, SEQUENCE_STEP_DAYS, inferred ask.
+for (const [column, type] of [
+  ["total_steps", "INTEGER NOT NULL DEFAULT 4"],
+  ["step_days", "INTEGER"],
+  ["cta", "TEXT"],
+  ["command_key", "TEXT"],
+] as const) {
+  if (!tableHasColumn("sales_sequences", column)) {
+    db.exec(`ALTER TABLE sales_sequences ADD COLUMN ${column} ${type}`);
+  }
+}
+// Which sent email an Aadi message was about, so "put this email in a follow-up
+// sequence" in reply to it can find the thread. (pending_actions gets its column
+// after its own rebuild below.)
+if (!tableHasColumn("command_sends", "telegram_message_id")) {
+  db.exec(`ALTER TABLE command_sends ADD COLUMN telegram_message_id INTEGER`);
+}
+
+const WIDE_SEQUENCES = "current_step BETWEEN 1 AND 9";
+const WIDE_STEPS = "step_no BETWEEN 1 AND 9";
+
+function tableSqlOf(handle: Database.Database, name: string): string {
+  return (
+    handle
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get(name) as { sql: string } | undefined
+  )?.sql ?? "";
+}
+
+function columnsOf(handle: Database.Database, table: string): string[] {
+  return (handle.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+    (row) => row.name,
+  );
+}
+
+/**
+ * SQLite can't widen a CHECK, so an old database gets both sequence tables rebuilt
+ * once, from the same definitions a new database uses. It runs in one transaction
+ * and checks counts and foreign keys before it commits. On any failure it rolls
+ * back, logs one line and leaves the old tables, which cap a sequence at 4 steps.
+ * Startup never stops on it.
+ */
+export function migrateSalesSequenceLimits(
+  handle: Database.Database = db,
+): "skipped" | "rebuilt" | "failed" {
+  const sequencesSql = tableSqlOf(handle, "sales_sequences");
+  const stepsSql = tableSqlOf(handle, "sales_sequence_steps");
+  if (!sequencesSql || !stepsSql || (sequencesSql.includes(WIDE_SEQUENCES) && stepsSql.includes(WIDE_STEPS))) {
+    return "skipped";
+  }
+  const foreignKeys = handle.pragma("foreign_keys", { simple: true }) as number;
+  handle.pragma("foreign_keys = OFF");
+  try {
+    handle.transaction(() => {
+      const copy = (from: string, to: string): void => {
+        const oldColumns = columnsOf(handle, from);
+        const newColumns = new Set(columnsOf(handle, to));
+        const unknown = oldColumns.filter((column) => !newColumns.has(column));
+        if (unknown.length > 0) {
+          throw new Error(`${from} has columns the new table lacks: ${unknown.join(", ")}`);
+        }
+        const list = oldColumns.join(", ");
+        handle.exec(`INSERT INTO ${to} (${list}) SELECT ${list} FROM ${from}`);
+        const count = (table: string): number =>
+          (handle.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+        if (count(from) !== count(to)) {
+          throw new Error(`${from} row count changed while copying`);
+        }
+      };
+      handle.exec(`CREATE TABLE sales_sequences_rebuild (${SALES_SEQUENCES_BODY})`);
+      copy("sales_sequences", "sales_sequences_rebuild");
+      handle.exec(
+        `CREATE TABLE sales_sequence_steps_rebuild (${SALES_SEQUENCE_STEPS_BODY})`,
+      );
+      copy("sales_sequence_steps", "sales_sequence_steps_rebuild");
+      handle.exec(`
+        DROP TABLE sales_sequence_steps;
+        DROP TABLE sales_sequences;
+        ALTER TABLE sales_sequences_rebuild RENAME TO sales_sequences;
+        ALTER TABLE sales_sequence_steps_rebuild RENAME TO sales_sequence_steps;
+        CREATE UNIQUE INDEX idx_sales_sequences_open_prospect
+          ON sales_sequences (prospect_key)
+          WHERE status IN ('proposed', 'active');
+        CREATE INDEX idx_sales_sequence_steps_sent_message
+          ON sales_sequence_steps (sent_message_id);
+      `);
+      const broken = handle.pragma("foreign_key_check") as unknown[];
+      if (broken.length > 0) {
+        throw new Error(`${broken.length} rows fail the foreign key check`);
+      }
+    })();
+    console.log("Sales sequences: tables rebuilt; up to 6 follow-ups allowed.");
+    return "rebuilt";
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    const detail = error instanceof Error ? error.message.replace(/\s+/g, " ").slice(0, 160) : "";
+    console.error(
+      `Sales sequence rebuild failed (${errorType}: ${detail}); rolled back, running on the old tables with follow-ups capped at 4.`,
+    );
+    return "failed";
+  } finally {
+    handle.pragma(`foreign_keys = ${foreignKeys ? "ON" : "OFF"}`);
+  }
+}
+
+migrateSalesSequenceLimits();
+
+let stepCapForTests: number | undefined;
+
+export function setSalesSequenceStepCapForTests(cap: number | undefined): void {
+  assertTestSeam("setSalesSequenceStepCapForTests");
+  stepCapForTests = cap;
+}
+
+/** How many step rows one sequence may have here: 9 once the tables are rebuilt,
+ *  4 while the old tables are still in place. */
+export function salesSequenceStepCap(): number {
+  if (stepCapForTests !== undefined) {
+    return stepCapForTests;
+  }
+  return tableSqlOf(db, "sales_sequence_steps").includes(WIDE_STEPS) ? 9 : 4;
 }
 // One open sequence per person, not per company: the key is the address itself.
 if (tableHasColumn("sales_sequences", "prospect_key")) {
@@ -1322,6 +1458,10 @@ if (!tableHasColumn("pending_actions", "event_title")) {
       ON pending_actions (draft_id, status);
   `);
   console.log("pending_actions migrated to support create_event rows.");
+}
+// The Gmail message a sent draft card became, for "put this email in a follow-up sequence".
+if (!tableHasColumn("pending_actions", "sent_message_id")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN sent_message_id TEXT`);
 }
 
 /**
@@ -1825,6 +1965,37 @@ export function setPendingActionTelegramMessage(
      SET telegram_message_id = ?
      WHERE id = ?`,
   ).run(telegramMessageId, id);
+}
+
+/** The Gmail message a draft card's send became. Recorded only; nothing reads it
+ *  to decide a send. */
+export function setPendingActionSentMessage(id: number, sentMessageId: string): void {
+  db.prepare(`UPDATE pending_actions SET sent_message_id = ? WHERE id = ?`).run(sentMessageId, id);
+}
+
+export function draftCardForTelegramMessage(telegramMessageId: number):
+  | { status: string; draft_id: string | null; google_account: GoogleAccountId; sent_message_id: string | null }
+  | undefined {
+  return db
+    .prepare(
+      `SELECT status, draft_id, google_account, sent_message_id FROM pending_actions
+       WHERE type = 'send_draft' AND telegram_message_id = ? ORDER BY id DESC LIMIT 1`,
+    )
+    .get(telegramMessageId) as
+    | { status: string; draft_id: string | null; google_account: GoogleAccountId; sent_message_id: string | null }
+    | undefined;
+}
+
+export function sentMessageForDraft(
+  draftId: string,
+): { google_account: GoogleAccountId; sent_message_id: string | null; to_header: string | null } | undefined {
+  return db
+    .prepare(
+      `SELECT google_account, sent_message_id, to_header FROM pending_actions
+       WHERE type = 'send_draft' AND draft_id = ? AND status = 'sent'
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(draftId) as { google_account: GoogleAccountId; sent_message_id: string | null; to_header: string | null } | undefined;
 }
 
 export function transitionPendingAction(
@@ -4738,6 +4909,16 @@ export interface SalesSequenceRecord {
   card_message_id: number | null;
   created_at: string;
   updated_at: string;
+  /** Every step row, manual ones included: 4 for a Start tap, his own count plus
+   *  the ones he sent himself for a command. */
+  total_steps: number;
+  /** Days between follow-ups. Null means SEQUENCE_STEP_DAYS. */
+  step_days: number | null;
+  /** His own call-to-action. Null means the ask in his email. */
+  cta: string | null;
+  /** The owner message that enrolled it by command, so a second run of the same
+   *  command reports it instead of enrolling again. */
+  command_key: string | null;
 }
 
 export interface SalesSequenceStepRecord {
@@ -4775,6 +4956,14 @@ export function getSalesSequence(id: number): SalesSequenceRecord | undefined {
   return db
     .prepare(`SELECT * FROM sales_sequences WHERE id = ?`)
     .get(id) as SalesSequenceRecord | undefined;
+}
+
+export function getSalesSequenceByCommandKey(
+  key: string,
+): SalesSequenceRecord | undefined {
+  return db
+    .prepare(`SELECT * FROM sales_sequences WHERE command_key = ? ORDER BY id DESC LIMIT 1`)
+    .get(key) as SalesSequenceRecord | undefined;
 }
 
 export function getSalesSequenceByThread(
@@ -4890,14 +5079,30 @@ export function activateSalesSequence(
     /** His own team from the pitch's Cc. Kept on step 1 only when step 1 is a
      *  sequence send; every later step has no Cc. */
     stepOneCc?: readonly string[];
+    /** Follow-ups Aadi sends, on top of the ones he sent himself. Omitted for a
+     *  Start tap, which keeps 4 steps in all. */
+    followups?: number;
+    /** Days between follow-ups. Null or omitted means SEQUENCE_STEP_DAYS. */
+    stepDays?: number | null;
+    /** His own call-to-action. Null or omitted means the ask in his email. */
+    cta?: string | null;
+    commandKey?: string | null;
   },
 ): boolean {
+  const total =
+    input.followups === undefined
+      ? SALES_SEQUENCE_STEP_COUNT
+      : input.manualFollowups + input.followups;
+  if (!Number.isInteger(total) || total < 1 || total > salesSequenceStepCap()) {
+    throw new Error(`A sequence can't have ${total} steps here.`);
+  }
   return db.transaction(() => {
     const updated = db
       .prepare(
         `UPDATE sales_sequences
          SET status = 'active', stop_reason = NULL, enrolled_at = ?,
              next_step_at = ?, current_step = ?, manual_followups = ?,
+             total_steps = ?, step_days = ?, cta = ?, command_key = ?,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND status = 'proposed'`,
       )
@@ -4906,6 +5111,10 @@ export function activateSalesSequence(
         input.nextStepAt,
         input.manualFollowups + 1,
         input.manualFollowups,
+        total,
+        input.stepDays ?? null,
+        input.cta ?? null,
+        input.commandKey ?? null,
         id,
       );
     if (updated.changes === 0) {
@@ -4916,7 +5125,7 @@ export function activateSalesSequence(
        VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const stepOneCc = (input.stepOneCc ?? []).join(", ");
-    for (let step = 1; step <= SALES_SEQUENCE_STEP_COUNT; step += 1) {
+    for (let step = 1; step <= total; step += 1) {
       const manual = step <= input.manualFollowups;
       insertStep.run(
         id,
@@ -4929,6 +5138,31 @@ export function activateSalesSequence(
     }
     return true;
   })();
+}
+
+/** A command's Start card holds exactly what was understood, so Start enrols exactly that. */
+export function setProposedSalesSequenceSettings(
+  id: number,
+  input: {
+    totalSteps: number;
+    stepDays: number | null;
+    cta: string | null;
+    commandKey: string | null;
+    /** The follow-ups he has sent himself as of this card, so total minus this is
+     *  exactly the number the card offered. Omitted: leave as stored. */
+    manualFollowups?: number;
+  },
+): boolean {
+  return (
+    db
+      .prepare(
+        `UPDATE sales_sequences
+         SET total_steps = ?, step_days = ?, cta = ?, command_key = ?,
+             manual_followups = COALESCE(?, manual_followups), updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'proposed'`,
+      )
+      .run(input.totalSteps, input.stepDays, input.cta, input.commandKey, input.manualFollowups ?? null, id).changes > 0
+  );
 }
 
 export function stopProposedSalesSequence(id: number, reason: string): boolean {
@@ -5035,6 +5269,8 @@ function advanceSalesSequenceAfterSend(
   if (sequence?.status !== "active") {
     return;
   }
+  // His own gap, when he set one by command.
+  const gapDays = sequence.step_days ?? stepDays;
   const next = db
     .prepare(
       `SELECT step_no FROM sales_sequence_steps
@@ -5051,7 +5287,7 @@ function advanceSalesSequenceAfterSend(
     return;
   }
   const nextAt = new Date(
-    new Date(sentAt).getTime() + stepDays * 24 * 60 * 60 * 1000,
+    new Date(sentAt).getTime() + gapDays * 24 * 60 * 60 * 1000,
   ).toISOString();
   db.prepare(
     `UPDATE sales_sequence_steps SET scheduled_at = ?
@@ -5329,6 +5565,27 @@ export function recordCommandSendSent(key: string, sentMessageId: string): void 
     `UPDATE command_sends SET status = 'sent', sent_message_id = ?, sent_at = CURRENT_TIMESTAMP
      WHERE idem_key = ? AND status = 'sending'`,
   ).run(sentMessageId, key);
+}
+
+/** The Telegram message that told him this email went out. */
+export function setCommandSendTelegramMessage(key: string, telegramMessageId: number): void {
+  db.prepare("UPDATE command_sends SET telegram_message_id = ? WHERE idem_key = ?").run(
+    telegramMessageId,
+    key,
+  );
+}
+
+export function commandSendForTelegramMessage(
+  telegramMessageId: number,
+): { account: string; status: string; sent_message_id: string | null } | undefined {
+  return db
+    .prepare(
+      `SELECT account, status, sent_message_id FROM command_sends
+       WHERE telegram_message_id = ? ORDER BY id DESC LIMIT 1`,
+    )
+    .get(telegramMessageId) as
+    | { account: string; status: string; sent_message_id: string | null }
+    | undefined;
 }
 
 export function markCommandSendUnconfirmed(key: string): void {

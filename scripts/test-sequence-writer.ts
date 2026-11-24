@@ -34,6 +34,8 @@ import {
   resolveOriginalAsk,
   SEQUENCE_FOOTER,
   SEQUENCE_FOOTER_HTML,
+  offersTimes,
+  slotStep,
   SLOTS_TOKEN,
   stepBrief,
   withSequenceFooter,
@@ -166,6 +168,24 @@ assert(/curiosity/i.test(stepBrief(1, "demo")), "step 1 is curiosity");
 assert(/SALES FACTS/.test(stepBrief(1, "demo")) && /SALES FACTS/.test(stepBrief(2, "demo")), "steps 1 and 2 draw on the sales facts");
 assert(/business value/i.test(stepBrief(2, "demo")), "step 2 is business value");
 assert(/meeting conversion/i.test(stepBrief(4, "demo")), "step 4 converts to a meeting");
+// ---- any number of steps, and his own CTA ----
+for (const stepNo of [1, 2, 3, 4]) {
+  assert(stepBrief(stepNo, "demo", true, 4) === stepBrief(stepNo, "demo"), `step ${stepNo} of 4 reads exactly as before`);
+}
+assert(stepBrief(3, "demo", false, 4) === stepBrief(3, "demo", false), "step 3 of 4 without times reads as before");
+assert(/last note/i.test(stepBrief(3, "demo", true, 3)) && stepBrief(3, "demo", true, 3).includes(SLOTS_TOKEN), "3 of 3 is the last note, with the times");
+assert(/last note/i.test(stepBrief(6, "demo", true, 6)) && !/last note/i.test(stepBrief(5, "demo", true, 6)), "only the last of 6 is the last note");
+assert(/proof/i.test(stepBrief(4, "demo", true, 6)) && /timing/i.test(stepBrief(5, "demo", true, 6)), "steps 4 and 5 of 6 take new angles");
+assert(!stepBrief(4, "demo", true, 6).includes(SLOTS_TOKEN), "times only on the time step");
+assert(!/last note/i.test(stepBrief(1, "demo", true, 1)) && stepBrief(1, "demo", true, 1).includes(SLOTS_TOKEN), "a lone follow-up offers times and isn't a last note");
+const own = stepBrief(2, "demo", true, 3, "ask them to book a call");
+assert(own.includes("ask them to book a call") && !own.includes("a demo"), "his CTA replaces the inferred ask");
+const ownLast = stepBrief(3, "demo", true, 3, "ask for the right person to talk to");
+assert(ownLast.includes("ask for the right person to talk to") && !ownLast.includes(SLOTS_TOKEN), "a CTA that isn't a meeting gets no times");
+assert(slotStep(4) === 3 && slotStep(6) === 3 && slotStep(3) === 3 && slotStep(2) === 2 && slotStep(1) === 1, "where the times go");
+assert(offersTimes(null) && offersTimes("ask them to book a call") && offersTimes("ask for a demo"), "meeting-like asks get times");
+assert(!offersTimes("ask for the right person to talk to"), "other asks don't");
+assert(/last note/i.test(WRITER_SYSTEM) && /how many/i.test(WRITER_SYSTEM), "the writer is told steps can number other than 4");
 assert(WRITER_SYSTEM.includes("Infrastructure Partners"), "the writer classifies infrastructure partners");
 assert(WRITER_SYSTEM.includes("Voice AI Companies and Builders"), "and Voice AI builders");
 assert(WRITER_SYSTEM.includes("one or two points most relevant"), "the writer picks one or two points");

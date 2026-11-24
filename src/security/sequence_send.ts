@@ -71,6 +71,8 @@ export interface SequenceSendGateInput {
         steps_sent: number;
         manual_followups: number;
         prospect_timezone: string | null;
+        /** Every step row, his own included. Missing means the original 4. */
+        total_steps?: number;
       }
     | undefined;
   /** The open sequence for this person, which must be this one. */
@@ -202,7 +204,7 @@ export function evaluateSequenceSendGate(
   if (input.stepNo <= sequence.manual_followups) {
     return refuse("step_used_by_manual_followup");
   }
-  if (sequence.manual_followups + sequence.steps_sent >= SEQUENCE_STEPS) {
+  if (sequence.manual_followups + sequence.steps_sent >= (sequence.total_steps ?? SEQUENCE_STEPS)) {
     return refuse("followups_used_up");
   }
   if (!input.body.trim() || input.body !== step.draft_text) {

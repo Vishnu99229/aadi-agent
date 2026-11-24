@@ -1,23 +1,47 @@
 import "dotenv/config";
+import Database from "better-sqlite3";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { fakeTelegramApi, type TelegramLog } from "./fakes.ts";
 import {
   addSalesDoNotContact,
+  getSalesSequence,
+  claimCommandSend,
+  createPendingAction,
   createProposedSalesSequence,
   getSalesSequenceByThread,
   createAccount,
   listSalesSequenceSteps,
+  migrateSalesSequenceLimits,
+  recordCommandSendSent,
+  salesSequenceStepCap,
+  setCommandSendTelegramMessage,
+  setPendingActionSentMessage,
+  setPendingActionTelegramMessage,
+  setSalesSequenceStepCapForTests,
   stopProposedSalesSequence,
+  transitionPendingAction,
   upsertMeetingThread,
 } from "../src/db.ts";
+import {
+  commandIntents,
+  parseSequenceCommand,
+  sequenceTargets,
+  withoutFollowupClause,
+} from "../src/command_intent.ts";
+import { bindRepliedMessageForTurn } from "../src/email_references.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteResult } from "../src/llm.ts";
 import { PERSONAL_DOMAINS } from "../src/meeting_book.ts";
 import {
   countManualFollowups,
+  EXCLUSION_LABELS,
   evaluatePitchExclusion,
   firstStepAt,
   hasOriginalOutreach,
@@ -32,8 +56,11 @@ import {
   type PitchFacts,
 } from "../src/sequence_logic.ts";
 import {
+  decideSequenceAction,
   detectPitches,
   handleSequenceCallback,
+  type SequenceDecision,
+  type SequenceFacts,
   handleSequenceCommand,
   requestSequenceCard,
   runSequenceDetection,
@@ -279,6 +306,15 @@ const gmailStub = {
       }),
     },
     messages: {
+      get: async ({ id }: { id: string }) => {
+        for (const [threadId, messages] of threads) {
+          const found = messages.find((message) => message.id === id);
+          if (found) {
+            return { data: toGmailMessage(threadId, found) };
+          }
+        }
+        throw new Error("no such message");
+      },
       list: async ({ q }: { q: string }) => {
         const from = /from:(\S+)/.exec(q)?.[1];
         if (from) {
@@ -1072,6 +1108,753 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
   assert(!src.includes("messages.send"), `${file} must not call messages.send`);
   assert(!src.includes("drafts."), `${file} must not touch drafts`);
 }
+// ---- follow-ups by his own command: ONE decision point, a fixed allowlist, fail closed ----
+const RECIPIENT = { name: "Mayur Galande", email: "mayur@caia.example" };
+function decide(words: string, over: Partial<SequenceFacts> = {}): SequenceDecision {
+  return decideSequenceAction({
+    source: "tool",
+    words,
+    ownTurn: true,
+    modelCalled: true,
+    toolTarget: "Mayur",
+    email: { state: "sent", recipient: RECIPIENT },
+    replied: { state: "sent", recipient: RECIPIENT },
+    ...over,
+  });
+}
+function kindOf(decision: SequenceDecision): string {
+  if (decision.action === "reply") {
+    if (decision.text.startsWith("Send one person per message")) return "several";
+    if (decision.text.startsWith("Not started: you said not")) return "negated";
+    if (decision.text.startsWith("No card sent")) return "none";
+    return "reply";
+  }
+  return decision.action === "standard_card" ? "standard" : decision.action;
+}
+type Settings = { followups: number; gapDays: number | null; cta: string | null };
+const PHRASES: Array<[string, string, Partial<Settings>?]> = [
+  // Clear imperatives: enrol at once.
+  ["start a 3-step follow-up to Mayur, 4 days apart, asking for a demo", "enroll", { followups: 3, gapDays: 4, cta: "ask for a demo" }],
+  ["put my email to Mayur in a follow-up sequence, 5 follow-ups every 3 days, ask them to book a call", "enroll", { followups: 5, gapDays: 3, cta: "ask them to book a call" }],
+  ["start a sequence for Mayur", "enroll", { followups: 3, gapDays: null, cta: null }],
+  ["Start a sequence for Mayur Galande", "enroll"],
+  ["start follow-ups for Mayur", "enroll", { followups: 3 }],
+  ["set up 2 follow-ups for Mayur every day", "enroll", { followups: 2, gapDays: 1 }],
+  ["Start 1 follow-up to Mayur, 1 day apart", "enroll", { followups: 1, gapDays: 1 }],
+  ["start 3 follow-ups for Mayur, gap of 5 days", "enroll", { gapDays: 5 }],
+  ["start 3 follow-ups for Mayur with a 5-day gap", "enroll", { gapDays: 5 }],
+  ["start 2 follow-ups for Mayur, 6 days between them", "enroll", { followups: 2, gapDays: 6 }],
+  ["add Mayur to the follow-up sequence, one follow-up", "enroll", { followups: 1 }],
+  ["add Mayur to follow-ups", "enroll"],
+  ["begin a follow-up sequence for Mayur", "enroll"],
+  ["please start 3 follow-ups for Mayur", "enroll"],
+  ["can you start 3 follow-ups for Mayur?", "enroll"],
+  ["Could you please start 3 follow-ups for Mayur", "enroll"],
+  ["would you set up follow-ups for Mayur every 3 days", "enroll", { gapDays: 3 }],
+  ['start 3 follow-ups for Mayur, CTA: "Book a call, or send your availability"', "enroll", { cta: "Book a call, or send your availability" }],
+  ['start 3 follow-ups for Mayur asking for "a demo, or a pilot", every 4 days', "enroll", { cta: "ask for a demo, or a pilot", gapDays: 4 }],
+  ["start six follow-ups to Mayur every 14 days", "enroll", { followups: 6, gapDays: 14 }],
+  ["start 3 follow-ups for Mayur every week", "enroll", { gapDays: 7 }],
+  ["email Mayur saying we're live and start 3 follow-ups", "enroll"],
+  ["email Mayur saying we offer 5 plans every 3 days and set up 2 follow-ups every 4 days asking for a demo", "enroll", { followups: 2, gapDays: 4, cta: "ask for a demo" }],
+  ["email Mayur saying we offer 5 plans, valid for 10 days, and start follow-ups", "enroll", { followups: 3, gapDays: null }],
+  ["send it and start 3 follow-ups", "enroll"],
+  ["email Mayur saying hi and start 3 follow-ups for him", "enroll"],
+  ["email Mayur saying hi and start 2 follow-ups for Mayur", "enroll", { followups: 2 }],
+  ["email Mayur saying the contract is not yet signed, and start 3 follow-ups", "enroll"],
+  ["email Mayur saying “please start 3 follow-ups” and start 2 follow-ups", "enroll", { followups: 2 }],
+  ["put this email in a follow up sequence", "enroll"],
+  ["add this to follow-ups", "enroll"],
+  ["Start a follow-up for Mayur", "enroll", { followups: 1 }],
+  ["start a single follow-up for Mayur", "enroll", { followups: 1 }],
+  ["start a follow-up sequence for Mayur", "enroll", { followups: 3 }],
+  // Not on the allowlist, not certain, or not a request: a pre-filled Start card.
+  ["start follow-up for Mayur", "card"],
+  ["auto follow up with Mayur every other day", "card"],
+  ["follow up Mayur 4 times, a week apart", "card"],
+  ["Can I start 3 follow-ups for Mayur?", "card"],
+  ["Could I set up follow-ups for Mayur?", "card"],
+  ["start 3 follow-ups for Mayur?", "card"],
+  ["I could start 3 follow-ups for Mayur", "card"],
+  ["maybe start a sequence for Mayur", "card"],
+  ["should we start a sequence for Mayur", "card"],
+  ["remind me tomorrow to start a sequence for Mayur", "card"],
+  ["remind me on Friday to put my email to Mayur in a follow-up sequence", "card"],
+  ["remind me to start 3 follow-ups for Mayur", "card"],
+  ["if he doesn't reply, start 3 follow-ups for Mayur", "card"],
+  ["he asked me to start follow-ups for Mayur", "card"],
+  ["start 7 follow-ups to Mayur", "card"],
+  ["start 0 follow-ups to Mayur", "card"],
+  ["start ten follow-ups to Mayur", "card"],
+  ["start 3 follow-ups to Mayur every 15 days", "card"],
+  ["start 3 follow-ups to Mayur, 0 days apart", "card"],
+  ["start 3 follow-ups to Mayur every 3 weeks", "card"],
+  ["start 3 follow-ups for Mayur, gap of 15 days", "card"],
+  ["start 3 follow-ups for Mayur with a 20-day gap", "card"],
+  ["start 3 follow-ups for Mayur every Monday", "card"],
+  ["start 3 follow-ups for Mayur twice a week", "card"],
+  ["start 3 follow-ups for Mayur every 2 months", "card"],
+  ["start 3 follow-ups for Mayur monthly", "card"],
+  ["start a few follow-ups for Mayur", "card"],
+  ["start 3 follow-ups for Mayur asking for a demo, or a call", "card"],
+  ["start follow-ups for her", "card"],
+  ["email Mayur saying hello and start 3 follow-ups for Jeff", "card"],
+  ["start 3 follow-ups for Mayur. Make them short.", "card"],
+  ["Kindly start 3 follow-ups for Mayur", "card"],
+  ["Aadi, start 3 follow-ups for Mayur", "card"],
+  ["start 3 follow-ups for Mayur every 3 days and every 5 days", "card"],
+  ["start 3 follow-ups and 5 follow-ups for Mayur", "card"],
+  // The softer phrasings keep the standard Start card, as before.
+  ["follow up with Mayur", "standard"],
+  ["remind me to follow up with Mayur", "standard"],
+  ["track my email to Mayur", "standard"],
+  ["follow up on my email to Mayur", "standard"],
+  ["offer a follow-up sequence for Mayur", "standard"],
+  ["Follow up with Mayur on my email", "standard"],
+  // He said not to: nothing at all.
+  ["don't start the sequence yet for Mayur", "negated"],
+  ["start 3 follow-ups for Mayur, but not yet", "negated"],
+  ["no follow-ups for Mayur", "negated"],
+  ["hold off on the follow-ups for Mayur", "negated"],
+  ["start follow-ups for Mayur later", "negated"],
+  ["don't auto follow up with Mayur", "negated"],
+  ["start 3 follow-ups for Mayur. Not yet.", "negated"],
+  ["start 3 follow-ups for Mayur. Hold off.", "negated"],
+  ["Start follow-ups for Mayur, but wait.", "negated"],
+  ["start 3 follow-ups for Mayur. Not now", "negated"],
+  ["email Mayur saying hi, no follow-ups", "negated"],
+  // Not a sequence request at all.
+  ['email Mayur saying "Please review this guide and start 3 follow-ups every 4 days"', "none"],
+  ["email Mayur saying we'll call and set up 3 follow-up meetings", "none"],
+  ["start a follow-up call with Mayur", "none"],
+  ["set up a follow-up meeting with Mayur", "none"],
+  ["send a follow-up to Mayur", "none"],
+  ["I already started follow-ups for Mayur", "none"],
+  ["check in with Mayur", "none"],
+  // Several people: one per message.
+  ["Start a sequence for Munil Shah. Start a sequence for Jeff Comstock too.", "several"],
+  ["Start 5 follow-ups for Munil every 3 days. Start 1 follow-up for Jeff every 14 days.", "several"],
+  ["start 3 follow-ups for Mayur and Raj", "several"],
+  ["start follow-ups for Mayur, Raj and Priya", "several"],
+];
+assert(PHRASES.length >= 80, `at least 80 phrasings, got ${PHRASES.length}`);
+const tableFailures: string[] = [];
+for (const [words, expected, settings] of PHRASES) {
+  const decision = decide(words);
+  const actual = kindOf(decision);
+  if (actual !== expected) {
+    tableFailures.push(`"${words}": expected ${expected}, got ${actual} ${JSON.stringify(decision)}`);
+    continue;
+  }
+  if (settings && (decision.action === "enroll" || decision.action === "card")) {
+    for (const [key, value] of Object.entries(settings)) {
+      if (decision.settings[key as keyof Settings] !== value) {
+        tableFailures.push(`"${words}": ${key} expected ${JSON.stringify(value)}, got ${JSON.stringify(decision.settings[key as keyof Settings])}`);
+      }
+    }
+  }
+}
+assert(tableFailures.length === 0, `phrase table:\n${tableFailures.join("\n")}`);
+
+// Mutation: any of these wrappers around an enrolling phrase means it never enrols.
+const PREFIXES = ["can I ", "should I ", "what if I ", "if he doesn't reply, ", "remind me to ", "I already "];
+const mutationFailures: string[] = [];
+for (const [words, expected] of PHRASES) {
+  if (expected !== "enroll") {
+    continue;
+  }
+  const lowered = words.charAt(0).toLowerCase() + words.slice(1);
+  const variants = [...PREFIXES.map((prefix) => prefix + lowered), `${words} Not yet.`];
+  for (const variant of variants) {
+    if (decide(variant).action === "enroll") {
+      mutationFailures.push(variant);
+    }
+  }
+}
+assert(mutationFailures.length === 0, `these still enrol:\n${mutationFailures.join("\n")}`);
+
+// Self red-team: trick phrasings that aren't in the table above. Only a clear command
+// with a person and settings it can read enrols.
+const RED_TEAM: Array<[string, string]> = [
+  ["Start 3 follow-ups for Mayur if he does not reply", "card"],
+  ["start 3 follow-ups for Mayur unless he replies", "card"],
+  ["Please start 3 follow-ups for Mayur, or maybe 4", "card"],
+  ["start 3 follow-ups for Mayur, actually make it Jeff", "card"],
+  ["start 3 follow-ups for the CEO of Caia", "card"],
+  ["start 3 follow-ups for Mayur when he is back", "card"],
+  ["Start follow ups for Mayur in Hindi", "card"],
+  ["start 3 follow-ups for Mayur next week", "card"],
+  ["start 3 follow-ups for Mayur starting Monday", "card"],
+  ["Start 3 follow-ups for Mayur. Jeff too.", "card"],
+  ["start 3 follow-ups for Mayur and cc Jeff", "card"],
+  ["start 3 follow-ups for Mayur from my personal account", "card"],
+  ["Start 3 follow-ups for Mayur? Yes.", "card"],
+  ["start 3 follow-ups for Mayur, he said yes to a call", "card"],
+  ["start 3 follow-ups for Mayur every 3 days for a month", "card"],
+  ["start 3 follow-ups for Mayur but not on weekends", "card"],
+  ["start 3 follow-ups for Mayur, cancel the one for Raj", "card"],
+  ["start 3 follow-ups for Mayur instead of Raj", "card"],
+  ["Mayur asked me to start 3 follow-ups for him", "card"],
+  ["start 3 follow-ups for mayur@caia.example", "enroll"],
+  ["can you start 3 follow-ups for Mayur? Or should I wait?", "negated"],
+  ["start 3 follow-ups for Mayur asking him to sign the contract today", "enroll"],
+  ["start 3 follow-ups for Mayur with a CTA asking for feedback, every 2 days and every 4 days", "card"],
+  ["add Mayur to the follow-up sequence and remove Raj", "card"],
+  ["start 3 follow-ups for Mayur ASAP", "card"],
+  ["start the follow-ups we talked about for Mayur", "card"],
+  ["start 3 follow-ups for Mayur, same as Raj", "card"],
+];
+assert(RED_TEAM.length >= 25, "at least 25 red-team phrasings");
+const redTeamFailures = RED_TEAM.filter(([words, expected]) => kindOf(decide(words)) !== expected).map(
+  ([words, expected]) => `"${words}": expected ${expected}, got ${kindOf(decide(words))}`,
+);
+assert(redTeamFailures.length === 0, `red team:\n${redTeamFailures.join("\n")}`);
+for (const [words] of RED_TEAM.filter(([, expected]) => expected === "enroll")) {
+  for (const variant of [...PREFIXES.map((prefix) => prefix + words), `${words} Not yet.`]) {
+    assert(decide(variant).action !== "enroll", `red-team mutation still enrols: ${variant}`);
+  }
+}
+
+// The model's argument never picks the person: he named Mayur, the model said Jeff.
+{
+  const wrong = decide("start 3 follow-ups for Mayur", { toolTarget: "Jeff" });
+  assert(wrong.action === "card" && wrong.person === "Mayur", `a card for Mayur, never Jeff: ${JSON.stringify(wrong)}`);
+  assert(wrong.reasons.some((reason) => reason.includes("Mayur") && reason.includes("Jeff")), "and it says why");
+  const vague = decide("start follow-ups for her", { toolTarget: "Mayur" });
+  assert(vague.action === "card" && vague.person === "Mayur", "no clear name in his words: a card for who it would be");
+  assert(decide("start 3 follow-ups for Mayur", { toolTarget: "Mayur Galande" }).action === "enroll", "the same person, said fuller, is fine");
+}
+// Every other condition: own turn, the model's own call, a live email.
+{
+  const clear = "start 3 follow-ups for Mayur";
+  assert(decide(clear, { ownTurn: false }).action === "card", "not his own turn: card");
+  assert(decide(clear, { modelCalled: false }).action === "card", "the command-guarantee fallback: card");
+  assert(decide("email Mayur saying hi and start 3 follow-ups", { source: "after_send", modelCalled: false }).action === "card", "the referenced-email send path: card");
+  const slash = decide("/outbox Mayur", { source: "slash" });
+  assert(slash.action === "standard_card" && slash.person === "Mayur", "/outbox: the standard card");
+  const waiting = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "pending" } });
+  assert(waiting.action === "reply" && waiting.text === "Not started yet: follow-ups start only once the email has gone out.", "before the send");
+  const failed = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "failed" } });
+  assert(failed.action === "reply" && failed.text === "No follow-ups started: the email didn't go out.", "a failed send");
+  const unconfirmed = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "unconfirmed" } });
+  assert(unconfirmed.action === "reply" && unconfirmed.text === "No follow-ups started: Gmail didn't confirm the email went out.", "unconfirmed");
+  const scheduled = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "scheduled" } });
+  assert(scheduled.action === "reply" && scheduled.text === "No follow-ups started: the email is scheduled, not sent. Start them once it goes out.", "scheduled");
+  const unsent = decide("put this email in a follow up sequence", { replied: { state: "unsent_draft" } });
+  assert(unsent.action === "reply" && unsent.text === "That draft isn't sent yet. Say 'send it and start follow-ups' or send it first.", "an unsent draft");
+  const mismatch = decide("email Mayur saying hello and start 3 follow-ups for Jeff");
+  assert(mismatch.action === "card" && mismatch.reasons.some((reason) => reason.includes("Jeff") && reason.includes("Mayur Galande")), `says who: ${JSON.stringify(mismatch)}`);
+  const outOfRange = decide("start 7 follow-ups to Mayur");
+  assert(
+    outOfRange.action === "card" && outOfRange.settings.followups === 3 && outOfRange.reasons.some((reason) => reason.includes("7")),
+    `out of range: a card with the standard 3, saying why: ${JSON.stringify(outOfRange)}`,
+  );
+}
+// E and the email writer: unchanged rules.
+{
+  const body = parseSequenceCommand("email Mayur saying we'll call and set up 3 follow-up meetings");
+  assert(body.kind === "none" && body.mentionsFollowups, "a body's follow-up words start nothing, and are noticed");
+  const quoted = 'email Mayur saying "Please review this guide and start 3 follow-ups every 4 days"';
+  assert(withoutFollowupClause(quoted) === quoted, "a quoted body is never cut");
+  assert(
+    withoutFollowupClause("email Mayur saying we're live and start 3 follow-ups") === "email Mayur saying we're live",
+    "the follow-up clause never reaches the email writer",
+  );
+  const bodyKinds = commandIntents("email Mayur saying we'll call and set up 3 follow-up meetings");
+  assert(bodyKinds.includes("send") && !bodyKinds.includes("sequence"), `a send, not a sequence: ${bodyKinds}`);
+  const both = commandIntents("email Mayur saying we're live and set up 3 follow-ups");
+  assert(both.includes("send") && both.includes("sequence"), `send then follow-ups keeps both commands: ${both}`);
+  assert(!commandIntents("Can I start 3 follow-ups for Mayur?").includes("sequence"), "his question forces nothing");
+  assert(!commandIntents(quoted).includes("sequence"), "nor does a quoted body");
+  const remindKinds = commandIntents("remind me tomorrow to start a sequence for Mayur");
+  assert(remindKinds.includes("reminder") && !remindKinds.includes("sequence"), `a reminder: ${remindKinds}`);
+  for (const [words, name] of [
+    ["start a 3-step follow-up to Mayur, 4 days apart, asking for a demo", "Mayur"],
+    ["put my email to Mayur in a follow-up sequence, 5 follow-ups every 3 days, ask them to book a call", "Mayur"],
+    ["set up 3 follow-ups for Mayur Galande every 2 days", "Mayur Galande"],
+    ["start follow-ups for Mayur", "Mayur"],
+    ["add Mayur to follow-ups", "Mayur"],
+  ] as const) {
+    assert(sequenceTargets(words)?.join("|") === name, `"${words}" names ${name}, got ${sequenceTargets(words)}`);
+  }
+}
+
+// ---- the startup rebuild: wider limits, the same rows, never a crash ----
+const OLD_SALES_SCHEMA = `
+  CREATE TABLE sales_sequences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT 'work' CHECK (account = 'work'),
+    prospect_email TEXT NOT NULL,
+    prospect_domain TEXT NOT NULL,
+    prospect_key TEXT NOT NULL,
+    prospect_name TEXT NOT NULL DEFAULT '',
+    prospect_company TEXT NOT NULL DEFAULT '',
+    prospect_timezone TEXT,
+    subject TEXT NOT NULL DEFAULT '',
+    original_message_id TEXT NOT NULL,
+    original_sent_at TEXT NOT NULL,
+    status TEXT NOT NULL
+      CHECK (status IN ('proposed', 'active', 'stopped', 'completed')),
+    stop_reason TEXT,
+    current_step INTEGER NOT NULL DEFAULT 1 CHECK (current_step BETWEEN 1 AND 4),
+    steps_sent INTEGER NOT NULL DEFAULT 0 CHECK (steps_sent BETWEEN 0 AND 4),
+    manual_followups INTEGER NOT NULL DEFAULT 0 CHECK (manual_followups BETWEEN 0 AND 3),
+    original_ask TEXT CHECK (original_ask IN ('demo', 'partnership_call', 'meeting')),
+    next_step_at TEXT,
+    enrolled_at TEXT,
+    classifier_confidence REAL,
+    classifier_reason TEXT,
+    card_message_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (account, thread_id)
+  );
+  CREATE UNIQUE INDEX idx_sales_sequences_open_prospect
+    ON sales_sequences (prospect_key)
+    WHERE status IN ('proposed', 'active');
+  CREATE TABLE sales_sequence_steps (
+    sequence_id INTEGER NOT NULL REFERENCES sales_sequences (id),
+    step_no INTEGER NOT NULL CHECK (step_no BETWEEN 1 AND 4),
+    scheduled_at TEXT,
+    draft_text TEXT,
+    check_result TEXT,
+    status TEXT NOT NULL DEFAULT 'planned'
+      CHECK (status IN ('planned', 'sending', 'sent', 'blocked', 'skipped')),
+    sent_message_id TEXT,
+    sent_at TEXT,
+    reason TEXT,
+    draft_id TEXT,
+    claimed_at TEXT,
+    blocked_at TEXT,
+    waiting_ping_at TEXT,
+    slot_lines TEXT,
+    PRIMARY KEY (sequence_id, step_no)
+  );
+  CREATE INDEX idx_sales_sequence_steps_sent_message
+    ON sales_sequence_steps (sent_message_id);
+  ALTER TABLE sales_sequences ADD COLUMN prospect_timezone_source TEXT;
+  ALTER TABLE sales_sequence_steps ADD COLUMN cc TEXT;
+`;
+
+function oldSalesDatabase(file = ":memory:"): Database.Database {
+  const handle = new Database(file);
+  handle.pragma("foreign_keys = ON");
+  handle.exec(OLD_SALES_SCHEMA);
+  const insert = handle.prepare(
+    `INSERT INTO sales_sequences (thread_id, prospect_email, prospect_domain, prospect_key, prospect_name,
+       subject, original_message_id, original_sent_at, status, current_step, steps_sent, manual_followups,
+       original_ask, next_step_at, enrolled_at, prospect_timezone, prospect_timezone_source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insert.run("th-a", "ann@a.example", "a.example", "ann@a.example", "Ann", "Pitch A", "ma", "2026-11-01T05:00:00.000Z",
+    "active", 2, 1, 0, "demo", "2026-11-25T05:00:00.000Z", "2026-11-02T05:00:00.000Z", "Asia/Kolkata", "email");
+  insert.run("th-b", "ben@b.example", "b.example", "ben@b.example", "Ben", "Pitch B", "mb", "2026-10-01T05:00:00.000Z",
+    "completed", 4, 4, 0, null, null, "2026-10-02T05:00:00.000Z", null, null);
+  const step = handle.prepare(
+    `INSERT INTO sales_sequence_steps (sequence_id, step_no, scheduled_at, draft_text, status, sent_message_id, sent_at, cc)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  step.run(1, 1, "2026-11-03T05:00:00.000Z", "Hi Ann", "sent", "s1", "2026-11-03T05:00:00.000Z", "sam@epicode.in");
+  for (const stepNo of [2, 3, 4]) {
+    step.run(1, stepNo, stepNo === 2 ? "2026-11-25T05:00:00.000Z" : null, null, "planned", null, null, null);
+  }
+  for (const stepNo of [1, 2, 3, 4]) {
+    step.run(2, stepNo, null, `Hi Ben ${stepNo}`, "sent", `b${stepNo}`, "2026-10-05T05:00:00.000Z", null);
+  }
+  return handle;
+}
+
+function salesRows(handle: Database.Database): { sequences: Array<Record<string, unknown>>; steps: Array<Record<string, unknown>> } {
+  return {
+    sequences: handle.prepare("SELECT * FROM sales_sequences ORDER BY id").all() as Array<Record<string, unknown>>,
+    steps: handle.prepare("SELECT * FROM sales_sequence_steps ORDER BY sequence_id, step_no").all() as Array<Record<string, unknown>>,
+  };
+}
+
+function sameOldColumns(before: Array<Record<string, unknown>>, after: Array<Record<string, unknown>>): boolean {
+  return before.length === after.length &&
+    before.every((row, index) => Object.keys(row).every((column) => row[column] === after[index]![column]));
+}
+
+function tableSql(handle: Database.Database, name: string): string {
+  return (handle.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) as { sql: string } | undefined)?.sql ?? "";
+}
+
+{
+  const handle = oldSalesDatabase();
+  const before = salesRows(handle);
+  assert(migrateSalesSequenceLimits(handle) === "rebuilt", "an old database is rebuilt");
+  const after = salesRows(handle);
+  assert(sameOldColumns(before.sequences, after.sequences), "every sequence row is unchanged");
+  assert(sameOldColumns(before.steps, after.steps), "every step row is unchanged, Cc included");
+  assert(
+    after.sequences.every((row) => row.total_steps === 4 && row.step_days === null && row.cta === null && row.command_key === null),
+    "old sequences keep 4 steps, the default gap and the inferred ask",
+  );
+  assert(tableSql(handle, "sales_sequence_steps").includes("step_no BETWEEN 1 AND 9"), "steps now go up to 9");
+  assert(tableSql(handle, "sales_sequences").includes("current_step BETWEEN 1 AND 9"), "and so does the current step");
+  assert((handle.pragma("foreign_key_check") as unknown[]).length === 0, "foreign keys hold");
+  assert(handle.pragma("integrity_check", { simple: true }) === "ok", "integrity holds");
+  assert(handle.pragma("foreign_keys", { simple: true }) === 1, "foreign keys are back on");
+  assert(
+    (handle.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_sales_%' ORDER BY name").all() as Array<{ name: string }>)
+      .map((row) => row.name).join(",") === "idx_sales_sequence_steps_sent_message,idx_sales_sequences_open_prospect",
+    "both indexes are back",
+  );
+  let blocked = false;
+  try {
+    handle.prepare("INSERT INTO sales_sequence_steps (sequence_id, step_no, status) VALUES (999, 1, 'planned')").run();
+  } catch {
+    blocked = true;
+  }
+  assert(blocked, "a step for a missing sequence is still refused");
+  handle.prepare("INSERT INTO sales_sequence_steps (sequence_id, step_no, status) VALUES (1, 9, 'planned')").run();
+  assert(migrateSalesSequenceLimits(handle) === "skipped", "a rebuilt database is left alone");
+  handle.close();
+}
+
+async function quietErrors<T>(run: () => T | Promise<T>): Promise<{ value: T; errors: string[] }> {
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...items: unknown[]) => errors.push(items.join(" "));
+  try {
+    return { value: await run(), errors };
+  } finally {
+    console.error = original;
+  }
+}
+
+{
+  // Fails before anything changes: the work table's name is taken.
+  const handle = oldSalesDatabase();
+  handle.exec("CREATE TABLE sales_sequences_rebuild (x TEXT)");
+  const before = salesRows(handle);
+  const { value, errors } = await quietErrors(() => migrateSalesSequenceLimits(handle));
+  assert(value === "failed", "a blocked rebuild reports failure");
+  assert(errors.length === 1 && /rebuild failed/i.test(errors[0]!) && /capped at 4/.test(errors[0]!), `one clear error line, got ${JSON.stringify(errors)}`);
+  assert(tableSql(handle, "sales_sequence_steps").includes("step_no BETWEEN 1 AND 4"), "the old schema stays");
+  const after = salesRows(handle);
+  assert(JSON.stringify(after) === JSON.stringify(before), "nothing changed");
+  assert(handle.pragma("foreign_keys", { simple: true }) === 1, "foreign keys are back on after a failure");
+  handle.close();
+}
+
+{
+  // Fails at the very end, after the old tables were dropped: everything rolls back.
+  const handle = oldSalesDatabase();
+  handle.pragma("foreign_keys = OFF");
+  handle.prepare("INSERT INTO sales_sequence_steps (sequence_id, step_no, status) VALUES (999, 1, 'planned')").run();
+  handle.pragma("foreign_keys = ON");
+  const before = salesRows(handle);
+  const { value, errors } = await quietErrors(() => migrateSalesSequenceLimits(handle));
+  assert(value === "failed" && errors.length === 1, "a foreign-key problem fails the rebuild with one line");
+  assert(tableSql(handle, "sales_sequences").includes("current_step BETWEEN 1 AND 4"), "the old sequences table is back");
+  assert(tableSql(handle, "sales_sequence_steps").includes("step_no BETWEEN 1 AND 4"), "the old steps table is back");
+  assert(tableSql(handle, "sales_sequences_rebuild") === "" && tableSql(handle, "sales_sequence_steps_rebuild") === "", "no work tables are left");
+  assert(JSON.stringify(salesRows(handle)) === JSON.stringify(before), "every row is as it was");
+  handle.close();
+}
+
+{
+  // The app itself starts on a database whose rebuild fails, and caps at 4.
+  const dir = mkdtempSync(join(tmpdir(), "aadi-rebuild-"));
+  try {
+    const file = join(dir, "aadi.db");
+    const handle = oldSalesDatabase(file);
+    handle.exec("CREATE TABLE sales_sequences_rebuild (x TEXT)");
+    handle.close();
+    const child = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "-e", "import('./src/db.ts').then((m) => { console.log('CAP=' + m.salesSequenceStepCap() + ' ROWS=' + m.listActiveSalesSequences().length); })"],
+      { env: { ...process.env, AADI_DB_PATH: file }, encoding: "utf8" },
+    );
+    assert(child.status === 0, `startup continues after a failed rebuild, exit ${child.status}: ${child.stderr}`);
+    assert(child.stdout.includes("CAP=4 ROWS=1"), `it runs capped at 4 with its rows: ${child.stdout}`);
+    const lines = child.stderr.split("\n").filter((line) => /rebuild failed/i.test(line));
+    assert(lines.length === 1, `one error line at startup, got ${JSON.stringify(lines)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
+
+// ---- follow-ups by his own command: what actually happens ----
+{
+  let ownMessage = 300;
+  const owner = (userText: string, extra: { modelCalled?: boolean; ownTurn?: boolean; messageId?: number } = {}) => ({
+    confirmation: { chatId: 1, messageId: extra.messageId ?? ++ownMessage },
+    userText,
+    ownTurn: extra.ownTurn ?? true,
+    modelCalled: extra.modelCalled ?? true,
+  });
+  const sentBefore = telegram.sent.length;
+  pitch("t-cmd", "Mayur Galande <mayur@caia.example>", "IraVoice for Caia", 1);
+  const turn = owner("start a 3-step follow-up to Mayur, 4 days apart, asking for a demo");
+  const reply = await startSequenceFromTool("Mayur", turn, api);
+  assert(
+    reply.startsWith("Started 3 follow-ups to Mayur Galande (mayur@caia.example), every 4 days, CTA: ask for a demo. First one goes "),
+    `a clear imperative enrols at once: ${reply}`,
+  );
+  assert(telegram.sent.length === sentBefore, "with no Start card");
+  const row = getSalesSequenceByThread("t-cmd")!;
+  assert(row.status === "active" && row.total_steps === 3 && row.step_days === 4 && row.cta === "ask for a demo", "his settings");
+  assert(row.command_key === `msg:1:${turn.confirmation.messageId}`, "keyed to his message");
+  assert(listSalesSequenceSteps(row.id).length === 3, "three steps");
+  const pitchAt = threads.get("t-cmd")![0]!.sentAt;
+  assert(Math.abs(new Date(row.next_step_at!).getTime() - (pitchAt + 4 * DAY)) < 5_000, "the first is 4 days after his email");
+  // The same message again (a repeated model call): the same start, nothing more.
+  const again = await startSequenceFromTool("Mayur Galande", turn, api);
+  assert(again === reply && listSalesSequenceSteps(row.id).length === 3, `enrolled once: ${again}`);
+  const later = await startSequenceFromTool("Mayur", owner("start a 3-step follow-up to Mayur"), api);
+  assert(later.startsWith("Not started"), `a new message for the same person is refused: ${later}`);
+
+  pitch("t-cmd-default", "Neeraja <neeraja@nu.example>", "Pitch for Neeraja", 1);
+  const plain = await startSequenceFromTool("Neeraja", owner("start a sequence for Neeraja"), api);
+  assert(plain.startsWith("Started 3 follow-ups to Neeraja (neeraja@nu.example), every 2 days, CTA: same ask as your email."), plain);
+
+  // The command-guarantee fallback (code, not the model): a pre-filled card, and Start
+  // enrols exactly what the card says.
+  pitch("t-cmd-fallback", "Farah <farah@fa.example>", "Pitch for Farah", 1);
+  const cardsBefore = telegram.sent.length;
+  const farahTurn = owner("start 2 follow-ups for Farah every 5 days, asking for a demo", { modelCalled: false });
+  const fallback = await startSequenceFromTool("Farah", farahTurn, api);
+  assert(fallback.startsWith("Start card sent for Farah (farah@fa.example):"), `the fallback only offers a card: ${fallback}`);
+  assert(fallback.includes("Nothing is enrolled until you tap Start."), "and says so");
+  const farahCard = telegram.sent[telegram.sent.length - 1] ?? "";
+  assert(telegram.sent.length === cardsBefore + 1, "one card");
+  assert(
+    farahCard.startsWith("Start 2 follow-ups to Farah (farah@fa.example), every 5 days, CTA: ask for a demo?"),
+    `the card shows what was understood: ${farahCard}`,
+  );
+  const farah = getSalesSequenceByThread("t-cmd-fallback")!;
+  assert(farah.status === "proposed", "nothing enrolled yet");
+  const tapLog = { edits: [] as string[], replies: [] as string[] };
+  // The card's own Start carries the message that set it.
+  await handleSequenceCallback(callbackCtx(`seq:start:${farah.id}:${farahTurn.confirmation.messageId}`, tapLog));
+  const tapped = getSalesSequenceByThread("t-cmd-fallback")!;
+  assert(tapped.status === "active" && tapped.total_steps === 2 && tapped.step_days === 5 && tapped.cta === "ask for a demo", "Start enrols exactly that");
+  assert(listSalesSequenceSteps(tapped.id).length === 2, "two steps");
+  assert(tapLog.edits[0]?.startsWith("Started 2 follow-ups to Farah"), `the card reports it: ${tapLog.edits[0]}`);
+
+  // Two cards for one thread: each Start enrols only what its own card showed. The
+  // older card is out of date once a newer one replaced it.
+  const markups: unknown[] = [];
+  let cardMessage = 9000;
+  const cardsApi = {
+    sendMessage: async (_chat: unknown, text: string, extra?: { reply_markup?: unknown }) => {
+      telegram.sent.push(text);
+      markups.push(extra?.reply_markup);
+      cardMessage += 1;
+      return { message_id: cardMessage, date: 0, chat: { id: 1, type: "private" }, text };
+    },
+    editMessageText: async () => true,
+  } as unknown as Api;
+  pitch("t-cmd-twocards", "Gauri <gauri@ga.example>", "Pitch for Gauri", 1);
+  const firstCard = await startSequenceFromTool(
+    "Gauri",
+    owner("start 2 follow-ups for Gauri every 3 days", { modelCalled: false }),
+    cardsApi,
+  );
+  assert(firstCard.startsWith("Start card sent for Gauri"), firstCard);
+  const gauri = getSalesSequenceByThread("t-cmd-twocards")!;
+  const firstButtons = markups[markups.length - 1];
+  const secondCard = await startSequenceFromTool(
+    "Gauri",
+    owner("start 6 follow-ups for Gauri every 5 days", { modelCalled: false }),
+    cardsApi,
+  );
+  assert(secondCard.startsWith("Start card sent for Gauri"), secondCard);
+  const secondButtons = markups[markups.length - 1];
+  const startOf = (markup: unknown): string => {
+    const rows = (markup as { inline_keyboard?: Array<Array<{ text: string; callback_data?: string }>> } | undefined)?.inline_keyboard ?? [];
+    return rows.flat().find((button) => button.text === "Start")?.callback_data ?? "";
+  };
+  assert(startOf(firstButtons) !== "" && startOf(firstButtons) !== startOf(secondButtons), "each card has its own Start");
+  const staleLog = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(startOf(firstButtons), staleLog));
+  assert(getSalesSequence(gauri.id)!.status === "proposed", "the older card enrols nothing");
+  assert(
+    [...staleLog.edits, ...staleLog.replies].some((text) => text.includes("out of date")),
+    `and says it's out of date: ${JSON.stringify(staleLog)}`,
+  );
+  const freshLog = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(startOf(secondButtons), freshLog));
+  const gauriActive = getSalesSequence(gauri.id)!;
+  assert(gauriActive.status === "active" && gauriActive.total_steps === 6 && gauriActive.step_days === 5, "the newest card enrols what it showed");
+
+  // He followed up himself after an older proposal: the card's 2 means 2 from Aadi.
+  pitch("t-cmd-bumped", "Ira Sen <ira@ir.example>", "Pitch for Ira", 2);
+  const oldProposal = createProposedSalesSequence({
+    threadId: "t-cmd-bumped",
+    prospectEmail: "ira@ir.example",
+    prospectDomain: "ir.example",
+    prospectKey: prospectKey("ira@ir.example"),
+    prospectName: "Ira Sen",
+    prospectCompany: "Ir",
+    subject: "Pitch for Ira",
+    originalMessageId: "t-cmd-bumped-m1",
+    originalSentAt: new Date(Date.now() - 2 * DAY).toISOString(),
+    manualFollowups: 0,
+    classifierConfidence: 0.9,
+    classifierReason: "pitch",
+  })!;
+  threads.get("t-cmd-bumped")!.push({
+    id: "t-cmd-bumped-m2",
+    from: `Vishnu Rajan <${ME}>`,
+    to: "Ira Sen <ira@ir.example>",
+    subject: "Re: Pitch for Ira",
+    sentAt: Date.now() - DAY,
+    sent: true,
+  });
+  const iraTurn = owner("start 2 follow-ups for Ira", { modelCalled: false });
+  const iraCard = await startSequenceFromTool("Ira", iraTurn, cardsApi);
+  assert(iraCard.startsWith("Start card sent for Ira Sen"), iraCard);
+  const iraLog = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(`seq:start:${oldProposal.id}:${iraTurn.confirmation.messageId}`, iraLog));
+  const ira = getSalesSequence(oldProposal.id)!;
+  assert(ira.status === "active", `the card enrols: ${JSON.stringify(iraLog)}`);
+  assert(ira.manual_followups === 1 && ira.total_steps === 3, `his own bump plus the 2 the card offered: ${ira.manual_followups}/${ira.total_steps}`);
+  assert(
+    listSalesSequenceSteps(ira.id).filter((step) => step.status === "planned").length === 2,
+    "exactly 2 automatic follow-ups, as the card said",
+  );
+
+  // A detection card shown before a command card is out of date too.
+  pitch("t-cmd-detected", "Hema <hema@he.example>", "Pitch for Hema", 1);
+  const detected = createProposedSalesSequence({
+    threadId: "t-cmd-detected",
+    prospectEmail: "hema@he.example",
+    prospectDomain: "he.example",
+    prospectKey: prospectKey("hema@he.example"),
+    prospectName: "Hema",
+    prospectCompany: "He",
+    subject: "Pitch for Hema",
+    originalMessageId: "t-cmd-detected-m1",
+    originalSentAt: new Date().toISOString(),
+    manualFollowups: 0,
+    classifierConfidence: 0.9,
+    classifierReason: "pitch",
+  })!;
+  await startSequenceFromTool("Hema", owner("start 5 follow-ups for Hema", { modelCalled: false }), cardsApi);
+  const oldTap = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(`seq:start:${detected.id}`, oldTap));
+  assert(getSalesSequence(detected.id)!.status === "proposed", "the older detection card can't enrol the command's settings");
+
+  // Not his own turn (a delegated goal or a workflow): a card.
+  pitch("t-cmd-deleg", "Olufemi <olufemi@omicron.example>", "Pitch for Olufemi", 1);
+  const delegated = await startSequenceFromTool("Olufemi", owner("start 3 follow-ups for Olufemi", { ownTurn: false }), api);
+  assert(delegated.startsWith("Start card sent") && getSalesSequenceByThread("t-cmd-deleg")!.status === "proposed", delegated);
+
+  // Soft phrasing: the standard card. Stop words: nothing. Out of range: a card, never a guess.
+  pitch("t-cmd-soft", "Pamposh <pamposh@pi3.example>", "Pitch for Pamposh", 1);
+  const soft = await startSequenceFromTool("Pamposh", owner("remind me to follow up with Pamposh"), api);
+  assert(soft.startsWith("Start card sent for Pamposh") && soft.includes("Nothing is enrolled unless Vishnu taps Start."), soft);
+  pitch("t-cmd-stop", "Quintus <quintus@qu.example>", "Pitch for Quintus", 1);
+  const stopped = await startSequenceFromTool("Quintus", owner("don't start the sequence yet for Quintus"), api);
+  assert(stopped === "Not started: you said not to start follow-ups.", stopped);
+  assert(getSalesSequenceByThread("t-cmd-stop") === undefined, "stop words: nothing at all");
+  const tooMany = await startSequenceFromTool("Quintus", owner("start 7 follow-ups to Quintus"), api);
+  assert(tooMany.startsWith("Start card sent for Quintus") && tooMany.includes("7"), `out of range: a card that says why: ${tooMany}`);
+  assert(getSalesSequenceByThread("t-cmd-stop")!.status === "proposed", "and nothing enrolled");
+
+  // Exclusions refuse with their reason, card or not. The newest email decides.
+  pitch("t-cmd-old", "Rayyan <rayyan@rho2.example>", "Old pitch", 10);
+  pitch("t-cmd-new", "Rayyan <rayyan@rho2.example>", "New pitch", 1, "Rajiv <rajiv@rho2.example>");
+  const newest = await startSequenceFromTool("Rayyan", owner("start follow-ups for Rayyan"), api);
+  assert(newest === `Not started for rayyan@rho2.example ('New pitch'): ${EXCLUSION_LABELS.external_cc}.`, newest);
+  assert(!getSalesSequenceByThread("t-cmd-old") && !getSalesSequenceByThread("t-cmd-new"), "no thread was enrolled");
+  for (const [threadId, to, label] of [
+    ["t-cmd-partner", "Siobhan <siobhan@pinnacle.in>", "partner_or_self_domain"],
+    ["t-cmd-colleague", "Tomasz <tomasz@tau2.example>, Sam <sam@epicode.in>", "colleague_on_email"],
+    ["t-cmd-two", "Urvashi <urvashi@up.example>, Vikrant <vikrant@up.example>", "multiple_recipients"],
+  ] as const) {
+    pitch(threadId, to, `Pitch ${threadId}`, 1);
+    const first = to.split("<")[0]!.trim();
+    const refused = await startSequenceFromTool(first, owner(`start 3 follow-ups for ${first}`), api);
+    assert(refused.includes(EXCLUSION_LABELS[label]), `${label} still refuses with its reason: ${refused}`);
+    assert(getSalesSequenceByThread(threadId)?.status !== "active", `${label}: nothing active`);
+  }
+
+  // Round-6 P1: he named Harish, the model asked for Ishaan. Ishaan is never touched.
+  pitch("t-cmd-harish", "Harish Menon <harish@ha.example>", "Pitch for Harish", 1);
+  pitch("t-cmd-ishaan", "Ishaan Roy <ishaan@is.example>", "Pitch for Ishaan", 1);
+  const swapped = await startSequenceFromTool("Ishaan", owner("start 3 follow-ups for Harish"), api);
+  assert(swapped.startsWith("Start card sent for Harish Menon (harish@ha.example):"), `a card for the person he named: ${swapped}`);
+  assert(swapped.includes("Harish") && swapped.includes("Ishaan"), "saying why");
+  assert(getSalesSequenceByThread("t-cmd-ishaan") === undefined, "Ishaan: no row at all");
+  assert(getSalesSequenceByThread("t-cmd-harish")!.status === "proposed", "Harish: only a card");
+
+  // Several people in one message: one per message.
+  pitch("t-cmd-munil", "Munil Shah <munil@mu.example>", "Pitch for Munil", 1);
+  pitch("t-cmd-jeff", "Jeff Comstock <jeff@je.example>", "Pitch for Jeff", 1);
+  const pair = owner("Start a sequence for Munil Shah. Start a sequence for Jeff Comstock too.");
+  assert((await startSequenceFromTool("Munil Shah", pair, api)) === "Send one person per message and I'll start each one.", "several people");
+  assert((await startSequenceFromTool("Jeff Comstock", pair, api)) === "Send one person per message and I'll start each one.", "for each call");
+  assert(!getSalesSequenceByThread("t-cmd-munil") && !getSalesSequenceByThread("t-cmd-jeff"), "nobody enrolled");
+
+  // A: a database still capped at 4 says so for more than 4.
+  setSalesSequenceStepCapForTests(4);
+  try {
+    pitch("t-cmd-cap", "Wesley <wesley@we.example>", "Pitch for Wesley", 1);
+    const capped = await startSequenceFromTool("Wesley", owner("start 5 follow-ups for Wesley"), api);
+    assert(capped === "Not started: this database still caps follow-ups at 4.", capped);
+    assert(getSalesSequenceByThread("t-cmd-cap") === undefined, "nothing created");
+    const four = await startSequenceFromTool("Wesley", owner("start 4 follow-ups for Wesley"), api);
+    assert(four.startsWith("Started 4 follow-ups to Wesley"), four);
+  } finally {
+    setSalesSequenceStepCapForTests(undefined);
+  }
+
+  // Replying to an Aadi message about an email: that message only says which email.
+  const draftCard = createPendingAction("d-unsent", null, "work");
+  setPendingActionTelegramMessage(draftCard.id, 7001);
+  const unsentTurn = owner("put this email in a follow up sequence");
+  bindRepliedMessageForTurn(1, unsentTurn.confirmation.messageId, 7001);
+  assert(
+    (await startSequenceFromTool("this email", unsentTurn, api)) === "That draft isn't sent yet. Say 'send it and start follow-ups' or send it first.",
+    "an unsent draft enrols nothing",
+  );
+  pitch("t-sent-cmd", "Umaima <umaima@upsilon.example>", "Hello Umaima", 0);
+  claimCommandSend({ key: "msg:1:150:umaima@upsilon.example", account: "work", threadId: null });
+  recordCommandSendSent("msg:1:150:umaima@upsilon.example", "t-sent-cmd-m1");
+  setCommandSendTelegramMessage("msg:1:150:umaima@upsilon.example", 7002);
+  const sentTurn = owner("add this to follow-ups");
+  bindRepliedMessageForTurn(1, sentTurn.confirmation.messageId, 7002);
+  const fromSent = await startSequenceFromTool("this email", sentTurn, api);
+  assert(fromSent.startsWith("Started 3 follow-ups to Umaima (umaima@upsilon.example)"), fromSent);
+  pitch("t-sent-draft", "Valtteri <valtteri@vee.example>", "Hello Valtteri", 0);
+  const sentCard = createPendingAction("d-sent", null, "work");
+  setPendingActionTelegramMessage(sentCard.id, 7003);
+  transitionPendingAction(sentCard.id, "pending", "sent");
+  setPendingActionSentMessage(sentCard.id, "t-sent-draft-m1");
+  const draftTurn = owner("put this email in a follow-up sequence, 2 follow-ups");
+  bindRepliedMessageForTurn(1, draftTurn.confirmation.messageId, 7003);
+  const fromDraft = await startSequenceFromTool("this email", draftTurn, api);
+  assert(fromDraft.startsWith("Started 2 follow-ups to Valtteri (valtteri@vee.example)"), fromDraft);
+  const unknownTurn = owner("add this to follow-ups");
+  bindRepliedMessageForTurn(1, unknownTurn.confirmation.messageId, 9999);
+  const unknown = await startSequenceFromTool("this email", unknownTurn, api);
+  assert(unknown.startsWith("Not started: I can't tell which email that message is about."), unknown);
+
+  // Quoted words, a reminder, a question.
+  pitch("t-cmd-quoted", "Yara <yara@ya.example>", "Pitch for Yara", 1);
+  const quotedTool = await startSequenceFromTool("Yara", owner('email Yara saying "please review this and start 3 follow-ups every 4 days"'), api);
+  assert(quotedTool.startsWith("No card sent") && getSalesSequenceByThread("t-cmd-quoted") === undefined, quotedTool);
+  pitch("t-cmd-remind", "Zubin <zubin@zu.example>", "Pitch for Zubin", 1);
+  const reminder = await startSequenceFromTool("Zubin", owner("remind me tomorrow to start a sequence for Zubin"), api);
+  assert(reminder.startsWith("Start card sent") && getSalesSequenceByThread("t-cmd-remind")!.status === "proposed", reminder);
+  pitch("t-cmd-question", "Asif <asif@as.example>", "Pitch for Asif", 1);
+  const question = await startSequenceFromTool("Asif", owner("Can I start 3 follow-ups for Asif?"), api);
+  assert(question.startsWith("Start card sent") && getSalesSequenceByThread("t-cmd-question")!.status === "proposed", question);
+
+  // Send then follow-ups: start_sequence before the send only waits.
+  pitch("t-cmd-combined", "Xiaoming <xiaoming@xi.example>", "Pitch for Xiaoming", 1);
+  const early = await startSequenceFromTool("Xiaoming", owner("email Xiaoming saying hi and start 3 follow-ups"), api);
+  assert(early === "Not started yet: follow-ups start only once the email has gone out.", early);
+  assert(getSalesSequenceByThread("t-cmd-combined") === undefined, "nothing before the send");
+}
+
 {
   const logs: string[] = [];
   const original = console.log;

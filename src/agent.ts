@@ -1014,6 +1014,8 @@ async function runAgentLoop(
         confirmation: options.sendConfirmation,
         userText: options.guardText ?? userText,
         ctx: options.ctx,
+        // These calls came from the model's own response, not from code.
+        modelCalled: true,
       };
       const toolResults = await Promise.all(
         clientToolCalls.map((call) => runTool(call, turn, allowedTools)),

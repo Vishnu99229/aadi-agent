@@ -13,9 +13,11 @@ import {
   getMeetingThread,
   getPromiseByMessageId,
   getSalesSequence,
+  getSalesSequenceByThread,
   getSalesSequenceStep,
   isSalesDoNotContact,
   listActiveSalesSequences,
+  listSalesSequenceSteps,
   setSalesSequenceTimezone,
   stopActiveSalesSequence,
 } from "../src/db.ts";
@@ -82,7 +84,7 @@ import {
   SLOTS_TOKEN,
   WRITER_SYSTEM,
 } from "../src/sequence_writer.ts";
-import { handleSequenceCallback } from "../src/sequences.ts";
+import { handleSequenceCallback, startSequenceFromTool } from "../src/sequences.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
 import { fakeTelegramApi } from "./fakes.ts";
 
@@ -1538,6 +1540,164 @@ function localHour(at: Date, zone: string): number {
   const row = getSalesSequence(id)!;
   assert(row.status === "stopped" && row.stop_reason === "replied", `a reply-all stops it: ${row.status} ${row.stop_reason}`);
   assert(sends.length === before + 1, "nothing more goes out");
+}
+
+// ======== follow-ups set by his own command: count, gap and CTA ========
+{
+  // The gate stops at the sequence's own total, not at 4.
+  const six = (patch: object) => ({ ...gateInput().sequence!, total_steps: 6, ...patch });
+  assert(
+    evaluateSequenceSendGate(gateInput({ stepNo: 5, sequence: six({ current_step: 5, steps_sent: 4 }) })).ok,
+    "follow-up 5 of 6 may go out",
+  );
+  const usedUp = evaluateSequenceSendGate(gateInput({ stepNo: 6, sequence: six({ current_step: 6, steps_sent: 6 }) }));
+  assert(!usedUp.ok && usedUp.reason === "followups_used_up", "six of six is used up");
+  const two = evaluateSequenceSendGate(
+    gateInput({ stepNo: 2, sequence: sequenceWith({ total_steps: 2, current_step: 2, steps_sent: 2 }) }),
+  );
+  assert(!two.ok && two.reason === "followups_used_up", "two of two is used up");
+  const old = evaluateSequenceSendGate(gateInput({ stepNo: 4, sequence: sequenceWith({ current_step: 4, steps_sent: 4 }) }));
+  assert(!old.ok && old.reason === "followups_used_up", "a row without a total still stops at 4");
+}
+{
+  nextScenario();
+  const SELF_ALIAS = "vishnu.self@selftest.example";
+  const previousSelf = process.env.SELF_EMAIL_ADDRESSES;
+  process.env.SELF_EMAIL_ADDRESSES = SELF_ALIAS;
+  enrolCounter += 1;
+  const threadId = `cmd-${enrolCounter}`;
+  const email = `hana@cmd${enrolCounter}.example`;
+  const pitch = push({
+    threadId,
+    from: `Vishnu Rajan <${ME}>`,
+    to: `Hana Kapoor <${email}>`,
+    cc: "Sam Iyer <sam@epicode.in>",
+    subject: "IraVoice for Cmd",
+    // On the test clock, so the 60-day Sent search still finds it.
+    at: clock.getTime() - 3 * DAY,
+    sent: true,
+    body: "Hi Hana,\n\nEpicode builds IraVoice. Would you be open to a short call?",
+  });
+  const reply = await startSequenceFromTool(
+    "Hana",
+    {
+      confirmation: { chatId: 1, messageId: 5001 },
+      userText: "start 5 follow-ups to Hana every 3 days, ask them to book a call",
+      ownTurn: true,
+      modelCalled: true,
+    },
+    api,
+  );
+  assert(
+    reply.startsWith(`Started 5 follow-ups to Hana Kapoor (${email}), every 3 days, CTA: ask them to book a call. First one goes `),
+    `the command enrols at once: ${reply}`,
+  );
+  assert(telegram.sent.every((text) => !text.includes("Start")), "no Start card was posted");
+  const id = getSalesSequenceByThread(threadId)!.id;
+  const row = getSalesSequence(id)!;
+  assert(row.status === "active" && row.total_steps === 5 && row.step_days === 3, "five steps, three days apart");
+  assert(
+    Math.abs(new Date(row.next_step_at!).getTime() - Math.max(pitch.at + 3 * DAY, Date.now())) < 10_000,
+    "the first follow-up is due three days after his email",
+  );
+  assert(getSalesSequenceStep(id, 1)!.cc === "sam@epicode.in", "follow-up 1 keeps his teammate");
+  for (const stepNo of [2, 3, 4, 5]) {
+    assert(getSalesSequenceStep(id, stepNo)!.cc === null, `follow-up ${stepNo} stores no Cc`);
+  }
+  assert(getSalesSequenceStep(id, 6) === undefined, "and there is no sixth step");
+  setSalesSequenceTimezone(id, IST_ZONE, "email");
+
+  const before = sends.length;
+  const writerPrompts: string[] = [];
+  let lastAt = 0;
+  for (let stepNo = 1; stepNo <= 5; stepNo += 1) {
+    const due = stepNo === 1 ? whenDue(id) : whenDue(id);
+    const callsBefore = modelCalls.length;
+    assert((await tick(due)).sent === 1, `follow-up ${stepNo} of 5 goes out`);
+    const sent = sends[before + stepNo - 1]!;
+    const at = world.get(threadId)!.find((message) => message.id === sent.id)!.at;
+    if (stepNo > 1) {
+      assert(at - lastAt >= 3 * DAY, `follow-up ${stepNo} is at least 3 days after the last`);
+    }
+    lastAt = at;
+    assert(sent.parsed.headers.to === `Hana Kapoor <${email}>`, `follow-up ${stepNo} To is the prospect`);
+    assert(
+      stepNo === 1 ? sent.parsed.headers.cc === "sam@epicode.in" : sent.parsed.headers.cc === undefined,
+      `follow-up ${stepNo} Cc: ${sent.parsed.headers.cc}`,
+    );
+    const prompt = modelCalls
+      .slice(callsBefore)
+      .filter((call) => (call.system as { cacheable?: string }).cacheable === WRITER_SYSTEM)
+      .map((call) => String((call.messages[0] as { content: unknown }).content))[0] ?? "";
+    writerPrompts.push(prompt);
+  }
+  assert((await tick(after(10 * DAY))).sent === 0, "nothing after the fifth");
+  assert(getSalesSequence(id)!.status === "completed", "the sequence completes after five");
+  writerPrompts.forEach((prompt, index) => {
+    assert(prompt.includes(`SEQUENCE STEP: ${index + 1} of 5`), `the writer knows it is step ${index + 1} of 5`);
+    assert(prompt.includes("THE ASK: ask them to book a call"), `step ${index + 1} pushes his CTA`);
+  });
+  assert(!modelCalls.some((call) => (call.system as { cacheable?: string }).cacheable === ASK_SYSTEM), "his CTA replaces the inferred ask");
+  assert(writerPrompts[2]!.includes(SLOTS_TOKEN), "times are offered on step 3");
+  assert(writerPrompts.filter((prompt) => prompt.includes(SLOTS_TOKEN)).length === 1, "and only once");
+  assert(/last note/i.test(writerPrompts[4]!), "the fifth is the last note");
+  assert(writerPrompts.slice(0, 4).every((prompt) => !/last note/i.test(prompt)), "no earlier step says it is the last");
+
+  if (previousSelf === undefined) {
+    delete process.env.SELF_EMAIL_ADDRESSES;
+  } else {
+    process.env.SELF_EMAIL_ADDRESSES = previousSelf;
+  }
+}
+{
+  // Two follow-ups, no CTA given: the ask inferred from his email, times on the last.
+  nextScenario();
+  enrolCounter += 1;
+  const threadId = `cmd-${enrolCounter}`;
+  const email = `ivo@cmd${enrolCounter}.example`;
+  push({
+    threadId,
+    from: `Vishnu Rajan <${ME}>`,
+    to: `Ivo Pinto <${email}>`,
+    subject: "IraVoice for Ivo",
+    at: clock.getTime() - 3 * DAY,
+    sent: true,
+    body: "Hi Ivo,\n\nWould you be open to a short demo?",
+  });
+  const reply = await startSequenceFromTool(
+    "Ivo",
+    { confirmation: { chatId: 1, messageId: 5002 }, userText: "start 2 follow-ups to Ivo", ownTurn: true, modelCalled: true },
+    api,
+  );
+  assert(reply.startsWith(`Started 2 follow-ups to Ivo Pinto (${email}), every 2 days, CTA: same ask as your email.`), reply);
+  const id = getSalesSequenceByThread(threadId)!.id;
+  setSalesSequenceTimezone(id, IST_ZONE, "email");
+  const prompts: string[] = [];
+  for (let stepNo = 1; stepNo <= 2; stepNo += 1) {
+    const callsBefore = modelCalls.length;
+    assert((await tick(whenDue(id))).sent === 1, `follow-up ${stepNo} of 2 goes out`);
+    prompts.push(
+      modelCalls
+        .slice(callsBefore)
+        .filter((call) => (call.system as { cacheable?: string }).cacheable === WRITER_SYSTEM)
+        .map((call) => String((call.messages[0] as { content: unknown }).content))[0] ?? "",
+    );
+  }
+  assert(getSalesSequence(id)!.status === "completed", "two and done");
+  assert(prompts.every((prompt) => prompt.includes("THE ASK: a demo")), "the ask from his email");
+  assert(prompts[1]!.includes(SLOTS_TOKEN) && !prompts[0]!.includes(SLOTS_TOKEN), "times on the last of two");
+  assert(prompts[0]!.includes("SEQUENCE STEP: 1 of 2") && /last note/i.test(prompts[1]!), "step 2 of 2 is the last note");
+}
+{
+  // An existing 4-step sequence is untouched: 4 steps, 2 days apart.
+  nextScenario();
+  const item = enrol({ first: "Jo" });
+  const row = getSalesSequence(item.id)!;
+  assert(row.total_steps === 4 && row.step_days === null && row.cta === null, "a Start-tap sequence keeps the defaults");
+  assert(listSalesSequenceSteps(item.id).length === 4, "four step rows");
+  assert((await tick(clock)).sent === 1, "follow-up 1");
+  const next = new Date(getSalesSequence(item.id)!.next_step_at!).getTime();
+  assert(next - clock.getTime() === 2 * DAY, "the next one is 2 days later, as before");
 }
 
 // ======== rolling forward, cap, spacing ========

@@ -28,6 +28,8 @@ import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
+import { withoutFollowupClause } from "./command_intent.js";
+import { followupsAfterSend } from "./sequences.js";
 import { mailDomainRefusal } from "./email_grounding.js";
 import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
@@ -37,6 +39,8 @@ import {
   createScheduledSend,
   getCommandChoice,
   getCommandSendByKey,
+  sentMessageForDraft,
+  setCommandSendTelegramMessage,
   listOpenCommandChoices,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
@@ -374,8 +378,17 @@ export async function writeAndSend(
   const summary = lines.join("\n");
   try {
     const full = `${summary}\n\n${shown(written.body)}`;
-    if (!holdForVoiceNote({ text: full, caption: summary })) {
-      await api().sendMessage(config.ownerTelegramId, full);
+    // Which message said it went out, so a reply to it can name this email.
+    const noted = (telegramMessageId: number): void => {
+      try {
+        setCommandSendTelegramMessage(key, telegramMessageId);
+      } catch {
+        console.error("Command send: sent note not recorded");
+      }
+    };
+    if (!holdForVoiceNote({ text: full, caption: summary, onPosted: noted })) {
+      const posted = await api().sendMessage(config.ownerTelegramId, full);
+      noted(posted.message_id);
     }
     return {
       text: summary,
@@ -844,7 +857,8 @@ function parseSendAt(
 /** The owner's command, typed or spoken. */
 export async function sendEmailFromTool(
   input: unknown,
-  turn: Pick<ToolTurn, "confirmation" | "userText">,
+  /** directSend: a path with no model after it (the referenced-email send in bot.ts). */
+  turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & { directSend?: boolean },
   now = new Date(),
 ): Promise<string> {
   if (!config.sendOnCommandEnabled) {
@@ -895,7 +909,8 @@ export async function sendEmailFromTool(
   ) {
     when = when ?? pendingEmail.sendAt;
   }
-  if (when === undefined && mentionsSendDate(ownWords)) {
+  // A follow-up clause ("... and start 3 follow-ups every Monday") is not a send date.
+  if (when === undefined && mentionsSendDate(withoutFollowupClause(ownWords))) {
     return "Not sent: he gave a date or time, so nothing went out. Call send_email again with send_on, and send_time if he gave one.";
   }
   if (when === undefined && /\bschedule\b/i.test(command) && !/\bsend\s+(?:it\s+)?now\b/i.test(command)) {
@@ -910,7 +925,7 @@ export async function sendEmailFromTool(
     pendingEmail.scheduledSendId
   ) {
     const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId);
-    return delivered.message;
+    return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok));
   }
   let toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
@@ -973,7 +988,8 @@ export async function sendEmailFromTool(
     threadId:
       typeof values.thread_id === "string" && values.thread_id.trim() ? values.thread_id.trim() : null,
     instruction,
-    ownWords,
+    // The email writer never sees a follow-up clause: only what the email should say.
+    ownWords: withoutFollowupClause(ownWords),
     account: values.account === "personal" ? "personal" : "work",
     ...(when ? { sendAt: when } : {}),
     ...(typeof values.subject === "string" && values.subject.trim()
@@ -984,14 +1000,62 @@ export async function sendEmailFromTool(
       ? { draftId: values.draft_id.trim() }
       : {}),
   };
-  return asToolResult(
-    await resolveAndContinue(
-      request,
-      `msg:${confirmation.chatId}:${confirmation.messageId}`,
-      confirmation,
-      now,
-    ),
+  const outcome = await resolveAndContinue(
+    request,
+    `msg:${confirmation.chatId}:${confirmation.messageId}`,
+    confirmation,
+    now,
   );
+  // Follow-ups he asked for in the same message start only after this send went out.
+  const first = request.to[0];
+  const followups = await followupsAfterSend({
+    turn,
+    result:
+      outcome.result === "sent"
+        ? "sent"
+        : outcome.result === "unknown"
+          ? "unknown"
+          : request.sendAt && outcome.result === undefined
+            ? "scheduled"
+            : outcome.result === undefined
+              ? "pending"
+              : "not_sent",
+    sentMessageId: outcome.result === "sent" ? outcome.messageId : undefined,
+    account: request.account,
+    recipient: first?.mailbox?.name.trim().split(/\s+/)[0] || first?.query || "them",
+    recipientMailbox: first?.mailbox ? { name: first.mailbox.name, email: first.mailbox.email } : undefined,
+  });
+  if (!followups.text && !followups.hint) {
+    return asToolResult(outcome);
+  }
+  const hint = [outcome.hint, followups.hint].filter(Boolean).join(" ");
+  return `${outcome.text}${followups.text ? `\n${followups.text}` : ""}${hint ? ` ${hint}` : ""}`;
+}
+
+type FollowupTurn = Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & { directSend?: boolean };
+
+/** A send result with what the same message's follow-ups came to. */
+export function withFollowups(message: string, followups: { text?: string; hint?: string }): string {
+  return [message, followups.text, followups.hint].filter(Boolean).join("\n");
+}
+
+/** After a draft he confirmed by message: the follow-ups from the same message, only
+ *  if this exact send went out. */
+export async function followupsAfterDraftSend(
+  turn: FollowupTurn,
+  draftId: string,
+  sent: boolean,
+): Promise<{ text?: string; hint?: string }> {
+  const delivered = sent ? sentMessageForDraft(draftId) : undefined;
+  const to = parseAddressList(delivered?.to_header ?? "")[0];
+  return followupsAfterSend({
+    turn,
+    result: delivered?.sent_message_id ? "sent" : "not_sent",
+    sentMessageId: delivered?.sent_message_id ?? undefined,
+    account: delivered?.google_account ?? "work",
+    recipient: to?.name.trim().split(/\s+/)[0] || to?.email || "them",
+    recipientMailbox: to ? { name: to.name, email: to.email } : undefined,
+  });
 }
 
 /** "Book a meeting with X". The event is created at once, but only after the attendee
