@@ -1526,7 +1526,9 @@ async function handleUserText(
           account,
           ...(parsedWhen ? { send_on: parsedWhen.sendOn, send_time: parsedWhen.sendTime } : {}),
         },
-        { confirmation, userText },
+        // His own message (a forwarded one never reaches this path), and no model runs
+        // after this send: any follow-ups he asked for become a pre-filled Start card.
+        { confirmation, userText, ownTurn: true, directSend: true },
       );
       await ctx.reply(result);
       return;

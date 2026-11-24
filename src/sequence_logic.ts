@@ -442,7 +442,7 @@ export const COUNT_WORD =
 const NOT_A_THING = `(?!\\s+(?:${FOLLOW_UP_THING})\\b)`;
 /** "start a 3-step follow-up to X", "set up 5 follow-ups", "start follow-ups for X". */
 const START_FOLLOWUPS = new RegExp(
-  `\\b(?:start|begin|set\\s*up|create|kick\\s*off|launch|schedule|run)\\b(?:\\s+(?:a|an|the|my|new|another|automatic|auto|email|more|${COUNT_WORD}(?:[\\s-]*steps?)?|steps?)){0,4}\\s+(?:(?:follow[\\s-]*up\\s+)?sequences?|follow[\\s-]*ups?)\\b${NOT_A_THING}`,
+  `\\b(?:start|begin|set\\s*up|create|kick\\s*off|launch|schedule|run)\\b(?:\\s+(?:a|an|the|my|new|another|automatic|auto|email|more|few|several|couple|of|some|many|multiple|${COUNT_WORD}(?:[\\s-]*steps?)?|steps?)){0,4}\\s+(?:(?:follow[\\s-]*up\\s+)?sequences?|follow[\\s-]*ups?)\\b${NOT_A_THING}`,
   "i",
 );
 /** "put my email to X in a follow-up sequence", "add X to follow-ups", "add this to the sequence". */

@@ -48,7 +48,8 @@ import {
   markTaskDone,
 } from "../src/db.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
-import { startSequenceFromTool } from "../src/sequences.ts";
+import { bindEmailReferenceForTurn } from "../src/email_references.ts";
+import { setSequenceTestHooks, startSequenceFromTool } from "../src/sequences.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
@@ -263,6 +264,7 @@ const telegram = {
   editMessageText: async () => true,
 } as unknown as Api;
 setCommandEmailTestHooks({ telegram });
+setSequenceTestHooks({ telegram });
 setApprovalsTestHooks({ telegram, gmailFor: () => gmail });
 
 // ---- the writer model ----
@@ -1781,37 +1783,51 @@ await expectCancelled("delete_task", async (row) => {
     return { data: { id } };
   };
   const own = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: true });
+  const model = <T extends object>(base: T) => ({ ...base, modelCalled: true });
   const threadOf = (id: string) => world.find((item) => item.id === id)!.threadId;
   const active = () => listActiveSalesSequences().length;
 
-  // It sends, then enrols the sent email's thread with his settings.
+  // The send goes first; the model's start_sequence then enrols that email's thread.
   written = { subject: "We're live", body: "Hi Kai,\n\nWe're live with the dialer." };
-  const words = "email kai@kappa-co.com saying we're live and start 2 follow-ups every 3 days";
-  const sentTurn = own(words);
+  const sentTurn = own("email kai@kappa-co.com saying we're live and start 2 follow-ups every 3 days");
   const before = sends.length;
   const result = await sendEmailFromTool({ to: ["kai@kappa-co.com"], instruction: "say we're live" }, sentTurn);
-  assert(sends.length === before + 1, `the email went out first: ${result}`);
-  assert(result.startsWith("Sent to"), `the send is reported first: ${result}`);
-  assert(
-    result.includes("Started 2 follow-ups to ") && result.includes("kai@kappa-co.com") && result.includes("every 3 days, CTA: same ask as your email."),
-    `then the follow-ups: ${result}`,
-  );
+  assert(sends.length === before + 1 && result.startsWith("Sent to"), `the email went out first: ${result}`);
+  assert(!result.includes("Started"), "the send itself enrols nothing");
   const thread = threadOf(`sent-${sends.length}`);
+  assert(getSalesSequenceByThread(thread) === undefined, "not yet");
+  const started = await startSequenceFromTool("Kai", model(sentTurn));
+  assert(
+    started.startsWith("Started 2 follow-ups to ") && started.includes("kai@kappa-co.com") && started.includes("every 3 days, CTA: same ask as your email."),
+    `then the model's own start_sequence enrols it: ${started}`,
+  );
   const row = getSalesSequenceByThread(thread)!;
-  assert(row?.status === "active" && row.total_steps === 2 && row.step_days === 3, "the sent email's thread is enrolled");
-  assert(row.command_key === `msg:1:${sentTurn.confirmation.messageId}`, "keyed to his message");
+  assert(row?.status === "active" && row.total_steps === 2 && row.step_days === 3, "the sent email's thread");
   const sentAt = world.find((item) => item.threadId === thread)!.at;
   assert(new Date(row.enrolled_at!).getTime() > sentAt, "enrolled after the send, so his own email never stops it");
   assert(Math.abs(new Date(row.next_step_at!).getTime() - (sentAt + 3 * 24 * 60 * 60 * 1000)) < 5_000, "the first follow-up is 3 days after it");
-  assert(listSalesSequenceSteps(row.id).length === 2, "two steps");
   const writerPrompt = JSON.stringify(writerCalls[writerCalls.length - 1]!.messages);
   assert(writerPrompt.includes("we're live") && !writerPrompt.includes("start 2 follow-ups"), "the follow-up clause never reaches the email writer");
-  // C: start_sequence on the same message, by the model or the fallback, adds nothing.
-  const repeated = await startSequenceFromTool("Kai", sentTurn);
-  assert(repeated.startsWith("Started 2 follow-ups to ") && repeated.includes("kai@kappa-co.com"), `the same start, reported again: ${repeated}`);
-  assert(listSalesSequenceSteps(row.id).length === 2, "still two steps");
+  const repeated = await startSequenceFromTool("Kai", model(sentTurn));
+  assert(repeated === started && listSalesSequenceSteps(row.id).length === 2, `a repeat changes nothing: ${repeated}`);
 
-  // A refused, unconfirmed or scheduled send enrols nothing.
+  // The model asked first: the send then enrols, because the model did ask this turn.
+  written = { subject: "Hi", body: "Hi Kim,\n\nHello." };
+  const askedFirst = own("email kim@kim-co.com saying hi and start 2 follow-ups");
+  const waiting = await startSequenceFromTool("Kim", model(askedFirst));
+  assert(waiting === "Not started yet: follow-ups start only once the email has gone out.", waiting);
+  const kimSend = await sendEmailFromTool({ to: ["kim@kim-co.com"], instruction: "say hi" }, askedFirst);
+  assert(kimSend.startsWith("Sent to") && kimSend.includes("Started 2 follow-ups to "), `the send completes the model's request: ${kimSend}`);
+
+  // The command-guarantee fallback after a send (code, not the model): a card.
+  const fallbackTurn = own("email fay@fay-co.com saying hi and start 3 follow-ups");
+  await sendEmailFromTool({ to: ["fay@fay-co.com"], instruction: "say hi" }, fallbackTurn);
+  const fallback = await startSequenceFromTool("Fay", fallbackTurn);
+  assert(fallback.startsWith("Start card sent for ") && fallback.includes("fay@fay-co.com"), `the fallback only offers a card: ${fallback}`);
+  const fayThread = threadOf(`sent-${sends.length}`);
+  assert(getSalesSequenceByThread(fayThread)?.status === "proposed", "Fay: a card, not enrolled");
+
+  // A refused, unconfirmed or scheduled send enrols nothing, and says so.
   const count = active();
   sendFails = 403;
   const refused = await sendEmailFromTool(
@@ -1821,37 +1837,18 @@ await expectCancelled("delete_task", async (row) => {
   sendFails = undefined;
   assert(refused.startsWith("Not sent") && refused.includes("No follow-ups started: the email didn't go out."), `refused: ${refused}`);
   sendFails = "network";
-  const unconfirmed = await sendEmailFromTool(
-    { to: ["lee@lambda-co.com"], instruction: "say hi" },
-    own("email lee@lambda-co.com saying hello and start 3 follow-ups"),
-  );
+  const unconfirmedTurn = own("email lee@lambda-co.com saying hello and start 3 follow-ups");
+  const unconfirmed = await sendEmailFromTool({ to: ["lee@lambda-co.com"], instruction: "say hi" }, unconfirmedTurn);
   sendFails = undefined;
   assert(unconfirmed.includes("No follow-ups started: Gmail didn't confirm the email went out."), `unconfirmed: ${unconfirmed}`);
+  const afterUnconfirmed = await startSequenceFromTool("Lee", model(unconfirmedTurn));
+  assert(afterUnconfirmed === "No follow-ups started: Gmail didn't confirm the email went out.", `and start_sequence agrees: ${afterUnconfirmed}`);
   const scheduled = await sendEmailFromTool(
     { to: ["lee@lambda-co.com"], instruction: "say hi", send_on: SOON, subject: "Hi" },
     own("email lee@lambda-co.com on Monday saying hi and start 3 follow-ups"),
   );
   assert(scheduled.includes("No follow-ups started: the email is scheduled, not sent. Start them once it goes out."), `scheduled: ${scheduled}`);
   assert(active() === count, "none of them enrolled anything");
-
-  // The clause names someone else: the email goes, nobody is enrolled.
-  const otherPerson = await sendEmailFromTool(
-    { to: ["mia@mu-co.com"], instruction: "say hello" },
-    own("email mia@mu-co.com saying hello and start 3 follow-ups for Jeff"),
-  );
-  assert(otherPerson.startsWith("Sent to"), `the email went: ${otherPerson}`);
-  assert(
-    otherPerson.includes("No follow-ups started: they were for Jeff, but the email went to ") &&
-      otherPerson.includes("mia@mu-co.com). Say 'start follow-ups for Jeff' for Jeff's own email."),
-    `and nobody was enrolled: ${otherPerson}`,
-  );
-  assert(active() === count, "Mia was not enrolled for Jeff's follow-ups");
-  const samePerson = await sendEmailFromTool(
-    { to: ["mona@mo-co.com"], instruction: "say hello" },
-    own("email mona@mo-co.com saying hello and start 2 follow-ups for Mona"),
-  );
-  assert(samePerson.includes("Started 2 follow-ups to ") && samePerson.includes("mona@mo-co.com"), `naming the recipient is fine: ${samePerson}`);
-  assert(active() === count + 1, "Mona was enrolled");
 
   // E: follow-up words in what the email says start nothing, and he's told.
   mail({ threadId: "lia-old", from: "Lia Wong <lia@lambda-co.com>", to: ME, subject: "Hi", body: "Hello" });
@@ -1862,23 +1859,45 @@ await expectCancelled("delete_task", async (row) => {
   );
   assert(bodyOnly.startsWith("Sent to"), `the email is sent: ${bodyOnly}`);
   assert(bodyOnly.includes("No follow-ups started; say 'start follow-ups for Lia' if you want them."), `and he's told: ${bodyOnly}`);
-  assert(active() === count + 1, "nothing more enrolled");
-
-  // Stop words in the same message: sent, nothing enrolled.
   const noFollowups = await sendEmailFromTool(
     { to: ["lia@lambda-co.com"], instruction: "say hi" },
     own("email lia@lambda-co.com saying hi, no follow-ups"),
   );
   assert(noFollowups.startsWith("Sent to") && noFollowups.includes("No follow-ups started, as you said."), noFollowups);
-  assert(active() === count + 1, "still nothing more enrolled");
+  assert(active() === count, "nothing enrolled");
 
-  // Not his own turn (a delegated goal): it may send, but never enrols.
-  const delegated = await sendEmailFromTool(
-    { to: ["lia@lambda-co.com"], instruction: "say thanks" },
-    turn("email lia@lambda-co.com saying thanks and start 2 follow-ups"),
-  );
-  assert(delegated.includes("No follow-ups started: only your own message can start them."), delegated);
-  assert(active() === count + 1, "a delegated turn enrolled nothing");
+  // Not his own turn (a delegated goal): the email may go, the follow-ups are only a card.
+  const delegatedTurn = turn("email lia@lambda-co.com saying thanks and start 2 follow-ups");
+  const delegatedSend = await sendEmailFromTool({ to: ["lia@lambda-co.com"], instruction: "say thanks" }, delegatedTurn);
+  assert(!delegatedSend.includes("only your own message"), `never a flat refusal: ${delegatedSend}`);
+  const delegated = await startSequenceFromTool("Lia", model(delegatedTurn));
+  assert(delegated.startsWith("Start card sent for "), `a delegated turn only gets a card: ${delegated}`);
+  assert(active() === count, "a delegated turn enrolled nothing");
+
+  // The clause names someone else: a card for the person the email went to, saying why.
+  const otherTurn = own("email mia@mu-co.com saying hello and start 3 follow-ups for Jeff");
+  const otherSend = await sendEmailFromTool({ to: ["mia@mu-co.com"], instruction: "say hello" }, otherTurn);
+  assert(otherSend.startsWith("Sent to"), `the email went: ${otherSend}`);
+  const other = await startSequenceFromTool("Jeff", model(otherTurn));
+  assert(other.startsWith("Start card sent for ") && other.includes("mia@mu-co.com") && other.includes("Jeff"), `a card that says why: ${other}`);
+  assert(active() === count, "Mia was not enrolled for Jeff's follow-ups");
+  const sameTurn = own("email mona@mo-co.com saying hello and start 2 follow-ups for Mona");
+  await sendEmailFromTool({ to: ["mona@mo-co.com"], instruction: "say hello" }, sameTurn);
+  const same = await startSequenceFromTool("Mona", model(sameTurn));
+  assert(same.startsWith("Started 2 follow-ups to ") && same.includes("mona@mo-co.com"), `naming the recipient is fine: ${same}`);
+  assert(active() === count + 1, "Mona was enrolled");
+
+  // Round-6 P2: the referenced-email (OCR) send path in bot.ts has no model after it,
+  // so after a successful send it shows the card with his settings.
+  const ocrTurn = { ...own("send an email to this address saying hello and start 3 follow-ups every 4 days"), directSend: true };
+  // As bot.ts does: the replied OCR message binds the address to his message first.
+  bindEmailReferenceForTurn(ocrTurn.confirmation.chatId, ocrTurn.confirmation.messageId, "omi@omi-co.com");
+  const ocr = await sendEmailFromTool({ to: ["omi@omi-co.com"], instruction: "say hello" }, ocrTurn);
+  assert(ocr.startsWith("Sent to") && ocr.includes("Start card sent for "), `sent, then a card: ${ocr}`);
+  assert(!ocr.includes("only your own message"), "never the flat refusal");
+  const ocrThread = threadOf(`sent-${sends.length}`);
+  const ocrRow = getSalesSequenceByThread(ocrThread)!;
+  assert(ocrRow.status === "proposed" && ocrRow.total_steps === 3 && ocrRow.step_days === 4, "the card holds his settings, enrolled nothing");
 
   // D: "send it and start 3 follow-ups" right after a draft card.
   await queueDraftApproval({
@@ -1892,10 +1911,10 @@ await expectCancelled("delete_task", async (row) => {
   const confirm = tools.confirm_send_pending_draft!;
   const draftTurn = { iteration: 1, calledTools: ["confirm_send_pending_draft"], ...own("send it and start 3 follow-ups", 99_000) };
   const draftResult = await confirm.handler({ draft_id: "draft-nora" }, draftTurn);
-  assert(draftsSent.includes("draft-nora"), `the draft was sent: ${draftResult}`);
-  assert(draftResult.includes("Started 3 follow-ups to Nora Lee (nora@nu-co.com)"), `then its thread enrolled: ${draftResult}`);
-  const draftThread = threadOf("sent-draft-nora");
-  assert(getSalesSequenceByThread(draftThread)?.status === "active", "the draft's own thread");
+  assert(draftsSent.includes("draft-nora") && !draftResult.includes("Started"), `the draft was sent, nothing enrolled yet: ${draftResult}`);
+  const draftStart = await startSequenceFromTool("Nora", model(draftTurn));
+  assert(draftStart.startsWith("Started 3 follow-ups to Nora Lee (nora@nu-co.com)"), `then its own thread: ${draftStart}`);
+  assert(getSalesSequenceByThread(threadOf("sent-draft-nora"))?.status === "active", "the draft's own thread");
 
   await queueDraftApproval({
     draftId: "draft-omar",
@@ -1906,14 +1925,12 @@ await expectCancelled("delete_task", async (row) => {
     googleAccount: "work",
   });
   draftFails = true;
-  const failedDraft = await confirm.handler(
-    { draft_id: "draft-omar" },
-    { iteration: 1, calledTools: ["confirm_send_pending_draft"], ...own("send it and start 3 follow-ups", 99_001) },
-  );
+  const failedTurn = { iteration: 1, calledTools: ["confirm_send_pending_draft"], ...own("send it and start 3 follow-ups", 99_001) };
+  const failedDraft = await confirm.handler({ draft_id: "draft-omar" }, failedTurn);
   draftFails = false;
   assert(failedDraft.includes("No follow-ups started: the email didn't go out."), `a failed draft send enrols nothing: ${failedDraft}`);
+  assert((await startSequenceFromTool("Omar", model(failedTurn))) === "No follow-ups started: the email didn't go out.", "and start_sequence agrees");
   assert(active() === count + 2, "only Mona and Nora were enrolled");
-
   users.messages.send = realSend;
   users.messages.list = realList;
   users.drafts.send = realDraftSend;

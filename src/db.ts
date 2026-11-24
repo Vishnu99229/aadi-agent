@@ -1988,14 +1988,14 @@ export function draftCardForTelegramMessage(telegramMessageId: number):
 
 export function sentMessageForDraft(
   draftId: string,
-): { google_account: GoogleAccountId; sent_message_id: string | null } | undefined {
+): { google_account: GoogleAccountId; sent_message_id: string | null; to_header: string | null } | undefined {
   return db
     .prepare(
-      `SELECT google_account, sent_message_id FROM pending_actions
+      `SELECT google_account, sent_message_id, to_header FROM pending_actions
        WHERE type = 'send_draft' AND draft_id = ? AND status = 'sent'
        ORDER BY id DESC LIMIT 1`,
     )
-    .get(draftId) as { google_account: GoogleAccountId; sent_message_id: string | null } | undefined;
+    .get(draftId) as { google_account: GoogleAccountId; sent_message_id: string | null; to_header: string | null } | undefined;
 }
 
 export function transitionPendingAction(
@@ -5138,6 +5138,22 @@ export function activateSalesSequence(
     }
     return true;
   })();
+}
+
+/** A command's Start card holds exactly what was understood, so Start enrols exactly that. */
+export function setProposedSalesSequenceSettings(
+  id: number,
+  input: { totalSteps: number; stepDays: number | null; cta: string | null; commandKey: string | null },
+): boolean {
+  return (
+    db
+      .prepare(
+        `UPDATE sales_sequences
+         SET total_steps = ?, step_days = ?, cta = ?, command_key = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'proposed'`,
+      )
+      .run(input.totalSteps, input.stepDays, input.cta, input.commandKey, id).changes > 0
+  );
 }
 
 export function stopProposedSalesSequence(id: number, reason: string): boolean {

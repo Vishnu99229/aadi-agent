@@ -498,35 +498,42 @@ export function maskQuoted(text: string): string {
   return text.replace(/"[^"]*(?:"|$)|“[^”]*(?:”|$)|‘[^’]*(?:’|$)/g, (match) => " ".repeat(match.length));
 }
 
+/** Settings he gave by command. Null gap: SEQUENCE_STEP_DAYS. Null CTA: the ask in his email. */
+export interface FollowupSettings {
+  followups: number;
+  gapDays: number | null;
+  cta: string | null;
+}
+
 /** What his words ask of the follow-ups. Only his own words are ever passed in. */
 export type SequenceCommand =
-  /** Not a sequence request. mentionsFollowups: the words "follow-up" or
+  /** Not a sequence request. mentionsFollowups: the words "follow-ups" or
    *  "sequence" appear anyway, e.g. inside an email he dictated. */
   | { kind: "none"; mentionsFollowups: boolean }
-  /** He said not to: "don't start the sequence yet", "no follow-ups". */
+  /** He said not to: "don't start the sequence yet", "no follow-ups", "... Not yet." */
   | { kind: "negated" }
-  /** A softer phrasing that only offers the Start card. */
+  /** More than one person in one message. */
+  | { kind: "several" }
+  /** A softer phrasing that only offers the standard Start card. */
   | { kind: "soft" }
-  /** Out of range, or a shape that can't be read safely. One line for him. */
-  | { kind: "refused"; text: string }
   | {
       kind: "direct";
-      /** The message also sends an email first; enrol its thread only after it went out. */
+      /** The message also sends an email first; the follow-ups are for that email. */
       combined: boolean;
       /** The follow-up clause, the only part settings are read from. */
       clause: string;
       /** In a combined message, everything before the clause. */
       emailPart: string;
-      /** Follow-ups Aadi sends, on top of any he sent himself. */
-      followups: number;
-      /** Null means the default gap. */
-      gapDays: number | null;
-      /** Null means the ask in his email. */
-      cta: string | null;
+      /** What could be read for certain. Anything unsure falls back to the standard
+       *  value, and `unsure` says so. */
+      settings: FollowupSettings;
+      /** Every setting he mentioned that wasn't read for certain, in words for him. */
+      unsure: string[];
+      /** The command is one of the plain imperatives that may enrol with no card. */
+      allowlisted: boolean;
       /** "put this email in a follow-up sequence": the email is the one he replied to. */
       thisEmail: boolean;
-      /** The person the follow-up clause names, if any ("... for Jeff"). After a send it
-       *  must be the person the email went to. */
+      /** The person the follow-up clause names, if any. */
       target: string | null;
     };
 
@@ -537,17 +544,20 @@ function nameTokens(value: string): string[] {
 /** "Jeff" and "Jeff Comstock" name the same person; "Jeff" and "Priya" don't. */
 export function namesMatch(left: string, right: string): boolean {
   const a = nameTokens(left);
-  const b = new Set(nameTokens(right));
-  const bList = [...b];
+  const b = nameTokens(right);
   const aSet = new Set(a);
-  return a.length > 0 && bList.length > 0 && (a.every((token) => b.has(token)) || bList.every((token) => aSet.has(token)));
+  const bSet = new Set(b);
+  return a.length > 0 && b.length > 0 && (a.every((token) => bSet.has(token)) || b.every((token) => aSet.has(token)));
 }
 
-/** Sentences of the text, with where each starts. */
+/** Sentences of the text, with where each starts and ends. */
 function sentencesOf(text: string): Array<{ start: number; end: number }> {
   const spans: Array<{ start: number; end: number }> = [];
-  for (const match of text.matchAll(/[^.!?\n]+(?:[.!?]+|$)/g)) {
-    spans.push({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
+  // A dot inside a word (an address, "e.g") doesn't end a sentence.
+  for (const match of text.matchAll(/(?:[^.!?\n]|[.!?](?=[^\s.!?]))+(?:[.!?]+|$)/g)) {
+    if (match[0].trim()) {
+      spans.push({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
+    }
   }
   return spans;
 }
@@ -575,35 +585,50 @@ const SEQUENCE_STOP: readonly RegExp[] = [
   /\b(?:follow[\s-]*ups?|sequences?)\b[^.?!\n]{0,40}?\b(?:not\s+yet|later|hold\s+off)\b/i,
 ];
 
-/** A deferral said on its own: "Start 3 follow-ups for Mayur. Not yet." or "..., but
- *  wait." Counted only when the message asks for follow-ups at all. */
+/** A deferral said on its own ("... Not yet.", "..., but wait.") or at the very end
+ *  ("... asking for a demo Not yet."). Counted when the message asks for follow-ups. */
 const STANDALONE_DEFERRAL =
   /(?:^|[.!?;,]\s*|\b(?:but|and)\s+)(?:not\s+(?:yet|now)|hold\s+off|wait|later|don'?t\s+start(?:\s+(?:it|them|yet))*)\s*(?:[.!?]+\s*|$)/i;
+const END_DEFERRAL = /\b(?:not\s+(?:yet|now)|hold\s+off|later|wait)\s*[.!?]*\s*$/i;
 
 /** His own question or musing, not a request to Aadi: "Can I start 3 follow-ups for
  *  X?", "start a sequence for X?", "I could ...", "maybe ...". "Can you / could you /
- *  please ..." is still a request. */
-const REQUEST_TO_AADI = /^(?:please\s+|pls\s+|kindly\s+)?(?:can|could|would|will)\s+you\b/i;
+ *  would you ..." is still a request. */
+const REQUEST_TO_AADI = /^(?:please\s+)?(?:can|could|would)\s+you\b/i;
 const FIRST_PERSON_MAYBE =
-  /\b(?:can|could|may|might|should|shall|would)\s+(?:i|we)\b|\b(?:i|we)\s+(?:could|might|may|should|would|can)\b|\b(?:thinking|wondering|considering)\s+(?:of|about|whether|if)\b|\bmaybe\b|\bwhat\s+if\b|\bhow\s+about\b/i;
+  /\b(?:can|could|may|might|should|shall|would)\s+(?:i|we)\b|\b(?:i|we)\s+(?:could|might|may|should|would|can|already|just)\b|\b(?:thinking|wondering|considering)\s+(?:of|about|whether|if)\b|\bmaybe\b|\bwhat\s+if\b|\bhow\s+about\b|\bif\b|\bunless\b|\bwhen(?:ever)?\s+(?:he|she|they|i|we)\b|\b(?:asked|told|said|wanted)\s+(?:me|us|him|her|them)?\s*to\b/i;
 
 function isQuestionOrMaybe(text: string): boolean {
   const trimmed = text.trim();
-  if (REQUEST_TO_AADI.test(trimmed)) {
+  if (REQUEST_TO_AADI.test(trimmed) && !FIRST_PERSON_MAYBE.test(trimmed.replace(REQUEST_TO_AADI, ""))) {
     return false;
   }
   return /\?\s*$/.test(trimmed) || FIRST_PERSON_MAYBE.test(trimmed);
 }
 
-/** A spacing he asked for that isn't in days: refused, never swapped for the default. */
+/** The only commands that may enrol with no card: a plain imperative to Aadi,
+ *  optionally after "please", "can you", "could you" or "would you". */
+const ALLOWED_IMPERATIVE =
+  /^(?:please\s+)?(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?(?:start|set\s*up|setup|put|add|begin)\b/i;
+/** In a send-then-follow-ups message, the email part must be a plain imperative too. */
+const EMAIL_IMPERATIVE =
+  /^(?:please\s+)?(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?(?:e-?mail|mail|send|reply|respond|write\s+to|tell)\b/i;
+
+/** A spacing he asked for that isn't in days: never swapped for the default. */
 const INTERVAL_MENTION =
   /\b(?:every|each)\s+(?!one\b|of\b)\S+|\b(?:apart|between|gap|daily|weekly|monthly|fortnightly|biweekly|twice|thrice)\b|\b(?:a|per)\s+(?:day|week|month)\b/i;
 const BEYOND_TWO_WEEKS = /\bmonths?\b|\bmonthly\b|\byears?\b|\byearly\b|\bannual(?:ly)?\b/i;
+/** "A few follow-ups": a count he didn't give. */
+const VAGUE_COUNT =
+  /\b(?:a\s+few|few|several|a\s+couple(?:\s+of)?|couple\s+of|some|many|multiple|a\s+bunch\s+of|lots\s+of|a\s+number\s+of)\s+(?:more\s+)?follow[\s-]*ups?\b/i;
+/** "for Mayur and Raj", "to Mayur, Raj and Priya": more than one person. */
+const PERSON_LIST =
+  /\b(?:for|to|with)\s+(.+?)(?=\s*(?:,\s*)?(?:\b(?:every|each|asking|ask|cta|call[\s-]*to[\s-]*action|gap|daily|weekly|monthly|fortnightly|with\s+(?:a|the)|apart|between|starting|from|on|by|next|this|tomorrow|today|in\s+(?:a|the|my))\b|\d|$|[.!?;]))/i;
 
 /** Where a follow-up clause may start after an email request: "..., and start 3
  *  follow-ups", "... then put it in a sequence", "... . Start follow-ups." */
 const CLAUSE_BOUNDARY =
-  /(?:[.!?;]\s+|,\s*(?:and\s+(?:then\s+)?|then\s+)?|\s+and\s+(?:then\s+|also\s+)?|\s+then\s+|\s+also\s+)(?:(?:please|pls|also|then|can you|could you)\s+)?(?=(?:start|begin|set\s*up|create|kick\s*off|launch|schedule|run|put|add|enrol|move|place|auto|follow)\b)/gi;
+  /(?:[.!?;]\s+|,\s*(?:and\s+(?:then\s+)?|then\s+)?|\s+and\s+(?:then\s+|also\s+)?|\s+then\s+|\s+also\s+)(?:(?:please|also|then|can you|could you|would you)\s+)?(?=(?:start|begin|set\s*up|create|kick\s*off|launch|schedule|run|put|add|enrol|move|place|auto|follow)\b)/gi;
 
 const SEND_IT = /\bsend\s+(?:it|this|that|the\s+(?:draft|email|mail))\b/i;
 
@@ -620,8 +645,21 @@ function asksToSendEmail(text: string): boolean {
 
 /** Where his CTA ends: at the next setting or the end of the clause. */
 const CTA_END = /,|;|\.(?:\s|$)|\s+(?:every|each|daily|weekly|fortnightly)\b|\s+\d+\s+days?\s+apart\b|\s+and\s+(?:every|space|make|send)\b/i;
+const CTA_MAX = 100;
 
-function ctaOf(clause: string): { cta: string; start: number; end: number } | undefined {
+/** What is left of a clause once its settings are taken out; anything else means he
+ *  said something these settings don't cover. */
+const SETTING_FRAGMENTS: readonly RegExp[] = [
+  /\b(?:every|each)\s+other\s+day\b/gi,
+  /\b(?:every|each)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fourteen)\s+(?:days?|weeks?)\b/gi,
+  /\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|a)\s+(?:days?|weeks?)\s+(?:apart|between(?:\s+(?:them|each))?|in\s+between)\b/gi,
+  /\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)[\s-]*days?\s+gap\b|\bgap\s+of\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\b/gi,
+  /\b(?:every|each)\s+(?:day|week)\b|\b(?:daily|weekly|fortnightly)\b|\bevery\s+fortnight\b/gi,
+  /\b(?:with\s+)?(?:a\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?:[\s-]*steps?)?(?:[\s-]+(?:more|automatic|auto))?[\s-]+follow[\s-]*ups?\b/gi,
+];
+const CONNECTIVES = /^(?:[\s,;.:!-]|\b(?:and|with|then|please|thanks|thank\s+you)\b)*$/i;
+
+function ctaOf(clause: string): { cta: string; start: number; end: number } | { unsure: string; start: number; end: number } | undefined {
   const patterns: Array<[RegExp, (value: string) => string]> = [
     [/\b(?:asking|ask|request(?:ing)?)\s+(?:(?:them|him|her|the\s+prospect)\s+)?for\s+/i, (value) => `ask for ${value}`],
     [/\b(?:asking|ask|getting|get|inviting|invite|telling|tell)\s+(?:them|him|her|the\s+prospect|\p{L}[\p{L}'’-]*)\s+to\s+/iu, (value) => `ask them to ${value}`],
@@ -640,73 +678,109 @@ function ctaOf(clause: string): { cta: string; start: number; end: number } | un
     const quoted = /^\s*(?:"([^"]+)"|“([^”]+)”|‘([^’]+)’)/.exec(tail);
     if (quoted) {
       const inner = (quoted[1] ?? quoted[2] ?? quoted[3] ?? "").replace(/\s+/g, " ").trim();
-      if (inner) {
-        return {
-          cta: shape(inner.length > 100 ? inner.slice(0, 100).replace(/\s+\S*$/, "") : inner),
-          start: match.index,
-          end: from + quoted[0].length,
-        };
+      const end = from + quoted[0].length;
+      if (inner.length > CTA_MAX) {
+        return { unsure: `your CTA is longer than ${CTA_MAX} characters`, start: match.index, end };
       }
+      return inner ? { cta: shape(inner), start: match.index, end } : { unsure: "your CTA was empty", start: match.index, end };
+    }
+    if (/^\s*["“‘]/.test(tail)) {
+      return { unsure: "your CTA's quote isn't closed", start: match.index, end: clause.length };
     }
     const stop = CTA_END.exec(tail);
-    let value = (stop ? tail.slice(0, stop.index) : tail)
-      .replace(/["“”]/g, "")
-      .replace(/\s+(?:please|pls|thanks|thank you)$/i, "")
+    const end = from + (stop ? stop.index : tail.length);
+    const value = (stop ? tail.slice(0, stop.index) : tail)
+      .replace(/\s+(?:please|thanks|thank you)$/i, "")
       .replace(/[.!?,;:]+$/, "")
       .replace(/\s+/g, " ")
       .trim();
     if (!value) {
-      continue;
+      return { unsure: "I couldn't read your CTA", start: match.index, end };
     }
-    if (value.length > 100) {
-      value = value.slice(0, 100).replace(/\s+\S*$/, "");
+    if (value.length > CTA_MAX) {
+      return { unsure: `your CTA is longer than ${CTA_MAX} characters`, start: match.index, end };
     }
-    return { cta: shape(value), start: match.index, end: from + (stop ? stop.index : tail.length) };
+    // Anything after the CTA that isn't another setting: unclear where the CTA ends.
+    let rest = clause.slice(end);
+    for (const fragment of SETTING_FRAGMENTS) {
+      rest = rest.replace(fragment, " ");
+    }
+    if (!CONNECTIVES.test(rest)) {
+      return { unsure: "I couldn't tell where your CTA ends (put it in quotes)", start: match.index, end: clause.length };
+    }
+    return { cta: shape(value), start: match.index, end };
   }
   return undefined;
 }
 
 const COUNT_PATTERNS: readonly RegExp[] = [
-  new RegExp(`\\b(${COUNT_WORD})(?:[\\s-]*steps?)?(?:[\\s-]+(?:more|automatic|auto))?[\\s-]+follow[\\s-]*ups?\\b`, "i"),
-  new RegExp(`\\b(${COUNT_WORD})[\\s-]*steps?\\b`, "i"),
-  new RegExp(`\\b(${COUNT_WORD})\\s+(?:more\\s+)?times?\\b`, "i"),
+  new RegExp(`\\b(${COUNT_WORD})(?:[\\s-]*steps?)?(?:[\\s-]+(?:more|automatic|auto))?[\\s-]+follow[\\s-]*ups?\\b`, "gi"),
+  new RegExp(`\\b(${COUNT_WORD})[\\s-]*steps?\\b`, "gi"),
+  new RegExp(`\\b(${COUNT_WORD})\\s+(?:more\\s+)?times?\\b`, "gi"),
 ];
 
-function gapOf(text: string): number | null {
-  const day = (pattern: RegExp, days: (value: number) => number): number | undefined => {
-    const match = pattern.exec(text);
-    if (!match) {
-      return undefined;
+/** Every count he gave: "3 follow-ups", "a 3-step ...", "4 times". */
+function countsOf(text: string): number[] {
+  const values = new Set<number>();
+  for (const pattern of COUNT_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      values.add(numberOf(match[1]!));
     }
-    // The number from whichever alternative matched: "5-day gap" or "gap of 5 days".
-    const value = match.slice(1).find((item) => item !== undefined);
-    return days(value ? numberOf(value) : 1);
+  }
+  return [...values];
+}
+
+/** Every gap he gave, in days. */
+function gapsOf(text: string): number[] {
+  const values = new Set<number>();
+  const add = (pattern: RegExp, days: (value: number) => number): void => {
+    for (const match of text.matchAll(pattern)) {
+      // The number from whichever alternative matched: "5-day gap" or "gap of 5 days".
+      const value = match.slice(1).find((item) => item !== undefined);
+      values.add(days(value ? numberOf(value) : 1));
+    }
   };
-  const found =
-    (/\bevery\s+other\s+day\b/i.test(text) ? 2 : undefined) ??
-    (/\bevery\s+fortnight\b|\bfortnightly\b/i.test(text) ? 14 : undefined) ??
-    day(new RegExp(`\\b(?:every|each)\\s+(${COUNT_WORD})\\s+weeks?\\b`, "i"), (value) => value * 7) ??
-    day(new RegExp(`\\b(${COUNT_WORD}|a)\\s+weeks?\\s+(?:apart|between|in\\s+between)\\b`, "i"), (value) => value * 7) ??
-    day(/\b(?:every|each)\s+week\b|\bweekly\b/i, () => 7) ??
-    day(new RegExp(`\\b(?:every|each)\\s+(${COUNT_WORD})\\s+days?\\b`, "i"), (value) => value) ??
-    day(new RegExp(`\\b(${COUNT_WORD}|a)\\s+days?\\s+(?:apart|between|in\\s+between)\\b`, "i"), (value) => value) ??
-    day(new RegExp(`\\b(${COUNT_WORD})[\\s-]*days?\\s+gap\\b|\\bgap\\s+of\\s+(${COUNT_WORD})\\s+days?\\b`, "i"), (value) => value) ??
-    day(/\b(?:every\s+day|each\s+day|daily)\b/i, () => 1);
-  return found ?? null;
+  add(/\bevery\s+other\s+day\b/gi, () => 2);
+  add(/\bevery\s+fortnight\b|\bfortnightly\b/gi, () => 14);
+  add(new RegExp(`\\b(?:every|each)\\s+(${COUNT_WORD})\\s+weeks?\\b`, "gi"), (value) => value * 7);
+  add(new RegExp(`\\b(${COUNT_WORD}|a)\\s+weeks?\\s+(?:apart|between|in\\s+between)\\b`, "gi"), (value) => value * 7);
+  add(/\b(?:every|each)\s+week\b|\bweekly\b/gi, () => 7);
+  add(new RegExp(`\\b(?:every|each)\\s+(${COUNT_WORD})\\s+days?\\b`, "gi"), (value) => value);
+  add(new RegExp(`\\b(${COUNT_WORD}|a)\\s+days?\\s+(?:apart|between|in\\s+between)\\b`, "gi"), (value) => value);
+  add(new RegExp(`\\b(${COUNT_WORD})[\\s-]*days?\\s+gap\\b|\\bgap\\s+of\\s+(${COUNT_WORD})\\s+days?\\b`, "gi"), (value) => value);
+  add(/\b(?:every\s+day|each\s+day|daily)\b/gi, () => 1);
+  return [...values];
 }
 
 const THIS_EMAIL =
   /\b(?:this|that)\s+(?:e-?mail|mail|message|thread|draft|one)\b|\b(?:put|add|enrol+|move|place)\s+(?:this|that|it)\b/i;
 
+/** Words a plain follow-up command is made of. Anything else in the clause is
+ *  something these settings don't cover ("next week", "in Hindi", "and cc Jeff"), so
+ *  it can't enrol on its own. */
+const COMMAND_WORDS = new Set([
+  "please", "can", "could", "would", "you", "start", "set", "up", "setup", "put", "add", "begin",
+  "a", "an", "the", "my", "new", "another", "automatic", "auto", "email", "mail", "more", "step", "steps",
+  "follow", "ups", "followup", "followups", "sequence", "sequences", "for", "to", "with", "on", "in", "into",
+  "of", "and", "then", "also", "them", "him", "her", "it", "this", "that", "last", "latest", "thread",
+  "message", "draft", "one", "every", "each", "other", "day", "days", "week", "weeks", "apart", "between",
+  "gap", "daily", "weekly", "fortnight", "fortnightly", "now", "thanks", "thank", "pls", "cta",
+  "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "fourteen",
+]);
+
+function leftoverWords(settingsText: string, target: string | null): string[] {
+  const named = new Set(nameTokens(target ?? ""));
+  return nameTokens(settingsText).filter((word) => !COMMAND_WORDS.has(word) && !named.has(word) && !/^\d+$/.test(word));
+}
+const POLITE_TAIL = /^\s*(?:thanks|thank\s+you|thx|please|pls|cheers)[\s.!]*$/i;
+
 /**
  * Reads a follow-up command from his own words. Only the follow-up clause sets
- * anything: in "email Mayur saying ... and start 3 follow-ups", what the email
- * says is never read for numbers. A stop word anywhere wins.
+ * anything: in "email Mayur saying ... and start 3 follow-ups", what the email says
+ * is never read for numbers. A stop word anywhere wins. Whether it may enrol with no
+ * card is decided by decideSequenceAction, from what this returns.
  */
-export function parseSequenceCommand(
-  ownWords: string,
-  options: { target?: string } = {},
-): SequenceCommand {
+export function parseSequenceCommand(ownWords: string): SequenceCommand {
   const text = ownWords.replace(/\s+/g, " ").trim();
   // What he quoted is what an email says; only the rest can be a command.
   const plain = maskQuoted(text);
@@ -717,40 +791,19 @@ export function parseSequenceCommand(
   if (
     SEQUENCE_STOP.some((pattern) => pattern.test(text)) ||
     NOT_A_SEQUENCE_COMMAND[0]!.test(text) ||
-    (explicit && STANDALONE_DEFERRAL.test(text))
+    (explicit && (STANDALONE_DEFERRAL.test(text) || END_DEFERRAL.test(text)))
   ) {
     return { kind: "negated" };
   }
   if (!explicit) {
     return { kind: "none", mentionsFollowups };
   }
-  if (
-    !isDirectSequenceCommand(plain) ||
-    // Any reminder wrapper: at most the Start card, never an enrolment.
-    REMIND_ME.test(plain) ||
-    isQuestionOrMaybe(plain) ||
-    NOT_A_SEQUENCE_COMMAND.slice(1).some((pattern) => pattern.test(plain)) ||
-    ASKED.test(plain) ||
-    ASKED_ABOUT.test(plain) ||
-    PLANNED.test(plain)
-  ) {
-    return { kind: "soft" };
+  const requests = sentencesOf(plain).filter((span) => isExplicitSequenceRequest(plain.slice(span.start, span.end)));
+  if (requests.length > 1) {
+    return { kind: "several" };
   }
-  // Several people, each with their own settings: read only this person's sentence.
-  if (options.target) {
-    const commands = sentencesOf(plain).filter((span) => isDirectSequenceCommand(plain.slice(span.start, span.end)));
-    if (commands.length > 1) {
-      const mine = commands.filter((span) =>
-        (sequenceTargets(text.slice(span.start, span.end)) ?? []).some((name) => namesMatch(name, options.target!)),
-      );
-      if (mine.length !== 1) {
-        return {
-          kind: "refused",
-          text: `Not started: I couldn't tell which follow-up settings were for ${options.target}. Say them in a message of their own.`,
-        };
-      }
-      return parseSequenceCommand(text.slice(mine[0]!.start, mine[0]!.end));
-    }
+  if (!isDirectSequenceCommand(plain)) {
+    return { kind: "soft" };
   }
   let clause = text;
   let emailPart = "";
@@ -765,50 +818,79 @@ export function parseSequenceCommand(
       break;
     }
   }
-  if (!combined && asksToSendEmail(plain)) {
-    return {
-      kind: "refused",
-      text: "Not started: say the email first, then the follow-ups, e.g. \"email Mayur saying … and start 3 follow-ups\".",
-    };
+  const clausePlain = maskQuoted(clause);
+  const people = PERSON_LIST.exec(clausePlain)?.[1] ?? "";
+  // "to the follow-up sequence, one follow-up" is where they go, not a list of people.
+  if (!/\bfollow[\s-]*ups?\b|\bsequences?\b/i.test(people) && /,\s*\p{Lu}|\s(?:and|&)\s+\p{Lu}/u.test(people)) {
+    return { kind: "several" };
+  }
+  const unsure: string[] = [];
+  const clauseSentences = sentencesOf(clausePlain);
+  const extra = clauseSentences.slice(1).some((span) => !POLITE_TAIL.test(clause.slice(span.start, span.end)));
+  if (extra || (!combined && asksToSendEmail(plain))) {
+    unsure.push("your message says more than the follow-up command");
   }
   const cta = ctaOf(clause);
+  if (cta && "unsure" in cta) {
+    unsure.push(cta.unsure);
+  }
   const settingsText = cta ? `${clause.slice(0, cta.start)} ${clause.slice(cta.end)}` : clause;
   let followups: number = COMMAND_FOLLOWUPS.default;
-  for (const pattern of COUNT_PATTERNS) {
-    const match = pattern.exec(settingsText);
-    if (match) {
-      followups = numberOf(match[1]!);
-      break;
+  const counts = countsOf(settingsText);
+  if (VAGUE_COUNT.test(settingsText)) {
+    unsure.push("I couldn't tell how many follow-ups you want");
+  } else if (counts.length > 1) {
+    unsure.push("you gave more than one number of follow-ups");
+  } else if (counts.length === 1) {
+    const count = counts[0]!;
+    if (Number.isInteger(count) && count >= COMMAND_FOLLOWUPS.min && count <= COMMAND_FOLLOWUPS.max) {
+      followups = count;
+    } else {
+      unsure.push(`${Number.isNaN(count) ? "that many" : count} follow-ups is outside ${COMMAND_FOLLOWUPS.min} to ${COMMAND_FOLLOWUPS.max}`);
     }
   }
-  if (!Number.isInteger(followups) || followups < COMMAND_FOLLOWUPS.min || followups > COMMAND_FOLLOWUPS.max) {
-    return { kind: "refused", text: `Not started: follow-ups can be ${COMMAND_FOLLOWUPS.min} to ${COMMAND_FOLLOWUPS.max}.` };
+  let gapDays: number | null = null;
+  const gaps = gapsOf(settingsText);
+  if (gaps.length > 1) {
+    unsure.push("you gave more than one gap");
+  } else if (gaps.length === 1) {
+    const gap = gaps[0]!;
+    if (Number.isInteger(gap) && gap >= COMMAND_GAP_DAYS.min && gap <= COMMAND_GAP_DAYS.max) {
+      gapDays = gap;
+    } else {
+      unsure.push(`a gap of ${gap} days is outside ${COMMAND_GAP_DAYS.min} to ${COMMAND_GAP_DAYS.max}`);
+    }
+  } else if (INTERVAL_MENTION.test(settingsText)) {
+    unsure.push(
+      BEYOND_TWO_WEEKS.test(settingsText)
+        ? `that gap is more than ${COMMAND_GAP_DAYS.max} days`
+        : `I can only space follow-ups in days, ${COMMAND_GAP_DAYS.min} to ${COMMAND_GAP_DAYS.max} apart`,
+    );
   }
-  const gapDays = gapOf(settingsText);
-  if (gapDays === null && INTERVAL_MENTION.test(settingsText)) {
-    return {
-      kind: "refused",
-      text: BEYOND_TWO_WEEKS.test(settingsText)
-        ? `Not started: the gap can be ${COMMAND_GAP_DAYS.min} to ${COMMAND_GAP_DAYS.max} days.`
-        : "Not started: give the gap in days, 1 to 14 (e.g. 'every 3 days').",
-    };
+  const target = sequenceTargets(clause)?.[0] ?? null;
+  const leftover = leftoverWords(settingsText, target);
+  if (leftover.length > 0 && !unsure.includes("your message says more than the follow-up command")) {
+    unsure.push(`I don't act on "${leftover.join(" ")}" on my own`);
   }
-  if (
-    gapDays !== null &&
-    (!Number.isInteger(gapDays) || gapDays < COMMAND_GAP_DAYS.min || gapDays > COMMAND_GAP_DAYS.max)
-  ) {
-    return { kind: "refused", text: `Not started: the gap can be ${COMMAND_GAP_DAYS.min} to ${COMMAND_GAP_DAYS.max} days.` };
-  }
+  const allowlisted =
+    ALLOWED_IMPERATIVE.test(clause.trim()) &&
+    (!combined || EMAIL_IMPERATIVE.test(emailPart)) &&
+    !isQuestionOrMaybe(plain) &&
+    !REMIND_ME.test(plain) &&
+    !NOT_A_SEQUENCE_COMMAND.slice(1).some((pattern) => pattern.test(plain)) &&
+    !ASKED.test(plain) &&
+    !ASKED_ABOUT.test(plain) &&
+    !PLANNED.test(plain);
   return {
     kind: "direct",
     combined,
     clause,
     emailPart,
-    followups,
-    gapDays,
-    cta: cta?.cta ?? null,
+    settings: { followups, gapDays, cta: cta && "cta" in cta ? cta.cta : null },
+    unsure,
+    allowlisted,
     thisEmail: THIS_EMAIL.test(clause),
-    target: sequenceTargets(clause)?.[0] ?? null,
+    target,
   };
 }
 
@@ -871,7 +953,7 @@ export function sequenceTargets(ownWords: string): string[] | undefined {
         "",
       )
       .replace(
-        /\s+(?:on|by|next|this|tomorrow|today|tonight|in|after|about|regarding|re)\b.*$/i,
+        /\s+(?:on|by|next|this|tomorrow|today|tonight|in|after|about|regarding|re|starting|from|instead|via|using|through|except|but|unless|if|when|before|until|because|since|so|or|as|like|same|only|without|and|then)\b.*$/i,
         "",
       )
       .replace(/[.!?,;:]+\s*$/, "")

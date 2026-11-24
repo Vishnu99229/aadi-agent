@@ -10,6 +10,7 @@ import {
   sequenceTargets,
 } from "../src/command_intent.ts";
 import { getRecentMessages, getSalesSequenceByThread, listSalesSequenceSteps, saveMessage } from "../src/db.ts";
+import { setSequenceTestHooks } from "../src/sequences.ts";
 import type { gmail_v1 } from "googleapis";
 import {
   backendForcesTools,
@@ -507,6 +508,7 @@ saveMessage("assistant", "Marked the Airtel bill paid. Next one due is LinkedIn 
   } as unknown as gmail_v1.Gmail;
   setGmailClientForTests(() => sequenceGmail);
   setGoogleAccountForTests((id) => ({ id, tag: id, label: id, client: {} }) as LoadedGoogleAccount);
+  setSequenceTestHooks({ telegram: fakeTelegramApi({ sent: [], edited: [] }) });
   const results: string[] = [];
   setToolInterceptorForTests((call: ToolCall, turn: ToolTurn) => {
     ran.push({ name: call.name, input: call.input, turn });
@@ -539,11 +541,15 @@ saveMessage("assistant", "Marked the Airtel bill paid. Next one due is LinkedIn 
     calls.every((item) => item.turn.ownTurn === true && item.turn.confirmation?.messageId === nextMessage),
     "both run on his own message, as his own turn",
   );
+  assert(calls[0]!.turn.modelCalled !== true, "the code run is not the model's call");
+  assert(calls[1]!.turn.modelCalled === true, "the model's own call is marked as such");
+  assert(
+    results.some((text) => text.startsWith("Start card sent for Dorothy Copeland")),
+    `the code run only offered a card: ${JSON.stringify(results)}`,
+  );
   const row = getSalesSequenceByThread("t-dorothy");
-  assert(row?.status === "active", "Dorothy is enrolled");
+  assert(row?.status === "active", "the model's own call enrolled Dorothy");
   assert(listSalesSequenceSteps(row!.id).length === 3, "exactly once: three steps, not six");
-  const started = [...new Set(results.filter((text) => text.startsWith("Started 3 follow-ups to Dorothy Copeland")))];
-  assert(started.length === 1, `both runs report the same start: ${JSON.stringify(results)}`);
 }
 
 // A forwarded message is never a command, whatever it says.

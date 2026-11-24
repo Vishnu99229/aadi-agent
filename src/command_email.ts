@@ -857,7 +857,8 @@ function parseSendAt(
 /** The owner's command, typed or spoken. */
 export async function sendEmailFromTool(
   input: unknown,
-  turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn">,
+  /** directSend: a path with no model after it (the referenced-email send in bot.ts). */
+  turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & { directSend?: boolean },
   now = new Date(),
 ): Promise<string> {
   if (!config.sendOnCommandEnabled) {
@@ -924,8 +925,7 @@ export async function sendEmailFromTool(
     pendingEmail.scheduledSendId
   ) {
     const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId);
-    const followups = await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok);
-    return followups ? `${delivered.message}\n${followups}` : delivered.message;
+    return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok));
   }
   let toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
@@ -1023,26 +1023,38 @@ export async function sendEmailFromTool(
     sentMessageId: outcome.result === "sent" ? outcome.messageId : undefined,
     account: request.account,
     recipient: first?.mailbox?.name.trim().split(/\s+/)[0] || first?.query || "them",
+    recipientMailbox: first?.mailbox ? { name: first.mailbox.name, email: first.mailbox.email } : undefined,
   });
-  return followups
-    ? `${outcome.text}\n${followups}${outcome.hint ? ` ${outcome.hint}` : ""}`
-    : asToolResult(outcome);
+  if (!followups.text && !followups.hint) {
+    return asToolResult(outcome);
+  }
+  const hint = [outcome.hint, followups.hint].filter(Boolean).join(" ");
+  return `${outcome.text}${followups.text ? `\n${followups.text}` : ""}${hint ? ` ${hint}` : ""}`;
 }
 
-/** After a draft he confirmed by message: follow-ups from the same message, only if
- *  this exact send went out. */
+type FollowupTurn = Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & { directSend?: boolean };
+
+/** A send result with what the same message's follow-ups came to. */
+export function withFollowups(message: string, followups: { text?: string; hint?: string }): string {
+  return [message, followups.text, followups.hint].filter(Boolean).join("\n");
+}
+
+/** After a draft he confirmed by message: the follow-ups from the same message, only
+ *  if this exact send went out. */
 export async function followupsAfterDraftSend(
-  turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn">,
+  turn: FollowupTurn,
   draftId: string,
   sent: boolean,
-): Promise<string | undefined> {
+): Promise<{ text?: string; hint?: string }> {
   const delivered = sent ? sentMessageForDraft(draftId) : undefined;
+  const to = parseAddressList(delivered?.to_header ?? "")[0];
   return followupsAfterSend({
     turn,
     result: delivered?.sent_message_id ? "sent" : "not_sent",
     sentMessageId: delivered?.sent_message_id ?? undefined,
     account: delivered?.google_account ?? "work",
-    recipient: "them",
+    recipient: to?.name.trim().split(/\s+/)[0] || to?.email || "them",
+    recipientMailbox: to ? { name: to.name, email: to.email } : undefined,
   });
 }
 

@@ -4,7 +4,7 @@ import {
   eligibleDrafts,
   sendPendingDraftByText,
 } from "../approvals.js";
-import { followupsAfterDraftSend } from "../command_email.js";
+import { followupsAfterDraftSend, withFollowups } from "../command_email.js";
 import { isAmbiguousSendAck } from "../send_triggers.js";
 import type { ToolTurn } from "./index.js";
 
@@ -65,6 +65,5 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   }
   const result = await sendPendingDraftByText(turn.confirmation, draftId);
   // "Send it and start 3 follow-ups": only if this exact draft went out.
-  const followups = await followupsAfterDraftSend(turn, draftId, result.ok);
-  return followups ? `${result.message}\n${followups}` : result.message;
+  return withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok));
 }

@@ -1584,6 +1584,7 @@ function localHour(at: Date, zone: string): number {
       confirmation: { chatId: 1, messageId: 5001 },
       userText: "start 5 follow-ups to Hana every 3 days, ask them to book a call",
       ownTurn: true,
+      modelCalled: true,
     },
     api,
   );
@@ -1665,7 +1666,7 @@ function localHour(at: Date, zone: string): number {
   });
   const reply = await startSequenceFromTool(
     "Ivo",
-    { confirmation: { chatId: 1, messageId: 5002 }, userText: "start 2 follow-ups to Ivo", ownTurn: true },
+    { confirmation: { chatId: 1, messageId: 5002 }, userText: "start 2 follow-ups to Ivo", ownTurn: true, modelCalled: true },
     api,
   );
   assert(reply.startsWith(`Started 2 follow-ups to Ivo Pinto (${email}), every 2 days, CTA: same ask as your email.`), reply);
