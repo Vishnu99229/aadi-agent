@@ -9,7 +9,8 @@ import {
   echoesEarlierReply,
   sequenceTargets,
 } from "../src/command_intent.ts";
-import { getRecentMessages, saveMessage } from "../src/db.ts";
+import { getRecentMessages, getSalesSequenceByThread, listSalesSequenceSteps, saveMessage } from "../src/db.ts";
+import type { gmail_v1 } from "googleapis";
 import {
   backendForcesTools,
   openAiToolChoice,
@@ -470,6 +471,79 @@ saveMessage("assistant", "Marked the Airtel bill paid. Next one due is LinkedIn 
   assert(reply === "Jeff said Monday works.", `a question is answered as usual, got: ${reply}`);
   assert(seen.every((params) => params.toolChoice === undefined), "nothing is forced");
   assert(seen.filter((params) => params.tools.length > 0).length === 1, "and nothing is retried");
+}
+
+// C: the code-run start_sequence and the model's own call on the same message enrol once.
+{
+  reset();
+  const ME = "vishnu.rajan@epicode.in";
+  const dorothy = {
+    id: "dm1",
+    threadId: "t-dorothy",
+    internalDate: String(Date.now() - 24 * 60 * 60 * 1000),
+    labelIds: ["SENT"],
+    payload: {
+      mimeType: "text/plain",
+      headers: [
+        { name: "From", value: `Vishnu Rajan <${ME}>` },
+        { name: "To", value: "Dorothy Copeland <dorothy.copeland@nice.com>" },
+        { name: "Subject", value: "Exploring a Telephony Technology Partnership with NiCE" },
+      ],
+      body: { data: Buffer.from("Hi Dorothy", "utf8").toString("base64url") },
+    },
+  };
+  const sequenceGmail = {
+    users: {
+      getProfile: async () => ({ data: { emailAddress: ME } }),
+      settings: { sendAs: { list: async () => ({ data: { sendAs: [{ sendAsEmail: ME }] } }) } },
+      threads: { get: async () => ({ data: { id: "t-dorothy", messages: [dorothy] } }) },
+      messages: {
+        list: async ({ q }: { q: string }) => ({
+          data: { messages: /^from:/.test(q) ? [] : [{ id: "dm1", threadId: "t-dorothy" }] },
+        }),
+        get: async () => ({ data: dorothy }),
+      },
+    },
+  } as unknown as gmail_v1.Gmail;
+  setGmailClientForTests(() => sequenceGmail);
+  setGoogleAccountForTests((id) => ({ id, tag: id, label: id, client: {} }) as LoadedGoogleAccount);
+  const results: string[] = [];
+  setToolInterceptorForTests((call: ToolCall, turn: ToolTurn) => {
+    ran.push({ name: call.name, input: call.input, turn });
+    return undefined;
+  });
+  let modelCalled = false;
+  setCompleteForTests(async (params) => {
+    seen.push(params);
+    if (params.tools.length === 0) {
+      return modelReply({ text: '{"facts":[]}' });
+    }
+    const codeRan = params.messages.some(
+      (message) => message.role === "assistant" && (message.toolCalls ?? []).some((call) => call.id.startsWith("code_start_sequence_")),
+    );
+    for (const message of params.messages) {
+      if (message.role === "tool") {
+        results.push(String(message.content));
+      }
+    }
+    if (codeRan && !modelCalled) {
+      modelCalled = true;
+      return modelReply({ tools: [{ name: "start_sequence", input: { prospect: "Dorothy" } }] });
+    }
+    return modelReply({ text: codeRan ? "Done." : "Sure, on it." });
+  });
+  await say("start 3 follow-ups for Dorothy Copeland", { backend: "claude" });
+  const calls = ran.filter((item) => item.name === "start_sequence");
+  assert(calls.length === 2, `the code run and the model's own call both ran, got ${calls.length}`);
+  assert(
+    calls.every((item) => item.turn.ownTurn === true && item.turn.confirmation?.messageId === nextMessage),
+    "both run on his own message, as his own turn",
+  );
+  const row = getSalesSequenceByThread("t-dorothy");
+  assert(row?.status === "active", "Dorothy is enrolled");
+  assert(listSalesSequenceSteps(row!.id).length === 3, "exactly once: three steps, not six");
+  const started = [...new Set(results.filter((text) => text.startsWith("Started 3 follow-ups to Dorothy Copeland")))];
+  assert(started.length === 1, `both runs report the same start: ${JSON.stringify(results)}`);
 }
 
 // A forwarded message is never a command, whatever it says.

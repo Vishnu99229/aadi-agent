@@ -558,7 +558,7 @@ export async function runSequenceTick(
       if (!live) {
         continue;
       }
-      if (live.followupsSoFar >= SEQUENCE_STEPS) {
+      if (live.followupsSoFar >= totalSteps(fresh)) {
         await stopSequence(fresh, "followups_used_up");
         result.stopped += 1;
         continue;
@@ -622,8 +622,14 @@ export async function runSequenceTick(
   return result;
 }
 
+/** How many follow-ups this sequence has in all: 4 for a Start tap, his own number
+ *  (plus any he sent himself) for a command. */
+function totalSteps(row: SalesSequenceRecord): number {
+  return row.total_steps ?? SEQUENCE_STEPS;
+}
+
 function progress(row: SalesSequenceRecord): string {
-  return `${row.manual_followups + row.steps_sent} of ${SEQUENCE_STEPS} follow-ups sent`;
+  return `${row.manual_followups + row.steps_sent} of ${totalSteps(row)} follow-ups sent`;
 }
 
 /** The owner's stop, typed or spoken. The tool result is exactly what was stopped. */
@@ -707,7 +713,7 @@ export function sequencesPanel(now = new Date()): {
   }
   const lines = rows.map(
     (row) =>
-      `- ${zoneLine(row)}\n  step ${row.current_step} of ${SEQUENCE_STEPS}, ${nextSendLabel(row, now)}`,
+      `- ${zoneLine(row)}\n  step ${row.current_step} of ${totalSteps(row)}, ${nextSendLabel(row, now)}`,
   );
   const off = config.sequencesEnabled
     ? ""

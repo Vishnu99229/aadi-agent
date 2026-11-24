@@ -1,4 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
+import { isOwnChatTurn } from "../src/agents/dispatch.ts";
+import { allowOwnTurnSequenceEnrollment } from "../src/security/send_approval.ts";
 import { join } from "node:path";
 import type { Api } from "grammy";
 import type { gmail_v1 } from "googleapis";
@@ -668,6 +670,44 @@ assert(
   assert(
     agentSrc.includes("const result = await runTool(call, turn, allowedTools);"),
     "a start_sequence run in code goes through runTool and the tool's own owner check",
+  );
+}
+{
+  // Enrolling with no Start tap needs his own chat turn: not a delegated goal, a
+  // workflow step, a forwarded message, A2A or a background job.
+  const confirmation = { chatId: 1, messageId: 2 };
+  const ownerGrant = { source: "owner_chat" as const, confirmation };
+  assert(isOwnChatTurn({ origin: "chat", depth: 0, grant: ownerGrant as never }, confirmation), "his own chat turn counts");
+  assert(!isOwnChatTurn({ origin: "delegate", depth: 1, grant: ownerGrant as never }, confirmation), "a delegated goal doesn't");
+  assert(!isOwnChatTurn({ origin: "chat", depth: 1, grant: ownerGrant as never }, confirmation), "nor anything below the top level");
+  assert(!isOwnChatTurn({ origin: "background", depth: 0, grant: ownerGrant as never }, confirmation), "nor a background job");
+  assert(!isOwnChatTurn({ origin: "a2a", depth: 0, grant: { source: "remote_agent" } as never }, confirmation), "nor A2A");
+  assert(!isOwnChatTurn({ origin: "chat", depth: 0, grant: { source: "forwarded" } as never }, undefined), "nor a forwarded message");
+  assert(!isOwnChatTurn({ origin: "chat", depth: 0, grant: ownerGrant as never }, undefined), "nor a turn without his confirmation");
+  const refuses = (turn: Parameters<typeof allowOwnTurnSequenceEnrollment>[0]): boolean => {
+    try {
+      allowOwnTurnSequenceEnrollment(turn);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  assert(!refuses({ confirmation, ownTurn: true }), "his own turn may enrol");
+  assert(refuses({ confirmation, ownTurn: false }), "a delegated turn may not");
+  assert(refuses({ confirmation }), "an unmarked turn may not");
+  assert(refuses({ ownTurn: true }), "nor a turn without his confirmation");
+  const dispatchSrc = await readFile(join(root, "src/agents/dispatch.ts"), "utf8");
+  assert(
+    dispatchSrc.includes("ownTurn: isOwnChatTurn(ctx, turn.confirmation)"),
+    "the own-turn mark is set in dispatch from the turn context, never taken from the caller",
+  );
+  const sequencesSrc = await readFile(join(root, "src/sequences.ts"), "utf8");
+  const enrol = sequencesSrc.slice(sequencesSrc.indexOf("async function enrolByCommand("));
+  const enrolBody = enrol.slice(0, enrol.indexOf("\n}\n"));
+  assert(
+    enrolBody.includes("allowOwnTurnSequenceEnrollment(turn)") &&
+      enrolBody.indexOf("allowOwnTurnSequenceEnrollment(turn)") < enrolBody.indexOf("enrolProposed("),
+    "a command enrolment checks his own turn before it enrols",
   );
 }
 for (const tool of ["set_sequence_timezone", "add_sales_fact", "list_sales_facts", "remove_sales_fact"]) {

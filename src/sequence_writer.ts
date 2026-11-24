@@ -22,6 +22,7 @@ import { freeSlotsForOffer } from "./meeting_book.js";
 import { htmlFromSchedulingBody } from "./security/auto_book.js";
 import { formatOfferSlot } from "./meeting_slots.js";
 import { salesFactsText } from "./sales_facts.js";
+import { SEQUENCE_STEPS } from "./sequence_logic.js";
 import { slotInProspectHours } from "./sequence_rules.js";
 import { slotDisplayZone } from "./sequence_timezone.js";
 
@@ -51,23 +52,75 @@ export function askPhrase(ask: SalesOriginalAsk): { short: string; offer: string
   return { short: "a meeting", offer: "a 15-20 minute meeting" };
 }
 
-const NO_LENGTH = "Don't say how long it would take.";
+const NO_LENGTH_INFERRED = "Don't say how long it would take.";
 
-/** Step 3 with times lists them; with none that suit both sides it asks for one. */
-export function stepBrief(stepNo: number, ask: SalesOriginalAsk, hasSlots = true): string {
+/** Times are offered once: on step 3 when there are 4 or more, otherwise on the last. */
+export function slotStep(total: number): number {
+  return total >= 4 ? 3 : total;
+}
+
+const MEETING_ASK =
+  /\b(?:meet(?:ing)?s?|calls?|demos?|chats?|discussions?|catch[\s-]*ups?|conversations?|sessions?|walk[\s-]*throughs?|slots?|times?|appointments?)\b/i;
+
+/** Times go only with an ask for a meeting, call or demo. The inferred ask always is one. */
+export function offersTimes(cta: string | null | undefined): boolean {
+  return !cta || MEETING_ASK.test(cta);
+}
+
+type StepAngle = "curiosity" | "value" | "technical" | "proof" | "timing" | "final";
+
+/** The last step is the final note; earlier ones take a new angle each, in this order. */
+function stepAngle(stepNo: number, total: number): StepAngle {
+  if (total > 1 && stepNo === total) {
+    return "final";
+  }
+  const order: StepAngle[] = ["curiosity", "value", "technical", "proof", "timing"];
+  if (stepNo <= order.length) {
+    return order[stepNo - 1]!;
+  }
+  return (["value", "technical", "proof"] as const)[(stepNo - order.length - 1) % 3]!;
+}
+
+/** One step's brief. Steps 1 to 4 of 4 read exactly as they always have. The time
+ *  step lists the times, or with none that suit both sides asks for one. His own
+ *  CTA, when he gave one, replaces the ask inferred from his email. */
+export function stepBrief(
+  stepNo: number,
+  ask: SalesOriginalAsk,
+  hasSlots = true,
+  total: number = SEQUENCE_STEPS,
+  cta?: string | null,
+): string {
   const { short, offer } = askPhrase(ask);
-  if (stepNo === 1) {
-    return `Curiosity. Introduce a relevant opportunity or challenge that makes them curious about a conversation. Refer lightly to your earlier email, give the one point from SALES FACTS most relevant to their business, and end with one clear ask for ${short}. ${NO_LENGTH}`;
+  const angle = stepAngle(stepNo, total);
+  const timesHere = stepNo === slotStep(total) && offersTimes(cta);
+  const times = !timesHere
+    ? ""
+    : hasSlots
+      ? ` Put the exact token ${SLOTS_TOKEN} on its own line where the times go; it is replaced with the real times, so never write a date or time yourself. Ask whether one of them suits, or what would.`
+      : " Ask them for a day and time that suits them, in their own time zone. Never write a date or time yourself.";
+  // His own CTA may name a length; then only that one is allowed.
+  const NO_LENGTH = cta ? "Don't add a length he didn't give." : NO_LENGTH_INFERRED;
+  const endAsk = cta ? `end with this one clear ask: ${cta}.` : `end with one clear ask for ${short}.`;
+  const EndAsk = cta ? `End with this one clear ask: ${cta}.` : `End with one clear ask for ${short}.`;
+  if (angle === "curiosity") {
+    return `Curiosity. Introduce a relevant opportunity or challenge that makes them curious about a conversation. Refer lightly to your earlier email, give the one point from SALES FACTS most relevant to their business, and ${endAsk}${times} ${NO_LENGTH}`;
   }
-  if (stepNo === 2) {
-    return `Business value. Take a different angle from every earlier email: highlight a potential revenue opportunity, cost efficiency, faster deployment or competitive advantage from SALES FACTS. End with one clear ask for ${short}. ${NO_LENGTH}`;
+  if (angle === "value") {
+    return `Business value. Take a different angle from every earlier email: highlight a potential revenue opportunity, cost efficiency, faster deployment or competitive advantage from SALES FACTS. ${EndAsk}${times} ${NO_LENGTH}`;
   }
-  if (stepNo === 3) {
-    return hasSlots
-      ? `Technical differentiation. Introduce a relevant technical capability or integration and why it matters to their business. Then a low-friction offer: ${offer}. Put the exact token ${SLOTS_TOKEN} on its own line where the times go; it is replaced with the real times, so never write a date or time yourself. Ask whether one of them suits, or what would.`
-      : `Technical differentiation. Introduce a relevant technical capability or integration and why it matters to their business. Then a low-friction offer: ${offer}. Ask them for a day and time that suits them, in their own time zone. Never write a date or time yourself.`;
+  if (angle === "technical") {
+    return `Technical differentiation. Introduce a relevant technical capability or integration and why it matters to their business. Then a low-friction offer: ${cta ?? offer}.${times}`;
   }
-  return `Meeting conversion. Make a concise, confident final case for exploring the opportunity together. Invite them to ${offer}. Say this is your last note on it, and leave the door open for ${short} whenever it suits them. ${NO_LENGTH}`;
+  if (angle === "proof") {
+    return `Proof. Share one relevant customer example or result from SALES FACTS, described as what that customer did, and why it matters to their business. ${EndAsk}${times} ${NO_LENGTH}`;
+  }
+  if (angle === "timing") {
+    return `Timing. A short, low-pressure check on whether this is a priority for them this quarter, or who the right person to speak to would be. ${EndAsk}${times} ${NO_LENGTH}`;
+  }
+  return cta
+    ? `Final note. Make a concise, confident final case for exploring the opportunity together. Close with this ask: ${cta}.${times} Say this is your last note on it, and leave the door open whenever it suits them. ${NO_LENGTH}`
+    : `Meeting conversion. Make a concise, confident final case for exploring the opportunity together. Invite them to ${offer}.${times} Say this is your last note on it, and leave the door open for ${short} whenever it suits them. ${NO_LENGTH}`;
 }
 
 export const WRITER_SYSTEM = `You are an expert B2B sales strategist representing Epicode (epicode.in), writing as Vishnu Rajan. Your goal is to generate highly personalised follow-up emails that create curiosity, communicate business value and convert prospects into qualified meetings. The recipient has not replied. The body is sent exactly as you write it, with no review.
@@ -101,6 +154,7 @@ Each email must introduce a new reason for the prospect to engage. Use SEQUENCE 
 - Step 2 (Business Value): Highlight potential revenue opportunities, cost efficiencies, faster deployment or competitive advantages relevant to their business.
 - Step 3 (Technical Differentiation): Introduce a relevant technical capability or integration possibility and explain why it matters to their business. If THIS FOLLOW-UP includes the exact token ${SLOTS_TOKEN}, put that token on its own line where times should go, and never write a date or time yourself.
 - Step 4 (Meeting Conversion): Make a concise, confident final case for exploring the opportunity together. Invite them to a 15 to 20-minute discussion.
+- A sequence can have 1 to 9 steps. SEQUENCE STEP says which step this is and how many there are, and THIS FOLLOW-UP gives its angle: follow it even where it differs from the list above. Only the last step says it is your last note.
 
 ## 3. Personalisation and Writing Rules
 - Analyse the prospect's company, website, designation, products and business model wherever information is available.
@@ -386,10 +440,12 @@ export function writerInput(input: {
   context: StepContext;
 }): string {
   const { short } = askPhrase(input.ask);
+  const total = input.sequence.total_steps ?? SEQUENCE_STEPS;
+  const cta = input.sequence.cta;
   return [
-    `SEQUENCE STEP: ${input.stepNo}`,
-    `THIS FOLLOW-UP: ${stepBrief(input.stepNo, input.ask, input.hasSlots)}`,
-    `THE ASK: ${short}`,
+    `SEQUENCE STEP: ${input.stepNo} of ${total}`,
+    `THIS FOLLOW-UP: ${stepBrief(input.stepNo, input.ask, input.hasSlots, total, cta)}`,
+    `THE ASK: ${cta ?? short}`,
     `ORIGINAL SUBJECT: ${input.sequence.subject}`,
     `RECIPIENT: ${input.sequence.prospect_name || input.sequence.prospect_email}${input.sequence.prospect_company ? `, ${input.sequence.prospect_company}` : ""}`,
     `SALES FACTS:\n${input.facts || "(none)"}`,
@@ -476,8 +532,11 @@ export async function prepareSequenceStep(
     if (!context) {
       return finish({ kind: "deferred", reason: "writer_failed" });
     }
-    const ask = await ensureOriginalAsk(sequence, context);
-    const slotLines = step.step_no === 3 ? await offerSlots(now, sequence.prospect_timezone) : [];
+    // His own CTA replaces the ask in his email, so the model needn't work it out.
+    const ask = sequence.cta ? "meeting" : await ensureOriginalAsk(sequence, context);
+    const total = sequence.total_steps ?? SEQUENCE_STEPS;
+    const timesStep = step.step_no === slotStep(total) && offersTimes(sequence.cta);
+    const slotLines = timesStep ? await offerSlots(now, sequence.prospect_timezone) : [];
     const hasSlots = slotLines.length > 0;
     const written = await writeDraft({
       stepNo: step.step_no,
@@ -487,7 +546,7 @@ export async function prepareSequenceStep(
       sequence,
       context,
     });
-    if (step.step_no === 3 && hasSlots && !written.includes(SLOTS_TOKEN)) {
+    if (timesStep && hasSlots && !written.includes(SLOTS_TOKEN)) {
       throw new Error("Sequence writer left out the times.");
     }
     body = written

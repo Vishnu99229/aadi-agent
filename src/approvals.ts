@@ -15,6 +15,7 @@ import {
   recordScheduledSendSent,
   setPendingActionDraftMeta,
   setPendingActionTelegramMessage,
+  setPendingActionSentMessage,
   transitionPendingAction,
   type GoogleAccountId,
   type PendingAction,
@@ -530,6 +531,15 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
       await afterDraftSend(draftId, sentMessageId);
     } catch {
       console.log(`Approval action ${action.id}: after-send hook failed`);
+    }
+  }
+  if (sentMessageId) {
+    // Recorded only, so "put this email in a follow-up sequence" can find it. It
+    // never decides a send, and a failure here never changes the outcome.
+    try {
+      setPendingActionSentMessage(action.id, sentMessageId);
+    } catch {
+      console.log(`Approval action ${action.id}: sent message not recorded`);
     }
   }
   if (!transitionPendingAction(action.id, "pending", "sent")) {

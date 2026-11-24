@@ -433,6 +433,43 @@ const ADD_TO_SEQUENCE =
 const PROPOSE_SEQUENCE =
   /\b(?:propose|offer|show|prepare)\b[^.?!\n]{0,50}\bfollow[\s-]*up\s+sequences?\b/i;
 
+/** Follow-ups he may ask for by command, and the gap between them in days. */
+export const COMMAND_FOLLOWUPS = { min: 1, max: 6, default: 3 } as const;
+export const COMMAND_GAP_DAYS = { min: 1, max: 14 } as const;
+
+export const COUNT_WORD =
+  "(?:\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)";
+const NOT_A_THING = `(?!\\s+(?:${FOLLOW_UP_THING})\\b)`;
+/** "start a 3-step follow-up to X", "set up 5 follow-ups", "start follow-ups for X". */
+const START_FOLLOWUPS = new RegExp(
+  `\\b(?:start|begin|set\\s*up|create|kick\\s*off|launch|schedule|run)\\b(?:\\s+(?:a|an|the|my|new|another|automatic|auto|email|more|${COUNT_WORD}(?:[\\s-]*steps?)?|steps?)){0,4}\\s+(?:(?:follow[\\s-]*up\\s+)?sequences?|follow[\\s-]*ups?)\\b${NOT_A_THING}`,
+  "i",
+);
+/** "put my email to X in a follow-up sequence", "add X to follow-ups", "add this to the sequence". */
+const PUT_IN_FOLLOWUPS = new RegExp(
+  `\\b(?:put|add|enrol+|move|place)\\b[^.?!\\n]{0,80}?\\b(?:in|into|to|on)\\s+(?:(?:a|an|the|my)\\s+)?(?:(?:automatic|auto|email|new)\\s+)?(?:(?:follow[\\s-]*up\\s+)?sequences?|follow[\\s-]*ups?)\\b${NOT_A_THING}`,
+  "i",
+);
+const AUTO_FOLLOW_UP = /\bauto(?:matic(?:ally)?)?[\s-]*follow[\s-]*up\b/i;
+/** "follow up Abhishek 4 times", "follow up with Mayur 3 times". */
+const FOLLOW_UP_TIMES = new RegExp(
+  `\\bfollow[\\s-]*up\\s+(?:with\\s+)?(?!(?:me|us|myself)\\b)\\S+(?:\\s+\\S+){0,4}?\\s+${COUNT_WORD}\\s+(?:more\\s+)?times?\\b`,
+  "i",
+);
+
+/** The clear sequence commands, which enrol at once on his own turn. The softer
+ *  phrasings ("follow up with X", "remind me to follow up with X", "track my email
+ *  to X", "follow up on my email to X") still only offer the Start card. */
+export function isDirectSequenceCommand(text: string): boolean {
+  return (
+    /\bstart\b(?:\s+\S+){0,4}?\s+sequences?\b/i.test(text) ||
+    START_FOLLOWUPS.test(text) ||
+    PUT_IN_FOLLOWUPS.test(text) ||
+    AUTO_FOLLOW_UP.test(text) ||
+    FOLLOW_UP_TIMES.test(text)
+  );
+}
+
 export function isExplicitSequenceRequest(text: string): boolean {
   return (
     /\bstart\b(?:\s+\S+){0,4}?\s+sequences?\b/i.test(text) ||
@@ -440,7 +477,8 @@ export function isExplicitSequenceRequest(text: string): boolean {
     PROPOSE_SEQUENCE.test(text) ||
     FOLLOW_UP_ON_EMAIL.some((pattern) => pattern.test(text)) ||
     FOLLOW_UP_WITH_PERSON.test(text) ||
-    ADD_TO_SEQUENCE.test(text)
+    ADD_TO_SEQUENCE.test(text) ||
+    isDirectSequenceCommand(text)
   );
 }
 

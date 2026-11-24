@@ -119,13 +119,27 @@ export function allowOwnerChatCancelScheduledSend(confirmation: {
   requireOwnerChatConfirmation(confirmation);
 }
 
-/** start_sequence runs only on Vishnu's own chat/voice turn. It shows a Start
- *  card and enrols nothing. Never call this from inbound email handling. */
+/** start_sequence runs only on Vishnu's own chat/voice turn. A soft request shows
+ *  a Start card; a clear command enrols once allowOwnTurnSequenceEnrollment also
+ *  passes. Never call this from inbound email handling. */
 export function allowOwnerChatStartSequence(confirmation: {
   chatId: number;
   messageId: number;
 } | undefined): void {
   requireOwnerChatConfirmation(confirmation);
+}
+
+/** Enrolling with no Start tap: his own confirmation, and the call came straight from
+ *  his own chat turn (dispatch sets ownTurn from the turn context). A delegated goal,
+ *  a workflow step, a forwarded message, A2A or a background job never passes. */
+export function allowOwnTurnSequenceEnrollment(turn: {
+  confirmation?: { chatId: number; messageId: number };
+  ownTurn?: boolean;
+}): void {
+  requireOwnerChatConfirmation(turn.confirmation);
+  if (turn.ownTurn !== true) {
+    throw new SendNotApprovedError();
+  }
 }
 
 /** stop_sequence runs only on Vishnu's own chat/voice turn. A forwarded message

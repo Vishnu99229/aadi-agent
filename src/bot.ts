@@ -24,7 +24,8 @@ import {
   savePendingAction,
   messageAuthorizesExternalSend,
 } from "./action_context.js";
-import { bindEmailReferenceForTurn, buildReferencedEmailRequest, classifyOwnerEmailIntent, isDraftApprovalText, refersToEarlierEmail, resolveEmailReference } from "./email_references.js";
+import { parseSequenceCommand } from "./command_intent.js";
+import { bindEmailReferenceForTurn, bindRepliedMessageForTurn, buildReferencedEmailRequest, classifyOwnerEmailIntent, isDraftApprovalText, refersToEarlierEmail, resolveEmailReference } from "./email_references.js";
 import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, reviseReferencedMeeting } from "./owner_calendar.js";
 import { composeWithEmailAgent, publishReadyDraft, reviseLinkedDraft } from "./context_draft.js";
 import { handler as draftNewEmailTool } from "./tools/draft_new_email.js";
@@ -1394,14 +1395,25 @@ async function handleUserText(
 
   // Resolve references to the actual Telegram reply or latest OCR *in this chat*
   // before any Gmail/calendar history or an older open draft can take priority.
+  // "Put this email in a follow-up sequence" names an email to follow up, not an
+  // address to write to, so the address lookup below never takes it.
+  const followupOnThisEmail = (() => {
+    const parsed = parseSequenceCommand(userText);
+    return parsed.kind === "direct" && parsed.thisEmail && !parsed.combined;
+  })();
   const emailReference =
-    ctx.chat && ctx.message && options.forwarded !== true && !isForwardedMessage(ctx.message)
+    ctx.chat && ctx.message && options.forwarded !== true && !isForwardedMessage(ctx.message) && !followupOnThisEmail
       ? resolveEmailReference({
           chatId: ctx.chat.id,
           ownerText: userText,
           replyTo: ctx.message.reply_to_message,
         })
       : { kind: "none" as const };
+  // "Put this email in a follow-up sequence" in reply to an Aadi message: the message
+  // he replied to only says which email. The instruction is still his own words.
+  if (ctx.chat && ctx.message?.reply_to_message && options.forwarded !== true && !isForwardedMessage(ctx.message)) {
+    bindRepliedMessageForTurn(ctx.chat.id, ctx.message.message_id, ctx.message.reply_to_message.message_id);
+  }
   if (emailReference.kind === "missing") {
     await ctx.reply("I couldn't find an email address in that message or the latest OCR photo. Reply directly to the OCR result, or share the address. I haven't drafted or sent anything.");
     return;

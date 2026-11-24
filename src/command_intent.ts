@@ -1,5 +1,11 @@
 import { notAnEventCommand, notASendCommand, splitOwnerEmailCommand, withoutActionConstraints } from "./command_logic.js";
-import { isExplicitSequenceRequest } from "./sequence_logic.js";
+import {
+  COMMAND_FOLLOWUPS,
+  COMMAND_GAP_DAYS,
+  COUNT_WORD,
+  isDirectSequenceCommand,
+  isExplicitSequenceRequest,
+} from "./sequence_logic.js";
 
 /** Commands where a reply must come from a tool that ran this turn, never from
  *  what Aadi said before. */
@@ -472,11 +478,231 @@ export function commandIntents(ownWords: string): CommandKind[] {
   }
   if (SPECIFIC.some((kind) => found.has(kind))) {
     found.delete("calendar");
-    if (!found.has("draft")) {
+    // "Email X saying ... and start 3 follow-ups" is a send first, then the follow-ups.
+    const sendThenFollowups = found.has("sequence") && (() => {
+      const parsed = parseSequenceCommand(text);
+      return parsed.kind === "direct" && parsed.combined;
+    })();
+    if (!found.has("draft") && !sendThenFollowups) {
       found.delete("send");
     }
   }
   return [...found];
+}
+
+/** What his words ask of the follow-ups. Only his own words are ever passed in. */
+export type SequenceCommand =
+  /** Not a sequence request. mentionsFollowups: the words "follow-up" or
+   *  "sequence" appear anyway, e.g. inside an email he dictated. */
+  | { kind: "none"; mentionsFollowups: boolean }
+  /** He said not to: "don't start the sequence yet", "no follow-ups". */
+  | { kind: "negated" }
+  /** A softer phrasing that only offers the Start card. */
+  | { kind: "soft" }
+  /** Out of range, or a shape that can't be read safely. One line for him. */
+  | { kind: "refused"; text: string }
+  | {
+      kind: "direct";
+      /** The message also sends an email first; enrol its thread only after it went out. */
+      combined: boolean;
+      /** The follow-up clause, the only part settings are read from. */
+      clause: string;
+      /** In a combined message, everything before the clause. */
+      emailPart: string;
+      /** Follow-ups Aadi sends, on top of any he sent himself. */
+      followups: number;
+      /** Null means the default gap. */
+      gapDays: number | null;
+      /** Null means the ask in his email. */
+      cta: string | null;
+      /** "put this email in a follow-up sequence": the email is the one he replied to. */
+      thisEmail: boolean;
+    };
+
+const NUMBER_WORDS: Record<string, number> = {
+  a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6,
+  seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
+};
+
+function numberOf(word: string): number {
+  const lower = word.toLowerCase();
+  return /^\d+$/.test(lower) ? Number(lower) : (NUMBER_WORDS[lower] ?? Number.NaN);
+}
+
+/** No connective between the negation and the noun: "not sure, and start
+ *  follow-ups" is not a stop word, "don't start the follow-ups" is. */
+const UNBROKEN = "(?:(?!\\b(?:and|then|but)\\b)[^.?!\\n,;]){0,30}?";
+const FOLLOWUP_NOUN = "(?:follow[\\s-]*ups?|sequences?|auto[\\s-]*follow)";
+/** Stop words win wherever they are in the message, the email he dictated included. */
+const SEQUENCE_STOP: readonly RegExp[] = [
+  /\bno\s+(?:more\s+)?(?:follow[\s-]*ups?|sequences?)\b/i,
+  /\bwithout\s+(?:any\s+)?(?:follow[\s-]*ups?|(?:a\s+)?sequences?)\b/i,
+  new RegExp(`\\b(?:don'?t|don’t|do not|never|not|no need to|shouldn'?t)\\b${UNBROKEN}\\b${FOLLOWUP_NOUN}`, "i"),
+  new RegExp(`\\b(?:not\\s+yet|hold\\s+off|wait\\s+(?:on|with|before))\\b${UNBROKEN}\\b${FOLLOWUP_NOUN}`, "i"),
+  /\b(?:follow[\s-]*ups?|sequences?)\b[^.?!\n]{0,40}?\b(?:not\s+yet|later|hold\s+off)\b/i,
+];
+
+/** Where a follow-up clause may start after an email request: "..., and start 3
+ *  follow-ups", "... then put it in a sequence", "... . Start follow-ups." */
+const CLAUSE_BOUNDARY =
+  /(?:[.!?;]\s+|,\s*(?:and\s+(?:then\s+)?|then\s+)?|\s+and\s+(?:then\s+|also\s+)?|\s+then\s+|\s+also\s+)(?:(?:please|pls|also|then|can you|could you)\s+)?(?=(?:start|begin|set\s*up|create|kick\s*off|launch|schedule|run|put|add|enrol|move|place|auto|follow)\b)/gi;
+
+const SEND_IT = /\bsend\s+(?:it|this|that|the\s+(?:draft|email|mail))\b/i;
+
+function asksToSendEmail(text: string): boolean {
+  const command = splitOwnerEmailCommand(text).command;
+  return (
+    SEND_IT.test(text) ||
+    SEND_SOMETHING.test(command) ||
+    REPLY_TO.test(command) ||
+    TELL_BY_EMAIL.test(command) ||
+    EMAIL_SOMEONE.test(command)
+  );
+}
+
+/** Where his CTA ends: at the next setting or the end of the clause. */
+const CTA_END = /,|;|\.(?:\s|$)|\s+(?:every|each|daily|weekly|fortnightly)\b|\s+\d+\s+days?\s+apart\b|\s+and\s+(?:every|space|make|send)\b/i;
+
+function ctaOf(clause: string): { cta: string; start: number; end: number } | undefined {
+  const patterns: Array<[RegExp, (value: string) => string]> = [
+    [/\b(?:asking|ask|request(?:ing)?)\s+(?:(?:them|him|her|the\s+prospect)\s+)?for\s+/i, (value) => `ask for ${value}`],
+    [/\b(?:asking|ask|getting|get|inviting|invite|telling|tell)\s+(?:them|him|her|the\s+prospect|\p{L}[\p{L}'’-]*)\s+to\s+/iu, (value) => `ask them to ${value}`],
+    [/\b(?:asking|ask)\s+to\s+/i, (value) => `ask them to ${value}`],
+    [/\b(?:cta|call[\s-]*to[\s-]*action)\b\s*(?:is\s+|:\s*|=\s*|of\s+|as\s+|being\s+|-\s*)?/i, (value) => value],
+    [/\bwith\s+(?:the\s+)?ask\s+(?:being\s+|of\s+|:\s*)?/i, (value) => value],
+  ];
+  for (const [pattern, shape] of patterns) {
+    const match = pattern.exec(clause);
+    if (!match) {
+      continue;
+    }
+    const from = match.index + match[0].length;
+    const tail = clause.slice(from);
+    const stop = CTA_END.exec(tail);
+    let value = (stop ? tail.slice(0, stop.index) : tail)
+      .replace(/["“”]/g, "")
+      .replace(/\s+(?:please|pls|thanks|thank you)$/i, "")
+      .replace(/[.!?,;:]+$/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!value) {
+      continue;
+    }
+    if (value.length > 100) {
+      value = value.slice(0, 100).replace(/\s+\S*$/, "");
+    }
+    return { cta: shape(value), start: match.index, end: from + (stop ? stop.index : tail.length) };
+  }
+  return undefined;
+}
+
+const COUNT_PATTERNS: readonly RegExp[] = [
+  new RegExp(`\\b(${COUNT_WORD})(?:[\\s-]*steps?)?(?:[\\s-]+(?:more|automatic|auto))?[\\s-]+follow[\\s-]*ups?\\b`, "i"),
+  new RegExp(`\\b(${COUNT_WORD})[\\s-]*steps?\\b`, "i"),
+  new RegExp(`\\b(${COUNT_WORD})\\s+(?:more\\s+)?times?\\b`, "i"),
+];
+
+function gapOf(text: string): number | null {
+  const day = (pattern: RegExp, days: (value: number) => number): number | undefined => {
+    const match = pattern.exec(text);
+    return match ? days(match[1] ? numberOf(match[1]) : 1) : undefined;
+  };
+  const found =
+    (/\bevery\s+other\s+day\b/i.test(text) ? 2 : undefined) ??
+    (/\bevery\s+fortnight\b|\bfortnightly\b/i.test(text) ? 14 : undefined) ??
+    day(new RegExp(`\\b(?:every|each)\\s+(${COUNT_WORD})\\s+weeks?\\b`, "i"), (value) => value * 7) ??
+    day(new RegExp(`\\b(${COUNT_WORD}|a)\\s+weeks?\\s+(?:apart|between|in\\s+between)\\b`, "i"), (value) => value * 7) ??
+    day(/\b(?:every|each)\s+week\b|\bweekly\b/i, () => 7) ??
+    day(new RegExp(`\\b(?:every|each)\\s+(${COUNT_WORD})\\s+days?\\b`, "i"), (value) => value) ??
+    day(new RegExp(`\\b(${COUNT_WORD}|a)\\s+days?\\s+(?:apart|between|in\\s+between)\\b`, "i"), (value) => value) ??
+    day(new RegExp(`\\b(${COUNT_WORD})[\\s-]*days?\\s+gap\\b|\\bgap\\s+of\\s+(${COUNT_WORD})\\s+days?\\b`, "i"), (value) => value) ??
+    day(/\b(?:every\s+day|each\s+day|daily)\b/i, () => 1);
+  return found ?? null;
+}
+
+const THIS_EMAIL =
+  /\b(?:this|that)\s+(?:e-?mail|mail|message|thread|draft|one)\b|\b(?:put|add|enrol+|move|place)\s+(?:this|that|it)\b/i;
+
+/**
+ * Reads a follow-up command from his own words. Only the follow-up clause sets
+ * anything: in "email Mayur saying ... and start 3 follow-ups", what the email
+ * says is never read for numbers. A stop word anywhere wins.
+ */
+export function parseSequenceCommand(ownWords: string): SequenceCommand {
+  const text = ownWords.replace(/\s+/g, " ").trim();
+  // "Follow-ups", "sequence" or "3 follow-up ...", not "send a follow-up to X".
+  const mentionsFollowups =
+    /\bfollow[\s-]*ups\b|\bsequences?\b|\b(?:\d+|two|three|four|five|six)\s+follow[\s-]*up\b/i.test(text);
+  if (SEQUENCE_STOP.some((pattern) => pattern.test(text)) || NOT_A_SEQUENCE_COMMAND[0]!.test(text)) {
+    return { kind: "negated" };
+  }
+  if (!text || !isExplicitSequenceRequest(text)) {
+    return { kind: "none", mentionsFollowups };
+  }
+  if (
+    !isDirectSequenceCommand(text) ||
+    NOT_A_SEQUENCE_COMMAND.slice(1).some((pattern) => pattern.test(text)) ||
+    ASKED.test(text) ||
+    ASKED_ABOUT.test(text) ||
+    PLANNED.test(text)
+  ) {
+    return { kind: "soft" };
+  }
+  let clause = text;
+  let emailPart = "";
+  let combined = false;
+  for (const match of text.matchAll(CLAUSE_BOUNDARY)) {
+    const before = text.slice(0, match.index);
+    const rest = text.slice((match.index ?? 0) + match[0].length);
+    if (isDirectSequenceCommand(rest) && asksToSendEmail(before)) {
+      clause = rest;
+      emailPart = before.trim();
+      combined = true;
+      break;
+    }
+  }
+  if (!combined && asksToSendEmail(text)) {
+    return {
+      kind: "refused",
+      text: "Not started: say the email first, then the follow-ups, e.g. \"email Mayur saying … and start 3 follow-ups\".",
+    };
+  }
+  const cta = ctaOf(clause);
+  const settingsText = cta ? `${clause.slice(0, cta.start)} ${clause.slice(cta.end)}` : clause;
+  let followups: number = COMMAND_FOLLOWUPS.default;
+  for (const pattern of COUNT_PATTERNS) {
+    const match = pattern.exec(settingsText);
+    if (match) {
+      followups = numberOf(match[1]!);
+      break;
+    }
+  }
+  if (!Number.isInteger(followups) || followups < COMMAND_FOLLOWUPS.min || followups > COMMAND_FOLLOWUPS.max) {
+    return { kind: "refused", text: `Not started: follow-ups can be ${COMMAND_FOLLOWUPS.min} to ${COMMAND_FOLLOWUPS.max}.` };
+  }
+  const gapDays = gapOf(settingsText);
+  if (
+    gapDays !== null &&
+    (!Number.isInteger(gapDays) || gapDays < COMMAND_GAP_DAYS.min || gapDays > COMMAND_GAP_DAYS.max)
+  ) {
+    return { kind: "refused", text: `Not started: the gap can be ${COMMAND_GAP_DAYS.min} to ${COMMAND_GAP_DAYS.max} days.` };
+  }
+  return {
+    kind: "direct",
+    combined,
+    clause,
+    emailPart,
+    followups,
+    gapDays,
+    cta: cta?.cta ?? null,
+    thisEmail: THIS_EMAIL.test(clause),
+  };
+}
+
+/** His words with the follow-up clause taken out, for the email writer. */
+export function withoutFollowupClause(ownWords: string): string {
+  const parsed = parseSequenceCommand(ownWords);
+  return parsed.kind === "direct" && parsed.combined ? parsed.emailPart : ownWords;
 }
 
 const VAGUE_TARGET =
@@ -505,19 +731,33 @@ export function sequenceTargets(ownWords: string): string[] | undefined {
     const reminded = onEmail
       ? null
       : /\bremind\s+me\s+to\s+follow[\s-]*up\s+(?:with|on)\s+(.+)$/i.exec(sentence);
-    const counted = /\bfollow[\s-]*ups?\s+(?:with\s+)?(.+?)\s+\d+\s+times?\b/i.exec(sentence);
+    const counted = new RegExp(`\\bfollow[\\s-]*ups?\\s+(?:with\\s+)?(.+?)\\s+${COUNT_WORD}\\s+(?:more\\s+)?times?\\b`, "i").exec(sentence);
     const added = /\badd\s+(.+?)\s+to\s+(?:the\s+|a\s+|my\s+)?sequences?\b/i.exec(sentence);
     const withPerson = /\bfollow[\s-]*ups?\s+with\s+(?!(?:me|us|myself)\b)(.+)$/i.exec(sentence);
+    // "put my email to Mayur in a follow-up sequence": the person after the email.
+    const putEmail = /\b(?:put|add|enrol+|move|place)\s+(?:my|the)\s+(?:last\s+|latest\s+)?(?:e-?mail|mail|thread|message|note)\s+(?:to|with|for)\s+(.+?)\s+(?:in|into|to|on)\s+(?:(?:a|an|the|my)\s+)?(?:(?:automatic|auto|email|new)\s+)?(?:follow[\s-]*ups?|sequences?)\b/i.exec(sentence);
+    // "add Mayur to follow-ups", "put Mayur in the sequence".
+    const putPerson = /\b(?:put|add|enrol+|move|place)\s+(.+?)\s+(?:in|into|to|on)\s+(?:(?:a|an|the|my)\s+)?(?:(?:automatic|auto|email|new)\s+)?(?:follow[\s-]*ups?|sequences?)\b/i.exec(sentence);
+    // "start a 3-step follow-up to Mayur", "set up 5 follow-ups for Mayur".
+    const startFollowups = /\b(?:start|begin|set\s*up|create|kick\s*off|launch|schedule|run)\b[^.?!\n]*?\bfollow[\s-]*ups?\s+(?:to|for|with|on)\s+(?!(?:me|us|myself)\b)(.+)$/i.exec(sentence);
     const match =
       onEmail ??
       /\b(?:start|begin)\b(?:\s+(?:a|an|the|new|another|follow[\s-]*up|auto(?:matic)?|email|mail))*\s+sequences?\s+(?:for|with|to|on)\s+(.+)$/i.exec(sentence) ??
-      /\bauto[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence) ??
+      /\bauto(?:matic(?:ally)?)?[\s-]*follow[\s-]*up\s+(?:with|on|for|to)\s+(.+)$/i.exec(sentence) ??
       counted ??
+      putEmail ??
       added ??
+      putPerson ??
+      startFollowups ??
       withPerson;
     // "Remind me to follow up with Jeff on Monday": the person, not the day.
     const named = (reminded?.[1] ?? match?.[1])
-      ?.replace(
+      ?.replace(/,.*$/, "")
+      .replace(
+        new RegExp(`\\s+(?:every|each|asking|ask|cta|daily|weekly|with\\s+(?:a|the)\\s+(?:cta|ask)|${COUNT_WORD}(?:[\\s-]*(?:steps?|days?|weeks?|times?|follow[\\s-]*ups?))|a\\s+(?:day|week)\\s+apart)\\b.*$`, "i"),
+        "",
+      )
+      .replace(
         /\s+(?:on|by|next|this|tomorrow|today|tonight|in|after|about|regarding|re)\b.*$/i,
         "",
       )

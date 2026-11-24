@@ -86,6 +86,10 @@ export interface ToolTurn {
   confirmation?: SendConfirmation;
   /** Vishnu's own words for this turn (no quoted-message wrapper). */
   userText?: string;
+  /** Set only by dispatch: this call comes straight from his own chat turn, not
+   *  from a delegated goal, a workflow step, A2A or a background job. Never trust
+   *  a value a caller passes in. */
+  ownTurn?: boolean;
   /** Telegram context for the current user message (react only). */
   ctx?: { react: (emoji: string) => Promise<unknown> };
 }

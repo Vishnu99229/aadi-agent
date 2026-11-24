@@ -1,6 +1,7 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { accountMatchesEmail } from "./account_logic.js";
+import { parseSequenceCommand, type SequenceCommand } from "./command_intent.js";
 import { decodedAccounts } from "./accounts.js";
 import { config } from "./config.js";
 import {
@@ -12,12 +13,16 @@ import {
   getOpenMeetingProposalByThread,
   getOpenSalesSequenceForKey,
   getSalesPitchScan,
+  commandSendForTelegramMessage,
+  draftCardForTelegramMessage,
   getSalesSequence,
+  getSalesSequenceByCommandKey,
   getSalesSequenceByThread,
   isSalesDoNotContact,
   recordSalesPitchScan,
   reproposeDeclinedSalesSequence,
   SALES_SEQUENCE_DECLINED,
+  salesSequenceStepCap,
   setSalesSequenceCardMessage,
   setSalesSequenceTimezone,
   stopProposedSalesSequence,
@@ -36,7 +41,11 @@ import { gmailClient, plainTextBody } from "./google/mail.js";
 import { completeBackground } from "./llm.js";
 import { blockedAutoSendDomains, PERSONAL_DOMAINS } from "./meeting_book.js";
 import { isSelfEmail } from "./mom_logic.js";
-import { allowOwnerChatStartSequence } from "./security/send_approval.js";
+import { repliedMessageForTurn } from "./email_references.js";
+import {
+  allowOwnerChatStartSequence,
+  allowOwnTurnSequenceEnrollment,
+} from "./security/send_approval.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
 import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
@@ -66,6 +75,7 @@ import {
   type PitchExclusion,
   type PitchFacts,
 } from "./sequence_logic.js";
+import { nextSendWindow } from "./sequence_rules.js";
 import { resolveProspectTimezone, zoneDisplay } from "./sequence_timezone.js";
 
 const TIME_ZONE = "Asia/Kolkata";
@@ -536,6 +546,49 @@ export async function handleSequenceCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  const outcome = await enrolProposed(id);
+  if (!outcome.ok) {
+    if (outcome.reason === "check_failed") {
+      await ctx.reply("I couldn't check that thread, so nothing started. Tap Start again.");
+      return;
+    }
+    if (outcome.reason === "excluded") {
+      await finish(`Not started for ${prospectLabel(row)}: ${EXCLUSION_LABELS[outcome.exclusion]}.`);
+      return;
+    }
+    await ctx.editMessageReplyMarkup().catch(() => undefined);
+    return;
+  }
+  await finish(startedText(row, outcome.firstAt, outcome.manualFollowups, outcome.zone));
+}
+
+/** What a command sets. A Start tap sets none of it: 4 steps, the default gap and
+ *  the ask in his email. */
+interface FollowupSettings {
+  followups?: number;
+  stepDays?: number | null;
+  cta?: string | null;
+  commandKey?: string | null;
+}
+
+type EnrolOutcome =
+  | {
+      ok: true;
+      row: SalesSequenceRecord;
+      firstAt: Date;
+      manualFollowups: number;
+      zone?: { zone: string; source: string };
+    }
+  | { ok: false; reason: "check_failed" | "not_proposed" | "too_many" }
+  | { ok: false; reason: "excluded"; exclusion: PitchExclusion };
+
+/** The one way a proposed row becomes active, for the Start tap and for a command
+ *  alike: the live thread is read again and every exclusion checked, right now. */
+async function enrolProposed(id: number, settings: FollowupSettings = {}): Promise<EnrolOutcome> {
+  const row = getSalesSequence(id);
+  if (!row || row.status !== "proposed") {
+    return { ok: false, reason: "not_proposed" };
+  }
   let assessed: ThreadAssessment | undefined;
   let liveGmail: gmail_v1.Gmail;
   let ownAddress: string;
@@ -551,26 +604,36 @@ export async function handleSequenceCallback(ctx: Context): Promise<void> {
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Sequence ${id}: start check failed (${errorType})`);
-    await ctx.reply("I couldn't check that thread, so nothing started. Tap Start again.");
-    return;
+    return { ok: false, reason: "check_failed" };
   }
   if (!assessed || assessed.exclusion) {
     const reason = assessed?.exclusion ?? "calendar_or_automated";
     stopProposedSalesSequence(id, `excluded:${reason}`);
-    await finish(`Not started for ${prospectLabel(row)}: ${EXCLUSION_LABELS[reason]}.`);
-    return;
+    return { ok: false, reason: "excluded", exclusion: reason };
   }
   const now = new Date();
-  const firstAt = firstStepAt(assessed.sentAt, config.sequenceStepDays, now);
-  const activated = activateSalesSequence(id, {
-    nextStepAt: firstAt.toISOString(),
-    enrolledAt: now.toISOString(),
-    manualFollowups: assessed.facts.manualFollowups,
-    stepOneCc: ownTeamCc(assessed.facts.cc, selfAddresses, ownAddress),
-  });
+  // Never before the email it follows, so his own email never reads as a later send.
+  const enrolledAt = new Date(Math.max(now.getTime(), assessed.sentAt.getTime() + 1000));
+  const firstAt = firstStepAt(assessed.sentAt, settings.stepDays ?? config.sequenceStepDays, now);
+  let activated: boolean;
+  try {
+    activated = activateSalesSequence(id, {
+      nextStepAt: firstAt.toISOString(),
+      enrolledAt: enrolledAt.toISOString(),
+      manualFollowups: assessed.facts.manualFollowups,
+      stepOneCc: ownTeamCc(assessed.facts.cc, selfAddresses, ownAddress),
+      followups: settings.followups,
+      stepDays: settings.stepDays ?? null,
+      cta: settings.cta ?? null,
+      commandKey: settings.commandKey ?? null,
+    });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Sequence ${id}: not activated (${errorType})`);
+    return { ok: false, reason: "too_many" };
+  }
   if (!activated) {
-    await ctx.editMessageReplyMarkup().catch(() => undefined);
-    return;
+    return { ok: false, reason: "not_proposed" };
   }
   console.log(`Sequence ${id}: status -> active`);
   let zone: { zone: string; source: string } | undefined;
@@ -581,7 +644,13 @@ export async function handleSequenceCallback(ctx: Context): Promise<void> {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Sequence ${id}: timezone lookup failed (${errorType}); retried before the first send`);
   }
-  await finish(startedText(row, firstAt, assessed.facts.manualFollowups, zone));
+  return {
+    ok: true,
+    row: getSalesSequence(id)!,
+    firstAt,
+    manualFollowups: assessed.facts.manualFollowups,
+    zone,
+  };
 }
 
 function revivable(row: SalesSequenceRecord): boolean {
@@ -690,16 +759,346 @@ export async function requestSequenceCard(
   return `Start card sent for ${prospectLabel(row)} ('${row.subject}'). Nothing is enrolled unless Vishnu taps Start.`;
 }
 
+type CommandTurn = Pick<ToolTurn, "confirmation" | "userText" | "ownTurn">;
+type DirectCommand = Extract<SequenceCommand, { kind: "direct" }>;
+
+const NOT_SENT_DRAFT = "That draft isn't sent yet. Say 'send it and start follow-ups' or send it first.";
+const UNKNOWN_EMAIL =
+  "Not started: I can't tell which email that message is about. Say who the follow-ups are for, e.g. 'start follow-ups for Mayur'.";
+const WAITING_FOR_SEND = "Not started yet: follow-ups start only once the email has gone out.";
+const VAGUE_TARGET = /^(?:this|that|it|the)\b/i;
+
+function commandKeyOf(turn: CommandTurn): string | undefined {
+  return turn.confirmation ? `msg:${turn.confirmation.chatId}:${turn.confirmation.messageId}` : undefined;
+}
+
+function dayAndTime(at: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(at);
+}
+
+/** Exactly what a command set, worked out from the row, so a second run of the same
+ *  command reports the same thing. */
+function commandStartedText(row: SalesSequenceRecord): string {
+  const followups = row.total_steps - row.manual_followups;
+  const gap = row.step_days ?? config.sequenceStepDays;
+  const count = `${followups} ${row.manual_followups > 0 ? "more " : ""}follow-up${followups === 1 ? "" : "s"}`;
+  const own = row.manual_followups > 0 ? ` (you've sent ${row.manual_followups} yourself)` : "";
+  const first = nextSendWindow(new Date(row.next_step_at ?? Date.now()), row.prospect_timezone);
+  const when = row.prospect_timezone
+    ? `${dayAndTime(first, row.prospect_timezone)} their time`
+    : `${dayAndTime(first, TIME_ZONE)} IST, once their time zone is checked`;
+  return `Started ${count} to ${prospectLabel(row)}${own}, every ${gap} day${gap === 1 ? "" : "s"}, CTA: ${row.cta ?? "same ask as your email"}. First one goes ${when}.${switchedOffNote()}`;
+}
+
+/** What a send-then-follow-ups message came to, for start_sequence on the same turn. */
+const afterSendOutcomes = new Map<string, { text: string; at: number }>();
+const AFTER_SEND_TTL_MS = 30 * 60_000;
+
+function rememberAfterSend(key: string, text: string): void {
+  const now = Date.now();
+  for (const [id, entry] of afterSendOutcomes) {
+    if (now - entry.at > AFTER_SEND_TTL_MS) {
+      afterSendOutcomes.delete(id);
+    }
+  }
+  afterSendOutcomes.set(key, { text, at: now });
+}
+
+/** His newest email to the person he named. More than one person: ask which. */
+async function newestThreadFor(
+  gmail: gmail_v1.Gmail,
+  target: string,
+  selfAddresses: ReadonlySet<string>,
+  ownAddress: string,
+): Promise<ThreadAssessment | string> {
+  const listed = await gmail.users.messages.list({
+    userId: "me",
+    q: `in:sent newer_than:${EXPLICIT_LOOKBACK_DAYS}d to:"${target}"`,
+    maxResults: 25,
+  });
+  const threadIds = [
+    ...new Set(
+      (listed.data.messages ?? [])
+        .map((message) => message.threadId)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  ].slice(0, EXPLICIT_THREAD_LIMIT);
+  const assessedThreads: ThreadAssessment[] = [];
+  for (const threadId of threadIds) {
+    const assessed = await assessLive(gmail, threadId, selfAddresses, ownAddress, {
+      ignoreSequence: (row) => row.thread_id === threadId && revivable(row),
+    });
+    if (assessed) {
+      assessedThreads.push(assessed);
+    }
+  }
+  assessedThreads.sort((left, right) => right.sentAt.getTime() - left.sentAt.getTime());
+  if (assessedThreads.length === 0) {
+    return `Not started: I found no email to "${target}" in your work Sent mail from the last ${EXPLICIT_LOOKBACK_DAYS} days.`;
+  }
+  const people = new Map<string, ThreadAssessment>();
+  for (const item of assessedThreads) {
+    if (item.prospect && !people.has(item.prospect.email)) {
+      people.set(item.prospect.email, item);
+    }
+  }
+  if (people.size > 1) {
+    const options = [...people.values()].map(
+      (item) => `- ${prospectDisplay(item.prospect!.name, item.prospect!.email)} ('${item.subject}')`,
+    );
+    return `Not started: more than one person matches "${target}". Which one?\n${options.join("\n")}`;
+  }
+  // The newest email decides. If it can't be followed up, say why: never an older one.
+  return assessedThreads[0]!;
+}
+
+/** The Gmail message an Aadi message was about: a draft card that went out, or a
+ *  "Sent to ..." note. */
+function emailForTelegramMessage(
+  telegramMessageId: number,
+): { sentMessageId: string; account: string } | string {
+  const card = draftCardForTelegramMessage(telegramMessageId);
+  if (card) {
+    if (card.status === "pending") {
+      return NOT_SENT_DRAFT;
+    }
+    if (card.status !== "sent") {
+      return "Not started: that draft was never sent.";
+    }
+    return card.sent_message_id
+      ? { sentMessageId: card.sent_message_id, account: card.google_account }
+      : UNKNOWN_EMAIL;
+  }
+  const sent = commandSendForTelegramMessage(telegramMessageId);
+  if (sent?.status === "sent" && sent.sent_message_id) {
+    return { sentMessageId: sent.sent_message_id, account: sent.account };
+  }
+  return UNKNOWN_EMAIL;
+}
+
+type CommandSource =
+  | { target: string }
+  | { telegramMessageId: number }
+  | { sentMessageId: string; account: string };
+
+/** Enrols at once from his own command, with no Start card. The same live check the
+ *  Start tap runs decides, and every exclusion still refuses with its reason. */
+async function enrolByCommand(
+  source: CommandSource,
+  command: DirectCommand,
+  turn: CommandTurn,
+): Promise<string> {
+  const commandKey = commandKeyOf(turn);
+  const done = commandKey ? getSalesSequenceByCommandKey(commandKey) : undefined;
+  if (done) {
+    return commandStartedText(done);
+  }
+  allowOwnTurnSequenceEnrollment(turn);
+  let sent = "telegramMessageId" in source ? emailForTelegramMessage(source.telegramMessageId) : undefined;
+  if (typeof sent === "string") {
+    return sent;
+  }
+  if ("sentMessageId" in source) {
+    sent = source;
+  }
+  if (sent && sent.account !== "work") {
+    return "Not started: follow-ups only run from your work mailbox.";
+  }
+  let chosen: ThreadAssessment | undefined;
+  try {
+    const { gmail } = await workGmail();
+    const ownAddress = await ownAddressOf(gmail);
+    const selfAddresses = await loadFollowupSelfAddresses();
+    if (sent) {
+      const message = await gmail.users.messages.get({ userId: "me", id: sent.sentMessageId, format: "minimal" });
+      const threadId = message.data.threadId;
+      if (!threadId) {
+        return UNKNOWN_EMAIL;
+      }
+      chosen = await assessLive(gmail, threadId, selfAddresses, ownAddress, {
+        ignoreSequence: (row) => row.thread_id === threadId && revivable(row),
+      });
+      if (!chosen) {
+        return UNKNOWN_EMAIL;
+      }
+    } else {
+      const found = await newestThreadFor(gmail, (source as { target: string }).target, selfAddresses, ownAddress);
+      if (typeof found === "string") {
+        return found;
+      }
+      chosen = found;
+    }
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Sequence command: thread check failed (${errorType})`);
+    return "Not started: I couldn't check that thread. Try again.";
+  }
+  if (chosen.exclusion || !chosen.prospect) {
+    const who = chosen.prospect?.email ?? chosen.recipientDomain;
+    return `Not started for ${who} ('${chosen.subject}'): ${EXCLUSION_LABELS[chosen.exclusion ?? "no_external_recipient"]}.`;
+  }
+  const cap = salesSequenceStepCap();
+  if (chosen.facts.manualFollowups + command.followups > cap) {
+    return cap < 9
+      ? "Not started: this database still caps follow-ups at 4."
+      : `Not started: that would be more than ${cap} emails after your first one.`;
+  }
+  const prospect = chosen.prospect;
+  const domain = domainOf(prospect.email);
+  const existing = getSalesSequenceByThread(chosen.threadId);
+  const row = !existing
+    ? createProposedSalesSequence({
+        threadId: chosen.threadId,
+        prospectEmail: prospect.email,
+        prospectDomain: domain,
+        prospectKey: prospectKey(prospect.email),
+        prospectName: prospect.name,
+        prospectCompany: companyFromDomain(domain, PERSONAL_DOMAINS),
+        subject: chosen.subject,
+        originalMessageId: chosen.latestSentId,
+        originalSentAt: chosen.sentAt.toISOString(),
+        manualFollowups: chosen.facts.manualFollowups,
+        classifierConfidence: null,
+        classifierReason: null,
+      })
+    : existing.status === "proposed"
+      ? existing
+      : reproposeDeclinedSalesSequence(existing.id);
+  if (!row) {
+    return `Not started for ${prospect.email}: ${EXCLUSION_LABELS.prospect_in_sequence}.`;
+  }
+  const outcome = await enrolProposed(row.id, {
+    followups: command.followups,
+    stepDays: command.gapDays,
+    cta: command.cta,
+    commandKey,
+  });
+  if (outcome.ok) {
+    console.log(`Sequence ${row.id}: enrolled by command steps=${outcome.row.total_steps}`);
+    return commandStartedText(outcome.row);
+  }
+  if (!existing && getSalesSequence(row.id)?.status === "proposed") {
+    deleteProposedSalesSequence(row.id);
+  }
+  if (outcome.reason === "excluded") {
+    return `Not started for ${prospect.email} ('${chosen.subject}'): ${EXCLUSION_LABELS[outcome.exclusion]}.`;
+  }
+  if (outcome.reason === "too_many") {
+    return "Not started: this database still caps follow-ups at 4.";
+  }
+  return outcome.reason === "check_failed"
+    ? "Not started: I couldn't check that thread. Try again."
+    : "Not started: that sequence was already started or stopped.";
+}
+
+/** After an email he asked for in the same message went out (or didn't): enrol its
+ *  thread only if this exact send succeeded. Returns a line for the send's result,
+ *  or nothing when the message says nothing about follow-ups. */
+export async function followupsAfterSend(input: {
+  turn: CommandTurn;
+  result: "sent" | "scheduled" | "unknown" | "not_sent" | "pending";
+  sentMessageId?: string;
+  account: string;
+  /** Who the email went to, as he'd say it, for the "say ..." hint. */
+  recipient: string;
+}): Promise<string | undefined> {
+  const command = parseSequenceCommand(input.turn.userText ?? "");
+  if (command.kind === "none") {
+    return command.mentionsFollowups && input.result === "sent"
+      ? `No follow-ups started; say 'start follow-ups for ${input.recipient}' if you want them.`
+      : undefined;
+  }
+  if (command.kind === "negated") {
+    return input.result === "sent" ? "No follow-ups started, as you said." : undefined;
+  }
+  if (command.kind === "refused") {
+    return command.text;
+  }
+  if (command.kind !== "direct" || !command.combined) {
+    return undefined;
+  }
+  let text: string;
+  if (input.result === "scheduled") {
+    text = "No follow-ups started: the email is scheduled, not sent. Start them once it goes out.";
+  } else if (input.result === "unknown") {
+    text = "No follow-ups started: Gmail didn't confirm the email went out.";
+  } else if (input.result === "pending") {
+    text = "No follow-ups started: the email hasn't gone out yet.";
+  } else if (input.result !== "sent" || !input.sentMessageId) {
+    text = "No follow-ups started: the email didn't go out.";
+  } else if (input.turn.ownTurn !== true || !input.turn.confirmation) {
+    text = "No follow-ups started: only your own message can start them.";
+  } else {
+    try {
+      text = await enrolByCommand(
+        { sentMessageId: input.sentMessageId, account: input.account },
+        command,
+        input.turn,
+      );
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(`Sequence after send: not enrolled (${errorType})`);
+      text = "No follow-ups started: something went wrong starting them. Say 'start follow-ups' to try again.";
+    }
+  }
+  const key = commandKeyOf(input.turn);
+  if (key) {
+    rememberAfterSend(key, text);
+  }
+  return text;
+}
+
 export async function startSequenceFromTool(
   target: string,
-  turn: Pick<ToolTurn, "confirmation" | "userText">,
+  turn: CommandTurn,
   api: Api = telegram,
 ): Promise<string> {
   allowOwnerChatStartSequence(turn.confirmation);
-  if (!isExplicitSequenceRequest(turn.userText ?? "")) {
+  const words = turn.userText ?? "";
+  if (!isExplicitSequenceRequest(words)) {
     return "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\", \"follow up with X\", \"follow up X N times\", \"add X to sequence\", \"auto follow up with X\", \"follow up on my email to X\" or \"remind me to follow up with X\". For a reminder about something else, use set_reminder.";
   }
-  return requestSequenceCard(target, api);
+  const command = parseSequenceCommand(words);
+  if (command.kind === "negated") {
+    return "Not started: you said not to start follow-ups.";
+  }
+  if (command.kind === "refused") {
+    return command.text;
+  }
+  // A softer phrasing, or anything but his own chat turn: the Start card, as before.
+  if (command.kind !== "direct" || turn.ownTurn !== true) {
+    return requestSequenceCard(target, api);
+  }
+  const key = commandKeyOf(turn);
+  if (command.combined) {
+    const done = key ? getSalesSequenceByCommandKey(key) : undefined;
+    if (done) {
+      return commandStartedText(done);
+    }
+    return (key ? afterSendOutcomes.get(key)?.text : undefined) ?? WAITING_FOR_SEND;
+  }
+  if (command.thisEmail) {
+    const replied = repliedMessageForTurn(turn.confirmation?.chatId, turn.confirmation?.messageId);
+    if (replied !== undefined) {
+      return enrolByCommand({ telegramMessageId: replied }, command, turn);
+    }
+    if (VAGUE_TARGET.test(target.trim())) {
+      return "Not started: reply to the message about that email, or say who the follow-ups are for.";
+    }
+  }
+  const cleaned = target.replace(/["\\]/g, " ").replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return "Who should the follow-ups be for? Give me a name, company or email.";
+  }
+  return enrolByCommand({ target: cleaned }, command, turn);
 }
 
 export async function handleSequenceCommand(ctx: Context): Promise<void> {

@@ -62,6 +62,37 @@ export function emailReferenceForTurn(
   return entry && entry.expiresAt > now ? entry.email : undefined;
 }
 
+/** The Telegram message his own message replied to, for this turn only. It says which
+ *  email he means ("put this email in a follow-up sequence"); it is never an instruction. */
+const REPLIED_WINDOW_MS = 10 * 60_000;
+const replied = new Map<string, { messageId: number; expiresAt: number }>();
+
+export function bindRepliedMessageForTurn(
+  chatId: number,
+  messageId: number,
+  repliedMessageId: number,
+  now = Date.now(),
+): void {
+  for (const [id, entry] of replied) {
+    if (entry.expiresAt <= now) {
+      replied.delete(id);
+    }
+  }
+  replied.set(key(chatId, messageId), { messageId: repliedMessageId, expiresAt: now + REPLIED_WINDOW_MS });
+}
+
+export function repliedMessageForTurn(
+  chatId: number | undefined,
+  messageId: number | undefined,
+  now = Date.now(),
+): number | undefined {
+  if (chatId === undefined || messageId === undefined) {
+    return undefined;
+  }
+  const entry = replied.get(key(chatId, messageId));
+  return entry && entry.expiresAt > now ? entry.messageId : undefined;
+}
+
 /** A Send/Edit/Discard card. Replying "send it" confirms that draft; it is not a new recipient. */
 export function isDraftApprovalText(text: string | undefined): boolean {
   return /draft waiting for approval|draft approval|waiting for your send tap/i.test(text ?? "");

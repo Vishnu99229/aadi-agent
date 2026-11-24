@@ -1,23 +1,46 @@
 import "dotenv/config";
+import Database from "better-sqlite3";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { fakeTelegramApi, type TelegramLog } from "./fakes.ts";
 import {
   addSalesDoNotContact,
+  claimCommandSend,
+  createPendingAction,
   createProposedSalesSequence,
   getSalesSequenceByThread,
   createAccount,
   listSalesSequenceSteps,
+  migrateSalesSequenceLimits,
+  recordCommandSendSent,
+  salesSequenceStepCap,
+  setCommandSendTelegramMessage,
+  setPendingActionSentMessage,
+  setPendingActionTelegramMessage,
+  setSalesSequenceStepCapForTests,
   stopProposedSalesSequence,
+  transitionPendingAction,
   upsertMeetingThread,
 } from "../src/db.ts";
+import {
+  commandIntents,
+  parseSequenceCommand,
+  sequenceTargets,
+  type SequenceCommand,
+} from "../src/command_intent.ts";
+import { bindRepliedMessageForTurn } from "../src/email_references.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteResult } from "../src/llm.ts";
 import { PERSONAL_DOMAINS } from "../src/meeting_book.ts";
 import {
   countManualFollowups,
+  EXCLUSION_LABELS,
   evaluatePitchExclusion,
   firstStepAt,
   hasOriginalOutreach,
@@ -279,6 +302,15 @@ const gmailStub = {
       }),
     },
     messages: {
+      get: async ({ id }: { id: string }) => {
+        for (const [threadId, messages] of threads) {
+          const found = messages.find((message) => message.id === id);
+          if (found) {
+            return { data: toGmailMessage(threadId, found) };
+          }
+        }
+        throw new Error("no such message");
+      },
       list: async ({ q }: { q: string }) => {
         const from = /from:(\S+)/.exec(q)?.[1];
         if (from) {
@@ -1072,6 +1104,479 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
   assert(!src.includes("messages.send"), `${file} must not call messages.send`);
   assert(!src.includes("drafts."), `${file} must not touch drafts`);
 }
+// ---- follow-ups started by his own command: the words ----
+{
+  const parse = parseSequenceCommand;
+  const direct = (words: string): Extract<SequenceCommand, { kind: "direct" }> => {
+    const parsed = parse(words);
+    assert(parsed.kind === "direct", `"${words}" is a direct command, got ${JSON.stringify(parsed)}`);
+    return parsed as Extract<SequenceCommand, { kind: "direct" }>;
+  };
+  const one = direct("start a 3-step follow-up to Mayur, 4 days apart, asking for a demo");
+  assert(
+    one.followups === 3 && one.gapDays === 4 && one.cta === "ask for a demo" && !one.combined,
+    `example 1: ${JSON.stringify(one)}`,
+  );
+  const two = direct("put my email to Mayur in a follow-up sequence, 5 follow-ups every 3 days, ask them to book a call");
+  assert(
+    two.followups === 5 && two.gapDays === 3 && two.cta === "ask them to book a call",
+    `example 2: ${JSON.stringify(two)}`,
+  );
+  const plain = direct("start a sequence for Mayur");
+  assert(
+    plain.followups === 3 && plain.gapDays === null && plain.cta === null,
+    "defaults: 3 follow-ups, the default gap, the ask inferred from his email",
+  );
+  for (const [words, followups, gap] of [
+    ["start follow-ups for Mayur", 3, null],
+    ["set up 2 follow-ups for Mayur every day", 2, 1],
+    ["auto follow up with Mayur every other day", 3, 2],
+    ["follow up Mayur 4 times, a week apart", 4, 7],
+    ["start six follow-ups to Mayur every 14 days", 6, 14],
+    ["add Mayur to the follow-up sequence, one follow-up", 1, null],
+    ["Start 1 follow-up to Mayur, 1 day apart", 1, 1],
+  ] as const) {
+    const parsed = direct(words);
+    assert(parsed.followups === followups && parsed.gapDays === gap, `"${words}": ${JSON.stringify(parsed)}`);
+  }
+  for (const [words, text] of [
+    ["start 7 follow-ups to Mayur", "Not started: follow-ups can be 1 to 6."],
+    ["start 0 follow-ups to Mayur", "Not started: follow-ups can be 1 to 6."],
+    ["start ten follow-ups to Mayur", "Not started: follow-ups can be 1 to 6."],
+    ["start 3 follow-ups to Mayur every 15 days", "Not started: the gap can be 1 to 14 days."],
+    ["start 3 follow-ups to Mayur, 0 days apart", "Not started: the gap can be 1 to 14 days."],
+    ["start 3 follow-ups to Mayur every 3 weeks", "Not started: the gap can be 1 to 14 days."],
+  ] as const) {
+    const parsed = parse(words);
+    assert(parsed.kind === "refused" && parsed.text === text, `"${words}" is refused in one line, got ${JSON.stringify(parsed)}`);
+  }
+  for (const words of [
+    "follow up with Mayur",
+    "remind me to follow up with Mayur",
+    "track my email to Mayur",
+    "follow up on my email to Mayur",
+    "offer a follow-up sequence for Mayur",
+  ]) {
+    assert(parse(words).kind === "soft", `"${words}" keeps the Start card, got ${parse(words).kind}`);
+  }
+  for (const words of [
+    "don't start the sequence yet for Mayur",
+    "start 3 follow-ups for Mayur, but not yet",
+    "no follow-ups for Mayur",
+    "email Mayur saying hi, no follow-ups",
+    "hold off on the follow-ups for Mayur",
+    "start follow-ups for Mayur later",
+    "don't auto follow up with Mayur",
+  ]) {
+    assert(parse(words).kind === "negated", `"${words}" enrols nothing, got ${parse(words).kind}`);
+  }
+  // Send then enrol: only the trailing clause sets anything, never the body.
+  const combined = direct("email Mayur saying we offer 5 plans every 3 days and set up 2 follow-ups every 4 days asking for a demo");
+  assert(
+    combined.combined && combined.followups === 2 && combined.gapDays === 4 && combined.cta === "ask for a demo",
+    `combined: ${JSON.stringify(combined)}`,
+  );
+  assert(
+    combined.emailPart === "email Mayur saying we offer 5 plans every 3 days",
+    `the email part ends where the follow-up clause starts: ${combined.emailPart}`,
+  );
+  const bodyNumbers = direct("email Mayur saying we offer 5 plans, valid for 10 days, and start follow-ups");
+  assert(
+    bodyNumbers.combined && bodyNumbers.followups === 3 && bodyNumbers.gapDays === null,
+    `numbers in the dictated body are never settings: ${JSON.stringify(bodyNumbers)}`,
+  );
+  const sendIt = direct("send it and start 3 follow-ups");
+  assert(sendIt.combined && sendIt.followups === 3, "\"send it and start 3 follow-ups\" sends, then enrols");
+  // E: follow-up words inside a dictated body are not a command.
+  const body = parse("email Mayur saying we'll call and set up 3 follow-up meetings");
+  assert(body.kind === "none" && body.mentionsFollowups, `a body's follow-up words start nothing: ${JSON.stringify(body)}`);
+  const bodyKinds = commandIntents("email Mayur saying we'll call and set up 3 follow-up meetings");
+  assert(bodyKinds.includes("send") && !bodyKinds.includes("sequence"), `it is a send, not a sequence: ${bodyKinds}`);
+  const both = commandIntents("email Mayur saying we're live and set up 3 follow-ups");
+  assert(both.includes("send") && both.includes("sequence"), `a send then enrol keeps both commands: ${both}`);
+  assert(
+    commandIntents("start a 3-step follow-up to Mayur, 4 days apart, asking for a demo").join(",") === "sequence",
+    "a pure follow-up command is a sequence",
+  );
+  assert(commandIntents("put my email to Mayur in a follow-up sequence").includes("sequence"), "put ... in a follow-up sequence");
+  const thisEmail = direct("put this email in a follow up sequence");
+  assert(thisEmail.thisEmail && thisEmail.followups === 3 && !thisEmail.combined, "put this email in a follow-up sequence");
+  assert(direct("add this to follow-ups").thisEmail, "add this to follow-ups");
+  for (const words of [
+    "start a follow-up call with Mayur",
+    "set up a follow-up meeting with Mayur",
+    "add a note to the follow-up email",
+    "send a follow-up to Mayur",
+  ]) {
+    assert(parse(words).kind !== "direct", `"${words}" is not a follow-up sequence command`);
+  }
+  for (const [words, name] of [
+    ["start a 3-step follow-up to Mayur, 4 days apart, asking for a demo", "Mayur"],
+    ["put my email to Mayur in a follow-up sequence, 5 follow-ups every 3 days, ask them to book a call", "Mayur"],
+    ["set up 3 follow-ups for Mayur Galande every 2 days", "Mayur Galande"],
+    ["start follow-ups for Mayur", "Mayur"],
+    ["add Mayur to follow-ups", "Mayur"],
+    ["follow up Mayur 4 times, a week apart", "Mayur"],
+  ] as const) {
+    const targets = sequenceTargets(words);
+    assert(targets?.join("|") === name, `"${words}" names ${name}, got ${targets}`);
+  }
+}
+
+// ---- the startup rebuild: wider limits, the same rows, never a crash ----
+const OLD_SALES_SCHEMA = `
+  CREATE TABLE sales_sequences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT 'work' CHECK (account = 'work'),
+    prospect_email TEXT NOT NULL,
+    prospect_domain TEXT NOT NULL,
+    prospect_key TEXT NOT NULL,
+    prospect_name TEXT NOT NULL DEFAULT '',
+    prospect_company TEXT NOT NULL DEFAULT '',
+    prospect_timezone TEXT,
+    subject TEXT NOT NULL DEFAULT '',
+    original_message_id TEXT NOT NULL,
+    original_sent_at TEXT NOT NULL,
+    status TEXT NOT NULL
+      CHECK (status IN ('proposed', 'active', 'stopped', 'completed')),
+    stop_reason TEXT,
+    current_step INTEGER NOT NULL DEFAULT 1 CHECK (current_step BETWEEN 1 AND 4),
+    steps_sent INTEGER NOT NULL DEFAULT 0 CHECK (steps_sent BETWEEN 0 AND 4),
+    manual_followups INTEGER NOT NULL DEFAULT 0 CHECK (manual_followups BETWEEN 0 AND 3),
+    original_ask TEXT CHECK (original_ask IN ('demo', 'partnership_call', 'meeting')),
+    next_step_at TEXT,
+    enrolled_at TEXT,
+    classifier_confidence REAL,
+    classifier_reason TEXT,
+    card_message_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (account, thread_id)
+  );
+  CREATE UNIQUE INDEX idx_sales_sequences_open_prospect
+    ON sales_sequences (prospect_key)
+    WHERE status IN ('proposed', 'active');
+  CREATE TABLE sales_sequence_steps (
+    sequence_id INTEGER NOT NULL REFERENCES sales_sequences (id),
+    step_no INTEGER NOT NULL CHECK (step_no BETWEEN 1 AND 4),
+    scheduled_at TEXT,
+    draft_text TEXT,
+    check_result TEXT,
+    status TEXT NOT NULL DEFAULT 'planned'
+      CHECK (status IN ('planned', 'sending', 'sent', 'blocked', 'skipped')),
+    sent_message_id TEXT,
+    sent_at TEXT,
+    reason TEXT,
+    draft_id TEXT,
+    claimed_at TEXT,
+    blocked_at TEXT,
+    waiting_ping_at TEXT,
+    slot_lines TEXT,
+    PRIMARY KEY (sequence_id, step_no)
+  );
+  CREATE INDEX idx_sales_sequence_steps_sent_message
+    ON sales_sequence_steps (sent_message_id);
+  ALTER TABLE sales_sequences ADD COLUMN prospect_timezone_source TEXT;
+  ALTER TABLE sales_sequence_steps ADD COLUMN cc TEXT;
+`;
+
+function oldSalesDatabase(file = ":memory:"): Database.Database {
+  const handle = new Database(file);
+  handle.pragma("foreign_keys = ON");
+  handle.exec(OLD_SALES_SCHEMA);
+  const insert = handle.prepare(
+    `INSERT INTO sales_sequences (thread_id, prospect_email, prospect_domain, prospect_key, prospect_name,
+       subject, original_message_id, original_sent_at, status, current_step, steps_sent, manual_followups,
+       original_ask, next_step_at, enrolled_at, prospect_timezone, prospect_timezone_source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insert.run("th-a", "ann@a.example", "a.example", "ann@a.example", "Ann", "Pitch A", "ma", "2026-11-01T05:00:00.000Z",
+    "active", 2, 1, 0, "demo", "2026-11-25T05:00:00.000Z", "2026-11-02T05:00:00.000Z", "Asia/Kolkata", "email");
+  insert.run("th-b", "ben@b.example", "b.example", "ben@b.example", "Ben", "Pitch B", "mb", "2026-10-01T05:00:00.000Z",
+    "completed", 4, 4, 0, null, null, "2026-10-02T05:00:00.000Z", null, null);
+  const step = handle.prepare(
+    `INSERT INTO sales_sequence_steps (sequence_id, step_no, scheduled_at, draft_text, status, sent_message_id, sent_at, cc)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  step.run(1, 1, "2026-11-03T05:00:00.000Z", "Hi Ann", "sent", "s1", "2026-11-03T05:00:00.000Z", "sam@epicode.in");
+  for (const stepNo of [2, 3, 4]) {
+    step.run(1, stepNo, stepNo === 2 ? "2026-11-25T05:00:00.000Z" : null, null, "planned", null, null, null);
+  }
+  for (const stepNo of [1, 2, 3, 4]) {
+    step.run(2, stepNo, null, `Hi Ben ${stepNo}`, "sent", `b${stepNo}`, "2026-10-05T05:00:00.000Z", null);
+  }
+  return handle;
+}
+
+function salesRows(handle: Database.Database): { sequences: Array<Record<string, unknown>>; steps: Array<Record<string, unknown>> } {
+  return {
+    sequences: handle.prepare("SELECT * FROM sales_sequences ORDER BY id").all() as Array<Record<string, unknown>>,
+    steps: handle.prepare("SELECT * FROM sales_sequence_steps ORDER BY sequence_id, step_no").all() as Array<Record<string, unknown>>,
+  };
+}
+
+function sameOldColumns(before: Array<Record<string, unknown>>, after: Array<Record<string, unknown>>): boolean {
+  return before.length === after.length &&
+    before.every((row, index) => Object.keys(row).every((column) => row[column] === after[index]![column]));
+}
+
+function tableSql(handle: Database.Database, name: string): string {
+  return (handle.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) as { sql: string } | undefined)?.sql ?? "";
+}
+
+{
+  const handle = oldSalesDatabase();
+  const before = salesRows(handle);
+  assert(migrateSalesSequenceLimits(handle) === "rebuilt", "an old database is rebuilt");
+  const after = salesRows(handle);
+  assert(sameOldColumns(before.sequences, after.sequences), "every sequence row is unchanged");
+  assert(sameOldColumns(before.steps, after.steps), "every step row is unchanged, Cc included");
+  assert(
+    after.sequences.every((row) => row.total_steps === 4 && row.step_days === null && row.cta === null && row.command_key === null),
+    "old sequences keep 4 steps, the default gap and the inferred ask",
+  );
+  assert(tableSql(handle, "sales_sequence_steps").includes("step_no BETWEEN 1 AND 9"), "steps now go up to 9");
+  assert(tableSql(handle, "sales_sequences").includes("current_step BETWEEN 1 AND 9"), "and so does the current step");
+  assert((handle.pragma("foreign_key_check") as unknown[]).length === 0, "foreign keys hold");
+  assert(handle.pragma("integrity_check", { simple: true }) === "ok", "integrity holds");
+  assert(handle.pragma("foreign_keys", { simple: true }) === 1, "foreign keys are back on");
+  assert(
+    (handle.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_sales_%' ORDER BY name").all() as Array<{ name: string }>)
+      .map((row) => row.name).join(",") === "idx_sales_sequence_steps_sent_message,idx_sales_sequences_open_prospect",
+    "both indexes are back",
+  );
+  let blocked = false;
+  try {
+    handle.prepare("INSERT INTO sales_sequence_steps (sequence_id, step_no, status) VALUES (999, 1, 'planned')").run();
+  } catch {
+    blocked = true;
+  }
+  assert(blocked, "a step for a missing sequence is still refused");
+  handle.prepare("INSERT INTO sales_sequence_steps (sequence_id, step_no, status) VALUES (1, 9, 'planned')").run();
+  assert(migrateSalesSequenceLimits(handle) === "skipped", "a rebuilt database is left alone");
+  handle.close();
+}
+
+async function quietErrors<T>(run: () => T | Promise<T>): Promise<{ value: T; errors: string[] }> {
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...items: unknown[]) => errors.push(items.join(" "));
+  try {
+    return { value: await run(), errors };
+  } finally {
+    console.error = original;
+  }
+}
+
+{
+  // Fails before anything changes: the work table's name is taken.
+  const handle = oldSalesDatabase();
+  handle.exec("CREATE TABLE sales_sequences_rebuild (x TEXT)");
+  const before = salesRows(handle);
+  const { value, errors } = await quietErrors(() => migrateSalesSequenceLimits(handle));
+  assert(value === "failed", "a blocked rebuild reports failure");
+  assert(errors.length === 1 && /rebuild failed/i.test(errors[0]!) && /capped at 4/.test(errors[0]!), `one clear error line, got ${JSON.stringify(errors)}`);
+  assert(tableSql(handle, "sales_sequence_steps").includes("step_no BETWEEN 1 AND 4"), "the old schema stays");
+  const after = salesRows(handle);
+  assert(JSON.stringify(after) === JSON.stringify(before), "nothing changed");
+  assert(handle.pragma("foreign_keys", { simple: true }) === 1, "foreign keys are back on after a failure");
+  handle.close();
+}
+
+{
+  // Fails at the very end, after the old tables were dropped: everything rolls back.
+  const handle = oldSalesDatabase();
+  handle.pragma("foreign_keys = OFF");
+  handle.prepare("INSERT INTO sales_sequence_steps (sequence_id, step_no, status) VALUES (999, 1, 'planned')").run();
+  handle.pragma("foreign_keys = ON");
+  const before = salesRows(handle);
+  const { value, errors } = await quietErrors(() => migrateSalesSequenceLimits(handle));
+  assert(value === "failed" && errors.length === 1, "a foreign-key problem fails the rebuild with one line");
+  assert(tableSql(handle, "sales_sequences").includes("current_step BETWEEN 1 AND 4"), "the old sequences table is back");
+  assert(tableSql(handle, "sales_sequence_steps").includes("step_no BETWEEN 1 AND 4"), "the old steps table is back");
+  assert(tableSql(handle, "sales_sequences_rebuild") === "" && tableSql(handle, "sales_sequence_steps_rebuild") === "", "no work tables are left");
+  assert(JSON.stringify(salesRows(handle)) === JSON.stringify(before), "every row is as it was");
+  handle.close();
+}
+
+{
+  // The app itself starts on a database whose rebuild fails, and caps at 4.
+  const dir = mkdtempSync(join(tmpdir(), "aadi-rebuild-"));
+  try {
+    const file = join(dir, "aadi.db");
+    const handle = oldSalesDatabase(file);
+    handle.exec("CREATE TABLE sales_sequences_rebuild (x TEXT)");
+    handle.close();
+    const child = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "-e", "import('./src/db.ts').then((m) => { console.log('CAP=' + m.salesSequenceStepCap() + ' ROWS=' + m.listActiveSalesSequences().length); })"],
+      { env: { ...process.env, AADI_DB_PATH: file }, encoding: "utf8" },
+    );
+    assert(child.status === 0, `startup continues after a failed rebuild, exit ${child.status}: ${child.stderr}`);
+    assert(child.stdout.includes("CAP=4 ROWS=1"), `it runs capped at 4 with its rows: ${child.stdout}`);
+    const lines = child.stderr.split("\n").filter((line) => /rebuild failed/i.test(line));
+    assert(lines.length === 1, `one error line at startup, got ${JSON.stringify(lines)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
+
+// ---- follow-ups started by his own command: enrolment ----
+{
+  let ownMessage = 300;
+  const owner = (userText: string, messageId = ++ownMessage) => ({
+    confirmation: { chatId: 1, messageId },
+    userText,
+    ownTurn: true,
+  });
+  const sentBefore = telegram.sent.length;
+  pitch("t-cmd", "Mayur Galande <mayur@caia.example>", "IraVoice for Caia", 1);
+  const turn = owner("start a 3-step follow-up to Mayur, 4 days apart, asking for a demo");
+  const reply = await startSequenceFromTool("Mayur", turn, api);
+  assert(
+    reply.startsWith("Started 3 follow-ups to Mayur Galande (mayur@caia.example), every 4 days, CTA: ask for a demo. First one goes "),
+    `the reply says exactly what was set, got: ${reply}`,
+  );
+  assert(telegram.sent.length === sentBefore, "no Start card");
+  const row = getSalesSequenceByThread("t-cmd")!;
+  assert(
+    row.status === "active" && row.total_steps === 3 && row.step_days === 4 && row.cta === "ask for a demo",
+    `enrolled with his settings: ${JSON.stringify(row)}`,
+  );
+  assert(row.command_key === `msg:1:${turn.confirmation.messageId}`, "keyed to his message");
+  const steps = listSalesSequenceSteps(row.id);
+  assert(steps.length === 3 && steps.every((step) => step.status === "planned"), "three planned steps");
+  const pitchAt = threads.get("t-cmd")![0]!.sentAt;
+  assert(
+    new Date(row.next_step_at!).getTime() === Math.max(pitchAt + 4 * DAY, new Date(row.enrolled_at!).getTime()) ||
+      Math.abs(new Date(row.next_step_at!).getTime() - (pitchAt + 4 * DAY)) < 5_000,
+    "the first follow-up is 4 days after his email",
+  );
+
+  // C: the model's call and the command-guarantee fallback run on the same message.
+  const again = await startSequenceFromTool("Mayur Galande", turn, api);
+  assert(again === reply, `the second run reports the same start, got: ${again}`);
+  assert(listSalesSequenceSteps(row.id).length === 3, "and creates no more steps");
+  assert(
+    [...threads.keys()].filter((id) => getSalesSequenceByThread(id)?.prospect_email === "mayur@caia.example").length === 1,
+    "one sequence for Mayur",
+  );
+  const later = await startSequenceFromTool("Mayur", owner("start a 3-step follow-up to Mayur"), api);
+  assert(later.startsWith("Not started"), `a new message for the same person is refused, got: ${later}`);
+
+  pitch("t-cmd-default", "Neeraja <neeraja@nu.example>", "Pitch for Nia", 1);
+  const plain = await startSequenceFromTool("Neeraja", owner("start a sequence for Neeraja"), api);
+  assert(
+    plain.startsWith("Started 3 follow-ups to Neeraja (neeraja@nu.example), every 2 days, CTA: same ask as your email. First one goes "),
+    `defaults are said plainly, got: ${plain}`,
+  );
+  const niaRow = getSalesSequenceByThread("t-cmd-default")!;
+  assert(niaRow.total_steps === 3 && niaRow.step_days === null && niaRow.cta === null, "defaults stored as defaults");
+
+  // Not his own turn (a delegated goal, a workflow): the Start card, as before.
+  pitch("t-cmd-deleg", "Olufemi <olufemi@omicron.example>", "Pitch for Olufemi", 1);
+  const delegated = await startSequenceFromTool(
+    "Olufemi",
+    { confirmation: { chatId: 1, messageId: ++ownMessage }, userText: "start 3 follow-ups for Olufemi" },
+    api,
+  );
+  assert(delegated.startsWith("Start card sent"), `a delegated call only offers the card, got: ${delegated}`);
+  assert(getSalesSequenceByThread("t-cmd-deleg")!.status === "proposed", "and enrols nothing");
+
+  // Soft phrasings keep the card even on his own turn.
+  pitch("t-cmd-soft", "Pamposh <pamposh@pi3.example>", "Pitch for Pamposh", 1);
+  const soft = await startSequenceFromTool("Pamposh", owner("remind me to follow up with Pamposh"), api);
+  assert(soft.startsWith("Start card sent") && getSalesSequenceByThread("t-cmd-soft")!.status === "proposed", "soft phrasing: card");
+
+  // Stop words and out-of-range settings enrol nothing.
+  pitch("t-cmd-stop", "Quintus <quintus@qu.example>", "Pitch for Quintus", 1);
+  const stopped = await startSequenceFromTool("Quintus", owner("don't start the sequence yet for Quintus"), api);
+  assert(stopped === "Not started: you said not to start follow-ups.", `stop words win, got: ${stopped}`);
+  const tooMany = await startSequenceFromTool("Quintus", owner("start 7 follow-ups to Quintus"), api);
+  assert(tooMany === "Not started: follow-ups can be 1 to 6.", `one line naming the limit, got: ${tooMany}`);
+  const tooFar = await startSequenceFromTool("Quintus", owner("start 2 follow-ups to Quintus every 20 days"), api);
+  assert(tooFar === "Not started: the gap can be 1 to 14 days.", `gap limit, got: ${tooFar}`);
+  assert(getSalesSequenceByThread("t-cmd-stop") === undefined, "nothing was created for Quintus");
+
+  // The newest email decides. If it's excluded, say why; never fall back to an older one.
+  pitch("t-cmd-old", "Rayyan <rayyan@rho2.example>", "Old pitch", 10);
+  pitch("t-cmd-new", "Rayyan <rayyan@rho2.example>", "New pitch", 1, "Rajiv <rajiv@rho2.example>");
+  const newest = await startSequenceFromTool("Rayyan", owner("start follow-ups for Rayyan"), api);
+  assert(
+    newest === `Not started for rayyan@rho2.example ('New pitch'): ${EXCLUSION_LABELS.external_cc}.`,
+    `the newest email's reason, got: ${newest}`,
+  );
+  assert(!getSalesSequenceByThread("t-cmd-old") && !getSalesSequenceByThread("t-cmd-new"), "no thread was enrolled");
+  for (const [threadId, to, cc, label] of [
+    ["t-cmd-partner", "Siobhan <siobhan@pinnacle.in>", "", "partner_or_self_domain"],
+    ["t-cmd-colleague", "Tomasz <tomasz@tau2.example>, Sam <sam@epicode.in>", "", "colleague_on_email"],
+    ["t-cmd-two", "Urvashi <urvashi@up.example>, Vikrant <vikrant@up.example>", "", "multiple_recipients"],
+  ] as const) {
+    pitch(threadId, to, `Pitch ${threadId}`, 1, cc);
+    const first = to.split("<")[0]!.trim();
+    const refused = await startSequenceFromTool(first, owner(`start 3 follow-ups for ${first}`), api);
+    assert(refused.includes(EXCLUSION_LABELS[label]), `${label} still refuses with its reason, got: ${refused}`);
+    assert(getSalesSequenceByThread(threadId)?.status !== "active", `${label}: nothing active`);
+  }
+
+  // A: a database still capped at 4 says so for more than 4.
+  setSalesSequenceStepCapForTests(4);
+  try {
+    pitch("t-cmd-cap", "Wesley <wesley@we.example>", "Pitch for Wesley", 1);
+    const capped = await startSequenceFromTool("Wesley", owner("start 5 follow-ups for Wesley"), api);
+    assert(capped === "Not started: this database still caps follow-ups at 4.", `the cap is named, got: ${capped}`);
+    assert(getSalesSequenceByThread("t-cmd-cap") === undefined, "nothing created");
+    const four = await startSequenceFromTool("Wesley", owner("start 4 follow-ups for Wesley"), api);
+    assert(four.startsWith("Started 4 follow-ups to Wesley"), `4 still fits, got: ${four}`);
+  } finally {
+    setSalesSequenceStepCapForTests(undefined);
+  }
+
+  // Replying to an Aadi message about an email: that message only says which email.
+  const draftCard = createPendingAction("d-unsent", null, "work");
+  setPendingActionTelegramMessage(draftCard.id, 7001);
+  const unsentTurn = owner("put this email in a follow up sequence");
+  bindRepliedMessageForTurn(1, unsentTurn.confirmation.messageId, 7001);
+  const unsent = await startSequenceFromTool("this email", unsentTurn, api);
+  assert(
+    unsent === "That draft isn't sent yet. Say 'send it and start follow-ups' or send it first.",
+    `an unsent draft enrols nothing, got: ${unsent}`,
+  );
+
+  pitch("t-sent-cmd", "Umaima <umaima@upsilon.example>", "Hello Umaima", 0);
+  claimCommandSend({ key: "msg:1:150:umaima@upsilon.example", account: "work", threadId: null });
+  recordCommandSendSent("msg:1:150:umaima@upsilon.example", "t-sent-cmd-m1");
+  setCommandSendTelegramMessage("msg:1:150:umaima@upsilon.example", 7002);
+  const sentTurn = owner("add this to follow-ups");
+  bindRepliedMessageForTurn(1, sentTurn.confirmation.messageId, 7002);
+  const fromSent = await startSequenceFromTool("this email", sentTurn, api);
+  assert(fromSent.startsWith("Started 3 follow-ups to Umaima (umaima@upsilon.example)"), `a sent email is enrolled, got: ${fromSent}`);
+  assert(getSalesSequenceByThread("t-sent-cmd")!.status === "active", "on that email's thread");
+
+  pitch("t-sent-draft", "Valtteri <valtteri@vee.example>", "Hello Valtteri", 0);
+  const sentCard = createPendingAction("d-sent", null, "work");
+  setPendingActionTelegramMessage(sentCard.id, 7003);
+  transitionPendingAction(sentCard.id, "pending", "sent");
+  setPendingActionSentMessage(sentCard.id, "t-sent-draft-m1");
+  const draftTurn = owner("put this email in a follow-up sequence, 2 follow-ups");
+  bindRepliedMessageForTurn(1, draftTurn.confirmation.messageId, 7003);
+  const fromDraft = await startSequenceFromTool("this email", draftTurn, api);
+  assert(fromDraft.startsWith("Started 2 follow-ups to Valtteri (valtteri@vee.example)"), `a sent draft card is enrolled, got: ${fromDraft}`);
+
+  const unknownTurn = owner("add this to follow-ups");
+  bindRepliedMessageForTurn(1, unknownTurn.confirmation.messageId, 9999);
+  const unknown = await startSequenceFromTool("this email", unknownTurn, api);
+  assert(unknown.startsWith("Not started: I can't tell which email that message is about."), `unknown message, got: ${unknown}`);
+
+  // Send then enrol never enrols from start_sequence alone: the send does it.
+  pitch("t-cmd-combined", "Xiaoming <xiaoming@xi.example>", "Pitch for Xiaoming", 1);
+  const early = await startSequenceFromTool("Xiaoming", owner("email Xiaoming saying hi and start 3 follow-ups"), api);
+  assert(early === "Not started yet: follow-ups start only once the email has gone out.", `got: ${early}`);
+  assert(getSalesSequenceByThread("t-cmd-combined") === undefined, "nothing enrolled before the send");
+}
+
 {
   const logs: string[] = [];
   const original = console.log;

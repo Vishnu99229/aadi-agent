@@ -112,6 +112,22 @@ export interface TurnContext {
   inflight: Map<string, Promise<ToolOutcome>>;
 }
 
+/** His own chat turn: an owner_chat grant with his confirmation, at the top level of
+ *  a chat turn. A delegated goal, a workflow step, A2A and background work all fail. */
+export function isOwnChatTurn(
+  ctx: Pick<TurnContext, "origin" | "depth" | "grant">,
+  confirmation: { chatId: number; messageId: number } | undefined,
+): boolean {
+  return (
+    ctx.origin === "chat" &&
+    (ctx.depth ?? 0) === 0 &&
+    ctx.grant?.source === "owner_chat" &&
+    confirmation !== undefined &&
+    Number.isSafeInteger(confirmation.chatId) &&
+    Number.isSafeInteger(confirmation.messageId)
+  );
+}
+
 export function newTurnContext(input: {
   actor?: string;
   origin?: WorkflowOrigin;
@@ -333,13 +349,15 @@ async function runCall(
   try {
     // The test seam stands in for the handler only: every check above still ran.
     let intercepted: string | undefined;
+    // Whatever the caller said, the own-turn mark comes from the turn context.
+    const handlerTurn: ToolTurn = { ...turn, ownTurn: isOwnChatTurn(ctx, turn.confirmation) };
     try {
-      intercepted = toolInterceptor?.(call, turn);
+      intercepted = toolInterceptor?.(call, handlerTurn);
     } catch (error) {
       crash = { error };
       throw error;
     }
-    outcome = { content: intercepted !== undefined ? intercepted : await tool.handler(input, turn) };
+    outcome = { content: intercepted !== undefined ? intercepted : await tool.handler(input, handlerTurn) };
     if (!outcome.isError) {
       notePresentedFromTool(call.name, outcome.content, turn.confirmation?.chatId ?? ctx.chatId);
     }
