@@ -1238,6 +1238,18 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
   assert(named.combined && named.target === "Jeff", `the clause names Jeff: ${JSON.stringify(named)}`);
   assert(direct("email Mayur saying hello and start 3 follow-ups").target === null, "no name in the clause");
   assert(direct("email Mayur saying hello and start 3 follow-ups for him").target === null, "a pronoun is the email's recipient");
+  // A reminder about a sequence is a reminder, never an enrolment.
+  for (const words of [
+    "remind me tomorrow to start a sequence for Mayur",
+    "remind me on Friday to put my email to Mayur in a follow-up sequence",
+    "remind me to start 3 follow-ups for Mayur",
+    "Remind me at 5pm to set up follow-ups for Mayur",
+  ]) {
+    assert(parse(words).kind === "soft", `"${words}" never enrols, got ${parse(words).kind}`);
+  }
+  const remindKinds = commandIntents("remind me tomorrow to start a sequence for Mayur");
+  assert(remindKinds.includes("reminder") && !remindKinds.includes("sequence"), `it is a reminder: ${remindKinds}`);
+  assert(commandIntents("remind me to follow up with Mayur").includes("sequence"), "\"remind me to follow up with X\" still offers the card");
   // E: follow-up words inside a dictated body are not a command.
   const body = parse("email Mayur saying we'll call and set up 3 follow-up meetings");
   assert(body.kind === "none" && body.mentionsFollowups, `a body's follow-up words start nothing: ${JSON.stringify(body)}`);
@@ -1643,6 +1655,11 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   bindRepliedMessageForTurn(1, unknownTurn.confirmation.messageId, 9999);
   const unknown = await startSequenceFromTool("this email", unknownTurn, api);
   assert(unknown.startsWith("Not started: I can't tell which email that message is about."), `unknown message, got: ${unknown}`);
+
+  pitch("t-cmd-remind", "Zubin <zubin@zu.example>", "Pitch for Zubin", 1);
+  const reminder = await startSequenceFromTool("Zubin", owner("remind me tomorrow to start a sequence for Zubin"), api);
+  assert(reminder.startsWith("Start card sent"), `a reminder wrapper only ever offers the card: ${reminder}`);
+  assert(getSalesSequenceByThread("t-cmd-remind")!.status === "proposed", "and enrols nothing");
 
   pitch("t-cmd-quoted", "Yara <yara@ya.example>", "Pitch for Yara", 1);
   const quotedTool = await startSequenceFromTool(

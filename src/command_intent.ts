@@ -220,7 +220,8 @@ const NOT_A_SEQUENCE_COMMAND: readonly RegExp[] = [
   new RegExp(`\\b(?:don'?t|don’t|do not|never|not to|no need to)\\b[^.?!\\n]{0,20}\\b${SEQUENCE_WORD}`, "i"),
   new RegExp(`\\b(?:did|have|has|was|were)\\s+(?:i|you|we|it)\\b[^.?!\\n]{0,20}\\b(?:start|started|begin|began|auto)`, "i"),
   new RegExp(`\\b(?:should|shall|must)\\s+(?:i|we)\\b[^.?!\\n]{0,20}\\b${SEQUENCE_WORD}`, "i"),
-  new RegExp(`\\bremind\\s+me\\s+to\\s+${SEQUENCE_WORD}`, "i"),
+  // "Remind me (tomorrow / on Friday / at 5pm) to start a sequence" is a reminder.
+  new RegExp(`\\bremind\\s+me\\b[^.?!\\n]{0,40}?\\bto\\s+(?:${SEQUENCE_WORD}|set\\s*up|put|add|create|schedule|run|launch|kick\\s*off)\\b`, "i"),
   new RegExp(`\\bi\\s+(?:need|have|want|plan|ought)\\s+to\\s+${SEQUENCE_WORD}`, "i"),
   new RegExp(`\\bi(?:'ll|’ll| will|'m going to|’m going to| am going to)\\s+${SEQUENCE_WORD}`, "i"),
 ];
@@ -697,6 +698,8 @@ export function parseSequenceCommand(
   }
   if (
     !isDirectSequenceCommand(plain) ||
+    // Any reminder wrapper: at most the Start card, never an enrolment.
+    REMIND_ME.test(plain) ||
     NOT_A_SEQUENCE_COMMAND.slice(1).some((pattern) => pattern.test(plain)) ||
     ASKED.test(plain) ||
     ASKED_ABOUT.test(plain) ||
