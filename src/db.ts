@@ -5143,16 +5143,25 @@ export function activateSalesSequence(
 /** A command's Start card holds exactly what was understood, so Start enrols exactly that. */
 export function setProposedSalesSequenceSettings(
   id: number,
-  input: { totalSteps: number; stepDays: number | null; cta: string | null; commandKey: string | null },
+  input: {
+    totalSteps: number;
+    stepDays: number | null;
+    cta: string | null;
+    commandKey: string | null;
+    /** The follow-ups he has sent himself as of this card, so total minus this is
+     *  exactly the number the card offered. Omitted: leave as stored. */
+    manualFollowups?: number;
+  },
 ): boolean {
   return (
     db
       .prepare(
         `UPDATE sales_sequences
-         SET total_steps = ?, step_days = ?, cta = ?, command_key = ?, updated_at = CURRENT_TIMESTAMP
+         SET total_steps = ?, step_days = ?, cta = ?, command_key = ?,
+             manual_followups = COALESCE(?, manual_followups), updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND status = 'proposed'`,
       )
-      .run(input.totalSteps, input.stepDays, input.cta, input.commandKey, id).changes > 0
+      .run(input.totalSteps, input.stepDays, input.cta, input.commandKey, input.manualFollowups ?? null, id).changes > 0
   );
 }
 

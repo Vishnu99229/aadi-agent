@@ -1683,6 +1683,43 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const gauriActive = getSalesSequence(gauri.id)!;
   assert(gauriActive.status === "active" && gauriActive.total_steps === 6 && gauriActive.step_days === 5, "the newest card enrols what it showed");
 
+  // He followed up himself after an older proposal: the card's 2 means 2 from Aadi.
+  pitch("t-cmd-bumped", "Ira Sen <ira@ir.example>", "Pitch for Ira", 2);
+  const oldProposal = createProposedSalesSequence({
+    threadId: "t-cmd-bumped",
+    prospectEmail: "ira@ir.example",
+    prospectDomain: "ir.example",
+    prospectKey: prospectKey("ira@ir.example"),
+    prospectName: "Ira Sen",
+    prospectCompany: "Ir",
+    subject: "Pitch for Ira",
+    originalMessageId: "t-cmd-bumped-m1",
+    originalSentAt: new Date(Date.now() - 2 * DAY).toISOString(),
+    manualFollowups: 0,
+    classifierConfidence: 0.9,
+    classifierReason: "pitch",
+  })!;
+  threads.get("t-cmd-bumped")!.push({
+    id: "t-cmd-bumped-m2",
+    from: `Vishnu Rajan <${ME}>`,
+    to: "Ira Sen <ira@ir.example>",
+    subject: "Re: Pitch for Ira",
+    sentAt: Date.now() - DAY,
+    sent: true,
+  });
+  const iraTurn = owner("start 2 follow-ups for Ira", { modelCalled: false });
+  const iraCard = await startSequenceFromTool("Ira", iraTurn, cardsApi);
+  assert(iraCard.startsWith("Start card sent for Ira Sen"), iraCard);
+  const iraLog = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(`seq:start:${oldProposal.id}:${iraTurn.confirmation.messageId}`, iraLog));
+  const ira = getSalesSequence(oldProposal.id)!;
+  assert(ira.status === "active", `the card enrols: ${JSON.stringify(iraLog)}`);
+  assert(ira.manual_followups === 1 && ira.total_steps === 3, `his own bump plus the 2 the card offered: ${ira.manual_followups}/${ira.total_steps}`);
+  assert(
+    listSalesSequenceSteps(ira.id).filter((step) => step.status === "planned").length === 2,
+    "exactly 2 automatic follow-ups, as the card said",
+  );
+
   // A detection card shown before a command card is out of date too.
   pitch("t-cmd-detected", "Hema <hema@he.example>", "Pitch for Hema", 1);
   const detected = createProposedSalesSequence({

@@ -1232,6 +1232,8 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     stepDays: settings.gapDays,
     cta: settings.cta,
     commandKey: commandKey ?? null,
+    // Today's count of his own follow-ups, so the card's number is what Start enrols.
+    manualFollowups: chosen.facts.manualFollowups,
   });
   const carded = getSalesSequence(row.id)!;
   if (!(await sendCommandCard(carry.api, carded, settings))) {
