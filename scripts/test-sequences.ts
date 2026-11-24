@@ -1250,6 +1250,27 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
   const remindKinds = commandIntents("remind me tomorrow to start a sequence for Mayur");
   assert(remindKinds.includes("reminder") && !remindKinds.includes("sequence"), `it is a reminder: ${remindKinds}`);
   assert(commandIntents("remind me to follow up with Mayur").includes("sequence"), "\"remind me to follow up with X\" still offers the card");
+  // A question or a maybe is never an enrolment; a request to Aadi still is.
+  for (const words of [
+    "Can I start 3 follow-ups for Mayur?",
+    "Could I set up follow-ups for Mayur?",
+    "start 3 follow-ups for Mayur?",
+    "I could start 3 follow-ups for Mayur",
+    "maybe start a sequence for Mayur",
+    "thinking of starting follow-ups for Mayur",
+  ]) {
+    assert(parse(words).kind !== "direct", `"${words}" never enrols, got ${parse(words).kind}`);
+  }
+  for (const words of ["Can you start 3 follow-ups for Mayur?", "Could you please start 3 follow-ups for Mayur", "please start 3 follow-ups for Mayur"]) {
+    assert(parse(words).kind === "direct", `"${words}" is a request to Aadi, got ${parse(words).kind}`);
+  }
+  assert(!commandIntents("Can I start 3 follow-ups for Mayur?").includes("sequence"), "his question forces nothing");
+  assert(commandIntents("Can you start 3 follow-ups for Mayur?").includes("sequence"), "a request still does");
+  // A quoted CTA keeps its punctuation.
+  const quotedCta = direct('start 3 follow-ups for Mayur, CTA: "Book a call, or send your availability"');
+  assert(quotedCta.cta === "Book a call, or send your availability", `the whole quoted CTA: ${JSON.stringify(quotedCta)}`);
+  const quotedAsk = direct('start 3 follow-ups for Mayur asking for "a demo, or a pilot", every 4 days');
+  assert(quotedAsk.cta === "ask for a demo, or a pilot" && quotedAsk.gapDays === 4, `quoted ask, then the gap: ${JSON.stringify(quotedAsk)}`);
   // E: follow-up words inside a dictated body are not a command.
   const body = parse("email Mayur saying we'll call and set up 3 follow-up meetings");
   assert(body.kind === "none" && body.mentionsFollowups, `a body's follow-up words start nothing: ${JSON.stringify(body)}`);
@@ -1660,6 +1681,11 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const reminder = await startSequenceFromTool("Zubin", owner("remind me tomorrow to start a sequence for Zubin"), api);
   assert(reminder.startsWith("Start card sent"), `a reminder wrapper only ever offers the card: ${reminder}`);
   assert(getSalesSequenceByThread("t-cmd-remind")!.status === "proposed", "and enrols nothing");
+
+  pitch("t-cmd-question", "Asif <asif@as.example>", "Pitch for Asif", 1);
+  const question = await startSequenceFromTool("Asif", owner("Can I start 3 follow-ups for Asif?"), api);
+  assert(question.startsWith("Start card sent"), `a question only ever offers the card: ${question}`);
+  assert(getSalesSequenceByThread("t-cmd-question")!.status === "proposed", "and enrols nothing");
 
   pitch("t-cmd-quoted", "Yara <yara@ya.example>", "Pitch for Yara", 1);
   const quotedTool = await startSequenceFromTool(

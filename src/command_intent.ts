@@ -396,6 +396,7 @@ export function commandIntents(ownWords: string): CommandKind[] {
   if (
     isExplicitSequenceRequest(maskQuoted(text)) &&
     !NOT_A_SEQUENCE_COMMAND.some((pattern) => pattern.test(text)) &&
+    !isQuestionOrMaybe(maskQuoted(text)) &&
     !notAnInstruction(text, { remindAllowed: true })
   ) {
     found.add("sequence");
@@ -579,6 +580,21 @@ const SEQUENCE_STOP: readonly RegExp[] = [
 const STANDALONE_DEFERRAL =
   /(?:^|[.!?;,]\s*|\b(?:but|and)\s+)(?:not\s+(?:yet|now)|hold\s+off|wait|later|don'?t\s+start(?:\s+(?:it|them|yet))*)\s*(?:[.!?]+\s*|$)/i;
 
+/** His own question or musing, not a request to Aadi: "Can I start 3 follow-ups for
+ *  X?", "start a sequence for X?", "I could ...", "maybe ...". "Can you / could you /
+ *  please ..." is still a request. */
+const REQUEST_TO_AADI = /^(?:please\s+|pls\s+|kindly\s+)?(?:can|could|would|will)\s+you\b/i;
+const FIRST_PERSON_MAYBE =
+  /\b(?:can|could|may|might|should|shall|would)\s+(?:i|we)\b|\b(?:i|we)\s+(?:could|might|may|should|would|can)\b|\b(?:thinking|wondering|considering)\s+(?:of|about|whether|if)\b|\bmaybe\b|\bwhat\s+if\b|\bhow\s+about\b/i;
+
+function isQuestionOrMaybe(text: string): boolean {
+  const trimmed = text.trim();
+  if (REQUEST_TO_AADI.test(trimmed)) {
+    return false;
+  }
+  return /\?\s*$/.test(trimmed) || FIRST_PERSON_MAYBE.test(trimmed);
+}
+
 /** A spacing he asked for that isn't in days: refused, never swapped for the default. */
 const INTERVAL_MENTION =
   /\b(?:every|each)\s+(?!one\b|of\b)\S+|\b(?:apart|between|gap|daily|weekly|monthly|fortnightly|biweekly|twice|thrice)\b|\b(?:a|per)\s+(?:day|week|month)\b/i;
@@ -620,6 +636,18 @@ function ctaOf(clause: string): { cta: string; start: number; end: number } | un
     }
     const from = match.index + match[0].length;
     const tail = clause.slice(from);
+    // A quoted CTA runs to its closing quote, commas and all.
+    const quoted = /^\s*(?:"([^"]+)"|“([^”]+)”|‘([^’]+)’)/.exec(tail);
+    if (quoted) {
+      const inner = (quoted[1] ?? quoted[2] ?? quoted[3] ?? "").replace(/\s+/g, " ").trim();
+      if (inner) {
+        return {
+          cta: shape(inner.length > 100 ? inner.slice(0, 100).replace(/\s+\S*$/, "") : inner),
+          start: match.index,
+          end: from + quoted[0].length,
+        };
+      }
+    }
     const stop = CTA_END.exec(tail);
     let value = (stop ? tail.slice(0, stop.index) : tail)
       .replace(/["“”]/g, "")
@@ -700,6 +728,7 @@ export function parseSequenceCommand(
     !isDirectSequenceCommand(plain) ||
     // Any reminder wrapper: at most the Start card, never an enrolment.
     REMIND_ME.test(plain) ||
+    isQuestionOrMaybe(plain) ||
     NOT_A_SEQUENCE_COMMAND.slice(1).some((pattern) => pattern.test(plain)) ||
     ASKED.test(plain) ||
     ASKED_ABOUT.test(plain) ||
