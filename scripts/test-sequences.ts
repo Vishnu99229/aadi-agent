@@ -10,6 +10,7 @@ import type { gmail_v1 } from "googleapis";
 import { fakeTelegramApi, type TelegramLog } from "./fakes.ts";
 import {
   addSalesDoNotContact,
+  getSalesSequence,
   claimCommandSend,
   createPendingAction,
   createProposedSalesSequence,
@@ -1164,7 +1165,11 @@ const PHRASES: Array<[string, string, Partial<Settings>?]> = [
   ["email Mayur saying “please start 3 follow-ups” and start 2 follow-ups", "enroll", { followups: 2 }],
   ["put this email in a follow up sequence", "enroll"],
   ["add this to follow-ups", "enroll"],
+  ["Start a follow-up for Mayur", "enroll", { followups: 1 }],
+  ["start a single follow-up for Mayur", "enroll", { followups: 1 }],
+  ["start a follow-up sequence for Mayur", "enroll", { followups: 3 }],
   // Not on the allowlist, not certain, or not a request: a pre-filled Start card.
+  ["start follow-up for Mayur", "card"],
   ["auto follow up with Mayur every other day", "card"],
   ["follow up Mayur 4 times, a week apart", "card"],
   ["Can I start 3 follow-ups for Mayur?", "card"],
@@ -1612,11 +1617,8 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   // enrols exactly what the card says.
   pitch("t-cmd-fallback", "Farah <farah@fa.example>", "Pitch for Farah", 1);
   const cardsBefore = telegram.sent.length;
-  const fallback = await startSequenceFromTool(
-    "Farah",
-    owner("start 2 follow-ups for Farah every 5 days, asking for a demo", { modelCalled: false }),
-    api,
-  );
+  const farahTurn = owner("start 2 follow-ups for Farah every 5 days, asking for a demo", { modelCalled: false });
+  const fallback = await startSequenceFromTool("Farah", farahTurn, api);
   assert(fallback.startsWith("Start card sent for Farah (farah@fa.example):"), `the fallback only offers a card: ${fallback}`);
   assert(fallback.includes("Nothing is enrolled until you tap Start."), "and says so");
   const farahCard = telegram.sent[telegram.sent.length - 1] ?? "";
@@ -1628,11 +1630,79 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const farah = getSalesSequenceByThread("t-cmd-fallback")!;
   assert(farah.status === "proposed", "nothing enrolled yet");
   const tapLog = { edits: [] as string[], replies: [] as string[] };
-  await handleSequenceCallback(callbackCtx(`seq:start:${farah.id}`, tapLog));
+  // The card's own Start carries the message that set it.
+  await handleSequenceCallback(callbackCtx(`seq:start:${farah.id}:${farahTurn.confirmation.messageId}`, tapLog));
   const tapped = getSalesSequenceByThread("t-cmd-fallback")!;
   assert(tapped.status === "active" && tapped.total_steps === 2 && tapped.step_days === 5 && tapped.cta === "ask for a demo", "Start enrols exactly that");
   assert(listSalesSequenceSteps(tapped.id).length === 2, "two steps");
   assert(tapLog.edits[0]?.startsWith("Started 2 follow-ups to Farah"), `the card reports it: ${tapLog.edits[0]}`);
+
+  // Two cards for one thread: each Start enrols only what its own card showed. The
+  // older card is out of date once a newer one replaced it.
+  const markups: unknown[] = [];
+  let cardMessage = 9000;
+  const cardsApi = {
+    sendMessage: async (_chat: unknown, text: string, extra?: { reply_markup?: unknown }) => {
+      telegram.sent.push(text);
+      markups.push(extra?.reply_markup);
+      cardMessage += 1;
+      return { message_id: cardMessage, date: 0, chat: { id: 1, type: "private" }, text };
+    },
+    editMessageText: async () => true,
+  } as unknown as Api;
+  pitch("t-cmd-twocards", "Gauri <gauri@ga.example>", "Pitch for Gauri", 1);
+  const firstCard = await startSequenceFromTool(
+    "Gauri",
+    owner("start 2 follow-ups for Gauri every 3 days", { modelCalled: false }),
+    cardsApi,
+  );
+  assert(firstCard.startsWith("Start card sent for Gauri"), firstCard);
+  const gauri = getSalesSequenceByThread("t-cmd-twocards")!;
+  const firstButtons = markups[markups.length - 1];
+  const secondCard = await startSequenceFromTool(
+    "Gauri",
+    owner("start 6 follow-ups for Gauri every 5 days", { modelCalled: false }),
+    cardsApi,
+  );
+  assert(secondCard.startsWith("Start card sent for Gauri"), secondCard);
+  const secondButtons = markups[markups.length - 1];
+  const startOf = (markup: unknown): string => {
+    const rows = (markup as { inline_keyboard?: Array<Array<{ text: string; callback_data?: string }>> } | undefined)?.inline_keyboard ?? [];
+    return rows.flat().find((button) => button.text === "Start")?.callback_data ?? "";
+  };
+  assert(startOf(firstButtons) !== "" && startOf(firstButtons) !== startOf(secondButtons), "each card has its own Start");
+  const staleLog = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(startOf(firstButtons), staleLog));
+  assert(getSalesSequence(gauri.id)!.status === "proposed", "the older card enrols nothing");
+  assert(
+    [...staleLog.edits, ...staleLog.replies].some((text) => text.includes("out of date")),
+    `and says it's out of date: ${JSON.stringify(staleLog)}`,
+  );
+  const freshLog = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(startOf(secondButtons), freshLog));
+  const gauriActive = getSalesSequence(gauri.id)!;
+  assert(gauriActive.status === "active" && gauriActive.total_steps === 6 && gauriActive.step_days === 5, "the newest card enrols what it showed");
+
+  // A detection card shown before a command card is out of date too.
+  pitch("t-cmd-detected", "Hema <hema@he.example>", "Pitch for Hema", 1);
+  const detected = createProposedSalesSequence({
+    threadId: "t-cmd-detected",
+    prospectEmail: "hema@he.example",
+    prospectDomain: "he.example",
+    prospectKey: prospectKey("hema@he.example"),
+    prospectName: "Hema",
+    prospectCompany: "He",
+    subject: "Pitch for Hema",
+    originalMessageId: "t-cmd-detected-m1",
+    originalSentAt: new Date().toISOString(),
+    manualFollowups: 0,
+    classifierConfidence: 0.9,
+    classifierReason: "pitch",
+  })!;
+  await startSequenceFromTool("Hema", owner("start 5 follow-ups for Hema", { modelCalled: false }), cardsApi);
+  const oldTap = { edits: [] as string[], replies: [] as string[] };
+  await handleSequenceCallback(callbackCtx(`seq:start:${detected.id}`, oldTap));
+  assert(getSalesSequence(detected.id)!.status === "proposed", "the older detection card can't enrol the command's settings");
 
   // Not his own turn (a delegated goal or a workflow): a card.
   pitch("t-cmd-deleg", "Olufemi <olufemi@omicron.example>", "Pitch for Olufemi", 1);

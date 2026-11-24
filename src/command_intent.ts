@@ -719,13 +719,21 @@ const COUNT_PATTERNS: readonly RegExp[] = [
   new RegExp(`\\b(${COUNT_WORD})\\s+(?:more\\s+)?times?\\b`, "gi"),
 ];
 
-/** Every count he gave: "3 follow-ups", "a 3-step ...", "4 times". */
+/** "a follow-up", "a single follow-up": one. Not "a follow-up sequence". */
+const ONE_FOLLOWUP = /\b(?:a|an|single|a\s+single|one\s+single)\s+follow[\s-]*up\b(?![\s-]*(?:s\b|sequences?\b))/gi;
+/** A bare singular "follow-up" with no number: one, or a sequence? Unclear. */
+const BARE_FOLLOWUP = /\bfollow[\s-]*up\b(?![\s-]*(?:s\b|sequences?\b))/i;
+
+/** Every count he gave: "3 follow-ups", "a 3-step ...", "4 times", "a follow-up". */
 function countsOf(text: string): number[] {
   const values = new Set<number>();
   for (const pattern of COUNT_PATTERNS) {
     for (const match of text.matchAll(pattern)) {
       values.add(numberOf(match[1]!));
     }
+  }
+  if (values.size === 0 && [...text.matchAll(ONE_FOLLOWUP)].length > 0) {
+    values.add(1);
   }
   return [...values];
 }
@@ -763,7 +771,7 @@ const COMMAND_WORDS = new Set([
   "a", "an", "the", "my", "new", "another", "automatic", "auto", "email", "mail", "more", "step", "steps",
   "follow", "ups", "followup", "followups", "sequence", "sequences", "for", "to", "with", "on", "in", "into",
   "of", "and", "then", "also", "them", "him", "her", "it", "this", "that", "last", "latest", "thread",
-  "message", "draft", "one", "every", "each", "other", "day", "days", "week", "weeks", "apart", "between",
+  "message", "draft", "one", "single", "every", "each", "other", "day", "days", "week", "weeks", "apart", "between",
   "gap", "daily", "weekly", "fortnight", "fortnightly", "now", "thanks", "thank", "pls", "cta",
   "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "fourteen",
 ]);
@@ -841,6 +849,8 @@ export function parseSequenceCommand(ownWords: string): SequenceCommand {
     unsure.push("I couldn't tell how many follow-ups you want");
   } else if (counts.length > 1) {
     unsure.push("you gave more than one number of follow-ups");
+  } else if (counts.length === 0 && BARE_FOLLOWUP.test(settingsText)) {
+    unsure.push("I couldn't tell whether you want one follow-up or a sequence");
   } else if (counts.length === 1) {
     const count = counts[0]!;
     if (Number.isInteger(count) && count >= COMMAND_FOLLOWUPS.min && count <= COMMAND_FOLLOWUPS.max) {

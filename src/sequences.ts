@@ -21,6 +21,7 @@ import {
   recordSalesPitchScan,
   reproposeDeclinedSalesSequence,
   SALES_SEQUENCE_DECLINED,
+  SALES_SEQUENCE_STEP_COUNT,
   salesSequenceStepCap,
   setSalesSequenceCardMessage,
   setProposedSalesSequenceSettings,
@@ -388,9 +389,15 @@ export async function detectPitches(options: {
   return rows;
 }
 
-function pitchCardKeyboard(id: number): InlineKeyboard {
+/** Which command a card shows: the message that set its settings. A detection card
+ *  has none. Start enrols only while the row still holds that card's settings. */
+function cardVersion(row: SalesSequenceRecord): string | undefined {
+  return row.command_key ? /^msg:-?\d+:(\d+)$/.exec(row.command_key)?.[1] ?? row.command_key : undefined;
+}
+
+function pitchCardKeyboard(id: number, version?: string): InlineKeyboard {
   return new InlineKeyboard()
-    .text("Start", `seq:start:${id}`)
+    .text("Start", version ? `seq:start:${id}:${version}` : `seq:start:${id}`)
     .text("No", `seq:no:${id}`)
     .row()
     .text("Never for this person", `seq:never:${id}`);
@@ -409,7 +416,7 @@ async function sendPitchCard(api: Api, row: SalesSequenceRecord, cardText?: stri
       subject: row.subject,
       manualFollowups: row.manual_followups,
     });
-    const keyboard = pitchCardKeyboard(row.id);
+    const keyboard = pitchCardKeyboard(row.id, cardVersion(row));
     if (
       holdForVoiceNote({
         text,
@@ -527,7 +534,7 @@ function startedText(
 }
 
 export async function handleSequenceCallback(ctx: Context): Promise<void> {
-  const match = /^seq:(start|no|never):(\d+)$/.exec(ctx.callbackQuery?.data ?? "");
+  const match = /^seq:(start|no|never):(\d+)(?::(\d+))?$/.exec(ctx.callbackQuery?.data ?? "");
   if (!match) {
     await ctx.answerCallbackQuery().catch(() => undefined);
     return;
@@ -558,6 +565,12 @@ export async function handleSequenceCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  // Each Start is bound to its own card: once a newer card replaced the settings, an
+  // older card can't enrol them.
+  if (match[3] !== cardVersion(row)) {
+    await finish(`This card is out of date: a newer card for ${prospectLabel(row)} replaced it. Tap Start on the newest card.`);
+    return;
+  }
   // A command card enrols exactly what it showed; a detection card, the standard 4.
   const outcome = await enrolProposed(id, settingsOfRow(row));
   if (!outcome.ok) {
@@ -765,7 +778,12 @@ export async function requestSequenceCard(
   if (!row) {
     return `Not started for ${prospect.email}: ${EXCLUSION_LABELS.prospect_in_sequence}.`;
   }
-  if (!(await sendPitchCard(api, row))) {
+  // The standard card shows the standard settings, so the row holds them too, and any
+  // earlier command card for it is out of date.
+  if (row.command_key) {
+    setProposedSalesSequenceSettings(row.id, { totalSteps: SALES_SEQUENCE_STEP_COUNT, stepDays: null, cta: null, commandKey: null });
+  }
+  if (!(await sendPitchCard(api, getSalesSequence(row.id) ?? row))) {
     if (!existing) {
       deleteProposedSalesSequence(row.id);
     } else if (existing.status === "stopped") {
