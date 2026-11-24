@@ -1834,6 +1834,25 @@ await expectCancelled("delete_task", async (row) => {
   assert(scheduled.includes("No follow-ups started: the email is scheduled, not sent. Start them once it goes out."), `scheduled: ${scheduled}`);
   assert(active() === count, "none of them enrolled anything");
 
+  // The clause names someone else: the email goes, nobody is enrolled.
+  const otherPerson = await sendEmailFromTool(
+    { to: ["mia@mu-co.com"], instruction: "say hello" },
+    own("email mia@mu-co.com saying hello and start 3 follow-ups for Jeff"),
+  );
+  assert(otherPerson.startsWith("Sent to"), `the email went: ${otherPerson}`);
+  assert(
+    otherPerson.includes("No follow-ups started: they were for Jeff, but the email went to ") &&
+      otherPerson.includes("mia@mu-co.com). Say 'start follow-ups for Jeff' for Jeff's own email."),
+    `and nobody was enrolled: ${otherPerson}`,
+  );
+  assert(active() === count, "Mia was not enrolled for Jeff's follow-ups");
+  const samePerson = await sendEmailFromTool(
+    { to: ["mona@mo-co.com"], instruction: "say hello" },
+    own("email mona@mo-co.com saying hello and start 2 follow-ups for Mona"),
+  );
+  assert(samePerson.includes("Started 2 follow-ups to ") && samePerson.includes("mona@mo-co.com"), `naming the recipient is fine: ${samePerson}`);
+  assert(active() === count + 1, "Mona was enrolled");
+
   // E: follow-up words in what the email says start nothing, and he's told.
   mail({ threadId: "lia-old", from: "Lia Wong <lia@lambda-co.com>", to: ME, subject: "Hi", body: "Hello" });
   written = { subject: "Call", body: "Hi Lia,\n\nWe'll call and set up three follow-up meetings." };
@@ -1843,7 +1862,7 @@ await expectCancelled("delete_task", async (row) => {
   );
   assert(bodyOnly.startsWith("Sent to"), `the email is sent: ${bodyOnly}`);
   assert(bodyOnly.includes("No follow-ups started; say 'start follow-ups for Lia' if you want them."), `and he's told: ${bodyOnly}`);
-  assert(active() === count, "nothing enrolled");
+  assert(active() === count + 1, "nothing more enrolled");
 
   // Stop words in the same message: sent, nothing enrolled.
   const noFollowups = await sendEmailFromTool(
@@ -1851,7 +1870,7 @@ await expectCancelled("delete_task", async (row) => {
     own("email lia@lambda-co.com saying hi, no follow-ups"),
   );
   assert(noFollowups.startsWith("Sent to") && noFollowups.includes("No follow-ups started, as you said."), noFollowups);
-  assert(active() === count, "still nothing enrolled");
+  assert(active() === count + 1, "still nothing more enrolled");
 
   // Not his own turn (a delegated goal): it may send, but never enrols.
   const delegated = await sendEmailFromTool(
@@ -1859,7 +1878,7 @@ await expectCancelled("delete_task", async (row) => {
     turn("email lia@lambda-co.com saying thanks and start 2 follow-ups"),
   );
   assert(delegated.includes("No follow-ups started: only your own message can start them."), delegated);
-  assert(active() === count, "a delegated turn enrolled nothing");
+  assert(active() === count + 1, "a delegated turn enrolled nothing");
 
   // D: "send it and start 3 follow-ups" right after a draft card.
   await queueDraftApproval({
@@ -1893,7 +1912,7 @@ await expectCancelled("delete_task", async (row) => {
   );
   draftFails = false;
   assert(failedDraft.includes("No follow-ups started: the email didn't go out."), `a failed draft send enrols nothing: ${failedDraft}`);
-  assert(active() === count + 1, "only Nora was enrolled");
+  assert(active() === count + 2, "only Mona and Nora were enrolled");
 
   users.messages.send = realSend;
   users.messages.list = realList;

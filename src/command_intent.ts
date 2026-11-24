@@ -523,7 +523,32 @@ export type SequenceCommand =
       cta: string | null;
       /** "put this email in a follow-up sequence": the email is the one he replied to. */
       thisEmail: boolean;
+      /** The person the follow-up clause names, if any ("... for Jeff"). After a send it
+       *  must be the person the email went to. */
+      target: string | null;
     };
+
+function nameTokens(value: string): string[] {
+  return value.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
+/** "Jeff" and "Jeff Comstock" name the same person; "Jeff" and "Priya" don't. */
+export function namesMatch(left: string, right: string): boolean {
+  const a = nameTokens(left);
+  const b = new Set(nameTokens(right));
+  const bList = [...b];
+  const aSet = new Set(a);
+  return a.length > 0 && bList.length > 0 && (a.every((token) => b.has(token)) || bList.every((token) => aSet.has(token)));
+}
+
+/** Sentences of the text, with where each starts. */
+function sentencesOf(text: string): Array<{ start: number; end: number }> {
+  const spans: Array<{ start: number; end: number }> = [];
+  for (const match of text.matchAll(/[^.!?\n]+(?:[.!?]+|$)/g)) {
+    spans.push({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
+  }
+  return spans;
+}
 
 const NUMBER_WORDS: Record<string, number> = {
   a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6,
@@ -649,7 +674,10 @@ const THIS_EMAIL =
  * anything: in "email Mayur saying ... and start 3 follow-ups", what the email
  * says is never read for numbers. A stop word anywhere wins.
  */
-export function parseSequenceCommand(ownWords: string): SequenceCommand {
+export function parseSequenceCommand(
+  ownWords: string,
+  options: { target?: string } = {},
+): SequenceCommand {
   const text = ownWords.replace(/\s+/g, " ").trim();
   // What he quoted is what an email says; only the rest can be a command.
   const plain = maskQuoted(text);
@@ -675,6 +703,22 @@ export function parseSequenceCommand(ownWords: string): SequenceCommand {
     PLANNED.test(plain)
   ) {
     return { kind: "soft" };
+  }
+  // Several people, each with their own settings: read only this person's sentence.
+  if (options.target) {
+    const commands = sentencesOf(plain).filter((span) => isDirectSequenceCommand(plain.slice(span.start, span.end)));
+    if (commands.length > 1) {
+      const mine = commands.filter((span) =>
+        (sequenceTargets(text.slice(span.start, span.end)) ?? []).some((name) => namesMatch(name, options.target!)),
+      );
+      if (mine.length !== 1) {
+        return {
+          kind: "refused",
+          text: `Not started: I couldn't tell which follow-up settings were for ${options.target}. Say them in a message of their own.`,
+        };
+      }
+      return parseSequenceCommand(text.slice(mine[0]!.start, mine[0]!.end));
+    }
   }
   let clause = text;
   let emailPart = "";
@@ -732,6 +776,7 @@ export function parseSequenceCommand(ownWords: string): SequenceCommand {
     gapDays,
     cta: cta?.cta ?? null,
     thisEmail: THIS_EMAIL.test(clause),
+    target: sequenceTargets(clause)?.[0] ?? null,
   };
 }
 

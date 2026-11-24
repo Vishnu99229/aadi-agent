@@ -1107,7 +1107,7 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
 }
 // ---- follow-ups started by his own command: the words ----
 {
-  const parse = parseSequenceCommand;
+  const parse = (words: string) => parseSequenceCommand(words);
   const direct = (words: string): Extract<SequenceCommand, { kind: "direct" }> => {
     const parsed = parse(words);
     assert(parsed.kind === "direct", `"${words}" is a direct command, got ${JSON.stringify(parsed)}`);
@@ -1222,6 +1222,22 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
     const parsed = parse(words);
     assert(parsed.kind === "refused" && parsed.text === text, `"${words}": ${JSON.stringify(parsed)}`);
   }
+  // Two people with their own settings: each call reads only its person's sentence.
+  const twoPeople = "Start 5 follow-ups for Munil every 3 days. Start 1 follow-up for Jeff every 14 days.";
+  const forJeff = parseSequenceCommand(twoPeople, { target: "Jeff" });
+  const forMunil = parseSequenceCommand(twoPeople, { target: "Munil Shah" });
+  assert(forJeff.kind === "direct" && forJeff.followups === 1 && forJeff.gapDays === 14, `Jeff's own settings: ${JSON.stringify(forJeff)}`);
+  assert(forMunil.kind === "direct" && forMunil.followups === 5 && forMunil.gapDays === 3, `Munil's own settings: ${JSON.stringify(forMunil)}`);
+  const forNobody = parseSequenceCommand(twoPeople, { target: "Priya" });
+  assert(
+    forNobody.kind === "refused" && forNobody.text === "Not started: I couldn't tell which follow-up settings were for Priya. Say them in a message of their own.",
+    `settings for nobody named: ${JSON.stringify(forNobody)}`,
+  );
+  // After a send, the clause may name the person; it must be the one the email went to.
+  const named = direct("email Mayur saying hello and start 3 follow-ups for Jeff");
+  assert(named.combined && named.target === "Jeff", `the clause names Jeff: ${JSON.stringify(named)}`);
+  assert(direct("email Mayur saying hello and start 3 follow-ups").target === null, "no name in the clause");
+  assert(direct("email Mayur saying hello and start 3 follow-ups for him").target === null, "a pronoun is the email's recipient");
   // E: follow-up words inside a dictated body are not a command.
   const body = parse("email Mayur saying we'll call and set up 3 follow-up meetings");
   assert(body.kind === "none" && body.mentionsFollowups, `a body's follow-up words start nothing: ${JSON.stringify(body)}`);
@@ -1513,6 +1529,16 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const munilAgain = await startSequenceFromTool("Munil", pair, api);
   assert(munilAgain === munil, `a repeat for Munil reports Munil's start: ${munilAgain}`);
   assert(listSalesSequenceSteps(getSalesSequenceByThread("t-cmd-munil")!.id).length === 3, "and Munil still has three steps");
+
+  pitch("t-cmd-kabir", "Kabir Rao <kabir@ka.example>", "Pitch for Kabir", 1);
+  pitch("t-cmd-leela", "Leela Nair <leela@le.example>", "Pitch for Leela", 1);
+  const settingsPair = owner("Start 5 follow-ups for Kabir every 3 days. Start 1 follow-up for Leela every 14 days.");
+  const kabir = await startSequenceFromTool("Kabir", settingsPair, api);
+  const leela = await startSequenceFromTool("Leela Nair", settingsPair, api);
+  assert(kabir.startsWith("Started 5 follow-ups to Kabir Rao (kabir@ka.example), every 3 days"), `Kabir: ${kabir}`);
+  assert(leela.startsWith("Started 1 follow-up to Leela Nair (leela@le.example), every 14 days"), `Leela gets her own settings: ${leela}`);
+  const leelaRow = getSalesSequenceByThread("t-cmd-leela")!;
+  assert(leelaRow.total_steps === 1 && leelaRow.step_days === 14, "stored as she was asked");
 
   pitch("t-cmd-default", "Neeraja <neeraja@nu.example>", "Pitch for Neeraja", 1);
   const plain = await startSequenceFromTool("Neeraja", owner("start a sequence for Neeraja"), api);

@@ -1,7 +1,7 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { accountMatchesEmail } from "./account_logic.js";
-import { maskQuoted, parseSequenceCommand, type SequenceCommand } from "./command_intent.js";
+import { maskQuoted, namesMatch, parseSequenceCommand, type SequenceCommand } from "./command_intent.js";
 import { decodedAccounts } from "./accounts.js";
 import { config } from "./config.js";
 import {
@@ -884,6 +884,13 @@ function emailForTelegramMessage(
   return UNKNOWN_EMAIL;
 }
 
+/** Every word of what he said appears in what's known about the person. */
+function nameTokensCover(said: string, known: string): boolean {
+  const words = new Set(known.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+  const named = said.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  return named.length > 0 && named.every((word) => words.has(word));
+}
+
 type CommandSource =
   | { target: string }
   | { telegramMessageId: number }
@@ -936,6 +943,15 @@ async function enrolByCommand(
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Sequence command: thread check failed (${errorType})`);
     return "Not started: I couldn't check that thread. Try again.";
+  }
+  // "Email Mayur ... and start 3 follow-ups for Jeff": the email went to Mayur, so the
+  // follow-ups meant for Jeff never fall on Mayur.
+  if (!("target" in source) && command.target && chosen.prospect) {
+    const prospect = chosen.prospect;
+    const known = `${prospect.name} ${prospect.email.split("@")[0]} ${domainOf(prospect.email).split(".")[0]}`;
+    if (!namesMatch(command.target, known) && !nameTokensCover(command.target, known)) {
+      return `No follow-ups started: they were for ${command.target}, but the email went to ${prospectDisplay(prospect.name, prospect.email)}. Say 'start follow-ups for ${command.target}' for ${command.target}'s own email.`;
+    }
   }
   // The same message already enrolled this thread (the model's call and the
   // command-guarantee fallback both ran): report it, enrol nothing more. Keyed to the
@@ -1070,7 +1086,8 @@ export async function startSequenceFromTool(
   if (!isExplicitSequenceRequest(maskQuoted(words))) {
     return "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\", \"follow up with X\", \"follow up X N times\", \"add X to sequence\", \"auto follow up with X\", \"follow up on my email to X\" or \"remind me to follow up with X\". For a reminder about something else, use set_reminder.";
   }
-  const command = parseSequenceCommand(words);
+  // With several people in one message, only this person's sentence sets anything.
+  const command = parseSequenceCommand(words, { target });
   if (command.kind === "negated") {
     return "Not started: you said not to start follow-ups.";
   }
