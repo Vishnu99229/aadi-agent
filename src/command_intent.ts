@@ -605,7 +605,12 @@ const COUNT_PATTERNS: readonly RegExp[] = [
 function gapOf(text: string): number | null {
   const day = (pattern: RegExp, days: (value: number) => number): number | undefined => {
     const match = pattern.exec(text);
-    return match ? days(match[1] ? numberOf(match[1]) : 1) : undefined;
+    if (!match) {
+      return undefined;
+    }
+    // The number from whichever alternative matched: "5-day gap" or "gap of 5 days".
+    const value = match.slice(1).find((item) => item !== undefined);
+    return days(value ? numberOf(value) : 1);
   };
   const found =
     (/\bevery\s+other\s+day\b/i.test(text) ? 2 : undefined) ??

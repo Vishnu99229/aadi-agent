@@ -1135,6 +1135,9 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
     ["start six follow-ups to Mayur every 14 days", 6, 14],
     ["add Mayur to the follow-up sequence, one follow-up", 1, null],
     ["Start 1 follow-up to Mayur, 1 day apart", 1, 1],
+    ["start 3 follow-ups for Mayur, gap of 5 days", 3, 5],
+    ["start 3 follow-ups for Mayur with a 5-day gap", 3, 5],
+    ["start 2 follow-ups for Mayur, 6 days between them", 2, 6],
   ] as const) {
     const parsed = direct(words);
     assert(parsed.followups === followups && parsed.gapDays === gap, `"${words}": ${JSON.stringify(parsed)}`);
@@ -1146,6 +1149,8 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
     ["start 3 follow-ups to Mayur every 15 days", "Not started: the gap can be 1 to 14 days."],
     ["start 3 follow-ups to Mayur, 0 days apart", "Not started: the gap can be 1 to 14 days."],
     ["start 3 follow-ups to Mayur every 3 weeks", "Not started: the gap can be 1 to 14 days."],
+    ["start 3 follow-ups for Mayur, gap of 15 days", "Not started: the gap can be 1 to 14 days."],
+    ["start 3 follow-ups for Mayur with a 20-day gap", "Not started: the gap can be 1 to 14 days."],
   ] as const) {
     const parsed = parse(words);
     assert(parsed.kind === "refused" && parsed.text === text, `"${words}" is refused in one line, got ${JSON.stringify(parsed)}`);
