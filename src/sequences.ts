@@ -1,7 +1,7 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { accountMatchesEmail } from "./account_logic.js";
-import { parseSequenceCommand, type SequenceCommand } from "./command_intent.js";
+import { maskQuoted, parseSequenceCommand, type SequenceCommand } from "./command_intent.js";
 import { decodedAccounts } from "./accounts.js";
 import { config } from "./config.js";
 import {
@@ -897,10 +897,6 @@ async function enrolByCommand(
   turn: CommandTurn,
 ): Promise<string> {
   const commandKey = commandKeyOf(turn);
-  const done = commandKey ? getSalesSequenceByCommandKey(commandKey) : undefined;
-  if (done) {
-    return commandStartedText(done);
-  }
   allowOwnTurnSequenceEnrollment(turn);
   let sent = "telegramMessageId" in source ? emailForTelegramMessage(source.telegramMessageId) : undefined;
   if (typeof sent === "string") {
@@ -940,6 +936,13 @@ async function enrolByCommand(
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Sequence command: thread check failed (${errorType})`);
     return "Not started: I couldn't check that thread. Try again.";
+  }
+  // The same message already enrolled this thread (the model's call and the
+  // command-guarantee fallback both ran): report it, enrol nothing more. Keyed to the
+  // thread, so a second person named in the same message is still checked.
+  const already = getSalesSequenceByThread(chosen.threadId);
+  if (commandKey && already?.command_key === commandKey) {
+    return commandStartedText(already);
   }
   if (chosen.exclusion || !chosen.prospect) {
     const who = chosen.prospect?.email ?? chosen.recipientDomain;
@@ -1063,7 +1066,8 @@ export async function startSequenceFromTool(
 ): Promise<string> {
   allowOwnerChatStartSequence(turn.confirmation);
   const words = turn.userText ?? "";
-  if (!isExplicitSequenceRequest(words)) {
+  // Quoted words are what an email says, never a request for follow-ups.
+  if (!isExplicitSequenceRequest(maskQuoted(words))) {
     return "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\", \"follow up with X\", \"follow up X N times\", \"add X to sequence\", \"auto follow up with X\", \"follow up on my email to X\" or \"remind me to follow up with X\". For a reminder about something else, use set_reminder.";
   }
   const command = parseSequenceCommand(words);

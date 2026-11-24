@@ -31,6 +31,7 @@ import {
   commandIntents,
   parseSequenceCommand,
   sequenceTargets,
+  withoutFollowupClause,
   type SequenceCommand,
 } from "../src/command_intent.ts";
 import { bindRepliedMessageForTurn } from "../src/email_references.ts";
@@ -1192,6 +1193,35 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
   );
   const sendIt = direct("send it and start 3 follow-ups");
   assert(sendIt.combined && sendIt.followups === 3, "\"send it and start 3 follow-ups\" sends, then enrols");
+  // Quoted email text is what the email says, never a command.
+  const quoted = 'email Mayur saying "Please review this guide and start 3 follow-ups every 4 days"';
+  const quotedParse = parse(quoted);
+  assert(quotedParse.kind === "none" && quotedParse.mentionsFollowups, `quoted words start nothing: ${JSON.stringify(quotedParse)}`);
+  assert(withoutFollowupClause(quoted) === quoted, "and the quoted body is never cut");
+  assert(!commandIntents(quoted).includes("sequence"), "nor is it a sequence command");
+  const curly = direct("email Mayur saying “please start 3 follow-ups” and start 2 follow-ups");
+  assert(curly.combined && curly.followups === 2, `only the clause outside the quotes counts: ${JSON.stringify(curly)}`);
+  // A deferral in its own sentence still wins.
+  for (const words of [
+    "start 3 follow-ups for Mayur. Not yet.",
+    "start 3 follow-ups for Mayur. Hold off.",
+    "Start follow-ups for Mayur, but wait.",
+    "start 3 follow-ups for Mayur. Not now",
+  ]) {
+    assert(parse(words).kind === "negated", `"${words}" enrols nothing, got ${parse(words).kind}`);
+  }
+  const notYetSigned = direct("email Mayur saying the contract is not yet signed, and start 3 follow-ups");
+  assert(notYetSigned.combined, "\"not yet\" inside the body's own sentence is not a deferral of the follow-ups");
+  // An interval it can't read is refused, never replaced by the default.
+  for (const [words, text] of [
+    ["start 3 follow-ups for Mayur every Monday", "Not started: give the gap in days, 1 to 14 (e.g. 'every 3 days')."],
+    ["start 3 follow-ups for Mayur twice a week", "Not started: give the gap in days, 1 to 14 (e.g. 'every 3 days')."],
+    ["start 3 follow-ups for Mayur every 2 months", "Not started: the gap can be 1 to 14 days."],
+    ["start 3 follow-ups for Mayur monthly", "Not started: the gap can be 1 to 14 days."],
+  ] as const) {
+    const parsed = parse(words);
+    assert(parsed.kind === "refused" && parsed.text === text, `"${words}": ${JSON.stringify(parsed)}`);
+  }
   // E: follow-up words inside a dictated body are not a command.
   const body = parse("email Mayur saying we'll call and set up 3 follow-up meetings");
   assert(body.kind === "none" && body.mentionsFollowups, `a body's follow-up words start nothing: ${JSON.stringify(body)}`);
@@ -1471,7 +1501,20 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const later = await startSequenceFromTool("Mayur", owner("start a 3-step follow-up to Mayur"), api);
   assert(later.startsWith("Not started"), `a new message for the same person is refused, got: ${later}`);
 
-  pitch("t-cmd-default", "Neeraja <neeraja@nu.example>", "Pitch for Nia", 1);
+  // Two people in one message: each call enrols its own person, once.
+  pitch("t-cmd-munil", "Munil Shah <munil@mu.example>", "Pitch for Munil", 1);
+  pitch("t-cmd-jeff", "Jeff Comstock <jeff@je.example>", "Pitch for Jeff", 1);
+  const pair = owner("Start a sequence for Munil Shah. Start a sequence for Jeff Comstock too.");
+  const munil = await startSequenceFromTool("Munil Shah", pair, api);
+  const jeff = await startSequenceFromTool("Jeff Comstock", pair, api);
+  assert(munil.startsWith("Started 3 follow-ups to Munil Shah (munil@mu.example)"), `Munil: ${munil}`);
+  assert(jeff.startsWith("Started 3 follow-ups to Jeff Comstock (jeff@je.example)"), `Jeff is checked and enrolled too: ${jeff}`);
+  assert(getSalesSequenceByThread("t-cmd-jeff")?.status === "active", "Jeff's sequence is active");
+  const munilAgain = await startSequenceFromTool("Munil", pair, api);
+  assert(munilAgain === munil, `a repeat for Munil reports Munil's start: ${munilAgain}`);
+  assert(listSalesSequenceSteps(getSalesSequenceByThread("t-cmd-munil")!.id).length === 3, "and Munil still has three steps");
+
+  pitch("t-cmd-default", "Neeraja <neeraja@nu.example>", "Pitch for Neeraja", 1);
   const plain = await startSequenceFromTool("Neeraja", owner("start a sequence for Neeraja"), api);
   assert(
     plain.startsWith("Started 3 follow-ups to Neeraja (neeraja@nu.example), every 2 days, CTA: same ask as your email. First one goes "),
@@ -1574,6 +1617,15 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   bindRepliedMessageForTurn(1, unknownTurn.confirmation.messageId, 9999);
   const unknown = await startSequenceFromTool("this email", unknownTurn, api);
   assert(unknown.startsWith("Not started: I can't tell which email that message is about."), `unknown message, got: ${unknown}`);
+
+  pitch("t-cmd-quoted", "Yara <yara@ya.example>", "Pitch for Yara", 1);
+  const quotedTool = await startSequenceFromTool(
+    "Yara",
+    owner('email Yara saying "please review this and start 3 follow-ups every 4 days"'),
+    api,
+  );
+  assert(quotedTool.startsWith("No card sent"), `quoted words reach no card and no enrolment: ${quotedTool}`);
+  assert(getSalesSequenceByThread("t-cmd-quoted") === undefined, "nothing for Yara");
 
   // Send then enrol never enrols from start_sequence alone: the send does it.
   pitch("t-cmd-combined", "Xiaoming <xiaoming@xi.example>", "Pitch for Xiaoming", 1);

@@ -393,7 +393,7 @@ export function commandIntents(ownWords: string): CommandKind[] {
   const found = new Set<CommandKind>();
   const any = (patterns: readonly RegExp[]): boolean => patterns.some((pattern) => pattern.test(text));
   if (
-    isExplicitSequenceRequest(text) &&
+    isExplicitSequenceRequest(maskQuoted(text)) &&
     !NOT_A_SEQUENCE_COMMAND.some((pattern) => pattern.test(text)) &&
     !notAnInstruction(text, { remindAllowed: true })
   ) {
@@ -490,6 +490,12 @@ export function commandIntents(ownWords: string): CommandKind[] {
   return [...found];
 }
 
+/** Quoted text is what an email should say, never an instruction to Aadi. Blanked
+ *  out (same length, so positions still line up), an unclosed quote to the end. */
+export function maskQuoted(text: string): string {
+  return text.replace(/"[^"]*(?:"|$)|“[^”]*(?:”|$)|‘[^’]*(?:’|$)/g, (match) => " ".repeat(match.length));
+}
+
 /** What his words ask of the follow-ups. Only his own words are ever passed in. */
 export type SequenceCommand =
   /** Not a sequence request. mentionsFollowups: the words "follow-up" or
@@ -541,6 +547,16 @@ const SEQUENCE_STOP: readonly RegExp[] = [
   new RegExp(`\\b(?:not\\s+yet|hold\\s+off|wait\\s+(?:on|with|before))\\b${UNBROKEN}\\b${FOLLOWUP_NOUN}`, "i"),
   /\b(?:follow[\s-]*ups?|sequences?)\b[^.?!\n]{0,40}?\b(?:not\s+yet|later|hold\s+off)\b/i,
 ];
+
+/** A deferral said on its own: "Start 3 follow-ups for Mayur. Not yet." or "..., but
+ *  wait." Counted only when the message asks for follow-ups at all. */
+const STANDALONE_DEFERRAL =
+  /(?:^|[.!?;,]\s*|\b(?:but|and)\s+)(?:not\s+(?:yet|now)|hold\s+off|wait|later|don'?t\s+start(?:\s+(?:it|them|yet))*)\s*(?:[.!?]+\s*|$)/i;
+
+/** A spacing he asked for that isn't in days: refused, never swapped for the default. */
+const INTERVAL_MENTION =
+  /\b(?:every|each)\s+(?!one\b|of\b)\S+|\b(?:apart|between|gap|daily|weekly|monthly|fortnightly|biweekly|twice|thrice)\b|\b(?:a|per)\s+(?:day|week|month)\b/i;
+const BEYOND_TWO_WEEKS = /\bmonths?\b|\bmonthly\b|\byears?\b|\byearly\b|\bannual(?:ly)?\b/i;
 
 /** Where a follow-up clause may start after an email request: "..., and start 3
  *  follow-ups", "... then put it in a sequence", "... . Start follow-ups." */
@@ -635,38 +651,45 @@ const THIS_EMAIL =
  */
 export function parseSequenceCommand(ownWords: string): SequenceCommand {
   const text = ownWords.replace(/\s+/g, " ").trim();
+  // What he quoted is what an email says; only the rest can be a command.
+  const plain = maskQuoted(text);
   // "Follow-ups", "sequence" or "3 follow-up ...", not "send a follow-up to X".
   const mentionsFollowups =
     /\bfollow[\s-]*ups\b|\bsequences?\b|\b(?:\d+|two|three|four|five|six)\s+follow[\s-]*up\b/i.test(text);
-  if (SEQUENCE_STOP.some((pattern) => pattern.test(text)) || NOT_A_SEQUENCE_COMMAND[0]!.test(text)) {
+  const explicit = Boolean(text) && isExplicitSequenceRequest(plain);
+  if (
+    SEQUENCE_STOP.some((pattern) => pattern.test(text)) ||
+    NOT_A_SEQUENCE_COMMAND[0]!.test(text) ||
+    (explicit && STANDALONE_DEFERRAL.test(text))
+  ) {
     return { kind: "negated" };
   }
-  if (!text || !isExplicitSequenceRequest(text)) {
+  if (!explicit) {
     return { kind: "none", mentionsFollowups };
   }
   if (
-    !isDirectSequenceCommand(text) ||
-    NOT_A_SEQUENCE_COMMAND.slice(1).some((pattern) => pattern.test(text)) ||
-    ASKED.test(text) ||
-    ASKED_ABOUT.test(text) ||
-    PLANNED.test(text)
+    !isDirectSequenceCommand(plain) ||
+    NOT_A_SEQUENCE_COMMAND.slice(1).some((pattern) => pattern.test(plain)) ||
+    ASKED.test(plain) ||
+    ASKED_ABOUT.test(plain) ||
+    PLANNED.test(plain)
   ) {
     return { kind: "soft" };
   }
   let clause = text;
   let emailPart = "";
   let combined = false;
-  for (const match of text.matchAll(CLAUSE_BOUNDARY)) {
-    const before = text.slice(0, match.index);
-    const rest = text.slice((match.index ?? 0) + match[0].length);
-    if (isDirectSequenceCommand(rest) && asksToSendEmail(before)) {
-      clause = rest;
-      emailPart = before.trim();
+  // Boundaries are found in the unquoted text, so a clause can't start inside a quote.
+  for (const match of plain.matchAll(CLAUSE_BOUNDARY)) {
+    const at = (match.index ?? 0) + match[0].length;
+    if (isDirectSequenceCommand(plain.slice(at)) && asksToSendEmail(plain.slice(0, match.index))) {
+      clause = text.slice(at);
+      emailPart = text.slice(0, match.index).trim();
       combined = true;
       break;
     }
   }
-  if (!combined && asksToSendEmail(text)) {
+  if (!combined && asksToSendEmail(plain)) {
     return {
       kind: "refused",
       text: "Not started: say the email first, then the follow-ups, e.g. \"email Mayur saying … and start 3 follow-ups\".",
@@ -686,6 +709,14 @@ export function parseSequenceCommand(ownWords: string): SequenceCommand {
     return { kind: "refused", text: `Not started: follow-ups can be ${COMMAND_FOLLOWUPS.min} to ${COMMAND_FOLLOWUPS.max}.` };
   }
   const gapDays = gapOf(settingsText);
+  if (gapDays === null && INTERVAL_MENTION.test(settingsText)) {
+    return {
+      kind: "refused",
+      text: BEYOND_TWO_WEEKS.test(settingsText)
+        ? `Not started: the gap can be ${COMMAND_GAP_DAYS.min} to ${COMMAND_GAP_DAYS.max} days.`
+        : "Not started: give the gap in days, 1 to 14 (e.g. 'every 3 days').",
+    };
+  }
   if (
     gapDays !== null &&
     (!Number.isInteger(gapDays) || gapDays < COMMAND_GAP_DAYS.min || gapDays > COMMAND_GAP_DAYS.max)
