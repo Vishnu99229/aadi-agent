@@ -2,6 +2,7 @@ import { InlineKeyboard, type Context } from "grammy";
 import {
   commandApi,
   readThread,
+  scheduledSendVerdict,
   scheduledWhen,
   writeAndSend,
   type CommandRequest,
@@ -25,6 +26,7 @@ import {
   retryScheduledSend,
   transitionScheduledSend,
   type ScheduledSendRecord,
+  holdScheduledSendForConfirm,
 } from "./db.js";
 import { formatMailbox } from "./draft_recipients.js";
 import type { ParsedMailbox } from "./mail_helpers.js";
@@ -173,6 +175,22 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
     }
     return;
   }
+  // Only people he confirmed when he scheduled it, or known now, receive it. A new
+  // address waits on his Confirm instead of going out.
+  const verdict = await scheduledSendVerdict(request);
+  if (verdict.action !== "send") {
+    if (holdScheduledSendForConfirm(row.id)) {
+      const newAddresses = verdict.action === "card" ? verdict.newAddresses : [];
+      console.log(`Scheduled send ${row.id}: status -> held for confirm`);
+      await tell(
+        `Held, not sent: ${row.item_text}\nNew address: ${newAddresses.join(", ") || "unconfirmed"}. Tap Confirm to send it.`,
+        new InlineKeyboard()
+          .text("Confirm", `cmdsend:confirmsched:${row.id}`)
+          .text("Cancel", `cmdsend:cancelsched:${row.id}`),
+      );
+    }
+    return;
+  }
   const late = now.getTime() - new Date(row.send_at).getTime() > LATE_AFTER_MS;
   const snapshot = finalizedCopy(request);
   const outcome = await writeAndSend(
@@ -196,6 +214,7 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
       note: late ? `This went out late: it was due ${scheduledWhen(row.send_at)}.` : undefined,
       prepared: snapshot,
       explicitSubject: request.subjectEdited ? request.finalSubject || request.subject : undefined,
+      verdict,
     },
   );
   if (outcome.result === "sent") {
@@ -375,6 +394,34 @@ export async function handleScheduledSendCallback(ctx: Context): Promise<void> {
     await ctx
       .editMessageText(text, after.keyboard ? { reply_markup: after.keyboard } : { reply_markup: undefined })
       .catch(() => undefined);
+    return;
+  }
+  // Confirm on a held send to a new address: his tap confirms everyone on it, once.
+  const confirm = /^cmdsend:confirmsched:(\d+)$/.exec(data);
+  if (confirm) {
+    const held = getScheduledSend(Number(confirm[1]));
+    if (!held || held.status !== "held") {
+      await ctx.editMessageText("That's already been handled.", { reply_markup: undefined }).catch(() => undefined);
+      return;
+    }
+    const request = requestOf(held);
+    const everyone = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : []));
+    request.confirmedRecipients = [...new Set([...(request.confirmedRecipients ?? []), ...everyone])];
+    if (!releaseHeldScheduledSend(held.id, JSON.stringify(request))) {
+      await ctx.editMessageText("That's already been handled.", { reply_markup: undefined }).catch(() => undefined);
+      return;
+    }
+    console.log(`Scheduled send ${held.id}: status -> scheduled (confirmed)`);
+    await ctx.editMessageText(`Confirmed: ${held.item_text}`, { reply_markup: undefined }).catch(() => undefined);
+    // Already due (it was held at send time): send it now.
+    if (new Date(held.send_at).getTime() <= Date.now()) {
+      try {
+        await fireScheduledSend(getScheduledSend(held.id)!, new Date());
+      } catch (error) {
+        const errorType = error instanceof Error ? error.name : "UnknownError";
+        console.error(`Scheduled send ${held.id}: fire after confirm failed (${errorType})`);
+      }
+    }
     return;
   }
   const pick = /^cmdsend:hold:(\d+):(\d+):(\d+)$/.exec(data);

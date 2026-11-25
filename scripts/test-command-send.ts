@@ -2,7 +2,8 @@
 // Fake Gmail, fake Telegram, stub models. Nothing real is sent.
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import { queueDraftApproval, setApprovalsTestHooks } from "../src/approvals.ts";
+import { handleApprovalCallback, queueDraftApproval, setApprovalsTestHooks } from "../src/approvals.ts";
+import { clearPendingAction } from "../src/action_context.ts";
 import { defaultToolNames, runAgent } from "../src/agent.ts";
 import { handleCommandSendCallback, sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import {
@@ -39,13 +40,16 @@ import { config } from "../src/config.ts";
 import {
   createMemory,
   getCommandSendByKey,
+  getPendingActionForDraft,
   getSalesSequenceByThread,
+  listCanonicalContacts,
   getScheduledSend,
   getTask,
   listActiveSalesSequences,
   listOpenScheduledSends,
   listSalesSequenceSteps,
   markTaskDone,
+  recordKnownRecipient,
 } from "../src/db.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
 import { bindEmailReferenceForTurn } from "../src/email_references.ts";
@@ -90,7 +94,11 @@ const settings = config as unknown as Record<string, unknown>;
 const turn = (userText: string, messageId = nextTurn()) => ({
   userText,
   confirmation: { chatId: 1, messageId },
+  // Dispatch marks his own chat turn; these direct calls stand in for it.
+  ownTurn: true,
 });
+/** A delegated goal: his approval, but not his own chat turn. */
+const delegatedTurn = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: false });
 let turnCounter = 100;
 function nextTurn(): number {
   turnCounter += 1;
@@ -188,6 +196,7 @@ interface Sent {
 const sends: Sent[] = [];
 let sendFails: number | "network" | undefined;
 const draftsCreated: string[] = [];
+const draftHeaders = new Map<string, Array<{ name: string; value: string }>>();
 const draftsSent: string[] = [];
 
 function headerOf(block: string, name: string): string {
@@ -236,16 +245,22 @@ const gmail = {
       },
     },
     drafts: {
-      create: async () => {
+      create: async (input?: { requestBody?: { message?: { raw?: string } } }) => {
         const id = `draft-${draftsCreated.length + 1}`;
         draftsCreated.push(id);
+        // Like Gmail, the draft goes to whoever its MIME says.
+        const raw = Buffer.from(input?.requestBody?.message?.raw ?? "", "base64url").toString("utf8");
+        draftHeaders.set(id, [
+          { name: "To", value: /^To: (.*)$/im.exec(raw)?.[1]?.trim() ?? "" },
+          { name: "Cc", value: /^Cc: (.*)$/im.exec(raw)?.[1]?.trim() ?? "" },
+        ]);
         return { data: { id, message: { id: "d", threadId: "t" } } };
       },
       send: async ({ requestBody }: { requestBody: { id: string } }) => {
         draftsSent.push(requestBody.id);
         return { data: { id: `sent-${requestBody.id}` } };
       },
-      get: async () => ({ data: { message: { payload: { headers: [] } } } }),
+      get: async ({ id }: { id?: string } = {}) => ({ data: { message: { payload: { headers: draftHeaders.get(id ?? "") ?? [] } } } }),
     },
   },
 } as unknown as gmail_v1.Gmail;
@@ -616,8 +631,14 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
 {
   const count = sends.length;
   createMemory({ content: "Deepak's email is deepak@memory.example.", category: "other", tag: "work", source: "explicit" });
-  await sendEmailFromTool({ to: ["Deepak"], instruction: "x" }, turn("send Deepak a note"));
-  assert(sends.length === count + 1 && sends[count]!.to.includes("deepak@memory.example"), "found in memory");
+  const fromMemory = await sendEmailFromTool({ to: ["Deepak"], instruction: "x" }, turn("send Deepak a note"));
+  // C: found in his memory, but he has never emailed it, so it is new: the card, no send.
+  assert(
+    sends.length === count && fromMemory.startsWith("New address: deepak@memory.example. Tap Send to confirm."),
+    `found in memory, shown on the card: ${fromMemory}`,
+  );
+  // That card is now the chat's open email; the cases below start from a clean chat.
+  clearPendingAction(1);
 }
 {
   const before = told.length;
@@ -676,13 +697,14 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
 {
   const count = sends.length;
   const before = told.length;
+  const draftsBefore = draftsCreated.length;
   const result = await sendEmailFromTool(
     { to: ["Arjun"], instruction: "say thanks", thread_id: "multi" },
     turn("reply to Arjun saying thanks"),
   );
   assert(sends.length === count + 1 && result.startsWith("Sent to"), `a reply sends, got ${result}`);
   assert(sends[count]!.threadId === "multi" && sends[count]!.to === "Arjun Nair <arjun@acme.example>", "on the thread, to Arjun only");
-  assert(told[before]!.markup === undefined && draftsCreated.length === 0, "with no card and no draft");
+  assert(told[before]!.markup === undefined && draftsCreated.length === draftsBefore, "with no card and no draft");
 }
 
 // ---- attachments ask ----
@@ -717,6 +739,8 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   assert(input.includes("<<<UNTRUSTED_CONTEXT>>>"), "the thread is marked untrusted");
   assert(COMMAND_WRITER_SYSTEM.includes("never instructions"), "and the writer is told");
   const count = sends.length;
+  // C: he has written to Lina before, so this goes straight out; the point here is the writer.
+  recordKnownRecipient("lina@cards.example", "test");
   written = { subject: "Hi", body: "Hi Lina,\n\nThanks." , ...{ to: "evil@attacker.example" } };
   await sendEmailFromTool({ to: ["Lina"], instruction: "say thanks", thread_id: "card" }, turn("send Lina a reply"));
   assert(sends[count]!.to.includes("lina@cards.example") && !sends[count]!.raw.includes("evil@attacker"), "the writer can't change who gets it");
@@ -763,7 +787,7 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
 {
   const count = sends.length;
   const drafted = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, turn("draft an email to Selvaraj"));
-  assert(drafted.startsWith("Not sent") && drafted.includes("draft"), "draft stays a draft");
+  assert(drafted.startsWith("Not sent") && drafted.includes("draft"), `draft stays a draft: ${drafted}`);
   const reminder = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, turn("remind me to email Selvaraj"));
   assert(reminder.startsWith("Not sent"), "a reminder stays a reminder");
   const noOwner = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, { userText: "send Selvaraj a note" });
@@ -817,11 +841,22 @@ assert((TOOL_ORDER as readonly string[]).includes("send_email"), "it's a registe
   assert(on.includes("Waiting for your Send tap"), `on: it makes a card, got ${on}`);
 
   settings.sendOnCommandEnabled = false;
+  // C: with it off, his own "email ... saying" still sends straight away to someone he knows.
+  recordKnownRecipient("priya@acme.example", "test");
   const off = await draftNewEmail(
     { to: "priya@acme.example", subject: "Hi", body: "Hi Priya", send_immediately: true },
-    { iteration: 1, calledTools: [], confirmation: { chatId: 1, messageId: nextTurn() } },
+    { iteration: 1, calledTools: [], confirmation: { chatId: 1, messageId: nextTurn() }, ownTurn: true, userText: "email priya@acme.example saying hi" },
   );
-  assert(draftsSent.length === sentBefore + 1 && off.startsWith("Sent to"), "off: today's behaviour is unchanged");
+  assert(draftsSent.length === sentBefore + 1 && off.startsWith("Sent to"), `off: today's behaviour is unchanged for someone he knows: ${off}`);
+  // ...and a new address gets the card instead.
+  const offNew = await draftNewEmail(
+    { to: "pat@never-emailed.example", subject: "Hi", body: "Hi Pat", send_immediately: true },
+    { iteration: 1, calledTools: [], confirmation: { chatId: 1, messageId: nextTurn() }, ownTurn: true, userText: "email pat@never-emailed.example saying hi" },
+  );
+  assert(
+    draftsSent.length === sentBefore + 1 && offNew.startsWith("New address: pat@never-emailed.example. Tap Send to confirm."),
+    `off: a new address gets the card: ${offNew}`,
+  );
   const count = sends.length;
   const disabled = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, turn("send Selvaraj a note"));
   assert(disabled.startsWith("Not sent") && sends.length === count, "off: send_email sends nothing");
@@ -1784,6 +1819,14 @@ await expectCancelled("delete_task", async (row) => {
   };
   const own = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: true });
   const model = <T extends object>(base: T) => ({ ...base, modelCalled: true });
+  // These follow-up tests are about follow-ups, so their recipients are people he has
+  // emailed before (known): the email itself goes out with no Send card.
+  for (const address of [
+    "kai@kappa-co.com", "kim@kim-co.com", "fay@fay-co.com", "lee@lambda-co.com", "lia@lambda-co.com",
+    "mia@mu-co.com", "mona@mo-co.com", "omi@omi-co.com",
+  ]) {
+    mail({ threadId: `earlier-${address}`, from: `Vishnu <${ME}>`, to: address, subject: "Earlier", body: "Hi", sent: true });
+  }
   const threadOf = (id: string) => world.find((item) => item.id === id)!.threadId;
   const active = () => listActiveSalesSequences().length;
 
@@ -1866,13 +1909,17 @@ await expectCancelled("delete_task", async (row) => {
   assert(noFollowups.startsWith("Sent to") && noFollowups.includes("No follow-ups started, as you said."), noFollowups);
   assert(active() === count, "nothing enrolled");
 
-  // Not his own turn (a delegated goal): the email may go, the follow-ups are only a card.
-  const delegatedTurn = turn("email lia@lambda-co.com saying thanks and start 2 follow-ups");
-  const delegatedSend = await sendEmailFromTool({ to: ["lia@lambda-co.com"], instruction: "say thanks" }, delegatedTurn);
+  // Not his own turn (a delegated goal): C makes the email a Send card too, so nothing
+  // has gone out and the follow-ups wait for it (case 10 below covers the tap).
+  const delegatedStep = delegatedTurn("email lia@lambda-co.com saying thanks and start 2 follow-ups");
+  const sendsBeforeDelegated = sends.length;
+  const delegatedSend = await sendEmailFromTool({ to: ["lia@lambda-co.com"], instruction: "say thanks" }, delegatedStep);
   assert(!delegatedSend.includes("only your own message"), `never a flat refusal: ${delegatedSend}`);
-  const delegated = await startSequenceFromTool("Lia", model(delegatedTurn));
-  assert(delegated.startsWith("Start card sent for "), `a delegated turn only gets a card: ${delegated}`);
+  assert(sends.length === sendsBeforeDelegated && delegatedSend.includes("Tap Send to confirm."), `a delegated send is a card: ${delegatedSend}`);
+  const delegated = await startSequenceFromTool("Lia", model(delegatedStep));
+  assert(delegated.startsWith("Not started yet"), `a delegated turn enrols nothing before the email goes: ${delegated}`);
   assert(active() === count, "a delegated turn enrolled nothing");
+  clearPendingAction(1);
 
   // The clause names someone else: a card for the person the email went to, saying why.
   const otherTurn = own("email mia@mu-co.com saying hello and start 3 follow-ups for Jeff");
@@ -1900,6 +1947,8 @@ await expectCancelled("delete_task", async (row) => {
   assert(ocrRow.status === "proposed" && ocrRow.total_steps === 3 && ocrRow.step_days === 4, "the card holds his settings, enrolled nothing");
 
   // D: "send it and start 3 follow-ups" right after a draft card.
+  // In Gmail this draft goes to the person its card shows.
+  draftHeaders.set("draft-nora", [{ name: "To", value: "Nora Lee <nora@nu-co.com>" }]);
   await queueDraftApproval({
     draftId: "draft-nora",
     threadId: null,
@@ -1916,6 +1965,8 @@ await expectCancelled("delete_task", async (row) => {
   assert(draftStart.startsWith("Started 3 follow-ups to Nora Lee (nora@nu-co.com)"), `then its own thread: ${draftStart}`);
   assert(getSalesSequenceByThread(threadOf("sent-draft-nora"))?.status === "active", "the draft's own thread");
 
+  // In Gmail this draft goes to the person its card shows.
+  draftHeaders.set("draft-omar", [{ name: "To", value: "Omar Ali <omar@omicron-co.com>" }]);
   await queueDraftApproval({
     draftId: "draft-omar",
     threadId: null,
@@ -1934,6 +1985,344 @@ await expectCancelled("delete_task", async (row) => {
   users.messages.send = realSend;
   users.messages.list = realList;
   users.drafts.send = realDraftSend;
+  setDomainLookupForTests(undefined);
+}
+
+// ======== C: a Send card for new addresses, a direct send for known ones ========
+{
+  setDomainLookupForTests(async () => "yes");
+  setCompleteForTests(async (params: CompleteParams): Promise<CompleteResult> => {
+    if (params.task === "command_send") {
+      writerCalls.push(params);
+      return modelReply({ text: JSON.stringify(written) });
+    }
+    if (chatScript && params.tools.length > 0) {
+      return chatScript(params);
+    }
+    return modelReply({ text: '{"facts":[]}' });
+  });
+  const own = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: true });
+  const sentTo = (address: string) =>
+    mail({ threadId: `c-known-${address}`, from: `Vishnu <${ME}>`, to: address, subject: "Earlier", body: "Hi", sent: true });
+  const cardCtx = (data: string, log: string[] = []) =>
+    ({
+      callbackQuery: { data, message: { chat: { id: config.ownerTelegramId }, message_id: 1 } },
+      from: { id: config.ownerTelegramId },
+      chat: { id: config.ownerTelegramId },
+      answerCallbackQuery: async () => true,
+      editMessageText: async (text: string) => {
+        log.push(text);
+        return true;
+      },
+      editMessageReplyMarkup: async () => true,
+      reply: async (text: string) => {
+        log.push(text);
+        return {};
+      },
+    }) as unknown as Context;
+  // Remembers each card, so a second tap on an already-sent card reaches the handler too.
+  const cardOfDraft = new Map<string, number>();
+  const tapSend = async (draftId: string) => {
+    const id = cardOfDraft.get(draftId) ?? getPendingActionForDraft(draftId)!.id;
+    cardOfDraft.set(draftId, id);
+    await handleApprovalCallback(cardCtx(`approval:send:${id}`), "send", id);
+  };
+  written = { subject: "Hello", body: "Hi,\n\nA short note." };
+  // Drafts keep their body, and a sent draft lands in the mailbox like Gmail keeps it.
+  const draftUsers = gmail.users as unknown as {
+    drafts: {
+      create: (input: { requestBody: { message: { raw: string; threadId?: string } } }) => Promise<{ data: { id: string; message: { id: string; threadId: string } } }>;
+      send: (input: { requestBody: { id: string } }) => Promise<{ data: { id: string } }>;
+    };
+  };
+  const realCreate = draftUsers.drafts.create;
+  const realSend = draftUsers.drafts.send;
+  const draftBodies: string[] = [];
+  const draftTo = new Map<string, string>();
+  let draftThreads = 0;
+  draftUsers.drafts.create = async (input) => {
+    const raw = Buffer.from(input.requestBody.message.raw, "base64url").toString("utf8");
+    const base64 = /Content-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1] ?? "";
+    draftBodies.push(base64 ? Buffer.from(base64.replace(/\s/g, ""), "base64").toString("utf8") : raw);
+    const result = await realCreate(input);
+    draftTo.set(result.data.id, headerOf(raw.split("\r\n\r\n")[0]!, "To"));
+    return result;
+  };
+  draftUsers.drafts.send = async (input) => {
+    const result = await realSend(input);
+    // The follow-up block's fake files every sent draft as Nora's; here it goes to
+    // whoever this draft is addressed to, so replace that entry rather than add one.
+    for (let index = world.length - 1; index >= 0; index -= 1) {
+      if (world[index]!.id === result.data.id) {
+        world.splice(index, 1);
+      }
+    }
+    draftThreads += 1;
+    world.push({
+      id: result.data.id,
+      threadId: `c-draft-thread-${draftThreads}`,
+      from: `Vishnu <${ME}>`,
+      to: draftTo.get(input.requestBody.id) ?? "",
+      subject: "Hello",
+      body: "Hi",
+      at: Date.now(),
+      sent: true,
+    });
+    return result;
+  };
+  const threadOf = (id: string) => world.find((item) => item.id === id)!.threadId;
+  // "Has the prospect written since?" reads from:<domain> after:<time>: only their mail counts.
+  const listUsers = gmail.users as unknown as { messages: { list: (input: { q: string; maxResults: number }) => Promise<unknown> } };
+  const cList = listUsers.messages.list;
+  listUsers.messages.list = async (input) => {
+    const since = /^from:(\S+) after:(\d+)$/.exec(input.q);
+    if (since) {
+      const found = world.filter(
+        (item) => !item.sent && item.from.toLowerCase().includes(since[1]!.toLowerCase()) && item.at > Number(since[2]) * 1000,
+      );
+      return { data: { messages: found.map((item) => ({ id: item.id, threadId: item.threadId })) } };
+    }
+    return cList(input);
+  };
+
+  // 1. Every recipient known + send intent: sends at once, no card.
+  sentTo("c.known@known-co.com");
+  {
+    const before = sends.length;
+    const drafts = draftsCreated.length;
+    const result = await sendEmailFromTool({ to: ["c.known@known-co.com"], instruction: "say hello" }, own("email c.known@known-co.com saying hello"));
+    assert(sends.length === before + 1 && result.startsWith("Sent to"), `a known address sends directly: ${result}`);
+    assert(draftsCreated.length === drafts, "and no draft card");
+  }
+
+  // 2. A new To: a draft and its card, nothing sent until the tap; the tap sends once.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.new@new-co.com"], instruction: "say hello" }, own("email c.new@new-co.com saying hello"));
+    assert(sends.length === before, `nothing sent to a new address: ${result}`);
+    assert(result.startsWith("New address: c.new@new-co.com. Tap Send to confirm."), `he's told why: ${result}`);
+    const draftId = draftsCreated[draftsCreated.length - 1]!;
+    assert(getPendingActionForDraft(draftId)?.status === "pending", "its card waits");
+    const draftSends = draftsSent.length;
+    await tapSend(draftId);
+    assert(draftsSent.length === draftSends + 1 && draftsSent.at(-1) === draftId, "the tap sends it");
+    await tapSend(draftId);
+    assert(draftsSent.length === draftSends + 1, "exactly once");
+  }
+
+  // 3. A known To with a new Cc: the card.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool(
+      { to: ["c.known@known-co.com"], cc: ["c.newcc@new-co.com"], instruction: "say hello" },
+      own("email c.known@known-co.com and cc c.newcc@new-co.com saying hello"),
+    );
+    assert(sends.length === before && result.startsWith("New address: c.newcc@new-co.com."), `a new Cc brings the card: ${result}`);
+  }
+
+  // 4. A near-miss of a known address is new.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.known@known-co.co"], instruction: "say hello" }, own("email c.known@known-co.co saying hello"));
+    assert(sends.length === before && result.startsWith("New address: c.known@known-co.co."), `near-miss: ${result}`);
+  }
+
+  // 5. The known-check fails: treated as new, never sent.
+  {
+    const users = gmail.users as unknown as { messages: { list: (input: { q: string; maxResults: number }) => Promise<unknown> } };
+    const realList = users.messages.list;
+    users.messages.list = async (input) => {
+      if (input.q.startsWith("in:sent (to:")) {
+        throw new Error("gmail down");
+      }
+      return realList(input);
+    };
+    const before = sends.length;
+    sentTo("c.flaky@known-co.com");
+    const result = await sendEmailFromTool({ to: ["c.flaky@known-co.com"], instruction: "say hello" }, own("email c.flaky@known-co.com saying hello"));
+    users.messages.list = realList;
+    assert(sends.length === before && result.startsWith("New address: c.flaky@known-co.com."), `a failed check is a card: ${result}`);
+  }
+
+  // 6. Sent before from his personal account only: known.
+  {
+    const personal = {
+      users: {
+        ...(gmail.users as object),
+        messages: {
+          ...(gmail.users.messages as object),
+          list: async ({ q }: { q: string }) => ({
+            data: { messages: q.includes("c.personal@friend-co.com") ? [{ id: "p-1", threadId: "p-t" }] : [] },
+          }),
+          get: async ({ id }: { id: string }) =>
+            id === "p-1"
+              ? { data: { id, threadId: "p-t", labelIds: ["SENT"], payload: { headers: [{ name: "To", value: "Pal <c.personal@friend-co.com>" }] } } }
+              : (gmail.users.messages as unknown as { get: (input: { id: string }) => Promise<unknown> }).get({ id }),
+        },
+      },
+    } as unknown as gmail_v1.Gmail;
+    setGmailClientForTests((account) => (account.id === "personal" ? personal : gmail));
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.personal@friend-co.com"], instruction: "say hello" }, own("email c.personal@friend-co.com saying hello"));
+    setGmailClientForTests(() => gmail);
+    assert(sends.length === before + 1 && result.startsWith("Sent to"), `known from either account: ${result}`);
+  }
+
+  // 7. A delegated goal (not his own turn): a card, even for a known address.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.known@known-co.com"], instruction: "say thanks" }, delegatedTurn("email c.known@known-co.com saying thanks"));
+    assert(sends.length === before && result.includes("Tap Send to confirm."), `delegated: a card: ${result}`);
+  }
+
+  // 8. Tapping one of the offered address buttons confirms it, even if it's new.
+  {
+    mail({ threadId: "zara-1", from: "Zara Kapoor <zara@zone-a.com>", to: ME, subject: "Hi", body: "Hello" });
+    mail({ threadId: "zara-2", from: "Zara Khan <zara@zone-b.com>", to: ME, subject: "Hi", body: "Hello" });
+    const before = sends.length;
+    const asked = await sendEmailFromTool({ to: ["Zara"], instruction: "say hello" }, own("email Zara saying hello"));
+    assert(sends.length === before && asked.includes("matches 2 people"), `asks which Zara: ${asked}`);
+    const card = told[told.length - 1]!;
+    const pick = buttons(card).find((button) => button.text.includes("zone-a.com"))!;
+    const picked = tap(pick.callback_data);
+    await picked.run();
+    assert(sends.length === before + 1 && sends.at(-1)!.to.includes("zara@zone-a.com"), "the tapped address is confirmed and sent");
+  }
+
+  // 9. A scheduled send to a new address is held until Confirm, then scheduled once.
+  {
+    const sizeBefore = listOpenScheduledSends().length;
+    const result = await sendEmailFromTool(
+      { to: ["c.sched@new-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" },
+      own("email c.sched@new-co.com on Monday saying hello"),
+    );
+    assert(result.startsWith("New address: c.sched@new-co.com. Tap Confirm to schedule for "), `held for a Confirm: ${result}`);
+    const held = listOpenScheduledSends().find((row) => row.request.includes("c.sched@new-co.com"))!;
+    assert(held?.status === "held", `held, not scheduled: ${held?.status}`);
+    const confirmButton = buttons(told[told.length - 1]!).find((button) => button.text === "Confirm")!;
+    await handleScheduledSendCallback(cardCtx(confirmButton.callback_data));
+    assert(getScheduledSend(held.id)!.status === "scheduled", "the tap schedules it");
+    await handleScheduledSendCallback(cardCtx(confirmButton.callback_data));
+    assert(getScheduledSend(held.id)!.status === "scheduled" && listOpenScheduledSends().length === sizeBefore + 1, "exactly once");
+    sentTo("c.schedknown@known-co.com");
+    const knownSched = await sendEmailFromTool(
+      { to: ["c.schedknown@known-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" },
+      own("email c.schedknown@known-co.com on Monday saying hello"),
+    );
+    assert(knownSched.startsWith("Scheduled:"), `a known address schedules as before: ${knownSched}`);
+  }
+
+  // 10. Send then follow-ups to a new address: the card first; after the tap, a Start card.
+  {
+    const before = sends.length;
+    const words = "email c.fu@new-co.com saying hello and start 3 follow-ups";
+    const fuTurn = own(words);
+    const result = await sendEmailFromTool({ to: ["c.fu@new-co.com"], instruction: "say hello" }, fuTurn);
+    assert(sends.length === before && result.startsWith("New address: c.fu@new-co.com. Tap Send to confirm."), result);
+    const early = await startSequenceFromTool("c.fu@new-co.com", { ...fuTurn, modelCalled: true });
+    assert(early === "Not started yet: follow-ups start only once the email has gone out.", `nothing yet: ${early}`);
+    const draftId = draftsCreated[draftsCreated.length - 1]!;
+    await tapSend(draftId);
+    assert(draftsSent.at(-1) === draftId, "the tap sends it");
+    const thread = threadOf(`sent-${draftId}`);
+    const row = getSalesSequenceByThread(thread);
+    assert(row?.status === "proposed", `after the tap: a Start card, never direct enrolment (${row?.status})`);
+  }
+
+  // 11. The referenced-email (OCR) path with a new address: a card.
+  {
+    const ocrTurn = { ...own("send an email to this address saying hello"), directSend: true };
+    bindEmailReferenceForTurn(ocrTurn.confirmation.chatId, ocrTurn.confirmation.messageId, "c.ocr@new-co.com");
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.ocr@new-co.com"], instruction: "say hello" }, ocrTurn);
+    assert(sends.length === before && result.startsWith("New address: c.ocr@new-co.com."), `OCR address: a card: ${result}`);
+  }
+
+  // 12. The command-guarantee path: the model retries with a new address: a card.
+  {
+    let step = 0;
+    chatScript = (params) => {
+      step += 1;
+      const asked = params.messages.some((message) => message.role === "user" && String(message.content).includes("looks like a command"));
+      if (asked && step < 4) {
+        return modelReply({ tools: [{ name: "send_email", input: { to: ["c.fallback@new-co.com"], instruction: "say hello" } }] });
+      }
+      return modelReply({ text: "Done." });
+    };
+    const before = sends.length;
+    const drafts = draftsCreated.length;
+    const id = nextTurn() + 7000;
+    await bot.handleUpdate({
+      update_id: id,
+      message: {
+        message_id: id,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: config.ownerTelegramId, type: "private", first_name: "Vishnu" },
+        from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+        text: "email c.fallback@new-co.com saying hello",
+      },
+    } as never);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    chatScript = undefined;
+    assert(sends.length === before, "the retried send to a new address sent nothing");
+    assert(draftsCreated.length >= drafts, "at most a card");
+  }
+
+  // 14. The card's own Send covers the people the card showed: an address added to the
+  //     Gmail draft outside Aadi is not sent by the tap, unless he has emailed it before.
+  {
+    sentTo("c.cardknown@known-co.com");
+    await queueDraftApproval({
+      draftId: "c-sneak",
+      threadId: null,
+      to: "c.cardknown@known-co.com",
+      subject: "Hi",
+      body: "Hi",
+      googleAccount: "work",
+    });
+    draftHeaders.set("c-sneak", [
+      { name: "To", value: "c.cardknown@known-co.com" },
+      { name: "Cc", value: "c.sneak@new-co.com" },
+    ]);
+    const action = getPendingActionForDraft("c-sneak")!;
+    const alerts: string[] = [];
+    const alerting = {
+      ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+      answerCallbackQuery: async (input?: string | { text?: string }) => {
+        alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+        return true;
+      },
+    } as unknown as Context;
+    const draftSends = draftsSent.length;
+    await handleApprovalCallback(alerting, "send", action.id);
+    assert(draftsSent.length === draftSends, "an address the card never showed is not sent by the tap");
+    assert(
+      alerts.some((text) => text.includes("c.sneak@new-co.com is on the draft now but wasn't on this card")),
+      `he is told who: ${alerts.join(" | ")}`,
+    );
+    assert(getPendingActionForDraft("c-sneak")?.status === "pending", "the card still waits");
+    draftHeaders.set("c-sneak", [
+      { name: "To", value: "c.cardknown@known-co.com" },
+      { name: "Cc", value: "c.known@known-co.com" },
+    ]);
+    await handleApprovalCallback(cardCtx(`approval:send:${action.id}`), "send", action.id);
+    assert(draftsSent.length === draftSends + 1 && draftsSent.at(-1) === "c-sneak", "someone he has emailed before goes with the tap");
+  }
+
+  // 13. Unchanged: resolution still marks the contact confirmed (cross-turn reuse), and
+  // the greeting is grounded the same way on the card path as on a direct send.
+  {
+    const selvaraj = listCanonicalContacts().find((row) => row.display_name.toLowerCase().includes("selvaraj"));
+    assert(selvaraj?.confirmed === 1, "a resolved recipient is still remembered as confirmed");
+    written = { subject: "Hi", body: "Hi Priya,\n\nA short note." };
+    await sendEmailFromTool({ to: ["c.greet@new-co.com"], instruction: "say hello" }, own("email c.greet@new-co.com saying hello"));
+    const draftBody = draftBodies.at(-1) ?? "";
+    assert(draftBody !== "" && !/Hi Priya/.test(draftBody), `the greeting is grounded on the card path too: ${draftBody.slice(0, 40)}`);
+  }
+
+  draftUsers.drafts.create = realCreate;
+  draftUsers.drafts.send = realSend;
+  listUsers.messages.list = cList;
   setDomainLookupForTests(undefined);
 }
 

@@ -26,7 +26,35 @@ function assert(condition: boolean, message: string): void {
 
 const gmailLog: GmailLog = { sent: [], created: [] };
 const cards: TelegramLog = { sent: [], edited: [] };
-const gmail = fakeGmail(gmailLog);
+// Each created draft goes to whoever its raw MIME says, the way Gmail keeps it.
+const draftMeta: Record<string, { to?: string; cc?: string; subject?: string }> = {};
+const base = fakeGmail(gmailLog, draftMeta);
+// He has emailed priya@acme.com before (Sent), so she is known; anyone else is new.
+const knownAddresses = new Set(["priya@acme.com"]);
+const baseDrafts = (base.users as unknown as { drafts: Record<string, (input: never) => Promise<{ data: { id: string } }>> }).drafts;
+const gmail = {
+  users: {
+    ...(base.users as object),
+    drafts: {
+      ...baseDrafts,
+      create: async (input: { requestBody: { message: { raw: string } } }) => {
+        const result = await baseDrafts.create!(input as never);
+        const raw = Buffer.from(input.requestBody.message.raw, "base64url").toString("utf8");
+        draftMeta[result.data.id] = { to: /^To: (.*)$/im.exec(raw)?.[1]?.trim() ?? "", cc: /^Cc: (.*)$/im.exec(raw)?.[1]?.trim() };
+        return result;
+      },
+    },
+    messages: {
+      list: async ({ q }: { q: string }) => {
+        const address = /to:([^\s)]+)/.exec(q)?.[1] ?? "";
+        return { data: { messages: knownAddresses.has(address) ? [{ id: `known-${address}`, threadId: "k" }] : [] } };
+      },
+      get: async ({ id }: { id: string }) => ({
+        data: { id, threadId: "k", labelIds: ["SENT"], payload: { headers: [{ name: "To", value: id.replace(/^known-/, "") }] } },
+      }),
+    },
+  },
+} as unknown as typeof base;
 setGmailClientForTests(() => gmail);
 setApprovalsTestHooks({
   telegram: fakeTelegramApi(cards),
@@ -41,11 +69,14 @@ const workAccount = {
 } as unknown as LoadedGoogleAccount;
 setGoogleAccountForTests((id) => (id === "work" ? workAccount : undefined));
 
-function ownerTurn(): ToolTurn {
+function ownerTurn(userText = "send priya@acme.com an email about the demo", ownTurn = true): ToolTurn {
   return {
     iteration: 1,
     calledTools: ["draft_new_email"],
     confirmation: { chatId: 1, messageId: nextMessageId() },
+    userText,
+    // Dispatch marks his own chat turn; these tests stand in for it.
+    ownTurn,
   };
 }
 
@@ -62,6 +93,8 @@ function clearLogs(): void {
     draftId: "draft-direct",
     googleAccount: "work",
     confirmation: { chatId: 1, messageId: nextMessageId() },
+    ownTurn: true,
+    userText: "send priya@acme.com an email about the demo",
   });
   assert(sent.ok === true, "owner-chat send_immediately sends");
   assert(gmailLog.sent.includes("draft-direct"), "Gmail drafts.send ran");
@@ -78,6 +111,8 @@ function clearLogs(): void {
     draftId: "draft-blocked",
     googleAccount: "work",
     confirmation: undefined,
+    ownTurn: true,
+    userText: "send priya@acme.com an email about the demo",
   });
   assert(blocked.ok === false, "no owner-chat confirmation means no send");
   assert(gmailLog.sent.length === 0, "unapproved send does not call Gmail");
@@ -161,6 +196,37 @@ function clearLogs(): void {
   assert(!systemMd.includes("Autonomy Rules Engine"), "system prompt has no autonomy engine");
   assert(!approvalsSrc.includes("startAutoSendDispatcher"), "auto-send dispatcher is gone");
   assert(!approvalsSrc.includes("evaluateDraft"), "rules engine is gone from approvals");
+}
+
+// ---- C: send_immediately only sends when every recipient is known ----
+{
+  clearLogs();
+  const reply = await draftNewEmail(
+    { to: "newbie@new-co.com", subject: "Hi", body: "Hi there.", send_immediately: true },
+    ownerTurn("send newbie@new-co.com an email saying hi"),
+  );
+  assert(gmailLog.sent.length === 0, `a new address is never sent directly: ${reply}`);
+  assert(reply.includes("New address: newbie@new-co.com. Tap Send to confirm."), `he's told why: ${reply}`);
+  const cardFor = /draft_id: (\S+)/.exec(reply)?.[1] ?? "";
+  assert(getPendingActionForDraft(cardFor)?.status === "pending", `the card is shown and waits: ${reply}`);
+}
+{
+  // PR #27: "draft ... please send me the proposal" is a draft, never a send.
+  clearLogs();
+  const reply = await draftNewEmail(
+    { to: "priya@acme.com", subject: "Proposal", body: "Please send me the proposal.", send_immediately: true },
+    ownerTurn("draft an email to priya@acme.com saying please send me the proposal"),
+  );
+  assert(gmailLog.sent.length === 0 && getPendingActionForDraft(/draft_id: (\S+)/.exec(reply)?.[1] ?? "")?.status === "pending", `"draft" never sends: ${reply}`);
+}
+{
+  // A delegated goal (not his own turn): a card, even for a known address.
+  clearLogs();
+  const reply = await draftNewEmail(
+    { to: "priya@acme.com", subject: "Demo", body: "Hi Priya.", send_immediately: true },
+    ownerTurn("send priya@acme.com an email about the demo", false),
+  );
+  assert(gmailLog.sent.length === 0 && getPendingActionForDraft(/draft_id: (\S+)/.exec(reply)?.[1] ?? "")?.status === "pending", `a delegated goal only gets a card: ${reply}`);
 }
 
 setGoogleAccountForTests(undefined);

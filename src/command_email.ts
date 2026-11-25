@@ -17,6 +17,7 @@ import {
   clearPendingAction,
   getPendingAction,
   holdEmailToolTurn,
+  linkPublishedDraft,
   matchOwnerSupplied,
   pendingResolvedEmails,
   rememberBookedMeeting,
@@ -28,6 +29,8 @@ import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
+import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
+import { cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
 import { withoutFollowupClause } from "./command_intent.js";
 import { followupsAfterSend } from "./sequences.js";
 import { mailDomainRefusal } from "./email_grounding.js";
@@ -42,18 +45,23 @@ import {
   sentMessageForDraft,
   setCommandSendTelegramMessage,
   listOpenCommandChoices,
+  setPendingActionFollowups,
+  draftRecipientsShownBefore,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
 import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
-import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
+import { getGoogleAccount, type GoogleAccountId, type LoadedGoogleAccount } from "./google/auth.js";
 import {
+  createNewEmailDraft,
+  createThreadReplyDraft,
   gmailClient,
   messageHeader as draftHeader,
   plainTextBody,
   resolveGmailDraft,
   signatureHtmlFor,
+  signaturePlainText,
   stripSignature,
 } from "./google/mail.js";
 import { isSelfEmail } from "./mom_logic.js";
@@ -67,7 +75,7 @@ import {
 import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
-import { sendPendingDraftByText } from "./approvals.js";
+import { queueDraftApproval, sendPendingDraftByText } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -119,6 +127,13 @@ export interface CommandRequest {
   finalSubject?: string;
   /** The thread's subject when a reply was scheduled. */
   threadSubject?: string;
+  /** It came straight from his own chat turn (dispatch's mark), not a delegated goal. */
+  ownTurn?: boolean;
+  /** Addresses he confirmed by a tap (an offered address button, or Confirm on a held
+   *  schedule), or that were known when he scheduled it. */
+  confirmedRecipients?: string[];
+  /** His whole message, when it also asked for follow-ups: they ride on the card. */
+  followupWords?: string;
 }
 
 let telegram: Api | undefined;
@@ -215,6 +230,111 @@ function shown(body: string): string {
 
 /** Writes the email and sends it. Everything that decides who gets it is already
  *  settled, and the writer can't change it. */
+/** The written email as a Gmail draft on its Send card. The tap sends it. */
+async function showSendCard(input: {
+  request: CommandRequest;
+  account: LoadedGoogleAccount;
+  confirmation: { chatId: number; messageId: number } | undefined;
+  verdict: Exclude<SendVerdict, { action: "send" }>;
+  toHeader: string;
+  ccHeader: string;
+  subject: string;
+  body: string;
+  reply?: { threadId: string; inReplyTo: string; references: string };
+}): Promise<Outcome> {
+  const signatureHtml = await signatureHtmlFor(input.account);
+  let draftId: string;
+  try {
+    draftId = input.reply
+      ? (
+          await createThreadReplyDraft({
+            account: input.account,
+            threadId: input.reply.threadId,
+            to: input.toHeader,
+            cc: input.ccHeader || undefined,
+            subject: input.subject,
+            inReplyTo: input.reply.inReplyTo,
+            references: input.reply.references,
+            body: input.body,
+            signatureHtml,
+          })
+        ).draftId
+      : (
+          await createNewEmailDraft({
+            account: input.account,
+            to: [input.toHeader],
+            cc: input.ccHeader ? [input.ccHeader] : undefined,
+            subject: input.subject,
+            body: input.body,
+            signatureHtml,
+          })
+        ).draftId;
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Command send: card draft failed (${errorType})`);
+    return { text: "Not sent: I couldn't save it as a draft for you to check, so nothing went out. Try again.", result: "not_sent" };
+  }
+  const signature = signaturePlainText(signatureHtml);
+  const actionId = await queueDraftApproval({
+    draftId,
+    threadId: input.reply?.threadId ?? null,
+    to: input.toHeader,
+    cc: input.ccHeader || undefined,
+    subject: input.subject,
+    body: input.body,
+    googleAccount: input.account.id === "personal" ? "personal" : "work",
+    ...(signature ? { signature } : {}),
+  });
+  if (input.request.followupWords && input.confirmation) {
+    setPendingActionFollowups(
+      actionId,
+      input.request.followupWords,
+      `msg:${input.confirmation.chatId}:${input.confirmation.messageId}`,
+    );
+  }
+  if (input.confirmation) {
+    linkPublishedDraft({
+      chatId: input.confirmation.chatId,
+      draftId,
+      to: input.toHeader,
+      cc: input.ccHeader,
+      subject: input.subject,
+      body: input.body,
+      account: input.account.id === "personal" ? "personal" : "work",
+    });
+  }
+  console.log(`Command send: card instead of a send new=${input.verdict.action === "card" ? input.verdict.newAddresses.length : 0}`);
+  const followups = input.request.followupWords ? " The follow-ups come as a Start card once it goes out." : "";
+  return {
+    text: `${cardReason(input.verdict, input.toHeader)}${followups}`,
+    hint: "Nothing has been sent. He has the card; answer in one short line.",
+    shown: true,
+  };
+}
+
+/** The decision for an email he asked to send now: known or confirmed people only.
+ *  Sending or scheduling a draft he was shown: whoever its card showed before this
+ *  message counts as confirmed. */
+async function sendVerdictFor(
+  request: CommandRequest,
+  confirmation: { chatId: number; messageId: number } | undefined,
+): Promise<SendVerdict> {
+  const recipients = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email] : []));
+  const confirmed = new Set((request.confirmedRecipients ?? []).map((email) => email.toLowerCase()));
+  if (request.draftId && confirmation) {
+    for (const email of draftRecipientsShownBefore(request.draftId, confirmation.messageId)) {
+      confirmed.add(email);
+    }
+  }
+  return decideSendAction({
+    intent: "send",
+    ownTurn: request.ownTurn === true,
+    recipients,
+    known: await knownRecipients(recipients),
+    confirmed,
+  });
+}
+
 export async function writeAndSend(
   request: CommandRequest,
   base: string,
@@ -229,7 +349,10 @@ export async function writeAndSend(
     /** A subject he changed himself. On a reply it wins over the thread's, and if it no
      *  longer matches the thread the email goes out as a new conversation. */
     explicitSubject?: string;
-  } = {},
+    /** decideSendAction's answer for these recipients. Anything but "send" leaves the
+     *  written email as a draft with its card. */
+    verdict: SendVerdict;
+  },
 ): Promise<Outcome> {
   const to = request.to.map((slot) => slot.mailbox!);
   const cc = request.cc.map((slot) => slot.mailbox!);
@@ -310,12 +433,27 @@ export async function writeAndSend(
       !isSelfEmail(item.email) &&
       !isAutomatedAddress(item.email),
   );
+  if (options.verdict.action !== "send") {
+    // Nothing goes out: the email he asked for waits as a draft on its card.
+    return showSendCard({
+      request,
+      account,
+      confirmation,
+      verdict: options.verdict,
+      toHeader,
+      ccHeader,
+      subject,
+      body: written.body,
+      reply: !newConversation && thread ? { threadId: request.threadId!, inReplyTo: thread.inReplyTo, references: thread.references } : undefined,
+    });
+  }
   if (options.beforeSend && !options.beforeSend()) {
     return { text: "Not sent: it was cancelled.", result: "cancelled" };
   }
   let messageId: string;
   try {
     ({ messageId } = await sendCommandEmail({
+      decision: options.verdict,
       key,
       confirmation,
       account,
@@ -367,6 +505,7 @@ export async function writeAndSend(
     throw error;
   }
 
+  markRecipientsKnown([...to, ...cc].map((item) => item.email));
   const lines = [
     `Sent to ${toHeader}.`,
     ...(ccHeader ? [`Cc: ${ccHeader}`] : []),
@@ -538,7 +677,15 @@ async function scheduleRequest(
   const shownSubject = subject || request.instruction.split(/\s+/).slice(0, 8).join(" ");
   const names = request.to.map((slot) => slot.mailbox!.name || slot.query).join(", ");
   const itemText = `Send email to ${names} — ${shownSubject} — ${scheduledWhen(request.sendAt!)}`;
+  // Known people (or ones he tapped) are scheduled; a new address waits on his Confirm.
+  const verdict = await sendVerdictFor(request, confirmation);
+  const recipients = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : []));
+  const held = verdict.action !== "send";
+  if (!held) {
+    request = { ...request, confirmedRecipients: [...new Set([...(request.confirmedRecipients ?? []), ...recipients])] };
+  }
   const row = createScheduledSend({
+    held,
     key: `${sendKey(base, to)}:${request.sendAt}`,
     sendAt: request.sendAt!,
     itemText,
@@ -554,7 +701,7 @@ async function scheduleRequest(
   if (!row) {
     return { text: "Not scheduled again: this command was already handled." };
   }
-  console.log(`Scheduled send ${row.id}: status -> scheduled`);
+  console.log(`Scheduled send ${row.id}: status -> ${held ? "held for confirm" : "scheduled"}`);
   rememberScheduledSend({
     chatId: confirmation.chatId,
     scheduledSendId: row.id,
@@ -565,6 +712,28 @@ async function scheduleRequest(
     draftId: request.draftId,
     body: draft?.body,
   });
+  if (held) {
+    // Nothing is scheduled until his tap: the card says why and what it would do.
+    const heldText =
+      verdict.action === "card" && verdict.newAddresses.length > 0
+        ? `New address: ${verdict.newAddresses.join(", ")}. Tap Confirm to schedule for ${scheduledWhen(request.sendAt!)}.`
+        : `Ready to schedule for ${scheduledWhen(request.sendAt!)}, but this didn't come straight from your own message. Tap Confirm to schedule it.`;
+    const heldCard = {
+      text: heldText,
+      caption: heldText,
+      keyboard: new InlineKeyboard()
+        .text("Confirm", `cmdsend:confirmsched:${row.id}`)
+        .text("Cancel", `cmdsend:cancelsched:${row.id}`),
+    };
+    if (!holdForVoiceNote(heldCard)) {
+      await api().sendMessage(config.ownerTelegramId, heldCard.text, { reply_markup: heldCard.keyboard });
+    }
+    return {
+      text: heldText,
+      hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.",
+      shown: true,
+    };
+  }
   const scheduledCard = {
     text: `Scheduled: ${itemText}`,
     caption: `Scheduled: ${itemText}`,
@@ -582,6 +751,19 @@ async function scheduleRequest(
   };
 }
 
+/** At send time: the people he confirmed when he scheduled it pass; anyone else must
+ *  be known now. A schedule only exists once he asked for it himself. */
+export async function scheduledSendVerdict(request: CommandRequest): Promise<SendVerdict> {
+  const recipients = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email] : []));
+  return decideSendAction({
+    intent: "send",
+    ownTurn: true,
+    recipients,
+    known: await knownRecipients(recipients),
+    confirmed: new Set((request.confirmedRecipients ?? []).map((email) => email.toLowerCase())),
+  });
+}
+
 async function finishRequest(
   request: CommandRequest,
   base: string,
@@ -592,7 +774,7 @@ async function finishRequest(
     return scheduleRequest(request, base, confirmation);
   }
   if (request.kind !== "meeting") {
-    return writeAndSend(request, base, confirmation, now);
+    return writeAndSend(request, base, confirmation, now, { verdict: await sendVerdictFor(request, confirmation) });
   }
   const attendees = request.to.map((slot) => slot.mailbox!);
   const result = await bookResolvedMeeting({
@@ -924,7 +1106,7 @@ export async function sendEmailFromTool(
     pendingEmail?.draftId &&
     pendingEmail.scheduledSendId
   ) {
-    const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId);
+    const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId, { ownTurn: turn.ownTurn === true });
     return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok));
   }
   let toQueries = stringList(values.to);
@@ -990,6 +1172,8 @@ export async function sendEmailFromTool(
     instruction,
     // The email writer never sees a follow-up clause: only what the email should say.
     ownWords: withoutFollowupClause(ownWords),
+    ownTurn: turn.ownTurn === true,
+    ...(withoutFollowupClause(ownWords) !== ownWords ? { followupWords: ownWords } : {}),
     account: values.account === "personal" ? "personal" : "work",
     ...(when ? { sendAt: when } : {}),
     ...(typeof values.subject === "string" && values.subject.trim()
@@ -1317,6 +1501,8 @@ export async function handleCommandSendCallback(ctx: Context): Promise<void> {
   slot.mailbox = picked;
   slot.seen = slot.options;
   delete slot.options;
+  // His tap on an offered address confirms it, even a new one.
+  request.confirmedRecipients = [...(request.confirmedRecipients ?? []), picked.email.toLowerCase()];
   await finish(`Picked ${formatMailbox(picked)}.`);
   const message = ctx.callbackQuery?.message;
   try {

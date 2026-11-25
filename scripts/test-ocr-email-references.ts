@@ -26,6 +26,7 @@ import {
   getScheduledSend,
   createScheduledSend,
   listOpenScheduledSends,
+  recordKnownRecipient,
   rememberTelegramDocumentRef,
 } from "../src/db.ts";
 import { queueDraftApproval } from "../src/approvals.ts";
@@ -59,6 +60,8 @@ let latestDraftBody = "";
 let latestSentTo = "";
 let latestSentCc = "";
 const sentAccounts: string[] = [];
+// Like Gmail, each draft goes to whoever its MIME (or its queued card) says.
+const draftTo = new Map<string, string>();
 const gmailFor = (account: { id: string }) => ({
   users: {
     drafts: {
@@ -67,6 +70,7 @@ const gmailFor = (account: { id: string }) => ({
         sentAccounts.push(account.id);
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
         latestDraftRecipient = /^To:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
+        draftTo.set(`new-${gmailDrafts}`, latestDraftRecipient);
         latestDraftCc = /^Cc:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
         latestDraftSubject = /^Subject:\s*(.*)$/im.exec(raw)?.[1]?.trim() ?? "";
         const encoded = /Content-Transfer-Encoding: base64\r?\n\r?\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1];
@@ -81,7 +85,7 @@ const gmailFor = (account: { id: string }) => ({
         return { data: { id: `sent-${requestBody.id}` } };
       },
       get: async ({ id }: { id: string }) => ({
-        data: { id, message: { id, threadId: `thread-${id}`, payload: { headers: [{ name: "To", value: "alice@example.com" }, { name: "Subject", value: "Hello" }], mimeType: "text/plain", body: { data: Buffer.from("Hello", "utf8").toString("base64url") } } } },
+        data: { id, message: { id, threadId: `thread-${id}`, payload: { headers: [{ name: "To", value: draftTo.get(id) ?? "alice@example.com" }, { name: "Subject", value: "Hello" }], mimeType: "text/plain", body: { data: Buffer.from("Hello", "utf8").toString("base64url") } } } },
       }),
       update: async ({ id }: { id: string }) => ({ data: { id, message: { id, threadId: `thread-${id}` } } }),
       delete: async () => ({ data: {} }),
@@ -310,11 +314,20 @@ assert.match(question, /does not schedule or send/i);
 assert.equal(messageSends + draftSends, beforeQuestion);
 
 const sendsBeforeAddress = messageSends;
+const draftsBeforeAddress = gmailDrafts;
 await say("Send an email to the address above about our discussion");
-assert.equal(latestSentTo.toLowerCase().includes("info@msopsai.com"), true, latestSentTo);
-assert.equal(latestSentTo.toLowerCase().includes("vasanth"), false);
-assert.equal(messageSends, sendsBeforeAddress + 1);
+// C: he has never emailed this OCR address, so it's new: a card, nothing sent. The
+// card's draft still goes to the referenced address, never the old thread's.
+assert.equal(messageSends, sendsBeforeAddress, "a new OCR address is never sent directly");
+assert.equal(gmailDrafts, draftsBeforeAddress + 1, "its card has a draft");
+assert.equal(latestDraftRecipient.toLowerCase().includes("info@msopsai.com"), true, latestDraftRecipient);
+assert.equal(latestDraftRecipient.toLowerCase().includes("vasanth"), false);
+assert.match(replies.join("\n"), /New address: info@msopsai\.com\. Tap Send to confirm\./);
 assert.equal(draftSends, 0);
+// From here on he has emailed both (as if he had tapped Send), so the address-choice
+// cases below keep sending directly; what they check is which address is used.
+recordKnownRecipient("info@msopsai.com", "test");
+recordKnownRecipient("alice.copied@example.com", "test");
 
 const oldDraft = "draft-old-scheduled";
 await queueDraftApproval({
@@ -487,20 +500,25 @@ const scheduleOnly = await sendEmailFromTool(
 assert.match(scheduleOnly, /nothing went out immediately/i);
 assert.equal(messageSends, sendsBeforeSchedule);
 
+// These check which account sends: people he has emailed before, on his own turn
+// (dispatch's mark, which these direct calls stand in for).
+recordKnownRecipient("personal@example.com", "test");
+recordKnownRecipient("work@example.com", "test");
 const personal = await sendEmailFromTool(
   { to: ["personal@example.com"], instruction: "A personal note", account: "personal" },
-  { userText: "Send an email to personal@example.com about the note", confirmation: { chatId: 9, messageId: 3 } },
+  { userText: "Send an email to personal@example.com about the note", confirmation: { chatId: 9, messageId: 3 }, ownTurn: true },
 );
 assert.match(personal, /Sent to/i);
 assert.equal(sentAccounts.includes("message:personal"), true);
 const work = await sendEmailFromTool(
   { to: ["work@example.com"], instruction: "A work note", account: "work" },
-  { userText: "Send an email to work@example.com about the note", confirmation: { chatId: 9, messageId: 4 } },
+  { userText: "Send an email to work@example.com about the note", confirmation: { chatId: 9, messageId: 4 }, ownTurn: true },
 );
 assert.match(work, /Sent to/i);
 assert.equal(sentAccounts.filter((item) => item === "message:work").length >= 1, true);
 
 const once = "draft-once";
+draftTo.set(once, "once@example.com");
 await queueDraftApproval({
   draftId: once,
   threadId: null,
@@ -536,14 +554,14 @@ savePendingAction(12, {
 const beforeOnce = draftSends + messageSends;
 const sentNow = await sendEmailFromTool(
   { to: ["once@example.com"], instruction: "Send this once" },
-  { userText: "send it now", confirmation: { chatId: 12, messageId: nextMessageId() } },
+  { userText: "send it now", confirmation: { chatId: 12, messageId: nextMessageId() }, ownTurn: true },
 );
 assert.match(sentNow, /Sent/i);
 assert.equal(draftSends + messageSends, beforeOnce + 1);
 assert.equal(getScheduledSend(onceSchedule!.id)?.status, "sent");
 const again = await sendEmailFromTool(
   { to: ["once@example.com"], instruction: "Send this once" },
-  { userText: "send it now", confirmation: { chatId: 12, messageId: nextMessageId() } },
+  { userText: "send it now", confirmation: { chatId: 12, messageId: nextMessageId() }, ownTurn: true },
 );
 assert.match(again, /already|nothing was sent|no draft is waiting/i);
 assert.equal(draftSends + messageSends, beforeOnce + 1);
@@ -643,13 +661,18 @@ async function ocrSay(chatId: number, text: string): Promise<void> {
 rememberContactChoice("Jeff", { name: "Jeff", emails: ["jeff@example.com"], sources: ["known"] });
 rememberContactChoice("Munil", { name: "Munil", emails: ["munil@example.com"], sources: ["known"] });
 rememberContactChoice("Dorothy", { name: "Dorothy", emails: ["dorothy@example.com"], sources: ["known"] });
+// These check what his words ask for, so they are people he has emailed before, and
+// each call stands in for dispatch's own-turn mark.
+for (const email of ["jeff@example.com", "munil@example.com", "dorothy@example.com"]) {
+  recordKnownRecipient(email, "test");
+}
 
 {
   const sendsBefore = messageSends;
   const scheduledBefore = listOpenScheduledSends().length;
   const sent = await sendEmailFromTool(
     { to: ["Jeff"], instruction: "the proposal is ready" },
-    { userText: "Send Jeff an email saying the proposal is ready", confirmation: { chatId: 44, messageId: 1 } },
+    { userText: "Send Jeff an email saying the proposal is ready", confirmation: { chatId: 44, messageId: 1 }, ownTurn: true },
   );
   assert.match(sent, /Sent to/i);
   assert.equal(messageSends, sendsBefore + 1);
@@ -661,7 +684,7 @@ rememberContactChoice("Dorothy", { name: "Dorothy", emails: ["dorothy@example.co
   const sendsBefore = messageSends;
   const sent = await sendEmailFromTool(
     { to: ["Munil"], instruction: "the pricing call" },
-    { userText: "Email Munil about the pricing call", confirmation: { chatId: 45, messageId: 1 } },
+    { userText: "Email Munil about the pricing call", confirmation: { chatId: 45, messageId: 1 }, ownTurn: true },
   );
   assert.match(sent, /Sent to/i);
   assert.equal(messageSends, sendsBefore + 1);
@@ -673,7 +696,7 @@ rememberContactChoice("Dorothy", { name: "Dorothy", emails: ["dorothy@example.co
   const scheduledBefore = listOpenScheduledSends().length;
   const sent = await sendEmailFromTool(
     { to: ["Dorothy"], instruction: "thanks, we'll share the deck tomorrow" },
-    { userText: "Reply to Dorothy saying thanks, we'll share the deck tomorrow", confirmation: { chatId: 46, messageId: 1 } },
+    { userText: "Reply to Dorothy saying thanks, we'll share the deck tomorrow", confirmation: { chatId: 46, messageId: 1 }, ownTurn: true },
   );
   assert.match(sent, /Sent to/i);
   assert.equal(messageSends, sendsBefore + 1);
@@ -697,19 +720,19 @@ rememberContactChoice("Dorothy", { name: "Dorothy", emails: ["dorothy@example.co
 
 {
   const sendsBefore = messageSends + draftSends;
-  await ocrSay(49, "Schedule an email to the address above on 2026-11-25 at 5:30 pm saying hello");
+  await ocrSay(49, `Schedule an email to the address above on ${future} at 5:30 pm saying hello`);
   assert.equal(messageSends + draftSends, sendsBefore);
-  assert.equal(latestSchedule(49)?.send_at, new Date("2026-11-25T17:30:00+05:30").toISOString());
+  assert.equal(latestSchedule(49)?.send_at, new Date(`${future}T17:30:00+05:30`).toISOString());
 }
 
 {
   const sendsBefore = messageSends + draftSends;
-  await ocrSay(50, "Schedule an email to the address above on 2026-11-25 at 12 am saying hello");
-  assert.equal(latestSchedule(50)?.send_at, new Date("2026-11-25T00:00:00+05:30").toISOString());
-  await ocrSay(51, "Schedule an email to the address above on 2026-11-25 at 12 pm saying hello");
-  assert.equal(latestSchedule(51)?.send_at, new Date("2026-11-25T12:00:00+05:30").toISOString());
+  await ocrSay(50, `Schedule an email to the address above on ${future} at 12 am saying hello`);
+  assert.equal(latestSchedule(50)?.send_at, new Date(`${future}T00:00:00+05:30`).toISOString());
+  await ocrSay(51, `Schedule an email to the address above on ${future} at 12 pm saying hello`);
+  assert.equal(latestSchedule(51)?.send_at, new Date(`${future}T12:00:00+05:30`).toISOString());
   const scheduledBefore = listOpenScheduledSends().length;
-  await ocrSay(52, "Schedule an email to the address above on 2026-11-25 at 17:30 pm saying hello");
+  await ocrSay(52, `Schedule an email to the address above on ${future} at 17:30 pm saying hello`);
   assert.match(replies.at(-1) ?? "", /doesn't make sense|day and time/i);
   assert.equal(messageSends + draftSends, sendsBefore);
   assert.equal(listOpenScheduledSends().length, scheduledBefore, "contradictory 17:30 pm must not schedule");
@@ -789,7 +812,7 @@ for (const [userText, recipient] of [
   const before = messageSends + draftSends;
   const result = await sendEmailFromTool(
     { to: [recipient], instruction: "Hello" },
-    { userText, confirmation: { chatId: 60, messageId: nextMessageId() } },
+    { userText, confirmation: { chatId: 60, messageId: nextMessageId() }, ownTurn: true },
   );
   assert.match(result, /^Sent to/);
   assert.equal(messageSends + draftSends, before + 1);
@@ -804,7 +827,7 @@ for (const [userText, recipient] of [
   assert.equal(parseOwnerEmailSendAt(wording), undefined);
   await sendEmailFromTool(
     { to: ["Jeff"], instruction: "The renewal", send_on: sendOn, send_time: "18:00" },
-    { userText: wording, confirmation: { chatId: 61, messageId: nextMessageId() } },
+    { userText: wording, confirmation: { chatId: 61, messageId: nextMessageId() }, ownTurn: true },
   );
   assert.equal(latestSchedule(61)?.send_at, tomorrowIso("18:00"));
   assert.equal(messageSends + draftSends, before);
@@ -820,7 +843,7 @@ for (const [userText, recipient] of [
       cc: [], notes: [], purpose: "The deck", account: "work", waiting: "confirm" },
   });
   const send = (userText: string, timing = {}) => sendEmailFromTool(
-    { to: ["Jeff"], instruction: "The deck", ...timing }, { userText, confirmation: { chatId, messageId: nextMessageId() } },
+    { to: ["Jeff"], instruction: "The deck", ...timing }, { userText, confirmation: { chatId, messageId: nextMessageId() }, ownTurn: true },
   );
   await send("tell him that the call moved to 5 pm");
   assert.equal(latestSchedule(chatId), undefined);

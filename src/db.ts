@@ -1463,6 +1463,31 @@ if (!tableHasColumn("pending_actions", "event_title")) {
 if (!tableHasColumn("pending_actions", "sent_message_id")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN sent_message_id TEXT`);
 }
+// A "send then follow-ups" request rides on the card of an email that needs his tap.
+if (!tableHasColumn("pending_actions", "followup_words")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN followup_words TEXT`);
+}
+if (!tableHasColumn("pending_actions", "followup_key")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN followup_key TEXT`);
+}
+db.exec(`
+  -- Addresses he has sent to (Gmail Sent, either account) or Aadi sent to on his
+  -- confirmation. Only "known" is ever stored; "new" is never cached.
+  CREATE TABLE IF NOT EXISTS known_recipients (
+    email TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+  );
+  -- Each address a draft's card has shown him, and the newest of his messages that had
+  -- arrived by then. Shown before message M means that watermark is below M.
+  CREATE TABLE IF NOT EXISTS draft_card_recipients (
+    draft_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    shown_watermark INTEGER NOT NULL,
+    shown_at TEXT NOT NULL,
+    PRIMARY KEY (draft_id, email)
+  );
+`);
 
 /**
  * Pre-fix NiCE HQ caches stored Asia/Jerusalem on sales_sequences.prospect_timezone,
@@ -2030,6 +2055,60 @@ export function setPendingActionDraftMeta(
      SET to_header = ?, cc_header = ?, subject = ?, updated_at = datetime('now')
      WHERE id = ?`,
   ).run(meta.toHeader, meta.ccHeader, meta.subject, id);
+  // The card now shows these people. Record when, against his messages, so "send it"
+  // only counts addresses that were on the card before he said it.
+  const row = db.prepare(`SELECT draft_id FROM pending_actions WHERE id = ?`).get(id) as { draft_id: string | null } | undefined;
+  if (row?.draft_id) {
+    const watermark = latestProcessedMessageId();
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO draft_card_recipients (draft_id, email, shown_watermark, shown_at)
+       VALUES (?, ?, ?, ?)`,
+    );
+    for (const email of headerAddresses(`${meta.toHeader},${meta.ccHeader}`)) {
+      insert.run(row.draft_id, email, watermark, new Date().toISOString());
+    }
+  }
+}
+
+const HEADER_ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+
+function headerAddresses(header: string): string[] {
+  return [...new Set((header.match(HEADER_ADDRESS) ?? []).map((item) => item.toLowerCase()))];
+}
+
+/** The newest of his messages already taken for processing. */
+export function latestProcessedMessageId(): number {
+  return (db.prepare(`SELECT MAX(message_id) AS id FROM processed_messages`).get() as { id: number | null }).id ?? 0;
+}
+
+/** Addresses this draft's card showed him before his message `messageId` arrived. */
+export function draftRecipientsShownBefore(draftId: string, messageId: number): Set<string> {
+  const rows = db
+    .prepare(`SELECT email FROM draft_card_recipients WHERE draft_id = ? AND shown_watermark < ?`)
+    .all(draftId, messageId) as Array<{ email: string }>;
+  return new Set(rows.map((row) => row.email));
+}
+
+export function isKnownRecipientCached(email: string): boolean {
+  return db.prepare(`SELECT 1 FROM known_recipients WHERE email = ?`).get(email.trim().toLowerCase()) !== undefined;
+}
+
+export function recordKnownRecipient(email: string, source: string): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO known_recipients (email, source, checked_at) VALUES (?, ?, ?)`,
+  ).run(email.trim().toLowerCase(), source, new Date().toISOString());
+}
+
+/** A "send then follow-ups" request waiting on this card's Send tap. */
+export function setPendingActionFollowups(id: number, words: string, key: string): void {
+  db.prepare(`UPDATE pending_actions SET followup_words = ?, followup_key = ? WHERE id = ?`).run(words, key, id);
+}
+
+export function pendingActionFollowups(id: number): { words: string; key: string } | undefined {
+  const row = db
+    .prepare(`SELECT followup_words, followup_key FROM pending_actions WHERE id = ?`)
+    .get(id) as { followup_words: string | null; followup_key: string | null } | undefined;
+  return row?.followup_words && row.followup_key ? { words: row.followup_words, key: row.followup_key } : undefined;
 }
 
 /** Tests only: pin created/updated so recency and 3-hour expiry are deterministic. */
@@ -5898,6 +5977,8 @@ export function createScheduledSend(input: {
   request: string;
   confirmChat: number;
   confirmMessage: number;
+  /** Held: waiting on his Confirm tap (a new address). */
+  held?: boolean;
 }): ScheduledSendRecord | undefined {
   return db.transaction(() => {
     if (db.prepare("SELECT 1 FROM scheduled_sends WHERE idem_key = ?").get(input.key)) {
@@ -5907,10 +5988,19 @@ export function createScheduledSend(input: {
     const result = db
       .prepare(
         `INSERT INTO scheduled_sends
-           (idem_key, send_at, task_id, item_text, request, confirm_chat, confirm_message)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (idem_key, send_at, task_id, item_text, request, confirm_chat, confirm_message, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.key, input.sendAt, task.id, input.itemText, input.request, input.confirmChat, input.confirmMessage);
+      .run(
+        input.key,
+        input.sendAt,
+        task.id,
+        input.itemText,
+        input.request,
+        input.confirmChat,
+        input.confirmMessage,
+        input.held ? "held" : "scheduled",
+      );
     return getScheduledSend(Number(result.lastInsertRowid));
   })();
 }
@@ -6259,6 +6349,13 @@ export function holdScheduledSend(id: number, request: string, checkedRequest: s
         "UPDATE scheduled_sends SET status = 'held', request = ? WHERE id = ? AND status = 'scheduled' AND request = ?",
       )
       .run(request, id, checkedRequest).changes === 1
+  );
+}
+
+/** A scheduled email whose recipients now include a new address waits on his Confirm. */
+export function holdScheduledSendForConfirm(id: number): boolean {
+  return (
+    db.prepare("UPDATE scheduled_sends SET status = 'held' WHERE id = ? AND status = 'scheduled'").run(id).changes === 1
   );
 }
 

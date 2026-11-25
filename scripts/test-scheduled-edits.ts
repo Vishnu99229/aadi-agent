@@ -1,6 +1,6 @@
 // Scheduled emails follow every approved edit, and the worker never sends a stale copy.
 // Fake Gmail, fake Telegram, stub models, an in-memory database. Nothing real is sent.
-import type { Api } from "grammy";
+import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { applyOwnerContextTurn, focusSelectedDraft, getPendingAction } from "../src/action_context.ts";
 import { queueDraftApproval, setApprovalsTestHooks } from "../src/approvals.ts";
@@ -12,6 +12,7 @@ import {
   getTask,
   listOpenScheduledSends,
   listScheduledSendsForDraft,
+  recordKnownRecipient,
   transitionScheduledSend,
   type ScheduledSendRecord,
 } from "../src/db.ts";
@@ -19,7 +20,7 @@ import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/googl
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, setRouteModelCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
 import { setAgentModelSetting } from "../src/models/agent_models.ts";
-import { runScheduledSendTick } from "../src/scheduled_sends.ts";
+import { handleScheduledSendCallback, runScheduledSendTick } from "../src/scheduled_sends.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { handler as updateDraft } from "../src/tools/update_draft.ts";
 import { modelReply } from "./fakes.ts";
@@ -337,8 +338,15 @@ const turnIn = (chatId: number, userText: string) => ({
   calledTools: [] as string[],
   userText,
   confirmation: { chatId, messageId: ++messageId },
+  // Dispatch marks his own chat turn; these direct calls stand in for it.
+  ownTurn: true,
 });
 const say = (chatId: number, text: string) => applyOwnerContextTurn(chatId, text, ++messageId);
+// C: the emails scheduled straight from his words (no draft card first) are to people he
+// has emailed before; these cases are about edits reaching the schedule, not new addresses.
+for (const email of ["priya@example.com", "gita@example.com", "jaya@example.com", "alice@example.com"]) {
+  recordKnownRecipient(email, "test");
+}
 const requestOf = (id: number) =>
   JSON.parse(getScheduledSend(id)!.request) as {
     to: Array<{ query: string; mailbox: { email: string } }>;
@@ -370,6 +378,15 @@ async function draftThenSchedule(chatId: number, address: string, subject: strin
 
 async function fire(): Promise<void> {
   await runScheduledSendTick(FIRE);
+}
+
+/** His tap on Confirm for a send held for a new address. */
+async function tapConfirmFor(id: number): Promise<void> {
+  await handleScheduledSendCallback({
+    callbackQuery: { data: `cmdsend:confirmsched:${id}` },
+    answerCallbackQuery: async () => true,
+    editMessageText: async () => true,
+  } as unknown as Context);
 }
 
 // 1. The example: schedule for 10, change the subject, then mention Friday, then edit the
@@ -437,6 +454,21 @@ async function fire(): Promise<void> {
   assert(stored.finalBody === tapBody && stored.finalSubject === "Invoice due date", "body and subject follow");
 
   const before = sends.length;
+  // C: Carol and Dave came in by an edit after he confirmed the schedule, and he has
+  // never emailed them: at send time it is held for his Confirm, not sent.
+  const toldBefore = told.length;
+  await fire();
+  assert(sends.length === before, "nothing goes out to the new addresses");
+  assert(getScheduledSend(row.id)!.status === "held", "it is held");
+  assert(
+    told.slice(toldBefore).some((text) => text.includes("New address: carol@example.com, dave@example.com. Tap Confirm to send it.")),
+    `he is told why: ${told.slice(toldBefore).join(" | ")}`,
+  );
+  // His Confirm tap puts it back on the schedule, once; a second tap does nothing.
+  const tapConfirm = () => tapConfirmFor(row.id);
+  await tapConfirm();
+  assert(getScheduledSend(row.id)!.status === "scheduled", "Confirm schedules it again");
+  await tapConfirm();
   await fire();
   assert(sends.length === before + 1, "one email goes out");
   const sent = sends.at(-1)!;
@@ -488,6 +520,12 @@ async function fire(): Promise<void> {
   const before = sends.length;
   await fire();
   assert(!duringPrepare, "the change happened while preparing");
+  // C: Frank is new and came in by a correction, so the latest version is held for his
+  // Confirm: nothing goes to Erin, nor to Frank unconfirmed.
+  assert(sends.length === before, `nothing goes out before Confirm, got ${sends.length - before}`);
+  assert(getScheduledSend(row.id)!.status === "held", "it is held for Confirm");
+  await tapConfirmFor(row.id);
+  await fire();
   assert(sends.length === before + 1, `exactly one email, got ${sends.length - before}`);
   const sent = sends.at(-1)!;
   assert(sent.to.includes("frank@example.com") && !sent.to.includes("erin@example.com"), `only the corrected recipient, got ${sent.to}`);
@@ -522,6 +560,9 @@ async function fire(): Promise<void> {
 
 // 6. A correction while recipients are being re-checked does not get overwritten by a hold.
 {
+  // C: both are people he has emailed before; this case is about the ambiguity race.
+  recordKnownRecipient("lata@one.example", "test");
+  recordKnownRecipient("zed@example.com", "test");
   const created = createScheduledSend({
     key: "hold-race",
     sendAt: atIst(SEND_DAY, "10:00").toISOString(),

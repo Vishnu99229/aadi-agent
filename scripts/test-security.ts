@@ -38,6 +38,7 @@ import {
   searchQaBank,
   setMeetingProposalStatus,
   transitionMeetingPendingBooking,
+  setPendingActionDraftMeta,
 } from "../src/db.ts";
 import {
   claimTelegramMessage,
@@ -749,6 +750,35 @@ assert(
   const codeRun = agentLoopSrc.slice(agentLoopSrc.indexOf("code_start_sequence_"));
   assert(!codeRun.slice(0, codeRun.indexOf("continue;")).includes("modelCalled"), "the code-run fallback is never marked");
 }
+{
+  // C: every Gmail send call site checks a send decision first. sequence_send.ts and
+  // auto_book.ts keep their own gates and are exempt (and checked above unchanged).
+  const exempt = new Set(["security/sequence_send.ts", "security/auto_book.ts"]);
+  const files = (await readdir(join(root, "src"), { recursive: true }))
+    .map(String)
+    .filter((file) => file.endsWith(".ts"));
+  let sendSites = 0;
+  for (const file of files) {
+    const src = await readFile(join(root, "src", file), "utf8");
+    for (const match of src.matchAll(/\.(?:messages|drafts)\.send\(/g)) {
+      if (exempt.has(file)) {
+        continue;
+      }
+      sendSites += 1;
+      const before = src.slice(0, match.index);
+      const functionStart = Math.max(before.lastIndexOf("\nexport async function "), before.lastIndexOf("\nasync function "));
+      const body = before.slice(functionStart);
+      assert(
+        functionStart !== -1 && body.includes("assertSendDecision("),
+        `${file}: a Gmail send must check a send decision first`,
+      );
+    }
+  }
+  assert(sendSites === 3, `the three checked send sites: command_send.ts and two in approvals.ts, got ${sendSites}`);
+  const decisionSrc = await readFile(join(root, "src/security/send_decision.ts"), "utf8");
+  assert(decisionSrc.includes("export function decideSendAction("), "one decision point");
+  assert(decisionSrc.includes("export function assertSendDecision("), "and one check of it");
+}
 for (const tool of ["set_sequence_timezone", "add_sales_fact", "list_sales_facts", "remove_sales_fact"]) {
   assert(
     !(FORWARDED_TOOLS as readonly string[]).includes(tool),
@@ -1388,6 +1418,8 @@ function draftWithCard(cardId: number | null): number {
   const action = createPendingAction(`confirm-${nextMessageId()}`, null, "work");
   if (cardId !== null) {
     setPendingActionTelegramMessage(action.id, cardId);
+    // A posted card shows the draft's people (the fake draft goes to Priya).
+    setPendingActionDraftMeta(action.id, { toHeader: "Priya <priya@acme.com>", ccHeader: "", subject: "Demo" });
   }
   confirmDrafts.push(action.id);
   return action.id;
@@ -1404,6 +1436,8 @@ function ownerTurn(messageId: number, extra: Partial<ToolTurn> = {}): ToolTurn {
     iteration: 1,
     calledTools: ["confirm_send_pending_draft"],
     confirmation: { chatId: ownerChat, messageId },
+    // Dispatch marks his own chat turn; these tests stand in for it.
+    ownTurn: true,
     ...extra,
   };
 }
@@ -1439,7 +1473,7 @@ assert(
   const fastPath = await sendPendingDraftByText({
     chatId: ownerChat,
     messageId: confirmingMessage,
-  });
+  }, undefined, { ownTurn: true });
   assert(confirmGmail.sent.length === 0, "a draft whose card came after the confirming message is never sent");
   assert(!fastPath.ok, "the exact-phrase fast path enforces shown-first too");
   assert(getPendingAction(shownAfter)!.status === "pending", "that draft stays pending");
@@ -1535,7 +1569,7 @@ function hoursAgo(hours: number): string {
   const sent = await sendPendingDraftByText({
     chatId: ownerChat,
     messageId: nextMessageId(),
-  });
+  }, undefined, { ownTurn: true });
   assert(sent.ok, "fast path sends the most recently edited draft");
   assert(
     confirmGmail.sent.at(-1) === getPendingAction(recent)!.draft_id,
@@ -1558,7 +1592,7 @@ function hoursAgo(hours: number): string {
   const asked = await sendPendingDraftByText({
     chatId: ownerChat,
     messageId: nextMessageId(),
-  });
+  }, undefined, { ownTurn: true });
   assert(!asked.ok, "two equally recent drafts: nothing is sent");
   assert(asked.message.includes("Which one"), "two equally recent drafts: Aadi asks which");
 }

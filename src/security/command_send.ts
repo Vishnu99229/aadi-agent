@@ -14,6 +14,7 @@ import {
   gmailClient,
   mimeHeaderBlock,
 } from "../google/mail.js";
+import { assertSendDecision, type SendDecision } from "./send_decision.js";
 import { allowOwnerChatCommandSend } from "./send_approval.js";
 
 export class CommandSendRefusedError extends Error {
@@ -111,6 +112,8 @@ export interface SendCommandEmailParams {
   threadId: string | null;
   inReplyTo: string;
   references: string;
+  /** decideSendAction's "send" for exactly these To and Cc. Without it nothing goes out. */
+  decision: SendDecision;
 }
 
 /** The only way an email sent on Vishnu's command reaches Gmail. */
@@ -118,6 +121,11 @@ export async function sendCommandEmail(
   params: SendCommandEmailParams,
 ): Promise<{ messageId: string }> {
   allowOwnerChatCommandSend(params.confirmation);
+  try {
+    assertSendDecision(params.decision, [...addresses(params.to), ...addresses(params.cc)]);
+  } catch {
+    throw new CommandSendRefusedError("send_not_decided");
+  }
   const gate = evaluateCommandSendGate({
     enabled: config.sendOnCommandEnabled,
     to: params.to,

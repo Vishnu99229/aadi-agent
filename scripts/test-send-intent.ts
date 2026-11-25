@@ -10,6 +10,7 @@ import {
   getLatestPendingSendAction,
   getPendingAction,
   listMemories,
+  setPendingActionDraftMeta,
   setPendingActionTelegramMessage,
   transitionPendingAction,
 } from "../src/db.ts";
@@ -118,6 +119,8 @@ function shownDraft(): number {
   claimTelegramMessage(1, nextMessageId());
   const action = createPendingAction(`draft-${nextMessageId()}`, null, "work");
   setPendingActionTelegramMessage(action.id, nextMessageId());
+  // A posted card shows the draft's people (the fake draft goes to Priya).
+  setPendingActionDraftMeta(action.id, { toHeader: "Priya <priya@acme.com>", ccHeader: "", subject: "Demo" });
   created.push(action.id);
   return action.id;
 }

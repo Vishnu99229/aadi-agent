@@ -138,6 +138,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     signatureHtml,
   });
 
+  let cardNote = "";
   const sendImmediately =
     values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
   const signature = signaturePlainText(signatureHtml);
@@ -146,7 +147,12 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       draftId,
       googleAccount: account.id,
       confirmation: turn.confirmation,
+      ownTurn: turn.ownTurn === true,
+      userText: turn.userText,
     });
+    if (!sent.ok && sent.reason === "card") {
+      cardNote = sent.message;
+    }
     if (sent.ok) {
       return `Sent to ${toHeader}.`;
     }
@@ -174,5 +180,5 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     });
   }
 
-  return `Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`;
+  return `${cardNote ? `${cardNote} ` : ""}Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`;
 }

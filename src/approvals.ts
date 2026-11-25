@@ -20,6 +20,8 @@ import {
   type GoogleAccountId,
   type PendingAction,
   type PendingEventInput,
+  draftRecipientsShownBefore,
+  pendingActionFollowups,
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import {
@@ -30,6 +32,10 @@ import {
 import { parseAddressList } from "./mail_helpers.js";
 import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
+import { classifyOwnerEmailIntent } from "./email_references.js";
+import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
+import { followupsAfterSend } from "./sequences.js";
+import { assertSendDecision, cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
 import { plainTextBody, stripSignature } from "./google/mail.js";
 import { assertTestSeam } from "./test_seam.js";
 
@@ -474,10 +480,51 @@ async function currentPendingAction(
 }
 
 type SendOutcome =
-  | { ok: true }
-  | { ok: false; reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" };
+  | { ok: true; sentMessageId?: string }
+  | { ok: false; reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" };
+
+/** The people a draft goes to right now, from Gmail itself: what drafts.send would use. */
+async function draftRecipients(account: GoogleAccountId, draftId: string): Promise<string[]> {
+  const gmail = await gmailFor(account);
+  const draft = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "metadata" });
+  const headers = draft.data.message?.payload?.headers ?? [];
+  const value = (name: string) =>
+    headers.find((item: { name?: string | null; value?: string | null }) => (item.name ?? "").toLowerCase() === name)?.value ?? "";
+  return [...new Set([...parseAddressList(value("to")), ...parseAddressList(value("cc"))].map((item) => item.email.toLowerCase()))];
+}
+
+/** Everyone this card has shown: its current To and Cc, and any address it showed
+ *  earlier (cards from before the log existed still have their To and Cc). */
+function shownOnCard(action: PendingAction): Set<string> {
+  const shown = new Set(
+    [...parseAddressList(action.to_header ?? ""), ...parseAddressList(action.cc_header ?? "")].map((item) => item.email.toLowerCase()),
+  );
+  if (action.draft_id) {
+    for (const email of draftRecipientsShownBefore(action.draft_id, Number.MAX_SAFE_INTEGER)) {
+      shown.add(email);
+    }
+  }
+  return shown;
+}
+
+/** His own "send it" for a draft he was shown: only addresses its card showed before
+ *  his message, or that he's sent to before, go out with no further tap. */
+async function textSendVerdict(action: PendingAction, messageId: number, ownTurn: boolean): Promise<{ verdict: SendVerdict; to: string }> {
+  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id).catch(() => []) : [];
+  const verdict = decideSendAction({
+    intent: "send",
+    ownTurn,
+    recipients,
+    known: await knownRecipients(recipients),
+    confirmed: action.draft_id ? draftRecipientsShownBefore(action.draft_id, messageId) : new Set(),
+  });
+  return { verdict, to: action.to_header ?? recipients.join(", ") };
+}
 
 function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"]): string {
+  if (reason === "not_decided") {
+    return "Not sent: the people on it changed, so check the card and tap Send again.";
+  }
   if (reason === "already_sent") {
     return "That email was already delivered. I didn't send it again.";
   }
@@ -492,10 +539,19 @@ function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"]): 
     : "The draft was sent, but its approval status could not be updated.";
 }
 
-async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
+async function performDraftSend(action: PendingAction, decision: SendVerdict): Promise<SendOutcome> {
   const draftId = action.draft_id;
   if (!draftId) {
     return { ok: false, reason: "send_failed" };
+  }
+  // The decision must cover exactly who the draft goes to now.
+  let recipients: string[];
+  try {
+    recipients = await draftRecipients(action.google_account, draftId);
+    assertSendDecision(decision, recipients);
+  } catch {
+    console.log(`Approval action ${action.id}: send refused reason=not_decided`);
+    return { ok: false, reason: "not_decided" };
   }
   const claim = claimDraftDelivery(draftId, action.google_account, new Date().toISOString());
   if (claim.state === "already_sent" || claim.state === "unconfirmed" || claim.state === "in_progress") {
@@ -513,6 +569,7 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
       requestBody: { id: draftId },
     });
     sentMessageId = sent.data.id ?? undefined;
+    markRecipientsKnown(recipients);
   } catch {
     if (claim.state === "claimed") {
       console.log(`Approval action ${action.id}: send unconfirmed; schedule ${claim.id} stays claimed`);
@@ -547,7 +604,7 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
     return { ok: false, reason: "status_update_failed" };
   }
   console.log(`Approval action ${action.id}: status -> sent`);
-  return { ok: true };
+  return { ok: true, sentMessageId };
 }
 
 /** Send a Gmail draft now. No Telegram card and no pending_actions row.
@@ -556,7 +613,15 @@ export async function sendCreatedDraftNow(params: {
   draftId: string;
   googleAccount: GoogleAccountId;
   confirmation: SendConfirmation | undefined;
-}): Promise<{ ok: true } | { ok: false; reason: "not_approved" | "send_failed" }> {
+  /** Straight from his own chat turn (dispatch's mark). */
+  ownTurn?: boolean;
+  /** His own words: "draft ..." never sends. */
+  userText?: string;
+}): Promise<
+  | { ok: true }
+  | { ok: false; reason: "not_approved" | "send_failed" }
+  | { ok: false; reason: "card"; message: string }
+> {
   // While send_email is on it is the only no-tap path, so its recipient check can't
   // be bypassed. The draft tools fall through to their Send card.
   if (config.sendOnCommandEnabled) {
@@ -566,6 +631,27 @@ export async function sendCreatedDraftNow(params: {
     allowOwnerChatSendDraft(params.confirmation);
   } catch {
     return { ok: false, reason: "not_approved" };
+  }
+  // Only known people, on his own turn, for a send he asked for: anything else is the card.
+  let recipients: string[];
+  try {
+    recipients = await draftRecipients(params.googleAccount, params.draftId);
+  } catch {
+    return { ok: false, reason: "send_failed" };
+  }
+  const verdict = decideSendAction({
+    intent: classifyOwnerEmailIntent(params.userText ?? "") === "draft" ? "draft" : "send",
+    ownTurn: params.ownTurn === true,
+    recipients,
+    known: await knownRecipients(recipients),
+  });
+  if (verdict.action !== "send") {
+    return { ok: false, reason: "card", message: cardReason(verdict, recipients.join(", ")) };
+  }
+  try {
+    assertSendDecision(verdict, recipients);
+  } catch {
+    return { ok: false, reason: "send_failed" };
   }
   const claim = claimDraftDelivery(params.draftId, params.googleAccount, new Date().toISOString());
   if (claim.state === "already_sent" || claim.state === "in_progress" || claim.state === "unconfirmed") {
@@ -580,6 +666,7 @@ export async function sendCreatedDraftNow(params: {
       requestBody: { id: params.draftId },
     });
     sentMessageId = sent.data.id ?? undefined;
+    markRecipientsKnown(recipients);
   } catch {
     console.log(`Draft ${params.draftId}: immediate send failed`);
     return { ok: false, reason: "send_failed" };
@@ -693,7 +780,26 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     actionId: action.id,
     actionStatus: action.status,
   });
-  const outcome = await performDraftSend(action);
+  // His tap on the card's own Send confirms the people the card showed. Anyone else on
+  // the Gmail draft now (changed outside Aadi) must be someone he has emailed before.
+  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id).catch(() => []) : [];
+  const shown = shownOnCard(action);
+  const verdict = decideSendAction({
+    intent: "send",
+    ownTurn: true,
+    recipients,
+    known: await knownRecipients(recipients.filter((email) => !shown.has(email))),
+    confirmed: shown,
+  });
+  if (verdict.action === "card" && verdict.newAddresses.length > 0) {
+    console.log(`Approval action ${action.id}: send refused, draft has addresses the card didn't show`);
+    await ctx.answerCallbackQuery({
+      text: `Not sent: ${verdict.newAddresses.join(", ")} is on the draft now but wasn't on this card. Ask me to show it again, then tap Send.`,
+      show_alert: true,
+    });
+    return;
+  }
+  const outcome = await performDraftSend(action, verdict);
   if (!outcome.ok) {
     if (outcome.reason === "already_sent") {
       await showStatus(ctx, "Sent").catch(() => undefined);
@@ -705,6 +811,42 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     console.log(`Approval action ${action.id}: sent preview update failed`);
   });
   await ctx.answerCallbackQuery("Sent").catch(() => undefined);
+  await followupsAfterCardSend(action, outcome.sentMessageId, recipients);
+}
+
+/** "Email a new address saying ... and start follow-ups": the email went out on his tap,
+ *  so the follow-ups come now, as a pre-filled Start card (never enrolled directly). */
+async function followupsAfterCardSend(action: PendingAction, sentMessageId: string | undefined, recipients: string[]): Promise<void> {
+  const followups = pendingActionFollowups(action.id);
+  if (!followups || !sentMessageId) {
+    return;
+  }
+  const key = /^msg:(-?\d+):(\d+)$/.exec(followups.key);
+  if (!key) {
+    return;
+  }
+  try {
+    const to = parseAddressList(action.to_header ?? "")[0];
+    const result = await followupsAfterSend({
+      turn: {
+        confirmation: { chatId: Number(key[1]), messageId: Number(key[2]) },
+        userText: followups.words,
+        ownTurn: true,
+        directSend: true,
+      },
+      result: "sent",
+      sentMessageId,
+      account: action.google_account,
+      recipient: to?.name.trim().split(/\s+/)[0] || to?.email || recipients[0] || "them",
+      recipientMailbox: to ? { name: to.name, email: to.email } : undefined,
+    });
+    if (result.text) {
+      await telegram.sendMessage(config.ownerTelegramId, result.text);
+    }
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Approval action ${action.id}: follow-ups after send failed (${errorType})`);
+  }
 }
 
 function recipientLabelFromHeader(header: string): string {
@@ -882,6 +1024,8 @@ function askedWhichMessage(
 export async function sendPendingDraftByText(
   confirmation: SendConfirmation,
   draftId?: string,
+  /** ownTurn: straight from his own chat turn. Anything else is never a send. */
+  options: { ownTurn?: boolean } = {},
 ): Promise<TextSendDraftResult> {
   const shown = await shownPendingDrafts(confirmation);
   if (shown.length === 0) {
@@ -927,7 +1071,12 @@ export async function sendPendingDraftByText(
       actionStatus: action.status,
     });
     const recipient = await fetchDraftRecipientLabel(action);
-    const outcome = await performDraftSend(action);
+    const { verdict, to } = await textSendVerdict(action, confirmation.messageId, options.ownTurn === true);
+    if (verdict.action !== "send") {
+      console.log(`Approval action ${action.id}: card, not sent (${verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
+      return { ok: false, message: cardReason(verdict, to) };
+    }
+    const outcome = await performDraftSend(action, verdict);
     if (!outcome.ok) {
       return { ok: false, message: sendFailureText(outcome.reason) };
     }

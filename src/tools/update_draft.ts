@@ -9,6 +9,7 @@ import {
   type ScheduleSync,
 } from "../action_context.js";
 import { queueDraftApproval } from "../approvals.js";
+import { noteDraftEditedThisTurn } from "./confirm_send_pending_draft.js";
 import { accountBoundToDraft, getPendingActionForDraft } from "../db.js";
 import {
   buildMimeMessage,
@@ -232,6 +233,8 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
       ...(scheduleNote ? [scheduleNote] : []),
     ],
   });
+  // His own edit this turn: a "send it" in the same message may now confirm this draft.
+  noteDraftEditedThisTurn(turn?.confirmation, savedDraftId);
 
   return JSON.stringify({
     draft_id: savedDraftId,

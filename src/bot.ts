@@ -1121,7 +1121,7 @@ bot.callbackQuery(/^am:/, async (ctx) => {
   await handleAgentModelCallback(ctx, sendModelPanel);
 });
 
-bot.callbackQuery(/^cmdsend:(?:hold|cancelsched):/, async (ctx) => {
+bot.callbackQuery(/^cmdsend:(?:hold|cancelsched|confirmsched):/, async (ctx) => {
   await handleScheduledSendCallback(ctx);
 });
 
@@ -1844,7 +1844,8 @@ async function handleUserText(
   const inWriting = voiceIn && wantsItInWriting(userText, lastReply);
   const spoken = voiceIn && !inWriting;
   if (confirmation && isSendDraftCommand(userText)) {
-    const result = await sendPendingDraftByText(confirmation);
+    // His own typed or spoken "send it" (forwarded messages never reach here).
+    const result = await sendPendingDraftByText(confirmation, undefined, { ownTurn: true });
     await replyInKind(ctx, result.message, spoken, userText);
     return;
   }

@@ -6,7 +6,7 @@ import { setApprovalsTestHooks } from "../src/approvals.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import { writeCommandEmail } from "../src/command_writer.ts";
 import { composeWithEmailAgent } from "../src/context_draft.ts";
-import { createDocument, createMemory, listOpenScheduledSends } from "../src/db.ts";
+import { createDocument, createMemory, listOpenScheduledSends, recordKnownRecipient } from "../src/db.ts";
 import {
   fromNameForAddress,
   neutralGreeting,
@@ -100,6 +100,11 @@ setDomainLookupForTests(async (domain): Promise<DomainStatus> => {
 });
 
 createMemory({ content: "Contact name is Nithish", category: "person", tag: "work", source: "auto" });
+// C: these check the greeting of an email that goes out, so they are people he has
+// emailed before; each turn stands in for dispatch's own-turn mark.
+for (const email of ["contact@sargvision.com", "jeff@example.com", "priya@example.com", "user@timeout.example", "contact@gmail.com"]) {
+  recordKnownRecipient(email, "test");
+}
 
 {
   const before = sends;
@@ -107,7 +112,7 @@ createMemory({ content: "Contact name is Nithish", category: "person", tag: "wor
     { to: ["contact@sargvision.com"], instruction: "Tell him we met at the Bangalore tech event and I am with Epicode." },
     {
       userText: "Send to contact@sargvision.com saying we met at the Bangalore tech event and I am with Epicode",
-      confirmation: { chatId: 1, messageId: 1 },
+      confirmation: { chatId: 1, messageId: 1 }, ownTurn: true,
     },
   );
   assert.match(sent, /Sent to/i);
@@ -124,7 +129,7 @@ rememberContactChoice("Jeff", { name: "Jeff Comstock", emails: ["jeff@example.co
     { to: ["jeff@example.com"], instruction: "the deck is ready" },
     {
       userText: "Send an email to jeff@example.com saying the deck is ready",
-      confirmation: { chatId: 1, messageId: 2 },
+      confirmation: { chatId: 1, messageId: 2 }, ownTurn: true,
     },
   );
   assert.match(sent, /Sent to/i);
@@ -138,7 +143,7 @@ rememberContactChoice("Jeff", { name: "Jeff Comstock", emails: ["jeff@example.co
     { to: ["priya@example.com"], instruction: "the deck is ready" },
     {
       userText: "Tell Priya at priya@example.com that the deck is ready",
-      confirmation: { chatId: 1, messageId: 3 },
+      confirmation: { chatId: 1, messageId: 3 }, ownTurn: true,
     },
   );
   assert.match(sent, /Sent to/i);
@@ -160,7 +165,7 @@ createDocument("card.jpg", "work", "contact@sargvision.com\nSARGVISION INTELLIGE
     },
     {
       userText: "Send to contact@sarkvision.com tomorrow at 10 AM",
-      confirmation: { chatId: 1, messageId: 4 },
+      confirmation: { chatId: 1, messageId: 4 }, ownTurn: true,
     },
   );
   assert.match(refused, /Not sent: sarkvision\.com doesn't accept email\. Did you mean contact@sargvision\.com\?/);
@@ -174,7 +179,7 @@ createDocument("card.jpg", "work", "contact@sargvision.com\nSARGVISION INTELLIGE
     { to: ["user@timeout.example"], instruction: "hello there" },
     {
       userText: "Send an email to user@timeout.example saying hello there",
-      confirmation: { chatId: 1, messageId: 5 },
+      confirmation: { chatId: 1, messageId: 5 }, ownTurn: true,
     },
   );
   assert.match(sent, /Sent to/i);
@@ -227,7 +232,7 @@ assert.equal(neutralGreeting("contact@sargvision.com"), "Hi Sargvision team,");
   };
   const created = await draftReply(
     { email_id: "reply-1", body: "Hi Nithish,\n\nThanks for writing.", account: "work" },
-    { iteration: 1, calledTools: [], userText: "Reply in this thread and say thanks", confirmation: { chatId: 1, messageId: 9 } },
+    { iteration: 1, calledTools: [], userText: "Reply in this thread and say thanks", confirmation: { chatId: 1, messageId: 9 }, ownTurn: true },
   );
   gmail.users.drafts.create = previous;
   assert.match(created, /reply-draft/);
@@ -241,7 +246,7 @@ assert.equal(neutralGreeting("contact@sargvision.com"), "Hi Sargvision team,");
     { to: ["contact@gmail.com"], instruction: "the notes from today" },
     {
       userText: "Send an email to contact@gmail.com saying the notes from today",
-      confirmation: { chatId: 1, messageId: 8 },
+      confirmation: { chatId: 1, messageId: 8 }, ownTurn: true,
     },
   );
   assert.match(sent, /Sent to/i);
