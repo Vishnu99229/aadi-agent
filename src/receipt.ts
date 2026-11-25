@@ -1,3 +1,7 @@
+import { COMMAND_TOOLS, commandIntents } from "./command_intent.js";
+import { mentionsSendDate, splitOwnerEmailCommand } from "./command_logic.js";
+import { isSendDraftCommand } from "./send_triggers.js";
+
 export const CLAIM_ACTIONS = [
   "sent",
   "booked",
@@ -20,6 +24,7 @@ export type ClaimAction = (typeof CLAIM_ACTIONS)[number];
 export interface ToolReceipt {
   name: string;
   success: boolean;
+  content?: string;
 }
 
 const TOOLS_FOR: Record<ClaimAction, ReadonlySet<string>> = {
@@ -148,6 +153,15 @@ export interface ClaimContext {
   ownerText?: string;
   /** True for a tool that only reads. */
   isReadTool?: (name: string) => boolean;
+  /** Actions grounded in the specific earlier record described by this reply. */
+  recordedActions?: readonly ClaimAction[];
+}
+
+export interface ReceiptRetryMetadata {
+  actions: ClaimAction[];
+  lookup: boolean;
+  /** True when the retry is limited to read tools. */
+  toolsRestricted: boolean;
 }
 
 const OWN_VERBS: Record<ClaimAction, string> = {
@@ -197,7 +211,44 @@ const ASKS_TO_LOOK =
   /\b(?:find|search|look|show|summari[sz]e|summary|recap|check|read|list|tell|what|when|who|whom|which|where|did|does|has|have|is|are|was|were|any|latest|last|recent|how)\b/i;
 
 /** "Did Hardik reply?" and "has it been sent?" ask what happened, not for it to happen. */
-const ASKS_WHAT_HAPPENED = /^\s*(?:did|has|have|had|was|were|is|are|when|who|what|which)\b/i;
+const ASKS_WHAT_HAPPENED = /^\s*(?:(?:thanks|thank you|please|hey|aadi)[,\s]+)*(?:how|why|any|did|does|has|have|had|was|were|is|are|when|where|who|what|which)\b/i;
+
+export function isLookupQuestion(ownerText: string): boolean {
+  return ASKS_WHAT_HAPPENED.test(ownerText) || /\?\s*$/.test(ownerText);
+}
+
+function instructionClauses(ownerText: string): string[] {
+  return ownerText.split(/(?<=[?!;\n]|\.\s)\s*/).filter(clause => !isLookupQuestion(clause));
+}
+
+export function hasCurrentSendRequest(ownerText: string): boolean {
+  return instructionClauses(ownerText).some(clause => isSendDraftCommand(clause) || commandIntents(clause).includes("send"));
+}
+
+/** Only an instruction in the owner's current message can authorize an action retry. */
+export function receiptActionTools(action: ClaimAction, ownerText: string): string[] {
+  // Evaluate clauses separately so "Did he reply? Send him a nudge" keeps its command.
+  return [...new Set(instructionClauses(ownerText).flatMap((clause) => {
+    if (action === "searched") return /\b(?:find|search|look|check|verify|latest|current)\b/i.test(clause) ? [...TOOLS_FOR.searched] : [];
+    if (action === "sent" && isSendDraftCommand(clause)) return ["confirm_send_pending_draft"];
+    const kinds = commandIntents(clause);
+    if (action === "sent" && !kinds.includes("send")) return [];
+    const command = splitOwnerEmailCommand(clause).command;
+    const verb = command.trim().replace(/^(?:(?:please|kindly|pls|can you|could you|would you|then|also)\s+)*/i, "").split(/\s+/, 2).join(" ");
+    if (action !== "sent" && action !== "offered" && !ASKED_FOR[action].test(verb)) return [];
+    // A sequence mentions an email but only a separate send instruction requests delivery.
+    if (action === "sent" && kinds.includes("sequence") && !/\b(?:send|reply|respond|e-?mail)\b/i.test(clause.trim().split(/\s+/).slice(0, 4).join(" "))) return [];
+    return kinds.flatMap(kind => {
+      if (kind === "send" && action === "scheduled" && !mentionsSendDate(clause) && !/^\s*(?:please\s+)?schedule\b/i.test(clause)) return [];
+      if (kind === "send" && action === "sent" && mentionsSendDate(clause)) return [];
+      return COMMAND_TOOLS[kind].filter(tool => TOOLS_FOR[action].has(tool));
+    });
+  }))];
+}
+
+export function requestedClaimAction(ownerText: string, action: ClaimAction): boolean {
+  return receiptActionTools(action, ownerText).length > 0;
+}
 
 /**
  * True when Vishnu asked for something to be looked up and did not ask for
@@ -206,18 +257,12 @@ const ASKS_WHAT_HAPPENED = /^\s*(?:did|has|have|had|was|were|is|are|when|who|wha
  */
 export function askedOnlyToLook(ownerText: string, action: ClaimAction): boolean {
   const text = ownerText.trim();
-  if (!text || !ASKS_TO_LOOK.test(text)) {
-    return false;
+  if (isLookupQuestion(text)) {
+    // A past question can be followed by an instruction too short to name a family.
+    const afterQuestion = text.split("?").slice(1).join(" ");
+    return !requestedClaimAction(text, action) && !ASKED_FOR[action].test(afterQuestion);
   }
-  if (!ASKED_FOR[action].test(text)) {
-    return true;
-  }
-  if (!ASKS_WHAT_HAPPENED.test(text)) {
-    return false;
-  }
-  // A question about the past, unless something after it asks for the action.
-  const rest = text.split(/[?.!,;\n]/).slice(1).join(" ");
-  return !ASKED_FOR[action].test(rest);
+  return ASKS_TO_LOOK.test(text) && !ASKED_FOR[action].test(text);
 }
 
 /** Words Aadi is quoting from what it read are not Aadi's own. */
@@ -255,17 +300,9 @@ export function unreceiptedClaims(
   if (claimed.length === 0) {
     return [];
   }
-  const ok = new Set(
-    receipts.filter((row) => row.success).map((row) => row.name),
+  const missing = claimed.filter(action => !context.recordedActions?.includes(action) &&
+    !receipts.some(receipt => receiptsAction(receipt, action)),
   );
-  const missing = claimed.filter((action) => {
-    for (const name of TOOLS_FOR[action]) {
-      if (ok.has(name)) {
-        return false;
-      }
-    }
-    return true;
-  });
   const { ownerText, isReadTool } = context;
   if (missing.length === 0 || !ownerText || !isReadTool) {
     return missing;
@@ -282,7 +319,22 @@ export function unreceiptedClaims(
   );
 }
 
-export function receiptRetryPrompt(actions: readonly ClaimAction[]): string {
+function receiptsAction(receipt: ToolReceipt, action: ClaimAction): boolean {
+  if (!receipt.success || !TOOLS_FOR[action].has(receipt.name)) return false;
+  if (receipt.content === undefined) return true;
+  if (action === "sent") return /^\s*sent\b/i.test(receipt.content);
+  if (action === "scheduled" && receipt.name === "send_email") return /^\s*scheduled\b/i.test(receipt.content);
+  return true;
+}
+
+export function receiptRetryIsReadOnly(actions: readonly ClaimAction[], ownerText: string): boolean {
+  return actions.some((action) => !requestedClaimAction(ownerText, action));
+}
+
+export function receiptRetryPrompt(actions: readonly ClaimAction[], ownerText = ""): string {
+  if (receiptRetryIsReadOnly(actions, ownerText)) {
+    return "Don't take any new action. Check the record with a read tool, then say what actually happened and when, or say you aren't sure.";
+  }
   if (actions.includes("searched")) {
     return "You stated a current fact as if you searched, but no search provider returned results this turn. Call web_search now, or say plainly you could not search. Do not invent news, prices or sources.";
   }

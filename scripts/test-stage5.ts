@@ -1,11 +1,11 @@
 import "dotenv/config";
-import Database from "better-sqlite3";
 import { handler as readDocument } from "../src/tools/read_document.ts";
 import { handler as searchNotesTool } from "../src/tools/search_notes.ts";
 import {
   createDocument,
   createNote,
   deleteExpiredDocuments,
+  db,
 } from "../src/db.ts";
 import { isWrapUpText, stripWrapUpPrefix } from "../src/wrapup_triggers.ts";
 import { handler as reactToMessage } from "../src/tools/react_to_message.ts";
@@ -79,12 +79,11 @@ function testNotesSearch(): void {
 }
 
 function testDocumentExpiry(): void {
-  const db = new Database("./aadi.db");
+  assert(process.env.AADI_DB_PATH === ":memory:", "Stage 5 expiry uses the in-memory test database");
   db.prepare(
     `INSERT INTO documents (file_name, tag, extracted_text, created_at)
      VALUES ('old.pdf', 'work', 'old', datetime('now', '-8 days'))`,
   ).run();
-  db.close();
   const removed = deleteExpiredDocuments();
   assert(removed >= 1, "expired documents removed");
 }

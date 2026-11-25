@@ -68,10 +68,16 @@ import type { ReactionSession } from "./contextual_react.js";
 import {
   isSuccessfulToolResult,
   receiptFailureMessage,
+  isLookupQuestion,
+  receiptActionTools,
+  receiptRetryIsReadOnly,
   receiptRetryPrompt,
   unreceiptedClaims,
+  type ReceiptRetryMetadata,
   type ToolReceipt,
 } from "./receipt.js";
+import { contradictsRecordedSend, recordedReceipt } from "./receipt_records.js";
+import { repliedMessageForTurn } from "./email_references.js";
 import {
   parseSearchSources,
   withSearchCitations,
@@ -163,6 +169,7 @@ export interface MetaTool {
 
 /** Filled in by runAgent so the caller can see what the turn did and cost. */
 export interface RunReport {
+  receiptRetries?: ReceiptRetryMetadata[];
   agentId: string;
   llmCalls: number;
   costUsd: number;
@@ -236,6 +243,7 @@ function sendIntentContext(confirmation: SendConfirmation | undefined): string {
 
 /** What this loop may call and how each call is carried out. */
 interface ToolScope {
+  receiptToolAllowed?: (name: string) => boolean;
   turnContext: TurnContext;
   meta: Map<string, MetaTool>;
   widen: () => void;
@@ -252,6 +260,9 @@ async function runTool(
   turn: ToolTurn,
   state: ToolScope,
 ): Promise<Extract<LlmMessage, { role: "tool" }>> {
+  if (state.receiptToolAllowed && (state.meta.has(call.name) || !state.receiptToolAllowed(call.name))) {
+    return { role: "tool", toolCallId: call.id, content: "Not done: this tool is unavailable on the receipt retry.", isError: true };
+  }
   const meta = state.meta.get(call.name);
   if (meta) {
     try {
@@ -607,6 +618,7 @@ async function runAgentLoop(
   options: RunAgentOptions,
   local?: LocalRun,
 ): Promise<string> {
+  const turnStartedAt = Date.now();
   const saveUserMessage = options.saveUserMessage ?? true;
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
   const promptUrl = new URL("../prompts/system.md", import.meta.url);
@@ -804,7 +816,7 @@ async function runAgentLoop(
     credit: (runs) => {
       for (const run of runs) {
         toolsUsed.add(run.tool);
-        receipts.push({ name: run.tool, success: run.ok });
+        receipts.push({ name: run.tool, success: run.ok, content: run.content });
         if (isFamilyTool(run.tool)) {
           freshResults.push(run.content);
         }
@@ -847,7 +859,10 @@ async function runAgentLoop(
   let succeeded = false;
   let toolFailed = false;
   let receiptRetryUsed = false;
+  let receiptRetryReadOnly = false;
   const receipts: ToolReceipt[] = [];
+  const receiptReads: string[] = [];
+  let previousReceipt: ReturnType<typeof recordedReceipt>;
   const draftBodies: string[] = [];
   let searchSources: SearchHit[] = [];
   /** The official release pages a release check read. They are cited ahead of search hits. */
@@ -859,8 +874,13 @@ async function runAgentLoop(
   // confirmation and a fixed tool list, so this never applies to them.
   const ownTurnIntents: CommandKind[] =
     options.sendConfirmation && !options.toolNames ? commandIntents(guardText) : [];
+  const commandsAfterQuestion = isLookupQuestion(guardText)
+    ? commandIntents(guardText.split("?").slice(1).join(" "))
+    : undefined;
   // A delegated task is one step of his request, so the whole-turn check stays with Aadi.
-  const intents: CommandKind[] = options.delegation ? [] : ownTurnIntents;
+  const intents: CommandKind[] = options.delegation ? [] : commandsAfterQuestion
+    ? ownTurnIntents.filter(kind => commandsAfterQuestion.includes(kind))
+    : ownTurnIntents;
   const earlierReplies = history.messages
     .filter((message) => message.role !== "user")
     .map((message) => message.content);
@@ -914,10 +934,14 @@ async function runAgentLoop(
         uncertain: turnContext.trace.some((entry) => entry.ok),
       });
     }
+    const canUseReceiptTool = allowedTools.receiptToolAllowed;
+    const iterationTools = canUseReceiptTool
+      ? activeTools.filter(tool => tool.type === "function" && !metaTools.has(tool.name) && canUseReceiptTool(tool.name))
+      : activeTools;
     const response = local
       ? await completeOnLocalModel({
           system,
-          tools: activeTools,
+          tools: iterationTools,
           messages,
           local: local.model,
           deadline: local.deadline,
@@ -925,12 +949,12 @@ async function runAgentLoop(
         })
       : await complete({
           system,
-          tools: activeTools,
+          tools: iterationTools,
           messages,
           ...(route ? { route } : { backend }),
           task: options.usageTask ?? usageTaskForAgent(options.task),
           effort,
-          ...(toolChoice ? { toolChoice } : {}),
+          ...(toolChoice && !receiptRetryUsed ? { toolChoice } : {}),
         });
     if (localAllowed) {
       // Checked before anything runs: a write the laptop model reaches for is never made by it.
@@ -1031,9 +1055,20 @@ async function runAgentLoop(
         const call = clientToolCalls[i]!;
         const result = toolResults[i]!;
         const success = isSuccessfulToolResult(result.content, result.isError);
+        if (success && call.name === "search_emails") receiptReads.push(result.content);
+        if (success && call.name === "read_email") {
+          const id = (call.input as { id?: unknown } | undefined)?.id;
+          const tag = /^Account: [^\n]+\nTag: (work|personal)\n/.exec(result.content)?.[1];
+          if (typeof id === "string" && tag) receiptReads.push(JSON.stringify({ id: id.trim(), account: tag }));
+        }
+        if (success && call.name === "read_draft") {
+          const draftId = /^Draft ID: (\S+)\n/.exec(result.content)?.[1];
+          if (draftId) receiptReads.push(JSON.stringify({ draft_id: draftId }));
+        }
         receipts.push({
           name: call.name,
           success,
+          content: result.content,
         });
         const draftBody = draftBodyFromCall(call.name, call.input, success);
         if (draftBody) {
@@ -1092,7 +1127,7 @@ async function runAgentLoop(
       continue;
     }
 
-    const missingKinds = commandDeferred
+    const missingKinds = commandDeferred || receiptRetryUsed
       ? []
       : intents.filter((kind) => !commandFamilyTools(kind).some((name) => toolsUsed.has(name)));
     if (response.toolCalls.length === 0 && missingKinds.length > 0) {
@@ -1121,7 +1156,7 @@ async function runAgentLoop(
           const result = await runTool(call, turn, allowedTools);
           results.push(result);
           toolsUsed.add(call.name);
-          receipts.push({ name: call.name, success: isSuccessfulToolResult(result.content, result.isError) });
+          receipts.push({ name: call.name, success: isSuccessfulToolResult(result.content, result.isError), content: result.content });
           freshResults.push(result.content);
           actionResults.push(result.content);
           if (result.isError) {
@@ -1153,7 +1188,7 @@ async function runAgentLoop(
     }
 
     if (
-      !calendarRetryUsed &&
+      !receiptRetryUsed && !calendarRetryUsed &&
       response.toolCalls.length === 0 &&
       shouldForceCalendarTool(nudgeText, [...toolsUsed])
     ) {
@@ -1176,7 +1211,7 @@ async function runAgentLoop(
     }
 
     if (
-      !deferredRetryUsed &&
+      !receiptRetryUsed && !deferredRetryUsed &&
       response.toolCalls.length === 0 &&
       looksLikeDeferredAction(responseText)
     ) {
@@ -1201,7 +1236,7 @@ async function runAgentLoop(
     );
     const missingDocIds = neededDocIds.filter((id) => !documentsRead.has(id));
     if (
-      !documentMultiReadRetryUsed &&
+      !receiptRetryUsed && !documentMultiReadRetryUsed &&
       response.toolCalls.length === 0 &&
       neededDocIds.length > 0 &&
       missingDocIds.length > 0
@@ -1227,7 +1262,7 @@ async function runAgentLoop(
 
     const recentUpload = getRecentUpload();
     if (
-      !documentRewriteRetryUsed &&
+      !receiptRetryUsed && !documentRewriteRetryUsed &&
       response.toolCalls.length === 0 &&
       !toolsUsed.has("read_document") &&
       looksLikeDocumentRewrite(nudgeText) &&
@@ -1252,7 +1287,7 @@ async function runAgentLoop(
       continue;
     }
 
-    if (response.stopReason === "pause_turn") {
+    if (!receiptRetryUsed && response.stopReason === "pause_turn") {
       const partialReply =
         collectedText.join("\n\n") || "I couldn't finish the request.";
       return saveAssistantReply(
@@ -1270,8 +1305,23 @@ async function runAgentLoop(
       succeeded = !toolFailed;
       return "";
     }
+    const record = recordedReceipt({
+      ownerText: guardText,
+      reply: finalReply,
+      repliedCard: repliedMessageForTurn(options.sendConfirmation?.chatId, options.sendConfirmation?.messageId),
+      reads: receiptReads,
+      history: history.messages.filter(message => message.role === "assistant").map(message => message.content),
+      turnStartedAt,
+    });
+    if (contradictsRecordedSend(finalReply)) {
+      const completed = record ?? (receiptRetryUsed && !/[@#]|\b(?:draft_id|thread_id|sent_message_id)\b/i.test(finalReply) ? previousReceipt : undefined);
+      if (completed?.actions.includes("sent")) {
+        succeeded = true;
+        return saveAssistantReply(completed.summary, saveAssistantMessage);
+      }
+    }
     if (
-      intents.length > 0 &&
+      !receiptRetryUsed && intents.length > 0 &&
       echoesEarlierReply(finalReply, earlierReplies, freshResults, earlierToolResults)
     ) {
       // A tool ran, but the words are an earlier turn's. Show what the action said
@@ -1286,10 +1336,19 @@ async function runAgentLoop(
     const missing = unreceiptedClaims(finalReply, receipts, {
       ownerText: guardText,
       isReadTool: (name) => toolOwnership(name)?.effect === "read",
+      recordedActions: record?.actions,
     });
     if (missing.length > 0) {
       if (!receiptRetryUsed) {
         receiptRetryUsed = true;
+        previousReceipt = record;
+        const retryText = options.delegation || options.toolNames ? "" : guardText;
+        receiptRetryReadOnly = receiptRetryIsReadOnly(missing, retryText);
+        allowedTools.receiptToolAllowed = (name) => toolOwnership(name)?.effect === "read" ||
+          (!receiptRetryReadOnly && missing.some(action => receiptActionTools(action, retryText).includes(name)));
+        if (report) {
+          (report.receiptRetries ??= []).push({ actions: missing, lookup: isLookupQuestion(guardText), toolsRestricted: receiptRetryReadOnly });
+        }
         console.log(`receipt check: retry actions=${missing.join(",")}`);
         messages.push({
           role: "assistant",
@@ -1298,14 +1357,16 @@ async function runAgentLoop(
         });
         messages.push({
           role: "user",
-          content: receiptRetryPrompt(missing),
+          content: receiptRetryPrompt(missing, retryText),
         });
         continue;
       }
       console.log(`receipt check: blocked actions=${missing.join(",")}`);
       succeeded = !toolFailed;
       return saveAssistantReply(
-        receiptFailureMessage(missing),
+        receiptRetryReadOnly && options.sendConfirmation && !missing.includes("searched")
+          ? "I am not sure what happened. I couldn't verify it from the records."
+          : receiptFailureMessage(missing),
         saveAssistantMessage,
       );
     }
@@ -1321,6 +1382,9 @@ async function runAgentLoop(
     );
   }
 
+  if (receiptRetryUsed) {
+    return saveAssistantReply("I am not sure what happened. I couldn't verify it from the records.", saveAssistantMessage);
+  }
   const partialReply =
     collectedText.join("\n\n") || "I couldn't finish the request.";
   return saveAssistantReply(
