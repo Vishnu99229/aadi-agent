@@ -44,7 +44,8 @@ db.exec(`
     success INTEGER NOT NULL,
     auth_required INTEGER NOT NULL,
     uncertain INTEGER NOT NULL,
-    error TEXT
+    error TEXT,
+    receipt_retries_json TEXT NOT NULL DEFAULT '[]'
   );
 
   CREATE INDEX IF NOT EXISTS idx_metric_turns_created ON metric_turns (created_at);
@@ -91,6 +92,7 @@ for (const table of ["metric_turns", "metric_agent_runs"]) {
   addColumn(table, "cache_hits", "INTEGER NOT NULL DEFAULT 0");
   addColumn(table, "tools_json", "TEXT NOT NULL DEFAULT '[]'");
 }
+addColumn("metric_turns", "receipt_retries_json", "TEXT NOT NULL DEFAULT '[]'");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS metric_workflows (
@@ -405,8 +407,9 @@ export function recordTurn(input: TurnRecordInput): number | undefined {
            created_at, chat_id, route, path, agents_json, models_json, fallbacks, model_calls,
            input_tokens, output_tokens, cost_usd, tool_calls, duplicate_skipped, first_model_ms,
            total_ms, workflow_ms, workflows, workflows_failed, success, auth_required, uncertain, error,
-           queue_ms, ctx_original_tokens, ctx_compressed_tokens, compress_ms, cache_hits, tools_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           queue_ms, ctx_original_tokens, ctx_compressed_tokens, compress_ms, cache_hits, tools_json,
+           receipt_retries_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         new Date().toISOString(),
@@ -437,6 +440,7 @@ export function recordTurn(input: TurnRecordInput): number | undefined {
         Math.round(report?.context?.ms ?? 0) + goals.compressMs,
         (report?.cacheHits ?? 0) + goals.cacheHits,
         JSON.stringify([...tools.map((entry) => entry.tool), ...goals.toolNames].slice(0, 40)),
+        JSON.stringify(report?.receiptRetries ?? []),
       );
     turnId = Number(result.lastInsertRowid);
     if (input.path !== "fast" || input.report) {

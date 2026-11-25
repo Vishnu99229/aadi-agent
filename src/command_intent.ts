@@ -594,7 +594,7 @@ const END_DEFERRAL = /\b(?:not\s+(?:yet|now)|hold\s+off|later|wait)\s*[.!?]*\s*$
 /** His own question or musing, not a request to Aadi: "Can I start 3 follow-ups for
  *  X?", "start a sequence for X?", "I could ...", "maybe ...". "Can you / could you /
  *  would you ..." is still a request. */
-const REQUEST_TO_AADI = /^(?:please\s+)?(?:can|could|would)\s+you\b/i;
+export const REQUEST_TO_AADI = /^(?:please\s+)?(?:can|could|would)\s+you\b/i;
 const FIRST_PERSON_MAYBE =
   /\b(?:can|could|may|might|should|shall|would)\s+(?:i|we)\b|\b(?:i|we)\s+(?:could|might|may|should|would|can|already|just)\b|\b(?:thinking|wondering|considering)\s+(?:of|about|whether|if)\b|\bmaybe\b|\bwhat\s+if\b|\bhow\s+about\b|\bif\b|\bunless\b|\bwhen(?:ever)?\s+(?:he|she|they|i|we)\b|\b(?:asked|told|said|wanted)\s+(?:me|us|him|her|them)?\s*to\b/i;
 

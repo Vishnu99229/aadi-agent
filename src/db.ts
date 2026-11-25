@@ -1470,6 +1470,9 @@ if (!tableHasColumn("pending_actions", "event_title")) {
 if (!tableHasColumn("pending_actions", "sent_message_id")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN sent_message_id TEXT`);
 }
+for (const table of ["pending_actions", "scheduled_sends"]) {
+  if (!tableHasColumn(table, "sent_at")) db.exec(`ALTER TABLE ${table} ADD COLUMN sent_at TEXT`);
+}
 // A "send then follow-ups" request rides on the card of an email that needs his tap.
 if (!tableHasColumn("pending_actions", "followup_words")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN followup_words TEXT`);
@@ -2029,7 +2032,7 @@ export function setPendingActionTelegramMessage(
 /** The Gmail message a draft card's send became. Recorded only; nothing reads it
  *  to decide a send. */
 export function setPendingActionSentMessage(id: number, sentMessageId: string): void {
-  db.prepare(`UPDATE pending_actions SET sent_message_id = ? WHERE id = ?`).run(sentMessageId, id);
+  db.prepare(`UPDATE pending_actions SET sent_message_id = ?, sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP) WHERE id = ?`).run(sentMessageId, id);
 }
 
 export function draftCardForTelegramMessage(telegramMessageId: number):
@@ -6447,7 +6450,7 @@ export function releaseHeldScheduledSend(id: number, request: string, expectedRe
 }
 
 export function recordScheduledSendSent(id: number, sentMessageId: string | null): void {
-  db.prepare("UPDATE scheduled_sends SET status = 'sent', sent_message_id = ? WHERE id = ?").run(
+  db.prepare("UPDATE scheduled_sends SET status = 'sent', sent_message_id = ?, sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP) WHERE id = ?").run(
     sentMessageId,
     id,
   );
