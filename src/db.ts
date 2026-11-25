@@ -44,6 +44,8 @@ export interface PendingAction {
   to_header: string | null;
   cc_header: string | null;
   subject: string | null;
+  /** The send command this card stands for, when a command became a card. */
+  command_key: string | null;
 }
 
 export type ItemTag = "work" | "personal";
@@ -1176,6 +1178,11 @@ if (!tableHasColumn("pending_actions", "to_header")) {
 if (!tableHasColumn("pending_actions", "cc_header")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN cc_header TEXT`);
 }
+// The send command a Send card stands for: one command, at most one email.
+if (!tableHasColumn("pending_actions", "command_key")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN command_key TEXT`);
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_actions_command_key ON pending_actions (command_key)`);
 if (!tableHasColumn("pending_actions", "subject")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN subject TEXT`);
 }
@@ -1836,7 +1843,7 @@ export function insertMessageEmbedding(row: {
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
               telegram_message_id, event_title, event_start, event_end,
               event_attendees, event_description, created_at, auto_send_at,
-              updated_at, to_header, cc_header, subject`;
+              updated_at, to_header, cc_header, subject, command_key`;
 
 export function createPendingAction(
   draftId: string,
@@ -1891,6 +1898,24 @@ export function getPendingAction(id: number): PendingAction | undefined {
        WHERE id = ?`,
     )
     .get(id) as PendingAction | undefined;
+}
+
+/** A send command became this card: its key lives with the card from now on. */
+export function setPendingActionCommandKey(id: number, key: string): void {
+  db.prepare(`UPDATE pending_actions SET command_key = ? WHERE id = ?`).run(key, id);
+}
+
+/** The card a send command became, whatever has happened to it since. */
+export function pendingActionForCommandKey(key: string): PendingAction | undefined {
+  return db
+    .prepare(
+      `SELECT ${PENDING_ACTION_COLUMNS}
+       FROM pending_actions
+       WHERE command_key = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get(key) as PendingAction | undefined;
 }
 
 export function getPendingActionForDraft(
@@ -6357,6 +6382,12 @@ export function holdScheduledSendForConfirm(id: number): boolean {
   return (
     db.prepare("UPDATE scheduled_sends SET status = 'held' WHERE id = ? AND status = 'scheduled'").run(id).changes === 1
   );
+}
+
+/** The schedule a command made, by its key. */
+export function scheduledSendByKey(key: string): ScheduledSendRecord | undefined {
+  const row = db.prepare("SELECT id FROM scheduled_sends WHERE idem_key = ?").get(key) as { id: number } | undefined;
+  return row ? getScheduledSend(row.id) : undefined;
 }
 
 export function releaseHeldScheduledSend(id: number, request: string, expectedRequest?: string): boolean {

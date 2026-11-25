@@ -2,7 +2,7 @@
 // Fake Gmail, fake Telegram, stub models. Nothing real is sent.
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import { handleApprovalCallback, queueDraftApproval, setApprovalsTestHooks } from "../src/approvals.ts";
+import { handleApprovalCallback, queueDraftApproval, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
 import { clearPendingAction } from "../src/action_context.ts";
 import { defaultToolNames, runAgent } from "../src/agent.ts";
 import { handleCommandSendCallback, sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
@@ -38,8 +38,13 @@ import {
 } from "../src/scheduled_sends.ts";
 import { config } from "../src/config.ts";
 import {
+  beginChatTurn,
+  claimTelegramMessage,
   createMemory,
+  db,
   getCommandSendByKey,
+  latestProcessedMessageId,
+  setChatTurnRetryText,
   getPendingActionForDraft,
   getSalesSequenceByThread,
   listCanonicalContacts,
@@ -261,6 +266,8 @@ const gmail = {
         return { data: { id: `sent-${requestBody.id}` } };
       },
       get: async ({ id }: { id?: string } = {}) => ({ data: { message: { payload: { headers: draftHeaders.get(id ?? "") ?? [] } } } }),
+      // Discard deletes the Gmail draft.
+      delete: async () => ({ data: {} }),
     },
   },
 } as unknown as gmail_v1.Gmail;
@@ -2307,6 +2314,184 @@ await expectCancelled("delete_task", async (row) => {
     ]);
     await handleApprovalCallback(cardCtx(`approval:send:${action.id}`), "send", action.id);
     assert(draftsSent.length === draftSends + 1 && draftsSent.at(-1) === "c-sneak", "someone he has emailed before goes with the tap");
+  }
+
+  // 15. One command = at most one email, whichever path it takes (Codex P2: the
+  //     command key survives the Send-card path).
+  {
+    const wait = () => new Promise((resolve) => setTimeout(resolve, 30));
+    const commandKeyOn = (draftId: string): string | undefined => {
+      try {
+        const row = db
+          .prepare("SELECT command_key FROM pending_actions WHERE draft_id = ? ORDER BY id DESC LIMIT 1")
+          .get(draftId) as { command_key?: string | null } | undefined;
+        return row?.command_key ?? undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const cardPosts = (actionId: number): number =>
+      told.filter((entry) => entry.markup !== undefined && buttons(entry).some((button) => button.callback_data === `approval:send:${actionId}`)).length;
+    const counts = () => ({ sends: sends.length, draftSends: draftsSent.length, drafts: draftsCreated.length });
+    const same = (left: ReturnType<typeof counts>, right: ReturnType<typeof counts>) =>
+      left.sends === right.sends && left.draftSends === right.draftSends && left.drafts === right.drafts;
+
+    // a) A retry before the tap: the same card again, never a second draft or a send.
+    const turnA = own("email c.idem@new-co.com saying hello");
+    const keyA = `msg:1:${turnA.confirmation.messageId}:c.idem@new-co.com`;
+    const firstA = await sendEmailFromTool({ to: ["c.idem@new-co.com"], instruction: "say hello" }, turnA);
+    assert(firstA.startsWith("New address: c.idem@new-co.com. Tap Send to confirm."), `a card: ${firstA}`);
+    const draftA = draftsCreated.at(-1)!;
+    const actionA = getPendingActionForDraft(draftA)!.id;
+    assert(getCommandSendByKey(keyA)?.status === "sending", `the card claims the command's key: ${getCommandSendByKey(keyA)?.status}`);
+    assert(commandKeyOn(draftA) === keyA, `and the card carries it: ${commandKeyOn(draftA)}`);
+    const beforeRetryA = counts();
+    const postsA = cardPosts(actionA);
+    const retryA = await sendEmailFromTool({ to: ["c.idem@new-co.com"], instruction: "say hello" }, turnA);
+    assert(same(counts(), beforeRetryA), "a retry before the tap makes no second draft and sends nothing");
+    assert(cardPosts(actionA) === postsA + 1, "it posts the same card again");
+    assert(retryA.includes("Tap Send to confirm."), `he's told it is still waiting: ${retryA}`);
+
+    // b) The tap delivers it and records the command as sent.
+    await tapSend(draftA);
+    assert(draftsSent.at(-1) === draftA && draftsSent.length === beforeRetryA.draftSends + 1, "the tap sends it once");
+    assert(getCommandSendByKey(keyA)?.status === "sent", `the command is recorded as sent: ${getCommandSendByKey(keyA)?.status}`);
+
+    // c) A retry after the tap: nothing more, and the same answer as a direct send's repeat.
+    const afterTap = counts();
+    const retryAfter = await sendEmailFromTool({ to: ["c.idem@new-co.com"], instruction: "say hello" }, turnA);
+    assert(same(counts(), afterTap), "a retry after the tap sends nothing");
+    assert(retryAfter === "Not sent again: this command was already handled.", `like a direct repeat: ${retryAfter}`);
+
+    // d) His own "send it" delivers it and records the command too.
+    const turnB = own("email c.idem2@new-co.com saying hello");
+    const keyB = `msg:1:${turnB.confirmation.messageId}:c.idem2@new-co.com`;
+    await sendEmailFromTool({ to: ["c.idem2@new-co.com"], instruction: "say hello" }, turnB);
+    const draftB = draftsCreated.at(-1)!;
+    const confirmId = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+    claimTelegramMessage(1, confirmId);
+    const delivered = await sendPendingDraftByText({ chatId: 1, messageId: confirmId }, draftB, { ownTurn: true });
+    assert(delivered.ok && draftsSent.at(-1) === draftB, `"send it" sends the card's draft: ${delivered.message}`);
+    assert(getCommandSendByKey(keyB)?.status === "sent", `"send it" records the command as sent: ${getCommandSendByKey(keyB)?.status}`);
+    const afterSendIt = counts();
+    const replayB = await sendEmailFromTool({ to: ["c.idem2@new-co.com"], instruction: "say hello" }, turnB);
+    assert(same(counts(), afterSendIt) && replayB === "Not sent again: this command was already handled.", `no second send: ${replayB}`);
+
+    // e) Discarded: a retry tells him and asks before making a new draft.
+    const turnC = own("email c.idem3@new-co.com saying hello");
+    await sendEmailFromTool({ to: ["c.idem3@new-co.com"], instruction: "say hello" }, turnC);
+    const draftC = draftsCreated.at(-1)!;
+    const actionC = getPendingActionForDraft(draftC)!.id;
+    await handleApprovalCallback(cardCtx(`approval:discard:${actionC}`), "discard", actionC);
+    assert(getPendingActionForDraft(draftC) === undefined, "the card is discarded");
+    const afterDiscard = counts();
+    const retryC = await sendEmailFromTool({ to: ["c.idem3@new-co.com"], instruction: "say hello" }, turnC);
+    assert(same(counts(), afterDiscard), "a retry after Discard makes no draft and sends nothing");
+    assert(/discarded/i.test(retryC) && /new one\?/i.test(retryC), `he's told it was discarded and asked: ${retryC}`);
+
+    // f) Through the bot: Telegram redelivers within five minutes (ignored), then the
+    //    same message is replayed after the window: the same card, never a second draft.
+    let step = 0;
+    chatScript = () =>
+      ++step === 1
+        ? modelReply({ tools: [{ name: "send_email", input: { to: ["c.replay@new-co.com"], instruction: "say hello" } }] })
+        : modelReply({ text: "Done." });
+    const replayId = nextTurn() + 20_000;
+    const update = (updateId: number) =>
+      ({
+        update_id: updateId,
+        message: {
+          message_id: replayId,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: config.ownerTelegramId, type: "private", first_name: "Vishnu" },
+          from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+          text: "email c.replay@new-co.com saying hello",
+        },
+      }) as never;
+    const ageReplay = () =>
+      db
+        .prepare("UPDATE processed_messages SET processed_at = datetime('now', '-10 minutes') WHERE chat_id = ? AND message_id = ?")
+        .run(config.ownerTelegramId, replayId);
+    const beforeBot = counts();
+    await bot.handleUpdate(update(replayId));
+    await wait();
+    assert(draftsCreated.length === beforeBot.drafts + 1 && sends.length === beforeBot.sends, "the message makes one card");
+    const draftR = draftsCreated.at(-1)!;
+    const keyR = `msg:${config.ownerTelegramId}:${replayId}:c.replay@new-co.com`;
+    const afterFirst = counts();
+    step = 0;
+    await bot.handleUpdate(update(replayId + 1));
+    await wait();
+    assert(same(counts(), afterFirst), "a redelivery inside five minutes does nothing");
+    ageReplay();
+    step = 0;
+    await bot.handleUpdate(update(replayId + 2));
+    await wait();
+    assert(same(counts(), afterFirst), "a replay after the window makes no second draft and sends nothing");
+    assert(getCommandSendByKey(keyR)?.status === "sending", `the replay finds the claimed key: ${getCommandSendByKey(keyR)?.status}`);
+
+    // g) The Retry button: it replays the words without his message, so it can't send
+    //    or make a draft at all.
+    const turnId = beginChatTurn();
+    setChatTurnRetryText(turnId, "email c.replay@new-co.com saying hello");
+    step = 0;
+    await bot.handleUpdate({
+      update_id: replayId + 3,
+      callback_query: {
+        id: "cb-retry",
+        from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+        chat_instance: "ci",
+        data: `retry:${turnId}`,
+        message: {
+          message_id: 77,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: config.ownerTelegramId, type: "private", first_name: "Vishnu" },
+          from: { id: 999, is_bot: true, first_name: "Aadi" },
+          text: "That didn't work.",
+        },
+      },
+    } as never);
+    await wait();
+    assert(same(counts(), afterFirst), "the Retry button makes no second draft and sends nothing");
+
+    // ...then the tap sends it once, and a later replay sends nothing more.
+    await tapSend(draftR);
+    assert(getCommandSendByKey(keyR)?.status === "sent", "the tap records the command");
+    const afterReplayTap = counts();
+    ageReplay();
+    step = 0;
+    await bot.handleUpdate(update(replayId + 4));
+    await wait();
+    assert(same(counts(), afterReplayTap), "a replay after the tap sends nothing");
+    chatScript = undefined;
+
+    // h) A held schedule to a new address, retried: one held schedule, its Confirm again.
+    const turnH = own("email c.heldidem@new-co.com on Monday saying hello");
+    const heldArgs = { to: ["c.heldidem@new-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" };
+    const heldFirst = await sendEmailFromTool(heldArgs, turnH);
+    assert(heldFirst.startsWith("New address: c.heldidem@new-co.com. Tap Confirm to schedule for "), heldFirst);
+    const rows = listOpenScheduledSends().length;
+    const heldRow = listOpenScheduledSends().find((row) => row.request.includes("c.heldidem@new-co.com"))!;
+    const toldBeforeHeld = told.length;
+    const heldRetry = await sendEmailFromTool(heldArgs, turnH);
+    assert(listOpenScheduledSends().length === rows, "one held schedule per command");
+    assert(heldRetry.includes("Tap Confirm to schedule for "), `he's told it still waits: ${heldRetry}`);
+    const reposted = told.slice(toldBeforeHeld).filter((entry) => entry.markup !== undefined).flatMap((entry) => buttons(entry));
+    const confirmAgain = reposted.find((button) => button.text === "Confirm");
+    assert(confirmAgain?.callback_data.startsWith(`cmdsend:confirmsched:${heldRow.id}:`), "its Confirm card is posted again");
+    await handleScheduledSendCallback(cardCtx(confirmAgain!.callback_data));
+    assert(getScheduledSend(heldRow.id)!.status === "scheduled", "and that Confirm schedules it");
+    const heldAfter = await sendEmailFromTool(heldArgs, turnH);
+    assert(listOpenScheduledSends().length === rows && heldAfter === "Not scheduled again: this command was already handled.", heldAfter);
+
+    // i) Unchanged: a direct send to someone he knows, repeated, sends once.
+    sentTo("c.idemknown@known-co.com");
+    const turnK = own("email c.idemknown@known-co.com saying hello");
+    const beforeKnown = sends.length;
+    const knownFirst = await sendEmailFromTool({ to: ["c.idemknown@known-co.com"], instruction: "say hello" }, turnK);
+    assert(knownFirst.startsWith("Sent to") && sends.length === beforeKnown + 1, knownFirst);
+    const knownAgain = await sendEmailFromTool({ to: ["c.idemknown@known-co.com"], instruction: "say hello" }, turnK);
+    assert(sends.length === beforeKnown + 1 && knownAgain === "Not sent again: this command was already handled.", knownAgain);
   }
 
   // 13. Unchanged: resolution still marks the contact confirmed (cross-turn reuse), and

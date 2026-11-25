@@ -22,6 +22,7 @@ import {
   type PendingEventInput,
   draftRecipientsShownBefore,
   pendingActionFollowups,
+  recordCommandSendSent,
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import {
@@ -599,12 +600,49 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
       console.log(`Approval action ${action.id}: sent message not recorded`);
     }
   }
+  if (action.command_key) {
+    // The send command this card stood for is done, exactly like a direct send.
+    recordCommandSendSent(action.command_key, sentMessageId ?? "unknown");
+  }
   if (!transitionPendingAction(action.id, "pending", "sent")) {
     console.log(`Approval action ${action.id}: sent; status update failed`);
     return { ok: false, reason: "status_update_failed" };
   }
   console.log(`Approval action ${action.id}: status -> sent`);
   return { ok: true, sentMessageId };
+}
+
+/** A repeat of the command a card stands for: the same card again (never a new draft).
+ *  It shows the people the card showed, with the draft's body as it is in Gmail. */
+export async function repostPendingCard(action: PendingAction): Promise<"reposted" | "expired" | "failed"> {
+  if (action.status !== "pending" || !action.draft_id) {
+    return "failed";
+  }
+  if (isStale(action)) {
+    await expireAction(action);
+    return "expired";
+  }
+  try {
+    const snapshot = await readDraftSnapshot(action.draft_id, action.google_account);
+    await queueDraftApproval(
+      {
+        draftId: action.draft_id,
+        threadId: action.thread_id,
+        to: action.to_header ?? snapshot.to,
+        cc: (action.to_header ? action.cc_header : snapshot.cc) || undefined,
+        subject: action.subject ?? snapshot.subject,
+        body: snapshot.body,
+        googleAccount: action.google_account,
+      },
+      { newCard: true, touch: false },
+    );
+    console.log(`Approval action ${action.id}: card posted again for a repeated command`);
+    return "reposted";
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Approval action ${action.id}: repost failed (${errorType})`);
+    return "failed";
+  }
 }
 
 /** Send a Gmail draft now. No Telegram card and no pending_actions row.

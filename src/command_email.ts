@@ -47,6 +47,12 @@ import {
   listOpenCommandChoices,
   setPendingActionFollowups,
   draftRecipientsShownBefore,
+  claimCommandSend,
+  releaseCommandSend,
+  setPendingActionCommandKey,
+  pendingActionForCommandKey,
+  getPendingActionForDraft,
+  scheduledSendByKey,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
 import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
@@ -75,7 +81,7 @@ import {
 import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
-import { queueDraftApproval, sendPendingDraftByText } from "./approvals.js";
+import { queueDraftApproval, repostPendingCard, sendPendingDraftByText } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -230,8 +236,52 @@ function shown(body: string): string {
 
 /** Writes the email and sends it. Everything that decides who gets it is already
  *  settled, and the writer can't change it. */
+/**
+ * The same send command again (Telegram redelivery, or his message replayed later):
+ * at most one email per command. A command that became a card is answered from that
+ * card: still waiting (the same card again, never a second draft), sent, or discarded
+ * (he is asked before anything new is made). Undefined: this command is new.
+ */
+async function repeatedCommand(key: string): Promise<Outcome | undefined> {
+  if (!getCommandSendByKey(key)) {
+    return undefined;
+  }
+  const card = pendingActionForCommandKey(key);
+  if (!card || card.status === "sent") {
+    return { text: "Not sent again: this command was already handled.", result: "not_sent" };
+  }
+  let status = card.status;
+  if (status === "pending") {
+    const reposted = await repostPendingCard(card);
+    if (reposted === "reposted") {
+      console.log(`Command send: repeat of a command waiting on card ${card.id}; same card again`);
+      return {
+        text: `Not sent yet: it's waiting on the card I've posted again for ${card.to_header ?? "them"}. Tap Send to confirm.`,
+        hint: "Nothing has been sent and no new draft was made. Answer in one short line.",
+        shown: true,
+      };
+    }
+    if (reposted === "failed") {
+      return {
+        text: "Not sent yet: it's still waiting on its card above. Tap Send to confirm.",
+        result: "not_sent",
+      };
+    }
+    status = "expired";
+  }
+  return {
+    text: status === "expired"
+      ? "Not sent: the draft from this message expired, so nothing went out. Want me to make a new one?"
+      : "Not sent: you discarded the draft from this message, so nothing went out. Want me to make a new one?",
+    hint: "Ask him before making a new draft; don't make one now.",
+    result: "not_sent",
+  };
+}
+
 /** The written email as a Gmail draft on its Send card. The tap sends it. */
 async function showSendCard(input: {
+  /** The command's key: claimed here exactly as a direct send would claim it. */
+  key: string;
   request: CommandRequest;
   account: LoadedGoogleAccount;
   confirmation: { chatId: number; messageId: number } | undefined;
@@ -242,6 +292,11 @@ async function showSendCard(input: {
   body: string;
   reply?: { threadId: string; inReplyTo: string; references: string };
 }): Promise<Outcome> {
+  // One command, at most one email: the key is claimed before any draft exists, so a
+  // repeat of this command finds this card instead of making another.
+  if (!claimCommandSend({ key: input.key, account: input.account.id, threadId: input.request.threadId })) {
+    return (await repeatedCommand(input.key)) ?? { text: "Not sent again: this command was already handled.", result: "not_sent" };
+  }
   const signatureHtml = await signatureHtmlFor(input.account);
   let draftId: string;
   try {
@@ -272,10 +327,14 @@ async function showSendCard(input: {
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Command send: card draft failed (${errorType})`);
+    // No draft was made, so the same command may try again.
+    releaseCommandSend(input.key);
     return { text: "Not sent: I couldn't save it as a draft for you to check, so nothing went out. Try again.", result: "not_sent" };
   }
   const signature = signaturePlainText(signatureHtml);
-  const actionId = await queueDraftApproval({
+  let actionId: number;
+  try {
+    actionId = await queueDraftApproval({
     draftId,
     threadId: input.reply?.threadId ?? null,
     to: input.toHeader,
@@ -284,7 +343,20 @@ async function showSendCard(input: {
     body: input.body,
     googleAccount: input.account.id === "personal" ? "personal" : "work",
     ...(signature ? { signature } : {}),
-  });
+    });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Command send: card post failed (${errorType})`);
+    const saved = getPendingActionForDraft(draftId);
+    if (!saved) {
+      releaseCommandSend(input.key);
+      return { text: "Not sent: I saved a draft but couldn't show its card, so nothing went out. Try again.", result: "not_sent" };
+    }
+    // The card exists but wasn't shown: a repeat of this command shows it.
+    setPendingActionCommandKey(saved.id, input.key);
+    return { text: "Not sent: I couldn't show its card. Ask me again and I'll show the same draft.", result: "not_sent" };
+  }
+  setPendingActionCommandKey(actionId, input.key);
   if (input.request.followupWords && input.confirmation) {
     setPendingActionFollowups(
       actionId,
@@ -361,8 +433,9 @@ export async function writeAndSend(
     return { text: domainRefusal, result: "not_sent" };
   }
   const key = sendKey(base, to);
-  if (getCommandSendByKey(key)) {
-    return { text: "Not sent again: this command was already handled.", result: "not_sent" };
+  const repeat = await repeatedCommand(key);
+  if (repeat) {
+    return repeat;
   }
   const account = await getGoogleAccount(request.account);
   const gmail = gmailClient(account);
@@ -436,6 +509,7 @@ export async function writeAndSend(
   if (options.verdict.action !== "send") {
     // Nothing goes out: the email he asked for waits as a draft on its card.
     return showSendCard({
+      key,
       request,
       account,
       confirmation,
@@ -684,9 +758,10 @@ async function scheduleRequest(
   if (!held) {
     request = { ...request, confirmedRecipients: [...new Set([...(request.confirmedRecipients ?? []), ...recipients])] };
   }
+  const scheduleKey = `${sendKey(base, to)}:${request.sendAt}`;
   const row = createScheduledSend({
     held,
-    key: `${sendKey(base, to)}:${request.sendAt}`,
+    key: scheduleKey,
     sendAt: request.sendAt!,
     itemText,
     tag: request.account === "personal" ? "personal" : "work",
@@ -699,6 +774,31 @@ async function scheduleRequest(
     confirmMessage: confirmation.messageId,
   });
   if (!row) {
+    // The same command again: one schedule per command. One still held for his Confirm
+    // gets its Confirm card again, bound to the people it goes to now.
+    const existing = scheduledSendByKey(scheduleKey);
+    if (existing?.status === "held") {
+      let people: string[] = [];
+      try {
+        const stored = JSON.parse(existing.request) as Pick<CommandRequest, "to" | "cc">;
+        people = [...new Set([...stored.to, ...stored.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : [])))];
+      } catch {
+        people = [];
+      }
+      const text = `Not scheduled yet: ${existing.item_text}\nIt's waiting on your Confirm. Tap Confirm to schedule for ${scheduledWhen(existing.send_at)}.`;
+      const card = {
+        text,
+        caption: text,
+        keyboard: new InlineKeyboard()
+          .text("Confirm", scheduleConfirmData(existing.id, people))
+          .text("Cancel", `cmdsend:cancelsched:${existing.id}`),
+      };
+      if (!holdForVoiceNote(card)) {
+        await api().sendMessage(config.ownerTelegramId, card.text, { reply_markup: card.keyboard });
+      }
+      console.log(`Scheduled send ${existing.id}: repeat of a held command; Confirm card posted again`);
+      return { text, hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.", shown: true };
+    }
     return { text: "Not scheduled again: this command was already handled." };
   }
   console.log(`Scheduled send ${row.id}: status -> ${held ? "held for confirm" : "scheduled"}`);
