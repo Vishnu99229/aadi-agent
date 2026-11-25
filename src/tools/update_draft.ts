@@ -10,7 +10,9 @@ import {
 } from "../action_context.js";
 import { queueDraftApproval } from "../approvals.js";
 import { noteDraftEditedThisTurn } from "./confirm_send_pending_draft.js";
-import { accountBoundToDraft, getPendingActionForDraft } from "../db.js";
+import { accountBoundToDraft, getPendingActionForDraft,
+  setPendingActionThread,
+} from "../db.js";
 import {
   buildMimeMessage,
   gmailClient,
@@ -195,6 +197,14 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
 
   const savedDraftId = result.data.id ?? values.draft_id;
   const draftThread = leavesThread ? result.data.message?.threadId ?? threadId : threadId;
+  if (leavesThread) {
+    // Gmail now has it as a new conversation (no thread, no reply headers): from this
+    // moment its card is a new email too, so the delivery check doesn't want reply headers.
+    const card = getPendingActionForDraft(savedDraftId);
+    if (card) {
+      setPendingActionThread(card.id, null);
+    }
+  }
   const conversationNote = leavesThread
     ? "New subject: this will go out as a new conversation, not as a reply in the original thread."
     : "";

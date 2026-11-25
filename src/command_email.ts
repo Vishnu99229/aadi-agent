@@ -99,6 +99,8 @@ export interface Outcome {
   shown?: boolean;
   result?: "sent" | "not_sent" | "unknown" | "write_failed" | "cancelled";
   messageId?: string;
+  /** The same command again: its follow-ups were handled the first time. */
+  repeat?: boolean;
 }
 
 function asToolResult(outcome: Outcome): string {
@@ -249,7 +251,7 @@ async function repeatedCommand(key: string): Promise<Outcome | undefined> {
   }
   const card = pendingActionForCommandKey(key);
   if (!card || card.status === "sent") {
-    return { text: "Not sent again: this command was already handled.", result: "not_sent" };
+    return { text: "Not sent again: this command was already handled.", result: "not_sent", repeat: true };
   }
   let status = card.status;
   if (status === "pending") {
@@ -261,15 +263,16 @@ async function repeatedCommand(key: string): Promise<Outcome | undefined> {
         text: `Not sent yet: it's waiting on the card I've posted again for ${reposted.to || card.to_header || "them"}.${fresh} Tap Send to confirm.`,
         hint: "Nothing has been sent and no new draft was made. Answer in one short line.",
         shown: true,
+        repeat: true,
       };
     }
     if (reposted.state === "read_failed") {
-      return { text: DRAFT_REREAD_FAILED, result: "not_sent" };
+      return { text: DRAFT_REREAD_FAILED, result: "not_sent", repeat: true };
     }
     if (reposted.state === "failed") {
       return {
         text: "Not sent yet: it's still waiting on its card above. Tap Send to confirm.",
-        result: "not_sent",
+        result: "not_sent", repeat: true,
       };
     }
     status = "expired";
@@ -279,7 +282,7 @@ async function repeatedCommand(key: string): Promise<Outcome | undefined> {
       ? "Not sent: the draft from this message expired, so nothing went out. Want me to make a new one?"
       : "Not sent: you discarded the draft from this message, so nothing went out. Want me to make a new one?",
     hint: "Ask him before making a new draft; don't make one now.",
-    result: "not_sent",
+    result: "not_sent", repeat: true,
   };
 }
 
@@ -299,6 +302,7 @@ function gateRefusal(reason: string): Outcome {
         ? "Not sent again: this command was already handled."
         : `Not sent: a delivery check refused it (${reason}), so nothing went out.`,
     result: "not_sent",
+    ...(reason === "already_handled" ? { repeat: true } : {}),
   };
 }
 
@@ -824,9 +828,9 @@ async function scheduleRequest(
         await api().sendMessage(config.ownerTelegramId, card.text, { reply_markup: card.keyboard });
       }
       console.log(`Scheduled send ${existing.id}: repeat of a held command; Confirm card posted again`);
-      return { text, hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.", shown: true };
+      return { text, hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.", shown: true, repeat: true };
     }
-    return { text: "Not scheduled again: this command was already handled." };
+    return { text: "Not scheduled again: this command was already handled.", repeat: true };
   }
   console.log(`Scheduled send ${row.id}: status -> ${held ? "held for confirm" : "scheduled"}`);
   rememberScheduledSend({
@@ -1317,6 +1321,10 @@ export async function sendEmailFromTool(
     confirmation,
     now,
   );
+  if (outcome.repeat) {
+    // The same command again: nothing new went out, and its follow-ups were handled then.
+    return asToolResult(outcome);
+  }
   // Follow-ups he asked for in the same message start only after this send went out.
   const first = request.to[0];
   const followups = await followupsAfterSend({

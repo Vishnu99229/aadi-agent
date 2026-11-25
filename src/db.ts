@@ -1904,6 +1904,11 @@ export function getPendingAction(id: number): PendingAction | undefined {
     .get(id) as PendingAction | undefined;
 }
 
+/** The card's draft is now a reply in this thread, or (null) a new conversation. */
+export function setPendingActionThread(id: number, threadId: string | null): void {
+  db.prepare(`UPDATE pending_actions SET thread_id = ? WHERE id = ?`).run(threadId, id);
+}
+
 /** A send command became this card: its key lives with the card from now on. */
 export function setPendingActionCommandKey(id: number, key: string): void {
   db.prepare(`UPDATE pending_actions SET command_key = ? WHERE id = ?`).run(key, id);

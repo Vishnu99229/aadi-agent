@@ -787,6 +787,9 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
     return { ok: false, reason: "status_update_failed" };
   }
   console.log(`Approval action ${action.id}: status -> sent`);
+  // Follow-ups he asked for with a send command come now, whether his tap or his own
+  // "send it" sent it: always as the pre-filled Start card.
+  await followupsAfterCardSend(action, sentMessageId, recipients);
   return { ok: true, sentMessageId };
 }
 
@@ -1028,7 +1031,6 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     console.log(`Approval action ${action.id}: sent preview update failed`);
   });
   await ctx.answerCallbackQuery("Sent").catch(() => undefined);
-  await followupsAfterCardSend(action, outcome.sentMessageId, recipients);
 }
 
 /** "Email a new address saying ... and start follow-ups": the email went out on his tap,

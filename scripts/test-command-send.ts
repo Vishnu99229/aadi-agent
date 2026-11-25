@@ -209,6 +209,8 @@ const unreadableDrafts = new Set<string>();
 /** Each draft's plain body as Gmail has it, and drafts with a real file attached. */
 const draftBodyById = new Map<string, string>();
 const draftAttachments = new Set<string>();
+/** The thread each drafts.update saved the draft to (null: a new conversation). */
+const draftUpdateThreads = new Map<string, string | null>();
 function draftBodyOf(raw: string): string {
   const base64 = /Content-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1];
   return base64 ? Buffer.from(base64.replace(/\s/g, ""), "base64").toString("utf8") : raw.split("\r\n\r\n").slice(1).join("\r\n\r\n");
@@ -309,7 +311,8 @@ const gmail = {
         };
       },
       // An edit replaces the draft; Gmail keeps its id and its new headers.
-      update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string } } }) => {
+      update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string; threadId?: string } } }) => {
+        draftUpdateThreads.set(id, requestBody.message.threadId ?? null);
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
         draftHeaders.set(id, rawHeaders(raw));
         draftBodyById.set(id, draftBodyOf(raw));
@@ -2841,6 +2844,108 @@ await expectCancelled("delete_task", async (row) => {
     await deliveryRefuses("c.d18d@new-co.com", (id) => setHeader(id, "Bcc", "c.hidden18@new-co.com"), "has a Bcc");
     mail({ threadId: "c-hdr", from: "Ola <c.d18e@new-co.com>", to: ME, subject: "Question", body: "Hi?" });
     await deliveryRefuses("c.d18e@new-co.com", (id) => setHeader(id, "In-Reply-To", ""), "lost its reply headers", { thread_id: "c-hdr" });
+    written = { subject: "Quick note", body: "Hi,\n\nThe note he asked for." };
+  }
+
+  // 19. "send it" on a new address's card that also asked for follow-ups: the Start card
+  //     comes after it goes out, as it does after the tap (Codex P2). One email, and the
+  //     follow-ups only ever through the pre-filled Start card.
+  {
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    written = { subject: "Hello", body: "Hi,\n\nA short note." };
+    const fuTurn = own("email c.fu19@new-co.com saying hello and start 3 follow-ups");
+    const carded = await sendEmailFromTool({ to: ["c.fu19@new-co.com"], instruction: "say hello" }, fuTurn);
+    assert(carded.startsWith("New address: c.fu19@new-co.com."), `a card first: ${carded}`);
+    const draftId = draftsCreated.at(-1)!;
+    const sentBefore = draftsSent.length;
+    const activeBefore = listActiveSalesSequences().length;
+    const viaText = await sendPendingDraftByText(ownMessage(), draftId, { ownTurn: true });
+    assert(viaText.ok && draftsSent.length === sentBefore + 1 && draftsSent.at(-1) === draftId, `"send it" sends it once: ${viaText.message}`);
+    const row = getSalesSequenceByThread(threadOf(`sent-${draftId}`));
+    assert(row?.status === "proposed" && row.total_steps === 3, `then a pre-filled Start card: ${row?.status}`);
+    assert(listActiveSalesSequences().length === activeBefore, "and nothing enrolled directly");
+    const again = await sendPendingDraftByText(ownMessage(), draftId, { ownTurn: true });
+    assert(!again.ok && draftsSent.length === sentBefore + 1, "a second \"send it\" sends nothing");
+    const replay = await sendEmailFromTool({ to: ["c.fu19@new-co.com"], instruction: "say hello" }, fuTurn);
+    assert(replay === "Not sent again: this command was already handled." && draftsSent.length === sentBefore + 1, `a replay sends nothing: ${replay}`);
+    assert(getSalesSequenceByThread(threadOf(`sent-${draftId}`))?.status === "proposed", "and no second Start card");
+  }
+
+  // 20. A command's reply card whose subject he changes leaves its thread on purpose: it
+  //     goes out as a new conversation (Codex P2). A reply that loses its headers without
+  //     that (edited in Gmail) is still refused, and an unchanged reply sends in its thread.
+  {
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    // Remembers each card, so a second tap on an already-sent card reaches the handler too.
+    const cardIds = new Map<string, number>();
+    const tapAlerts = async (draftId: string): Promise<string[]> => {
+      const action = { id: cardIds.get(draftId) ?? getPendingActionForDraft(draftId)!.id };
+      cardIds.set(draftId, action.id);
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        action.id,
+      );
+      return alerts;
+    };
+    const replyCard = async (address: string, thread: string): Promise<string> => {
+      mail({ threadId: thread, from: `Rhea <${address}>`, to: ME, subject: "Question", body: "Hi?" });
+      written = { subject: "Hello", body: "Hi,\n\nA short note." };
+      const result = await sendEmailFromTool({ to: [address], instruction: "say hello", thread_id: thread }, own(`reply to ${address} saying hello`));
+      assert(result.startsWith(`New address: ${address}.`), `a reply card: ${result}`);
+      const draftId = draftsCreated.at(-1)!;
+      assert(getPendingActionForDraft(draftId)?.thread_id === thread, "it starts as a reply in its thread");
+      return draftId;
+    };
+
+    // a) He changes the subject, then taps Send: it goes once, as a new conversation.
+    const tapped = await replyCard("c.r20a@new-co.com", "c-thr20a");
+    await updateDraft({ draft_id: tapped, subject: "A new topic" }, own("change the subject to A new topic"));
+    assert(draftUpdateThreads.get(tapped) === null, "Gmail's draft left the thread");
+    assert(getPendingActionForDraft(tapped)?.thread_id === null, "and the card is a new email now");
+    const sentA = draftsSent.length;
+    const alertsA = await tapAlerts(tapped);
+    assert(draftsSent.length === sentA + 1 && draftsSent.at(-1) === tapped, `the tap sends it: ${alertsA.join(" | ")}`);
+    await tapAlerts(tapped);
+    assert(draftsSent.length === sentA + 1, "once");
+
+    // b) The same with his "send it".
+    const texted = await replyCard("c.r20b@new-co.com", "c-thr20b");
+    await updateDraft({ draft_id: texted, subject: "Another topic" }, own("change the subject to Another topic"));
+    const sentB = draftsSent.length;
+    const viaText = await sendPendingDraftByText(ownMessage(), texted, { ownTurn: true });
+    assert(viaText.ok && draftsSent.length === sentB + 1 && draftsSent.at(-1) === texted, `"send it" sends it: ${viaText.message}`);
+    const textAgain = await sendPendingDraftByText(ownMessage(), texted, { ownTurn: true });
+    assert(!textAgain.ok && draftsSent.length === sentB + 1, "once");
+
+    // c) Reply headers lost in Gmail with no subject change: still refused.
+    const lost = await replyCard("c.r20c@new-co.com", "c-thr20c");
+    draftHeaders.set(lost, (draftHeaders.get(lost) ?? []).filter((header) => header.name !== "In-Reply-To"));
+    const sentC = draftsSent.length;
+    const alertsC = await tapAlerts(lost);
+    assert(draftsSent.length === sentC && alertsC.some((text) => text.includes("lost its reply headers")), `refused: ${alertsC.join(" | ")}`);
+    assert(getPendingActionForDraft(lost)?.thread_id === "c-thr20c", "it is still a reply in its thread");
+
+    // d) An unchanged reply sends in its thread.
+    const kept = await replyCard("c.r20d@new-co.com", "c-thr20d");
+    const sentD = draftsSent.length;
+    await tapAlerts(kept);
+    assert(draftsSent.length === sentD + 1 && draftsSent.at(-1) === kept, "an unchanged reply sends");
     written = { subject: "Quick note", body: "Hi,\n\nThe note he asked for." };
   }
 
