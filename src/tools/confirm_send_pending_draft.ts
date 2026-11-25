@@ -26,6 +26,31 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   },
 };
 
+/** "cc Ashwini and send it": the draft he edited earlier in this same turn, by his
+ *  message. Only that draft may then be confirmed in a later step. */
+const editedThisTurn = new Map<string, { draftId: string; at: number }>();
+const EDIT_TTL_MS = 10 * 60_000;
+
+function turnKey(confirmation: { chatId: number; messageId: number }): string {
+  return `${confirmation.chatId}:${confirmation.messageId}`;
+}
+
+export function noteDraftEditedThisTurn(
+  confirmation: { chatId: number; messageId: number } | undefined,
+  draftId: string,
+): void {
+  if (!confirmation) {
+    return;
+  }
+  const now = Date.now();
+  for (const [key, entry] of editedThisTurn) {
+    if (now - entry.at > EDIT_TTL_MS) {
+      editedThisTurn.delete(key);
+    }
+  }
+  editedThisTurn.set(turnKey(confirmation), { draftId, at: now });
+}
+
 const DRAFTING_TOOLS = new Set([
   "draft_reply",
   "draft_new_email",
@@ -37,7 +62,12 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   if (!turn.confirmation) {
     return "Not sent: only Vishnu's own chat message can confirm a send.";
   }
-  if (turn.iteration !== 1) {
+  const requested =
+    typeof input === "object" && input !== null && "draft_id" in input && typeof (input as { draft_id?: unknown }).draft_id === "string"
+      ? (input as { draft_id: string }).draft_id.trim()
+      : "";
+  // A later step only for "edit it and send it": the same draft he just had changed.
+  if (turn.iteration !== 1 && editedThisTurn.get(turnKey(turn.confirmation))?.draftId !== requested) {
     return "Not sent: a send must be confirmed by Vishnu's message before anything else is read. Ask him to confirm again.";
   }
   if (turn.calledTools.some((name) => DRAFTING_TOOLS.has(name))) {
@@ -63,7 +93,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       ? "No draft is waiting for your approval, so nothing was sent."
       : "Not sent: pass draft_id from the pending-draft list in your context.";
   }
-  const result = await sendPendingDraftByText(turn.confirmation, draftId);
+  const result = await sendPendingDraftByText(turn.confirmation, draftId, { ownTurn: turn.ownTurn === true });
   // "Send it and start 3 follow-ups": only if this exact draft went out.
   return withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok));
 }

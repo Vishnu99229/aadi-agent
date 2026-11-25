@@ -8,6 +8,10 @@ import {
   setApprovalsTestHooks,
 } from "../src/approvals.ts";
 import { setCompleteForTests } from "../src/llm.ts";
+import type { gmail_v1 } from "googleapis";
+import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
+import { setGmailClientForTests } from "../src/google/mail.ts";
+import { noteDraftEditedThisTurn } from "../src/tools/confirm_send_pending_draft.ts";
 import { modelReply, scriptedModel } from "./fakes.ts";
 import {
   createPendingAction,
@@ -17,6 +21,8 @@ import {
   setPendingActionTelegramMessage,
   setPendingActionTimestampsForTests,
   transitionPendingAction,
+  claimTelegramMessage,
+  recordCardRecipients,
 } from "../src/db.ts";
 import {
   fakeGmail,
@@ -33,6 +39,17 @@ import { handler as discardHandler } from "../src/tools/discard_pending_draft.ts
 import { handler as resendHandler } from "../src/tools/resend_draft_card.ts";
 import type { ToolTurn } from "../src/tools/index.ts";
 
+
+/** A posted card shows these people: its To/Cc, and the record for its message, as the
+ *  card builder writes them once Telegram confirms the card. */
+function showOnCard(id: number, meta: { toHeader: string; ccHeader: string; subject: string }): void {
+  setPendingActionDraftMeta(id, meta);
+  const action = getPendingAction(id)!;
+  if (action.telegram_message_id && action.draft_id) {
+    recordCardRecipients(action.telegram_message_id, action.draft_id, `${meta.toHeader},${meta.ccHeader}`);
+  }
+}
+
 function assert(condition: boolean, message: string): void {
   if (!condition) {
     throw new Error(message);
@@ -41,9 +58,11 @@ function assert(condition: boolean, message: string): void {
 
 const gmail: GmailLog = { sent: [], created: [], deleted: [] };
 const cards: TelegramLog = { sent: [], edited: [] };
+// What each draft holds in Gmail: the same people its card showed.
+const draftMeta: Record<string, { to?: string; cc?: string; subject?: string }> = {};
 setApprovalsTestHooks({
   telegram: fakeTelegramApi(cards),
-  gmailFor: () => fakeGmail(gmail),
+  gmailFor: () => fakeGmail(gmail, draftMeta),
 });
 
 const chatId = 1;
@@ -61,8 +80,9 @@ function showDraft(
   meta: { to: string; cc?: string; subject: string },
 ): number {
   const action = createPendingAction(draftId, null, "work");
+  draftMeta[draftId] = { to: meta.to, cc: meta.cc, subject: meta.subject };
   setPendingActionTelegramMessage(action.id, nextMessageId());
-  setPendingActionDraftMeta(action.id, {
+  showOnCard(action.id, {
     toHeader: meta.to,
     ccHeader: meta.cc ?? "",
     subject: meta.subject,
@@ -88,6 +108,8 @@ function ownerTurn(messageId: number, extra: Partial<ToolTurn> = {}): ToolTurn {
     iteration: 1,
     calledTools: ["confirm_send_pending_draft"],
     confirmation: { chatId, messageId },
+    // Dispatch marks his own chat turn; these tests stand in for it.
+    ownTurn: true,
     ...extra,
   };
 }
@@ -135,7 +157,7 @@ const aspirare = {
   const sent = await sendPendingDraftByText({
     chatId,
     messageId: nextMessageId(),
-  });
+  }, undefined, { ownTurn: true });
   assert(sent.ok && gmail.sent.at(-1) === "d-new", "send it picks the most recently edited");
 }
 
@@ -159,7 +181,7 @@ const aspirare = {
   const sent = await sendPendingDraftByText({
     chatId,
     messageId: nextMessageId(),
-  });
+  }, undefined, { ownTurn: true });
   assert(sent.ok && gmail.sent.at(-1) === "p4", "one clearly latest sends");
 }
 
@@ -174,7 +196,7 @@ const aspirare = {
   const asked = await sendPendingDraftByText({
     chatId,
     messageId: nextMessageId(),
-  });
+  }, undefined, { ownTurn: true });
   assert(!asked.ok && asked.message.includes("Which one"), "equal recency asks which");
   assert(gmail.sent.filter((id) => id === "eq-a" || id === "eq-b").length === 0, "neither equal draft sent");
 }
@@ -183,6 +205,8 @@ const aspirare = {
 {
   clear();
   const older = showDraft("keep-old", { to: "old@x.com", subject: "Old" });
+  // In Gmail the edited draft goes to the people its refreshed card shows.
+  draftMeta["edit-me"] = { to: aspirare.to, cc: aspirare.cc, subject: aspirare.subject };
   await queueDraftApproval({
     draftId: "edit-me",
     threadId: null,
@@ -218,8 +242,8 @@ const aspirare = {
   const sent = await sendPendingDraftByText({
     chatId,
     messageId: nextMessageId(),
-  });
-  assert(sent.ok && gmail.sent.at(-1) === "edit-me", "edited draft is treated as latest");
+  }, undefined, { ownTurn: true });
+  assert(sent.ok && gmail.sent.at(-1) === "edit-me", `edited draft is treated as latest: ${sent.message}`);
   assert(getPendingAction(older)!.status === "pending", "pre-edit sibling stays pending");
 }
 
@@ -239,7 +263,7 @@ const aspirare = {
   const sent = await sendPendingDraftByText({
     chatId,
     messageId: nextMessageId(),
-  });
+  }, undefined, { ownTurn: true });
   assert(sent.ok && gmail.sent.at(-1) === "fresh", "stale draft is ignored");
   assert(getPendingAction(stale)!.status === "expired", "untouched 3h draft expires");
 }
@@ -290,7 +314,7 @@ const aspirare = {
   const createdThisTurn = createPendingAction("this-turn", null, "work");
   created.push(createdThisTurn.id);
   setPendingActionTelegramMessage(createdThisTurn.id, nextMessageId());
-  setPendingActionDraftMeta(createdThisTurn.id, {
+  showOnCard(createdThisTurn.id, {
     toHeader: "x@y.com",
     ccHeader: "",
     subject: "Nope",
@@ -382,6 +406,71 @@ assert(
   assert(/remind/i.test(reply), "unknown-tool follow-up names a closest alternative");
   assert(gmail.sent.length === 0, "honesty path sends no draft");
   setCompleteForTests(undefined);
+}
+
+// ---- C: "send it" sends what his card showed; a new address since needs the card ----
+{
+  clear();
+  const knownAddresses = new Set(["ashwini@known-co.com"]);
+  setGoogleAccountForTests((id) => ({ id, tag: id, label: id, client: {} }) as LoadedGoogleAccount);
+  setGmailClientForTests(() => ({
+    users: {
+      messages: {
+        list: async ({ q }: { q: string }) => {
+          const address = /to:([^\s)]+)/.exec(q)?.[1] ?? "";
+          return { data: { messages: knownAddresses.has(address) ? [{ id: `known-${address}`, threadId: "k" }] : [] } };
+        },
+        get: async ({ id }: { id: string }) => ({
+          data: { id, threadId: "k", labelIds: ["SENT"], payload: { headers: [{ name: "To", value: id.replace(/^known-/, "") }] } },
+        }),
+      },
+    },
+  }) as unknown as gmail_v1.Gmail);
+
+  // Shown on a card before his message: "send it" sends.
+  showDraft("c-shown", { to: "Ravi <ravi@shown-co.com>", subject: "Shown" });
+  const shown = await sendPendingDraftByText({ chatId, messageId: nextMessageId() }, "c-shown", { ownTurn: true });
+  assert(shown.ok && gmail.sent.at(-1) === "c-shown", `what his card showed sends: ${shown.message}`);
+
+  // An edit in this same turn added a new Cc: the card comes back, nothing is sent.
+  const edited = showDraft("c-newcc", { to: "Ravi <ravi@shown-co.com>", subject: "Edit" });
+  const thisMessage = nextMessageId();
+  claimTelegramMessage(chatId, thisMessage);
+  draftMeta["c-newcc"] = { to: "Ravi <ravi@shown-co.com>", cc: "brand.new@new-co.com", subject: "Edit" };
+  showOnCard(edited, { toHeader: "Ravi <ravi@shown-co.com>", ccHeader: "brand.new@new-co.com", subject: "Edit" });
+  const blocked = await sendPendingDraftByText({ chatId, messageId: thisMessage }, "c-newcc", { ownTurn: true });
+  assert(!blocked.ok && blocked.message.startsWith("New address: brand.new@new-co.com. Tap Send to confirm."), `the card comes back: ${blocked.message}`);
+  assert(gmail.sent.at(-1) !== "c-newcc", "and nothing was sent");
+
+  // "cc Ashwini and send it": the edit adds a known address this turn, and it sends.
+  const cc = showDraft("c-knowncc", { to: "Ravi <ravi@shown-co.com>", subject: "Known" });
+  const ccMessage = nextMessageId();
+  claimTelegramMessage(chatId, ccMessage);
+  draftMeta["c-knowncc"] = { to: "Ravi <ravi@shown-co.com>", cc: "Ashwini <ashwini@known-co.com>", subject: "Known" };
+  showOnCard(cc, { toHeader: "Ravi <ravi@shown-co.com>", ccHeader: "Ashwini <ashwini@known-co.com>", subject: "Known" });
+  noteDraftEditedThisTurn({ chatId, messageId: ccMessage }, "c-knowncc");
+  const confirmTurn = {
+    iteration: 2,
+    calledTools: ["confirm_send_pending_draft"],
+    confirmation: { chatId, messageId: ccMessage },
+    userText: "cc Ashwini and send it",
+    ownTurn: true,
+  } as ToolTurn;
+  const ccSent = await confirmHandler({ draft_id: "c-knowncc" }, confirmTurn);
+  assert(gmail.sent.at(-1) === "c-knowncc", `the edit applies, then it sends: ${ccSent}`);
+  // The same, without an edit of that draft this turn: a later step can't send.
+  const other = showDraft("c-noedit", { to: "Ravi <ravi@shown-co.com>", subject: "No edit" });
+  void other;
+  const noEdit = await confirmHandler({ draft_id: "c-noedit" }, { ...confirmTurn, confirmation: { chatId, messageId: nextMessageId() } } as ToolTurn);
+  assert(noEdit.startsWith("Not sent") && gmail.sent.at(-1) !== "c-noedit", `a later step with no edit still refuses: ${noEdit}`);
+
+  // Not his own turn (a delegated goal): never sends, even what the card showed.
+  showDraft("c-deleg", { to: "Ravi <ravi@shown-co.com>", subject: "Deleg" });
+  const delegated = await sendPendingDraftByText({ chatId, messageId: nextMessageId() }, "c-deleg", { ownTurn: false });
+  assert(!delegated.ok && gmail.sent.at(-1) !== "c-deleg", `a delegated "send it" doesn't send: ${delegated.message}`);
+
+  setGmailClientForTests(undefined);
+  setGoogleAccountForTests(undefined);
 }
 
 console.log("Pending draft checks passed.");

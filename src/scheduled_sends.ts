@@ -2,6 +2,7 @@ import { InlineKeyboard, type Context } from "grammy";
 import {
   commandApi,
   readThread,
+  scheduledSendVerdict,
   scheduledWhen,
   writeAndSend,
   type CommandRequest,
@@ -25,8 +26,9 @@ import {
   retryScheduledSend,
   transitionScheduledSend,
   type ScheduledSendRecord,
+  holdScheduledSendForConfirm,
 } from "./db.js";
-import { formatMailbox } from "./draft_recipients.js";
+import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
 import type { ParsedMailbox } from "./mail_helpers.js";
 import { loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { getGoogleAccount } from "./google/auth.js";
@@ -35,6 +37,9 @@ import { everyMs, type IntervalJob } from "./scheduler.js";
 import { retireDraftApproval } from "./approvals.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { allowOwnerChatCancelScheduledSend } from "./security/send_approval.js";
+import { recipientFingerprint } from "./security/send_decision.js";
+import { cardRecipientsForMessage } from "./db.js";
+import { postConfirmCard, scheduleCardKey, type ConfirmCardSpec } from "./confirm_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const TICK_INTERVAL_MS = 60 * 1000;
@@ -130,6 +135,27 @@ async function recheckRecipients(request: CommandRequest): Promise<RecheckResult
   return { ok: true };
 }
 
+/** The schedule's current To and Cc, as a card shows them. */
+function peopleOf(request: CommandRequest): { to: string; cc: string } {
+  const mailboxes = (slots: readonly RecipientSlot[]) => slots.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []));
+  return { to: formatMailboxList(mailboxes(request.to)), cc: formatMailboxList(mailboxes(request.cc)) };
+}
+
+/** A card whose buttons confirm who it goes to, through the one card builder. */
+async function tellCard(spec: ConfirmCardSpec): Promise<void> {
+  try {
+    await postConfirmCard(spec, { api: commandApi() });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Scheduled sends: card not posted (${errorType})`);
+  }
+}
+
+/** Everyone a scheduled email would go to now (To and Cc), lowercased. */
+function recipientsOf(request: CommandRequest): string[] {
+  return [...new Set([...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : [])))];
+}
+
 /** False when the row changed or ended while its recipients were being checked. */
 async function hold(row: ScheduledSendRecord, request: CommandRequest, check: Extract<RecheckResult, { ok: false }>): Promise<boolean> {
   const slots = [...request.to, ...request.cc];
@@ -138,15 +164,13 @@ async function hold(row: ScheduledSendRecord, request: CommandRequest, check: Ex
     return false;
   }
   console.log(`Scheduled send ${row.id}: status -> held`);
-  const keyboard = new InlineKeyboard();
-  check.options.slice(0, MAX_HOLD_BUTTONS).forEach((option, index) => {
-    keyboard.text(formatMailbox(option).slice(0, 60), `cmdsend:hold:${row.id}:${check.slotIndex}:${index}`).row();
+  await tellCard({
+    kind: "schedule_pick",
+    scheduleId: row.id,
+    slotIndex: check.slotIndex,
+    options: check.options.slice(0, MAX_HOLD_BUTTONS),
+    headline: `Held, not sent: ${row.item_text}\n${check.reason}. Who should it go to?`,
   });
-  keyboard.text("Cancel", `cmdsend:cancelsched:${row.id}`);
-  await tell(
-    `Held, not sent: ${row.item_text}\n${check.reason}. Who should it go to?`,
-    keyboard,
-  );
   return true;
 }
 
@@ -173,6 +197,22 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
     }
     return;
   }
+  // Only people he confirmed when he scheduled it, or known now, receive it. A new
+  // address waits on his Confirm instead of going out.
+  const verdict = await scheduledSendVerdict(request);
+  if (verdict.action !== "send") {
+    if (holdScheduledSendForConfirm(row.id)) {
+      const newAddresses = verdict.action === "card" ? verdict.newAddresses : [];
+      console.log(`Scheduled send ${row.id}: status -> held for confirm`);
+      await tellCard({
+        kind: "schedule_confirm",
+        scheduleId: row.id,
+        ...peopleOf(request),
+        headline: `Held, not sent: ${row.item_text}\nNew address: ${newAddresses.join(", ") || "unconfirmed"}. Tap Confirm to send it.`,
+      });
+    }
+    return;
+  }
   const late = now.getTime() - new Date(row.send_at).getTime() > LATE_AFTER_MS;
   const snapshot = finalizedCopy(request);
   const outcome = await writeAndSend(
@@ -196,6 +236,7 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
       note: late ? `This went out late: it was due ${scheduledWhen(row.send_at)}.` : undefined,
       prepared: snapshot,
       explicitSubject: request.subjectEdited ? request.finalSubject || request.subject : undefined,
+      verdict,
     },
   );
   if (outcome.result === "sent") {
@@ -375,6 +416,55 @@ export async function handleScheduledSendCallback(ctx: Context): Promise<void> {
     await ctx
       .editMessageText(text, after.keyboard ? { reply_markup: after.keyboard } : { reply_markup: undefined })
       .catch(() => undefined);
+    return;
+  }
+  // Confirm on a held send to a new address: his tap confirms the people that card
+  // showed, once, and only while the schedule still goes to exactly them.
+  const confirm = /^cmdsend:confirmsched:(\d+)(?::([0-9a-f]{12}))?$/.exec(data);
+  if (confirm) {
+    const held = getScheduledSend(Number(confirm[1]));
+    if (!held || held.status !== "held") {
+      await ctx.editMessageText("That's already been handled.", { reply_markup: undefined }).catch(() => undefined);
+      return;
+    }
+    const request = requestOf(held);
+    const everyone = recipientsOf(request);
+    // Who the tapped card message showed (when it was recorded): the tap can't confirm more.
+    const tapped = ctx.callbackQuery?.message?.message_id;
+    const shownThere = tapped === undefined ? new Set<string>() : cardRecipientsForMessage(scheduleCardKey(held.id), tapped);
+    const beyondCard = shownThere.size > 0 && everyone.some((email) => !shownThere.has(email));
+    if (!confirm[2] || confirm[2] !== recipientFingerprint(everyone) || beyondCard) {
+      // The people changed after that card: nothing is confirmed. A fresh card shows who now.
+      console.log(`Scheduled send ${held.id}: confirm refused, recipients changed since the card`);
+      await ctx
+        .editMessageText("Not confirmed: the people on it changed since this card. I've sent a new one.", { reply_markup: undefined })
+        .catch(() => undefined);
+      const verdict = await scheduledSendVerdict(request);
+      const newAddresses = verdict.action === "card" ? verdict.newAddresses : [];
+      await tellCard({
+        kind: "schedule_confirm",
+        scheduleId: held.id,
+        ...peopleOf(request),
+        headline: `Held, not sent: ${held.item_text}\nIt now goes to ${everyone.join(", ")}.${newAddresses.length > 0 ? ` New address: ${newAddresses.join(", ")}.` : ""} Tap Confirm to send it to them.`,
+      });
+      return;
+    }
+    request.confirmedRecipients = [...new Set([...(request.confirmedRecipients ?? []), ...everyone])];
+    if (!releaseHeldScheduledSend(held.id, JSON.stringify(request), held.request)) {
+      await ctx.editMessageText("Not confirmed: it changed while you tapped. Check the newest card.", { reply_markup: undefined }).catch(() => undefined);
+      return;
+    }
+    console.log(`Scheduled send ${held.id}: status -> scheduled (confirmed)`);
+    await ctx.editMessageText(`Confirmed: ${held.item_text}`, { reply_markup: undefined }).catch(() => undefined);
+    // Already due (it was held at send time): send it now.
+    if (new Date(held.send_at).getTime() <= Date.now()) {
+      try {
+        await fireScheduledSend(getScheduledSend(held.id)!, new Date());
+      } catch (error) {
+        const errorType = error instanceof Error ? error.name : "UnknownError";
+        console.error(`Scheduled send ${held.id}: fire after confirm failed (${errorType})`);
+      }
+    }
     return;
   }
   const pick = /^cmdsend:hold:(\d+):(\d+):(\d+)$/.exec(data);

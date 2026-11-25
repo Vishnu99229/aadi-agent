@@ -2,7 +2,8 @@
 // Fake Gmail, fake Telegram, stub models. Nothing real is sent.
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import { queueDraftApproval, setApprovalsTestHooks } from "../src/approvals.ts";
+import { handleApprovalCallback, queueDraftApproval, resendDraftCard, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
+import { clearPendingAction } from "../src/action_context.ts";
 import { defaultToolNames, runAgent } from "../src/agent.ts";
 import { handleCommandSendCallback, sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import {
@@ -37,15 +38,25 @@ import {
 } from "../src/scheduled_sends.ts";
 import { config } from "../src/config.ts";
 import {
+  beginChatTurn,
+  claimTelegramMessage,
   createMemory,
+  db,
   getCommandSendByKey,
+  getPendingAction as approvalAction,
+  latestProcessedMessageId,
+  setChatTurnRetryText,
+  writeScheduledCopy,
+  getPendingActionForDraft,
   getSalesSequenceByThread,
+  listCanonicalContacts,
   getScheduledSend,
   getTask,
   listActiveSalesSequences,
   listOpenScheduledSends,
   listSalesSequenceSteps,
   markTaskDone,
+  recordKnownRecipient,
 } from "../src/db.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
 import { bindEmailReferenceForTurn } from "../src/email_references.ts";
@@ -55,6 +66,7 @@ import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
 import { evaluateCommandSendGate } from "../src/security/command_send.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
+import { handler as updateDraft } from "../src/tools/update_draft.ts";
 import { setOwnerCalendarTestHooks, type OwnerCalendarEvent } from "../src/owner_calendar.ts";
 import {
   createOwnerCalendarEvent,
@@ -90,7 +102,11 @@ const settings = config as unknown as Record<string, unknown>;
 const turn = (userText: string, messageId = nextTurn()) => ({
   userText,
   confirmation: { chatId: 1, messageId },
+  // Dispatch marks his own chat turn; these direct calls stand in for it.
+  ownTurn: true,
 });
+/** A delegated goal: his approval, but not his own chat turn. */
+const delegatedTurn = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: false });
 let turnCounter = 100;
 function nextTurn(): number {
   turnCounter += 1;
@@ -188,6 +204,24 @@ interface Sent {
 const sends: Sent[] = [];
 let sendFails: number | "network" | undefined;
 const draftsCreated: string[] = [];
+const draftHeaders = new Map<string, Array<{ name: string; value: string }>>();
+/** Drafts Gmail fails to read (drafts.get throws). */
+const unreadableDrafts = new Set<string>();
+/** Each draft's plain body as Gmail has it, and drafts with a real file attached. */
+const draftBodyById = new Map<string, string>();
+const draftAttachments = new Set<string>();
+/** The thread each drafts.update saved the draft to (null: a new conversation). */
+const draftUpdateThreads = new Map<string, string | null>();
+function draftBodyOf(raw: string): string {
+  const base64 = /Content-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1];
+  return base64 ? Buffer.from(base64.replace(/\s/g, ""), "base64").toString("utf8") : raw.split("\r\n\r\n").slice(1).join("\r\n\r\n");
+}
+function rawHeaders(raw: string): Array<{ name: string; value: string }> {
+  const block = raw.split("\r\n\r\n")[0]!;
+  return ["To", "Cc", "Bcc", "Subject", "In-Reply-To"]
+    .map((name) => ({ name, value: new RegExp(`^${name}: (.*)$`, "im").exec(block)?.[1]?.trim() ?? "" }))
+    .filter((header) => header.value !== "");
+}
 const draftsSent: string[] = [];
 
 function headerOf(block: string, name: string): string {
@@ -236,16 +270,57 @@ const gmail = {
       },
     },
     drafts: {
-      create: async () => {
+      create: async (input?: { requestBody?: { message?: { raw?: string } } }) => {
         const id = `draft-${draftsCreated.length + 1}`;
         draftsCreated.push(id);
+        // Like Gmail, the draft goes to whoever its MIME says.
+        const raw = Buffer.from(input?.requestBody?.message?.raw ?? "", "base64url").toString("utf8");
+        draftHeaders.set(id, rawHeaders(raw));
+        draftBodyById.set(id, draftBodyOf(raw));
         return { data: { id, message: { id: "d", threadId: "t" } } };
       },
       send: async ({ requestBody }: { requestBody: { id: string } }) => {
         draftsSent.push(requestBody.id);
         return { data: { id: `sent-${requestBody.id}` } };
       },
-      get: async () => ({ data: { message: { payload: { headers: [] } } } }),
+      get: async ({ id }: { id?: string } = {}) => {
+        if (unreadableDrafts.has(id ?? "")) {
+          throw new Error("gmail unavailable");
+        }
+        return {
+          data: {
+            id,
+            message: {
+              id: `m-${id}`,
+              threadId: `t-${id}`,
+              payload: draftAttachments.has(id ?? "")
+                ? {
+                    headers: draftHeaders.get(id ?? "") ?? [],
+                    mimeType: "multipart/mixed",
+                    parts: [
+                      { mimeType: "text/plain", body: { data: Buffer.from(draftBodyById.get(id ?? "") ?? "Hi,\n\nA short note.", "utf8").toString("base64url") } },
+                      { mimeType: "application/pdf", filename: "deck.pdf", body: { attachmentId: "att-1", size: 1200 } },
+                    ],
+                  }
+                : {
+                    headers: draftHeaders.get(id ?? "") ?? [],
+                    mimeType: "text/plain",
+                    body: { data: Buffer.from(draftBodyById.get(id ?? "") ?? "Hi,\n\nA short note.", "utf8").toString("base64url") },
+                  },
+            },
+          },
+        };
+      },
+      // An edit replaces the draft; Gmail keeps its id and its new headers.
+      update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string; threadId?: string } } }) => {
+        draftUpdateThreads.set(id, requestBody.message.threadId ?? null);
+        const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
+        draftHeaders.set(id, rawHeaders(raw));
+        draftBodyById.set(id, draftBodyOf(raw));
+        return { data: { id, message: { id: `m-${id}`, threadId: `t-${id}` } } };
+      },
+      // Discard deletes the Gmail draft.
+      delete: async () => ({ data: {} }),
     },
   },
 } as unknown as gmail_v1.Gmail;
@@ -256,12 +331,22 @@ setGoogleAccountForTests((id) => (id === "work" ? workAccount : personalAccount)
 setGmailClientForTests(() => gmail);
 
 const told: Array<{ text: string; markup?: unknown }> = [];
+/** Telegram refusing to post a message or edit one, for the cases that need it. */
+const telegramFails = { send: false, edit: false };
 const telegram = {
   sendMessage: async (_chat: unknown, text: string, extra?: { reply_markup?: unknown }) => {
+    if (telegramFails.send) {
+      throw new Error("telegram down");
+    }
     told.push({ text, markup: extra?.reply_markup });
     return { message_id: 900 + told.length, date: 0, chat: { id: 1, type: "private" }, text };
   },
-  editMessageText: async () => true,
+  editMessageText: async () => {
+    if (telegramFails.edit) {
+      throw new Error("telegram down");
+    }
+    return true;
+  },
 } as unknown as Api;
 setCommandEmailTestHooks({ telegram });
 setSequenceTestHooks({ telegram });
@@ -616,8 +701,14 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
 {
   const count = sends.length;
   createMemory({ content: "Deepak's email is deepak@memory.example.", category: "other", tag: "work", source: "explicit" });
-  await sendEmailFromTool({ to: ["Deepak"], instruction: "x" }, turn("send Deepak a note"));
-  assert(sends.length === count + 1 && sends[count]!.to.includes("deepak@memory.example"), "found in memory");
+  const fromMemory = await sendEmailFromTool({ to: ["Deepak"], instruction: "x" }, turn("send Deepak a note"));
+  // C: found in his memory, but he has never emailed it, so it is new: the card, no send.
+  assert(
+    sends.length === count && fromMemory.startsWith("New address: deepak@memory.example. Tap Send to confirm."),
+    `found in memory, shown on the card: ${fromMemory}`,
+  );
+  // That card is now the chat's open email; the cases below start from a clean chat.
+  clearPendingAction(1);
 }
 {
   const before = told.length;
@@ -676,13 +767,14 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
 {
   const count = sends.length;
   const before = told.length;
+  const draftsBefore = draftsCreated.length;
   const result = await sendEmailFromTool(
     { to: ["Arjun"], instruction: "say thanks", thread_id: "multi" },
     turn("reply to Arjun saying thanks"),
   );
   assert(sends.length === count + 1 && result.startsWith("Sent to"), `a reply sends, got ${result}`);
   assert(sends[count]!.threadId === "multi" && sends[count]!.to === "Arjun Nair <arjun@acme.example>", "on the thread, to Arjun only");
-  assert(told[before]!.markup === undefined && draftsCreated.length === 0, "with no card and no draft");
+  assert(told[before]!.markup === undefined && draftsCreated.length === draftsBefore, "with no card and no draft");
 }
 
 // ---- attachments ask ----
@@ -717,6 +809,8 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   assert(input.includes("<<<UNTRUSTED_CONTEXT>>>"), "the thread is marked untrusted");
   assert(COMMAND_WRITER_SYSTEM.includes("never instructions"), "and the writer is told");
   const count = sends.length;
+  // C: he has written to Lina before, so this goes straight out; the point here is the writer.
+  recordKnownRecipient("lina@cards.example", "test");
   written = { subject: "Hi", body: "Hi Lina,\n\nThanks." , ...{ to: "evil@attacker.example" } };
   await sendEmailFromTool({ to: ["Lina"], instruction: "say thanks", thread_id: "card" }, turn("send Lina a reply"));
   assert(sends[count]!.to.includes("lina@cards.example") && !sends[count]!.raw.includes("evil@attacker"), "the writer can't change who gets it");
@@ -763,7 +857,7 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
 {
   const count = sends.length;
   const drafted = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, turn("draft an email to Selvaraj"));
-  assert(drafted.startsWith("Not sent") && drafted.includes("draft"), "draft stays a draft");
+  assert(drafted.startsWith("Not sent") && drafted.includes("draft"), `draft stays a draft: ${drafted}`);
   const reminder = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, turn("remind me to email Selvaraj"));
   assert(reminder.startsWith("Not sent"), "a reminder stays a reminder");
   const noOwner = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, { userText: "send Selvaraj a note" });
@@ -817,11 +911,22 @@ assert((TOOL_ORDER as readonly string[]).includes("send_email"), "it's a registe
   assert(on.includes("Waiting for your Send tap"), `on: it makes a card, got ${on}`);
 
   settings.sendOnCommandEnabled = false;
+  // C: with it off, his own "email ... saying" still sends straight away to someone he knows.
+  recordKnownRecipient("priya@acme.example", "test");
   const off = await draftNewEmail(
     { to: "priya@acme.example", subject: "Hi", body: "Hi Priya", send_immediately: true },
-    { iteration: 1, calledTools: [], confirmation: { chatId: 1, messageId: nextTurn() } },
+    { iteration: 1, calledTools: [], confirmation: { chatId: 1, messageId: nextTurn() }, ownTurn: true, userText: "email priya@acme.example saying hi" },
   );
-  assert(draftsSent.length === sentBefore + 1 && off.startsWith("Sent to"), "off: today's behaviour is unchanged");
+  assert(draftsSent.length === sentBefore + 1 && off.startsWith("Sent to"), `off: today's behaviour is unchanged for someone he knows: ${off}`);
+  // ...and a new address gets the card instead.
+  const offNew = await draftNewEmail(
+    { to: "pat@never-emailed.example", subject: "Hi", body: "Hi Pat", send_immediately: true },
+    { iteration: 1, calledTools: [], confirmation: { chatId: 1, messageId: nextTurn() }, ownTurn: true, userText: "email pat@never-emailed.example saying hi" },
+  );
+  assert(
+    draftsSent.length === sentBefore + 1 && offNew.startsWith("New address: pat@never-emailed.example. Tap Send to confirm."),
+    `off: a new address gets the card: ${offNew}`,
+  );
   const count = sends.length;
   const disabled = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, turn("send Selvaraj a note"));
   assert(disabled.startsWith("Not sent") && sends.length === count, "off: send_email sends nothing");
@@ -1784,6 +1889,14 @@ await expectCancelled("delete_task", async (row) => {
   };
   const own = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: true });
   const model = <T extends object>(base: T) => ({ ...base, modelCalled: true });
+  // These follow-up tests are about follow-ups, so their recipients are people he has
+  // emailed before (known): the email itself goes out with no Send card.
+  for (const address of [
+    "kai@kappa-co.com", "kim@kim-co.com", "fay@fay-co.com", "lee@lambda-co.com", "lia@lambda-co.com",
+    "mia@mu-co.com", "mona@mo-co.com", "omi@omi-co.com",
+  ]) {
+    mail({ threadId: `earlier-${address}`, from: `Vishnu <${ME}>`, to: address, subject: "Earlier", body: "Hi", sent: true });
+  }
   const threadOf = (id: string) => world.find((item) => item.id === id)!.threadId;
   const active = () => listActiveSalesSequences().length;
 
@@ -1866,13 +1979,17 @@ await expectCancelled("delete_task", async (row) => {
   assert(noFollowups.startsWith("Sent to") && noFollowups.includes("No follow-ups started, as you said."), noFollowups);
   assert(active() === count, "nothing enrolled");
 
-  // Not his own turn (a delegated goal): the email may go, the follow-ups are only a card.
-  const delegatedTurn = turn("email lia@lambda-co.com saying thanks and start 2 follow-ups");
-  const delegatedSend = await sendEmailFromTool({ to: ["lia@lambda-co.com"], instruction: "say thanks" }, delegatedTurn);
+  // Not his own turn (a delegated goal): C makes the email a Send card too, so nothing
+  // has gone out and the follow-ups wait for it (case 10 below covers the tap).
+  const delegatedStep = delegatedTurn("email lia@lambda-co.com saying thanks and start 2 follow-ups");
+  const sendsBeforeDelegated = sends.length;
+  const delegatedSend = await sendEmailFromTool({ to: ["lia@lambda-co.com"], instruction: "say thanks" }, delegatedStep);
   assert(!delegatedSend.includes("only your own message"), `never a flat refusal: ${delegatedSend}`);
-  const delegated = await startSequenceFromTool("Lia", model(delegatedTurn));
-  assert(delegated.startsWith("Start card sent for "), `a delegated turn only gets a card: ${delegated}`);
+  assert(sends.length === sendsBeforeDelegated && delegatedSend.includes("Tap Send to confirm."), `a delegated send is a card: ${delegatedSend}`);
+  const delegated = await startSequenceFromTool("Lia", model(delegatedStep));
+  assert(delegated.startsWith("Not started yet"), `a delegated turn enrols nothing before the email goes: ${delegated}`);
   assert(active() === count, "a delegated turn enrolled nothing");
+  clearPendingAction(1);
 
   // The clause names someone else: a card for the person the email went to, saying why.
   const otherTurn = own("email mia@mu-co.com saying hello and start 3 follow-ups for Jeff");
@@ -1900,6 +2017,8 @@ await expectCancelled("delete_task", async (row) => {
   assert(ocrRow.status === "proposed" && ocrRow.total_steps === 3 && ocrRow.step_days === 4, "the card holds his settings, enrolled nothing");
 
   // D: "send it and start 3 follow-ups" right after a draft card.
+  // In Gmail this draft goes to the person its card shows.
+  draftHeaders.set("draft-nora", [{ name: "To", value: "Nora Lee <nora@nu-co.com>" }]);
   await queueDraftApproval({
     draftId: "draft-nora",
     threadId: null,
@@ -1916,6 +2035,8 @@ await expectCancelled("delete_task", async (row) => {
   assert(draftStart.startsWith("Started 3 follow-ups to Nora Lee (nora@nu-co.com)"), `then its own thread: ${draftStart}`);
   assert(getSalesSequenceByThread(threadOf("sent-draft-nora"))?.status === "active", "the draft's own thread");
 
+  // In Gmail this draft goes to the person its card shows.
+  draftHeaders.set("draft-omar", [{ name: "To", value: "Omar Ali <omar@omicron-co.com>" }]);
   await queueDraftApproval({
     draftId: "draft-omar",
     threadId: null,
@@ -1934,6 +2055,954 @@ await expectCancelled("delete_task", async (row) => {
   users.messages.send = realSend;
   users.messages.list = realList;
   users.drafts.send = realDraftSend;
+  setDomainLookupForTests(undefined);
+}
+
+// ======== C: a Send card for new addresses, a direct send for known ones ========
+{
+  setDomainLookupForTests(async () => "yes");
+  setCompleteForTests(async (params: CompleteParams): Promise<CompleteResult> => {
+    if (params.task === "command_send") {
+      writerCalls.push(params);
+      return modelReply({ text: JSON.stringify(written) });
+    }
+    if (chatScript && params.tools.length > 0) {
+      return chatScript(params);
+    }
+    return modelReply({ text: '{"facts":[]}' });
+  });
+  const own = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: true });
+  const sentTo = (address: string) =>
+    mail({ threadId: `c-known-${address}`, from: `Vishnu <${ME}>`, to: address, subject: "Earlier", body: "Hi", sent: true });
+  // A tap comes from the card message that carries the button: by default the card's
+  // own (latest) Telegram message.
+  const cardMessageOf = (data: string): number => {
+    const id = /^approval:\w+:(\d+)$/.exec(data)?.[1];
+    return (id ? approvalAction(Number(id))?.telegram_message_id : undefined) ?? 1;
+  };
+  const cardCtx = (data: string, log: string[] = []) =>
+    ({
+      callbackQuery: { data, message: { chat: { id: config.ownerTelegramId }, message_id: cardMessageOf(data) } },
+      from: { id: config.ownerTelegramId },
+      chat: { id: config.ownerTelegramId },
+      answerCallbackQuery: async () => true,
+      editMessageText: async (text: string) => {
+        log.push(text);
+        return true;
+      },
+      editMessageReplyMarkup: async () => true,
+      reply: async (text: string) => {
+        log.push(text);
+        return {};
+      },
+    }) as unknown as Context;
+  // Remembers each card, so a second tap on an already-sent card reaches the handler too.
+  const cardOfDraft = new Map<string, number>();
+  const tapSend = async (draftId: string) => {
+    const id = cardOfDraft.get(draftId) ?? getPendingActionForDraft(draftId)!.id;
+    cardOfDraft.set(draftId, id);
+    await handleApprovalCallback(cardCtx(`approval:send:${id}`), "send", id);
+  };
+  written = { subject: "Hello", body: "Hi,\n\nA short note." };
+  // Drafts keep their body, and a sent draft lands in the mailbox like Gmail keeps it.
+  const draftUsers = gmail.users as unknown as {
+    drafts: {
+      create: (input: { requestBody: { message: { raw: string; threadId?: string } } }) => Promise<{ data: { id: string; message: { id: string; threadId: string } } }>;
+      send: (input: { requestBody: { id: string } }) => Promise<{ data: { id: string } }>;
+    };
+  };
+  const realCreate = draftUsers.drafts.create;
+  const realSend = draftUsers.drafts.send;
+  const draftBodies: string[] = [];
+  const draftTo = new Map<string, string>();
+  let draftThreads = 0;
+  draftUsers.drafts.create = async (input) => {
+    const raw = Buffer.from(input.requestBody.message.raw, "base64url").toString("utf8");
+    const base64 = /Content-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1] ?? "";
+    draftBodies.push(base64 ? Buffer.from(base64.replace(/\s/g, ""), "base64").toString("utf8") : raw);
+    const result = await realCreate(input);
+    draftTo.set(result.data.id, headerOf(raw.split("\r\n\r\n")[0]!, "To"));
+    return result;
+  };
+  draftUsers.drafts.send = async (input) => {
+    const result = await realSend(input);
+    // The follow-up block's fake files every sent draft as Nora's; here it goes to
+    // whoever this draft is addressed to, so replace that entry rather than add one.
+    for (let index = world.length - 1; index >= 0; index -= 1) {
+      if (world[index]!.id === result.data.id) {
+        world.splice(index, 1);
+      }
+    }
+    draftThreads += 1;
+    // Gmail sends the draft as it is now: its current To and Cc.
+    const live = draftHeaders.get(input.requestBody.id);
+    const liveHeader = (name: string) => live?.find((header) => header.name === name)?.value ?? "";
+    world.push({
+      id: result.data.id,
+      threadId: `c-draft-thread-${draftThreads}`,
+      from: `Vishnu <${ME}>`,
+      to: (live ? liveHeader("To") : draftTo.get(input.requestBody.id)) ?? "",
+      cc: live ? liveHeader("Cc") : undefined,
+      subject: "Hello",
+      body: "Hi",
+      at: Date.now(),
+      sent: true,
+    });
+    return result;
+  };
+  const threadOf = (id: string) => world.find((item) => item.id === id)!.threadId;
+  // "Has the prospect written since?" reads from:<domain> after:<time>: only their mail counts.
+  const listUsers = gmail.users as unknown as { messages: { list: (input: { q: string; maxResults: number }) => Promise<unknown> } };
+  const cList = listUsers.messages.list;
+  listUsers.messages.list = async (input) => {
+    const since = /^from:(\S+) after:(\d+)$/.exec(input.q);
+    if (since) {
+      const found = world.filter(
+        (item) => !item.sent && item.from.toLowerCase().includes(since[1]!.toLowerCase()) && item.at > Number(since[2]) * 1000,
+      );
+      return { data: { messages: found.map((item) => ({ id: item.id, threadId: item.threadId })) } };
+    }
+    return cList(input);
+  };
+
+  // 1. Every recipient known + send intent: sends at once, no card.
+  sentTo("c.known@known-co.com");
+  {
+    const before = sends.length;
+    const drafts = draftsCreated.length;
+    const result = await sendEmailFromTool({ to: ["c.known@known-co.com"], instruction: "say hello" }, own("email c.known@known-co.com saying hello"));
+    assert(sends.length === before + 1 && result.startsWith("Sent to"), `a known address sends directly: ${result}`);
+    assert(draftsCreated.length === drafts, "and no draft card");
+  }
+
+  // 2. A new To: a draft and its card, nothing sent until the tap; the tap sends once.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.new@new-co.com"], instruction: "say hello" }, own("email c.new@new-co.com saying hello"));
+    assert(sends.length === before, `nothing sent to a new address: ${result}`);
+    assert(result.startsWith("New address: c.new@new-co.com. Tap Send to confirm."), `he's told why: ${result}`);
+    const draftId = draftsCreated[draftsCreated.length - 1]!;
+    assert(getPendingActionForDraft(draftId)?.status === "pending", "its card waits");
+    const draftSends = draftsSent.length;
+    await tapSend(draftId);
+    assert(draftsSent.length === draftSends + 1 && draftsSent.at(-1) === draftId, "the tap sends it");
+    await tapSend(draftId);
+    assert(draftsSent.length === draftSends + 1, "exactly once");
+  }
+
+  // 3. A known To with a new Cc: the card.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool(
+      { to: ["c.known@known-co.com"], cc: ["c.newcc@new-co.com"], instruction: "say hello" },
+      own("email c.known@known-co.com and cc c.newcc@new-co.com saying hello"),
+    );
+    assert(sends.length === before && result.startsWith("New address: c.newcc@new-co.com."), `a new Cc brings the card: ${result}`);
+  }
+
+  // 4. A near-miss of a known address is new.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.known@known-co.co"], instruction: "say hello" }, own("email c.known@known-co.co saying hello"));
+    assert(sends.length === before && result.startsWith("New address: c.known@known-co.co."), `near-miss: ${result}`);
+  }
+
+  // 5. The known-check fails: treated as new, never sent.
+  {
+    const users = gmail.users as unknown as { messages: { list: (input: { q: string; maxResults: number }) => Promise<unknown> } };
+    const realList = users.messages.list;
+    users.messages.list = async (input) => {
+      if (input.q.startsWith("in:sent (to:")) {
+        throw new Error("gmail down");
+      }
+      return realList(input);
+    };
+    const before = sends.length;
+    sentTo("c.flaky@known-co.com");
+    const result = await sendEmailFromTool({ to: ["c.flaky@known-co.com"], instruction: "say hello" }, own("email c.flaky@known-co.com saying hello"));
+    users.messages.list = realList;
+    assert(sends.length === before && result.startsWith("New address: c.flaky@known-co.com."), `a failed check is a card: ${result}`);
+  }
+
+  // 6. Sent before from his personal account only: known.
+  {
+    const personal = {
+      users: {
+        ...(gmail.users as object),
+        messages: {
+          ...(gmail.users.messages as object),
+          list: async ({ q }: { q: string }) => ({
+            data: { messages: q.includes("c.personal@friend-co.com") ? [{ id: "p-1", threadId: "p-t" }] : [] },
+          }),
+          get: async ({ id }: { id: string }) =>
+            id === "p-1"
+              ? { data: { id, threadId: "p-t", labelIds: ["SENT"], payload: { headers: [{ name: "To", value: "Pal <c.personal@friend-co.com>" }] } } }
+              : (gmail.users.messages as unknown as { get: (input: { id: string }) => Promise<unknown> }).get({ id }),
+        },
+      },
+    } as unknown as gmail_v1.Gmail;
+    setGmailClientForTests((account) => (account.id === "personal" ? personal : gmail));
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.personal@friend-co.com"], instruction: "say hello" }, own("email c.personal@friend-co.com saying hello"));
+    setGmailClientForTests(() => gmail);
+    assert(sends.length === before + 1 && result.startsWith("Sent to"), `known from either account: ${result}`);
+  }
+
+  // 7. A delegated goal (not his own turn): a card, even for a known address.
+  {
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.known@known-co.com"], instruction: "say thanks" }, delegatedTurn("email c.known@known-co.com saying thanks"));
+    assert(sends.length === before && result.includes("Tap Send to confirm."), `delegated: a card: ${result}`);
+  }
+
+  // 8. Tapping one of the offered address buttons confirms it, even if it's new.
+  {
+    mail({ threadId: "zara-1", from: "Zara Kapoor <zara@zone-a.com>", to: ME, subject: "Hi", body: "Hello" });
+    mail({ threadId: "zara-2", from: "Zara Khan <zara@zone-b.com>", to: ME, subject: "Hi", body: "Hello" });
+    const before = sends.length;
+    const asked = await sendEmailFromTool({ to: ["Zara"], instruction: "say hello" }, own("email Zara saying hello"));
+    assert(sends.length === before && asked.includes("matches 2 people"), `asks which Zara: ${asked}`);
+    const card = told[told.length - 1]!;
+    const pick = buttons(card).find((button) => button.text.includes("zone-a.com"))!;
+    const picked = tap(pick.callback_data);
+    await picked.run();
+    assert(sends.length === before + 1 && sends.at(-1)!.to.includes("zara@zone-a.com"), "the tapped address is confirmed and sent");
+  }
+
+  // 9. A scheduled send to a new address is held until Confirm, then scheduled once.
+  {
+    const sizeBefore = listOpenScheduledSends().length;
+    const result = await sendEmailFromTool(
+      { to: ["c.sched@new-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" },
+      own("email c.sched@new-co.com on Monday saying hello"),
+    );
+    assert(result.startsWith("New address: c.sched@new-co.com. Tap Confirm to schedule for "), `held for a Confirm: ${result}`);
+    const held = listOpenScheduledSends().find((row) => row.request.includes("c.sched@new-co.com"))!;
+    assert(held?.status === "held", `held, not scheduled: ${held?.status}`);
+    const confirmButton = buttons(told[told.length - 1]!).find((button) => button.text === "Confirm")!;
+    await handleScheduledSendCallback(cardCtx(confirmButton.callback_data));
+    assert(getScheduledSend(held.id)!.status === "scheduled", "the tap schedules it");
+    await handleScheduledSendCallback(cardCtx(confirmButton.callback_data));
+    assert(getScheduledSend(held.id)!.status === "scheduled" && listOpenScheduledSends().length === sizeBefore + 1, "exactly once");
+    sentTo("c.schedknown@known-co.com");
+    const knownSched = await sendEmailFromTool(
+      { to: ["c.schedknown@known-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" },
+      own("email c.schedknown@known-co.com on Monday saying hello"),
+    );
+    assert(knownSched.startsWith("Scheduled:"), `a known address schedules as before: ${knownSched}`);
+  }
+
+  // 10. Send then follow-ups to a new address: the card first; after the tap, a Start card.
+  {
+    const before = sends.length;
+    const words = "email c.fu@new-co.com saying hello and start 3 follow-ups";
+    const fuTurn = own(words);
+    const result = await sendEmailFromTool({ to: ["c.fu@new-co.com"], instruction: "say hello" }, fuTurn);
+    assert(sends.length === before && result.startsWith("New address: c.fu@new-co.com. Tap Send to confirm."), result);
+    const early = await startSequenceFromTool("c.fu@new-co.com", { ...fuTurn, modelCalled: true });
+    assert(early === "Not started yet: follow-ups start only once the email has gone out.", `nothing yet: ${early}`);
+    const draftId = draftsCreated[draftsCreated.length - 1]!;
+    await tapSend(draftId);
+    assert(draftsSent.at(-1) === draftId, "the tap sends it");
+    const thread = threadOf(`sent-${draftId}`);
+    const row = getSalesSequenceByThread(thread);
+    assert(row?.status === "proposed", `after the tap: a Start card, never direct enrolment (${row?.status})`);
+  }
+
+  // 11. The referenced-email (OCR) path with a new address: a card.
+  {
+    const ocrTurn = { ...own("send an email to this address saying hello"), directSend: true };
+    bindEmailReferenceForTurn(ocrTurn.confirmation.chatId, ocrTurn.confirmation.messageId, "c.ocr@new-co.com");
+    const before = sends.length;
+    const result = await sendEmailFromTool({ to: ["c.ocr@new-co.com"], instruction: "say hello" }, ocrTurn);
+    assert(sends.length === before && result.startsWith("New address: c.ocr@new-co.com."), `OCR address: a card: ${result}`);
+  }
+
+  // 12. The command-guarantee path: the model retries with a new address: a card.
+  {
+    let step = 0;
+    chatScript = (params) => {
+      step += 1;
+      const asked = params.messages.some((message) => message.role === "user" && String(message.content).includes("looks like a command"));
+      if (asked && step < 4) {
+        return modelReply({ tools: [{ name: "send_email", input: { to: ["c.fallback@new-co.com"], instruction: "say hello" } }] });
+      }
+      return modelReply({ text: "Done." });
+    };
+    const before = sends.length;
+    const drafts = draftsCreated.length;
+    const id = nextTurn() + 7000;
+    await bot.handleUpdate({
+      update_id: id,
+      message: {
+        message_id: id,
+        date: Math.floor(Date.now() / 1000),
+        chat: { id: config.ownerTelegramId, type: "private", first_name: "Vishnu" },
+        from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+        text: "email c.fallback@new-co.com saying hello",
+      },
+    } as never);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    chatScript = undefined;
+    assert(sends.length === before, "the retried send to a new address sent nothing");
+    assert(draftsCreated.length >= drafts, "at most a card");
+  }
+
+  // 14. The card's own Send covers the people the card showed: an address added to the
+  //     Gmail draft outside Aadi is not sent by the tap, unless he has emailed it before.
+  {
+    sentTo("c.cardknown@known-co.com");
+    await queueDraftApproval({
+      draftId: "c-sneak",
+      threadId: null,
+      to: "c.cardknown@known-co.com",
+      subject: "Hi",
+      body: "Hi",
+      googleAccount: "work",
+    });
+    draftHeaders.set("c-sneak", [
+      { name: "To", value: "c.cardknown@known-co.com" },
+      { name: "Cc", value: "c.sneak@new-co.com" },
+    ]);
+    const action = getPendingActionForDraft("c-sneak")!;
+    const alerts: string[] = [];
+    const alerting = {
+      ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+      answerCallbackQuery: async (input?: string | { text?: string }) => {
+        alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+        return true;
+      },
+    } as unknown as Context;
+    const draftSends = draftsSent.length;
+    await handleApprovalCallback(alerting, "send", action.id);
+    assert(draftsSent.length === draftSends, "an address the card never showed is not sent by the tap");
+    assert(
+      alerts.some((text) => text.includes("c.sneak@new-co.com is on the draft now but wasn't on this card")),
+      `he is told who: ${alerts.join(" | ")}`,
+    );
+    assert(getPendingActionForDraft("c-sneak")?.status === "pending", "the card still waits");
+    draftHeaders.set("c-sneak", [
+      { name: "To", value: "c.cardknown@known-co.com" },
+      { name: "Cc", value: "c.known@known-co.com" },
+    ]);
+    await handleApprovalCallback(cardCtx(`approval:send:${action.id}`), "send", action.id);
+    assert(draftsSent.length === draftSends + 1 && draftsSent.at(-1) === "c-sneak", "someone he has emailed before goes with the tap");
+  }
+
+  // 15. One command = at most one email, whichever path it takes (Codex P2: the
+  //     command key survives the Send-card path).
+  {
+    const wait = () => new Promise((resolve) => setTimeout(resolve, 30));
+    const commandKeyOn = (draftId: string): string | undefined => {
+      try {
+        const row = db
+          .prepare("SELECT command_key FROM pending_actions WHERE draft_id = ? ORDER BY id DESC LIMIT 1")
+          .get(draftId) as { command_key?: string | null } | undefined;
+        return row?.command_key ?? undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const cardPosts = (actionId: number): number =>
+      told.filter((entry) => entry.markup !== undefined && buttons(entry).some((button) => button.callback_data === `approval:send:${actionId}`)).length;
+    const counts = () => ({ sends: sends.length, draftSends: draftsSent.length, drafts: draftsCreated.length });
+    const same = (left: ReturnType<typeof counts>, right: ReturnType<typeof counts>) =>
+      left.sends === right.sends && left.draftSends === right.draftSends && left.drafts === right.drafts;
+
+    // a) A retry before the tap: the same card again, never a second draft or a send.
+    const turnA = own("email c.idem@new-co.com saying hello");
+    const keyA = `msg:1:${turnA.confirmation.messageId}:c.idem@new-co.com`;
+    const firstA = await sendEmailFromTool({ to: ["c.idem@new-co.com"], instruction: "say hello" }, turnA);
+    assert(firstA.startsWith("New address: c.idem@new-co.com. Tap Send to confirm."), `a card: ${firstA}`);
+    const draftA = draftsCreated.at(-1)!;
+    const actionA = getPendingActionForDraft(draftA)!.id;
+    assert(getCommandSendByKey(keyA)?.status === "sending", `the card claims the command's key: ${getCommandSendByKey(keyA)?.status}`);
+    assert(commandKeyOn(draftA) === keyA, `and the card carries it: ${commandKeyOn(draftA)}`);
+    const beforeRetryA = counts();
+    const postsA = cardPosts(actionA);
+    const retryA = await sendEmailFromTool({ to: ["c.idem@new-co.com"], instruction: "say hello" }, turnA);
+    assert(same(counts(), beforeRetryA), "a retry before the tap makes no second draft and sends nothing");
+    assert(cardPosts(actionA) === postsA + 1, "it posts the same card again");
+    assert(retryA.includes("Tap Send to confirm."), `he's told it is still waiting: ${retryA}`);
+
+    // b) The tap delivers it and records the command as sent.
+    await tapSend(draftA);
+    assert(draftsSent.at(-1) === draftA && draftsSent.length === beforeRetryA.draftSends + 1, "the tap sends it once");
+    assert(getCommandSendByKey(keyA)?.status === "sent", `the command is recorded as sent: ${getCommandSendByKey(keyA)?.status}`);
+
+    // c) A retry after the tap: nothing more, and the same answer as a direct send's repeat.
+    const afterTap = counts();
+    const retryAfter = await sendEmailFromTool({ to: ["c.idem@new-co.com"], instruction: "say hello" }, turnA);
+    assert(same(counts(), afterTap), "a retry after the tap sends nothing");
+    assert(retryAfter === "Not sent again: this command was already handled.", `like a direct repeat: ${retryAfter}`);
+
+    // d) His own "send it" delivers it and records the command too.
+    const turnB = own("email c.idem2@new-co.com saying hello");
+    const keyB = `msg:1:${turnB.confirmation.messageId}:c.idem2@new-co.com`;
+    await sendEmailFromTool({ to: ["c.idem2@new-co.com"], instruction: "say hello" }, turnB);
+    const draftB = draftsCreated.at(-1)!;
+    const confirmId = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+    claimTelegramMessage(1, confirmId);
+    const delivered = await sendPendingDraftByText({ chatId: 1, messageId: confirmId }, draftB, { ownTurn: true });
+    assert(delivered.ok && draftsSent.at(-1) === draftB, `"send it" sends the card's draft: ${delivered.message}`);
+    assert(getCommandSendByKey(keyB)?.status === "sent", `"send it" records the command as sent: ${getCommandSendByKey(keyB)?.status}`);
+    const afterSendIt = counts();
+    const replayB = await sendEmailFromTool({ to: ["c.idem2@new-co.com"], instruction: "say hello" }, turnB);
+    assert(same(counts(), afterSendIt) && replayB === "Not sent again: this command was already handled.", `no second send: ${replayB}`);
+
+    // e) Discarded: a retry tells him and asks before making a new draft.
+    const turnC = own("email c.idem3@new-co.com saying hello");
+    await sendEmailFromTool({ to: ["c.idem3@new-co.com"], instruction: "say hello" }, turnC);
+    const draftC = draftsCreated.at(-1)!;
+    const actionC = getPendingActionForDraft(draftC)!.id;
+    await handleApprovalCallback(cardCtx(`approval:discard:${actionC}`), "discard", actionC);
+    assert(getPendingActionForDraft(draftC) === undefined, "the card is discarded");
+    const afterDiscard = counts();
+    const retryC = await sendEmailFromTool({ to: ["c.idem3@new-co.com"], instruction: "say hello" }, turnC);
+    assert(same(counts(), afterDiscard), "a retry after Discard makes no draft and sends nothing");
+    assert(/discarded/i.test(retryC) && /new one\?/i.test(retryC), `he's told it was discarded and asked: ${retryC}`);
+
+    // f) Through the bot: Telegram redelivers within five minutes (ignored), then the
+    //    same message is replayed after the window: the same card, never a second draft.
+    let step = 0;
+    chatScript = () =>
+      ++step === 1
+        ? modelReply({ tools: [{ name: "send_email", input: { to: ["c.replay@new-co.com"], instruction: "say hello" } }] })
+        : modelReply({ text: "Done." });
+    const replayId = nextTurn() + 20_000;
+    const update = (updateId: number) =>
+      ({
+        update_id: updateId,
+        message: {
+          message_id: replayId,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: config.ownerTelegramId, type: "private", first_name: "Vishnu" },
+          from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+          text: "email c.replay@new-co.com saying hello",
+        },
+      }) as never;
+    const ageReplay = () =>
+      db
+        .prepare("UPDATE processed_messages SET processed_at = datetime('now', '-10 minutes') WHERE chat_id = ? AND message_id = ?")
+        .run(config.ownerTelegramId, replayId);
+    const beforeBot = counts();
+    await bot.handleUpdate(update(replayId));
+    await wait();
+    assert(draftsCreated.length === beforeBot.drafts + 1 && sends.length === beforeBot.sends, "the message makes one card");
+    const draftR = draftsCreated.at(-1)!;
+    const keyR = `msg:${config.ownerTelegramId}:${replayId}:c.replay@new-co.com`;
+    const afterFirst = counts();
+    step = 0;
+    await bot.handleUpdate(update(replayId + 1));
+    await wait();
+    assert(same(counts(), afterFirst), "a redelivery inside five minutes does nothing");
+    ageReplay();
+    step = 0;
+    await bot.handleUpdate(update(replayId + 2));
+    await wait();
+    assert(same(counts(), afterFirst), "a replay after the window makes no second draft and sends nothing");
+    assert(getCommandSendByKey(keyR)?.status === "sending", `the replay finds the claimed key: ${getCommandSendByKey(keyR)?.status}`);
+
+    // g) The Retry button: it replays the words without his message, so it can't send
+    //    or make a draft at all.
+    const turnId = beginChatTurn();
+    setChatTurnRetryText(turnId, "email c.replay@new-co.com saying hello");
+    step = 0;
+    await bot.handleUpdate({
+      update_id: replayId + 3,
+      callback_query: {
+        id: "cb-retry",
+        from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+        chat_instance: "ci",
+        data: `retry:${turnId}`,
+        message: {
+          message_id: 77,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: config.ownerTelegramId, type: "private", first_name: "Vishnu" },
+          from: { id: 999, is_bot: true, first_name: "Aadi" },
+          text: "That didn't work.",
+        },
+      },
+    } as never);
+    await wait();
+    assert(same(counts(), afterFirst), "the Retry button makes no second draft and sends nothing");
+
+    // ...then the tap sends it once, and a later replay sends nothing more.
+    await tapSend(draftR);
+    assert(getCommandSendByKey(keyR)?.status === "sent", "the tap records the command");
+    const afterReplayTap = counts();
+    ageReplay();
+    step = 0;
+    await bot.handleUpdate(update(replayId + 4));
+    await wait();
+    assert(same(counts(), afterReplayTap), "a replay after the tap sends nothing");
+    chatScript = undefined;
+
+    // h) A held schedule to a new address, retried: one held schedule, its Confirm again.
+    const turnH = own("email c.heldidem@new-co.com on Monday saying hello");
+    const heldArgs = { to: ["c.heldidem@new-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" };
+    const heldFirst = await sendEmailFromTool(heldArgs, turnH);
+    assert(heldFirst.startsWith("New address: c.heldidem@new-co.com. Tap Confirm to schedule for "), heldFirst);
+    const rows = listOpenScheduledSends().length;
+    const heldRow = listOpenScheduledSends().find((row) => row.request.includes("c.heldidem@new-co.com"))!;
+    const toldBeforeHeld = told.length;
+    const heldRetry = await sendEmailFromTool(heldArgs, turnH);
+    assert(listOpenScheduledSends().length === rows, "one held schedule per command");
+    assert(heldRetry.includes("Tap Confirm to schedule for "), `he's told it still waits: ${heldRetry}`);
+    const reposted = told.slice(toldBeforeHeld).filter((entry) => entry.markup !== undefined).flatMap((entry) => buttons(entry));
+    const confirmAgain = reposted.find((button) => button.text === "Confirm");
+    assert(confirmAgain?.callback_data.startsWith(`cmdsend:confirmsched:${heldRow.id}:`), "its Confirm card is posted again");
+    await handleScheduledSendCallback(cardCtx(confirmAgain!.callback_data));
+    assert(getScheduledSend(heldRow.id)!.status === "scheduled", "and that Confirm schedules it");
+    const heldAfter = await sendEmailFromTool(heldArgs, turnH);
+    assert(listOpenScheduledSends().length === rows && heldAfter === "Not scheduled again: this command was already handled.", heldAfter);
+
+    // i) Unchanged: a direct send to someone he knows, repeated, sends once.
+    sentTo("c.idemknown@known-co.com");
+    const turnK = own("email c.idemknown@known-co.com saying hello");
+    const beforeKnown = sends.length;
+    const knownFirst = await sendEmailFromTool({ to: ["c.idemknown@known-co.com"], instruction: "say hello" }, turnK);
+    assert(knownFirst.startsWith("Sent to") && sends.length === beforeKnown + 1, knownFirst);
+    const knownAgain = await sendEmailFromTool({ to: ["c.idemknown@known-co.com"], instruction: "say hello" }, turnK);
+    assert(sends.length === beforeKnown + 1 && knownAgain === "Not sent again: this command was already handled.", knownAgain);
+  }
+
+  // 16. A draft changed directly in Gmail: the replacement card re-reads its people
+  //     (Codex P2). Refreshed addresses count as shown only once that card is posted.
+  {
+    const posts = () => told.filter((entry) => entry.markup !== undefined).length;
+    const lastCardText = () => [...told].reverse().find((entry) => entry.markup !== undefined)?.text ?? "";
+    const alertingTap = async (draftId: string): Promise<string[]> => {
+      const action = getPendingActionForDraft(draftId)!;
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        action.id,
+      );
+      return alerts;
+    };
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    const sentCopy = (draftId: string) => world.find((item) => item.id === `sent-${draftId}`);
+    sentTo("c.k16@known-co.com");
+    sentTo("c.k16b@known-co.com");
+
+    // a) A new Cc added in Gmail: Send and "send it" are refused before a new card.
+    await queueDraftApproval({ draftId: "c-refresh", threadId: null, to: "c.k16@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    draftHeaders.set("c-refresh", [
+      { name: "To", value: "c.k16@known-co.com" },
+      { name: "Cc", value: "c.newcc16@new-co.com" },
+    ]);
+    const sentBefore = draftsSent.length;
+    const refused = await alertingTap("c-refresh");
+    assert(draftsSent.length === sentBefore, "the tap is refused");
+    assert(refused.some((text) => text.includes("c.newcc16@new-co.com is on the draft now")), `he's told who: ${refused.join(" | ")}`);
+    const early = await sendPendingDraftByText(ownMessage(), "c-refresh", { ownTurn: true });
+    assert(!early.ok && draftsSent.length === sentBefore, `"send it" before the new card can't send to it: ${early.message}`);
+
+    // b) The replacement card re-reads To and Cc, known-checks them, and names the new one.
+    const asking = ownMessage();
+    const postsBefore = posts();
+    const resent = await resendDraftCard(asking, "c-refresh");
+    assert(resent.ok && posts() === postsBefore + 1, `a replacement card is posted: ${resent.message}`);
+    assert(lastCardText().includes("c.newcc16@new-co.com"), `it shows the new Cc: ${lastCardText()}`);
+    assert(lastCardText().includes("New address: c.newcc16@new-co.com. Tap Send to confirm."), `and says it's new: ${lastCardText()}`);
+    assert((getPendingActionForDraft("c-refresh")?.cc_header ?? "").includes("c.newcc16@new-co.com"), "the card's recipients are updated");
+    // His "send it" in the same message that asked for the card came before it: no send.
+    const sameMessage = await sendPendingDraftByText(asking, "c-refresh", { ownTurn: true });
+    assert(!sameMessage.ok && draftsSent.length === sentBefore, `a "send it" from before the card still can't: ${sameMessage.message}`);
+
+    // c) Tapping Send on the replacement sends once, to the refreshed people.
+    const refreshCard = getPendingActionForDraft("c-refresh")!.id;
+    await alertingTap("c-refresh");
+    assert(draftsSent.length === sentBefore + 1 && draftsSent.at(-1) === "c-refresh", "the tap on the new card sends it");
+    assert((sentCopy("c-refresh")?.cc ?? "").includes("c.newcc16@new-co.com"), `to the refreshed people: ${sentCopy("c-refresh")?.cc}`);
+    await handleApprovalCallback(cardCtx(`approval:send:${refreshCard}`), "send", refreshCard);
+    assert(draftsSent.length === sentBefore + 1, "once");
+
+    // d) Someone removed in Gmail is gone from the new card and from the send.
+    await queueDraftApproval({ draftId: "c-removed", threadId: null, to: "c.k16@known-co.com", cc: "c.k16b@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    draftHeaders.set("c-removed", [{ name: "To", value: "c.k16@known-co.com" }]);
+    const resentRemoved = await resendDraftCard(ownMessage(), "c-removed");
+    assert(resentRemoved.ok && !lastCardText().includes("c.k16b@known-co.com"), `the removed Cc is gone from the card: ${lastCardText()}`);
+    assert(!(getPendingActionForDraft("c-removed")?.cc_header ?? "").includes("c.k16b@known-co.com"), "and from its recipients");
+    const removedSends = draftsSent.length;
+    await alertingTap("c-removed");
+    assert(draftsSent.length === removedSends + 1, "the tap sends it");
+    assert(!(sentCopy("c-removed")?.cc ?? "").includes("c.k16b@known-co.com"), `and not to the removed Cc: ${sentCopy("c-removed")?.cc}`);
+
+    // e) Gmail can't be read: no card with stale people, and no send.
+    await queueDraftApproval({ draftId: "c-unreadable", threadId: null, to: "c.k16@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    unreadableDrafts.add("c-unreadable");
+    const failedPosts = posts();
+    const unreadable = await resendDraftCard(ownMessage(), "c-unreadable");
+    assert(!unreadable.ok && unreadable.message === "I couldn't re-read the draft from Gmail, so I didn't send it. Try again.", unreadable.message);
+    assert(posts() === failedPosts, "no card is posted");
+    const unreadSends = draftsSent.length;
+    const unreadTap = await alertingTap("c-unreadable");
+    assert(draftsSent.length === unreadSends, "the tap sends nothing");
+    assert(unreadTap.includes("I couldn't re-read the draft from Gmail, so I didn't send it. Try again."), `the tap says why: ${unreadTap.join(" | ")}`);
+    unreadableDrafts.delete("c-unreadable");
+  }
+
+  // 17. Recipients count as shown only once Telegram confirms the card that shows them
+  //     (Codex P1), and a tap confirms only what that card message rendered.
+  {
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    const tapMessage = async (actionId: number, messageId: number): Promise<string[]> => {
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${actionId}`) as unknown as Record<string, unknown>),
+          callbackQuery: { data: `approval:send:${actionId}`, message: { chat: { id: config.ownerTelegramId }, message_id: messageId } },
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        actionId,
+      );
+      return alerts;
+    };
+    const gmailCc = (draftId: string) => draftHeaders.get(draftId)?.find((header) => header.name === "Cc")?.value ?? "";
+    sentTo("c.k17@known-co.com");
+    await queueDraftApproval({ draftId: "c-edit17", threadId: null, to: "c.k17@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    draftHeaders.set("c-edit17", [
+      { name: "To", value: "c.k17@known-co.com" },
+      { name: "Subject", value: "Hi" },
+    ]);
+    const card = getPendingActionForDraft("c-edit17")!;
+    const oldCard = card.telegram_message_id!;
+    const sent0 = draftsSent.length;
+
+    // a) update_draft adds a new Cc, and Telegram can neither edit nor post the card.
+    telegramFails.edit = true;
+    telegramFails.send = true;
+    try {
+      await updateDraft({ draft_id: "c-edit17", cc: ["c.new17@new-co.com"] }, own("cc c.new17@new-co.com"));
+    } catch {
+      // The tool may report the failed card; what matters is what counts as shown.
+    }
+    telegramFails.edit = false;
+    telegramFails.send = false;
+    assert(gmailCc("c-edit17").includes("c.new17@new-co.com"), `Gmail has the new Cc: ${gmailCc("c-edit17")}`);
+    assert(!(getPendingActionForDraft("c-edit17")?.cc_header ?? "").includes("c.new17@new-co.com"), "the card's recipients don't take an unshown Cc");
+    const sendIt = await sendPendingDraftByText(ownMessage(), "c-edit17", { ownTurn: true });
+    assert(!sendIt.ok && draftsSent.length === sent0, `"send it" refuses the unshown Cc: ${sendIt.message}`);
+    assert(sendIt.message.startsWith("New address: c.new17@new-co.com."), `as a new address: ${sendIt.message}`);
+    const oldTap = await tapMessage(card.id, oldCard);
+    assert(draftsSent.length === sent0, "a tap on the old card sends nothing");
+    assert(oldTap.some((text) => text.includes("c.new17@new-co.com is on the draft now")), `and says why: ${oldTap.join(" | ")}`);
+
+    // b) The edit fails but a new card is posted: only that new card confirms the Cc.
+    telegramFails.edit = true;
+    await updateDraft({ draft_id: "c-edit17", cc: ["c.new17@new-co.com"] }, own("cc c.new17@new-co.com"));
+    telegramFails.edit = false;
+    const newCard = getPendingActionForDraft("c-edit17")!.telegram_message_id!;
+    assert(newCard !== oldCard, "a new card was posted");
+    const oldAfter = await tapMessage(card.id, oldCard);
+    assert(draftsSent.length === sent0, "the old card still can't confirm the new Cc");
+    assert(oldAfter.some((text) => text.includes("c.new17@new-co.com is on the draft now")), `and says why: ${oldAfter.join(" | ")}`);
+    await tapMessage(card.id, newCard);
+    assert(draftsSent.length === sent0 + 1 && draftsSent.at(-1) === "c-edit17", "the tap on the new card sends it");
+    await tapMessage(card.id, newCard);
+    assert(draftsSent.length === sent0 + 1, "once");
+  }
+
+  // 18. One content gate for both routes (Codex P2): the written email is checked before
+  //     direct vs card, and a command's card is checked again at delivery on the draft
+  //     as Gmail has it now.
+  {
+    const tapAlerts = async (draftId: string): Promise<string[]> => {
+      const action = getPendingActionForDraft(draftId)!;
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        action.id,
+      );
+      return alerts;
+    };
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    const setHeader = (draftId: string, name: string, value: string) => {
+      const headers = (draftHeaders.get(draftId) ?? []).filter((header) => header.name !== name);
+      draftHeaders.set(draftId, value ? [...headers, { name, value }] : headers);
+    };
+    const cardFor = async (address: string, extra: Record<string, unknown> = {}): Promise<string> => {
+      written = { subject: "Hello", body: "Hi,\n\nA short note." };
+      const result = await sendEmailFromTool({ to: [address], instruction: "say hello", ...extra }, own(`email ${address} saying hello`));
+      assert(result.startsWith(`New address: ${address}.`), `a card for ${address}: ${result}`);
+      return draftsCreated.at(-1)!;
+    };
+    const ATTACHMENT_REFUSAL = "Not sent: the email it wrote mentions an attachment and I can't attach anything, so nothing went out.";
+
+    // a) A new recipient and a written "please find attached" with no file: no card,
+    //    refused exactly as the direct route refuses it.
+    sentTo("c.k18@known-co.com");
+    written = { subject: "Deck", body: "Hi,\n\nPlease find attached the deck." };
+    const directBefore = sends.length;
+    const direct = await sendEmailFromTool({ to: ["c.k18@known-co.com"], instruction: "send the deck" }, own("email c.k18@known-co.com the deck"));
+    assert(direct.startsWith(ATTACHMENT_REFUSAL) && sends.length === directBefore, `the direct route refuses it: ${direct}`);
+    const draftsBeforeA = draftsCreated.length;
+    const turnA = own("email c.att18@new-co.com the deck");
+    const carded = await sendEmailFromTool({ to: ["c.att18@new-co.com"], instruction: "send the deck" }, turnA);
+    assert(carded === direct, `the card route refuses it the same way: ${carded}`);
+    assert(draftsCreated.length === draftsBeforeA, "and makes no draft or card");
+    assert(getCommandSendByKey(`msg:1:${turnA.confirmation.messageId}:c.att18@new-co.com`) === undefined, "nor claims the command");
+
+    // b) The card's text, edited in Gmail to mention a file that is really attached: the tap sends.
+    const withFile = await cardFor("c.att18b@new-co.com");
+    draftBodyById.set(withFile, "Hi,\n\nPlease find attached the deck.");
+    draftAttachments.add(withFile);
+    const sentB = draftsSent.length;
+    await tapAlerts(withFile);
+    assert(draftsSent.length === sentB + 1 && draftsSent.at(-1) === withFile, "an attachment mention with the file attached sends");
+
+    // c) Edited in Gmail to mention an attachment that isn't there: the tap and "send it" refuse.
+    const noFile = await cardFor("c.att18c@new-co.com");
+    draftBodyById.set(noFile, "Hi,\n\nPlease find attached the deck.");
+    const sentC = draftsSent.length;
+    const refusedC = await tapAlerts(noFile);
+    assert(draftsSent.length === sentC, "the tap sends nothing");
+    assert(refusedC.some((text) => text.includes("mentions an attachment, but the draft has none")), `and says why: ${refusedC.join(" | ")}`);
+    const textC = await sendPendingDraftByText(ownMessage(), noFile, { ownTurn: true });
+    assert(!textC.ok && draftsSent.length === sentC && textC.message.includes("mentions an attachment, but the draft has none"), `"send it" too: ${textC.message}`);
+
+    // d) The other checks, at creation.
+    written = { subject: "", body: "Hi,\n\nA short note." };
+    const draftsBeforeD = draftsCreated.length;
+    const noSubject = await sendEmailFromTool({ to: ["c.subj18@new-co.com"], instruction: "say hello" }, own("email c.subj18@new-co.com saying hello"));
+    assert(noSubject.startsWith("Not sent: a delivery check refused it (no_subject), so nothing went out."), `no subject: ${noSubject}`);
+    written = { subject: "Hello", body: "" };
+    const noBody = await sendEmailFromTool({ to: ["c.body18@new-co.com"], instruction: "say hello" }, own("email c.body18@new-co.com saying hello"));
+    assert(noBody.startsWith("Not sent"), `no body (the writer refuses it before the gate): ${noBody}`);
+    written = { subject: "Hello", body: "Hi,\n\nA short note." };
+    mail({ threadId: "c-nohdr", from: "Thea <c.thr18@new-co.com>", to: ME, subject: "Question", body: "Hi?", messageId: "" });
+    const noHeaders = await sendEmailFromTool(
+      { to: ["c.thr18@new-co.com"], instruction: "say hello", thread_id: "c-nohdr" },
+      own("reply to c.thr18@new-co.com saying hello"),
+    );
+    assert(noHeaders.startsWith("Not sent: a delivery check refused it (no_thread_headers), so nothing went out."), `no thread headers: ${noHeaders}`);
+    assert(draftsCreated.length === draftsBeforeD, "none of them made a draft or card");
+    const badRecipient = evaluateCommandSendGate({
+      enabled: true,
+      to: "c.rc18@new-co.com",
+      cc: "",
+      resolved: new Set(["someone.else@new-co.com"]),
+      subject: "Hello",
+      body: "Hi",
+      threadId: null,
+      inReplyTo: "",
+    });
+    assert(!badRecipient.ok && badRecipient.reason === "recipient_not_resolved", "a recipient code didn't resolve is refused by the same gate");
+
+    // e) The other checks, at delivery, on the draft as Gmail has it now.
+    const deliveryRefuses = async (address: string, change: (draftId: string) => void, words: string, extra: Record<string, unknown> = {}) => {
+      const draftId = await cardFor(address, extra);
+      change(draftId);
+      const before = draftsSent.length;
+      const alerts = await tapAlerts(draftId);
+      assert(draftsSent.length === before, `${words}: the tap sends nothing`);
+      assert(alerts.some((text) => text.includes(words)), `${words}: ${alerts.join(" | ")}`);
+      const viaText = await sendPendingDraftByText(ownMessage(), draftId, { ownTurn: true });
+      assert(!viaText.ok && draftsSent.length === before && viaText.message.includes(words), `${words}, by "send it": ${viaText.message}`);
+    };
+    await deliveryRefuses("c.d18a@new-co.com", (id) => setHeader(id, "Subject", ""), "has no subject");
+    await deliveryRefuses("c.d18b@new-co.com", (id) => draftBodyById.set(id, ""), "body is empty");
+    await deliveryRefuses(
+      "c.d18c@new-co.com",
+      (id) => {
+        setHeader(id, "Cc", getPendingActionForDraft(id)!.to_header!);
+        setHeader(id, "To", "");
+      },
+      "has no To address",
+    );
+    await deliveryRefuses("c.d18d@new-co.com", (id) => setHeader(id, "Bcc", "c.hidden18@new-co.com"), "has a Bcc");
+    mail({ threadId: "c-hdr", from: "Ola <c.d18e@new-co.com>", to: ME, subject: "Question", body: "Hi?" });
+    await deliveryRefuses("c.d18e@new-co.com", (id) => setHeader(id, "In-Reply-To", ""), "lost its reply headers", { thread_id: "c-hdr" });
+    written = { subject: "Quick note", body: "Hi,\n\nThe note he asked for." };
+  }
+
+  // 19. "send it" on a new address's card that also asked for follow-ups: the Start card
+  //     comes after it goes out, as it does after the tap (Codex P2). One email, and the
+  //     follow-ups only ever through the pre-filled Start card.
+  {
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    written = { subject: "Hello", body: "Hi,\n\nA short note." };
+    const fuTurn = own("email c.fu19@new-co.com saying hello and start 3 follow-ups");
+    const carded = await sendEmailFromTool({ to: ["c.fu19@new-co.com"], instruction: "say hello" }, fuTurn);
+    assert(carded.startsWith("New address: c.fu19@new-co.com."), `a card first: ${carded}`);
+    const draftId = draftsCreated.at(-1)!;
+    const sentBefore = draftsSent.length;
+    const activeBefore = listActiveSalesSequences().length;
+    const viaText = await sendPendingDraftByText(ownMessage(), draftId, { ownTurn: true });
+    assert(viaText.ok && draftsSent.length === sentBefore + 1 && draftsSent.at(-1) === draftId, `"send it" sends it once: ${viaText.message}`);
+    const row = getSalesSequenceByThread(threadOf(`sent-${draftId}`));
+    assert(row?.status === "proposed" && row.total_steps === 3, `then a pre-filled Start card: ${row?.status}`);
+    assert(listActiveSalesSequences().length === activeBefore, "and nothing enrolled directly");
+    const again = await sendPendingDraftByText(ownMessage(), draftId, { ownTurn: true });
+    assert(!again.ok && draftsSent.length === sentBefore + 1, "a second \"send it\" sends nothing");
+    const replay = await sendEmailFromTool({ to: ["c.fu19@new-co.com"], instruction: "say hello" }, fuTurn);
+    assert(replay === "Not sent again: this command was already handled." && draftsSent.length === sentBefore + 1, `a replay sends nothing: ${replay}`);
+    assert(getSalesSequenceByThread(threadOf(`sent-${draftId}`))?.status === "proposed", "and no second Start card");
+  }
+
+  // 20. A command's reply card whose subject he changes leaves its thread on purpose: it
+  //     goes out as a new conversation (Codex P2). A reply that loses its headers without
+  //     that (edited in Gmail) is still refused, and an unchanged reply sends in its thread.
+  {
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    // Remembers each card, so a second tap on an already-sent card reaches the handler too.
+    const cardIds = new Map<string, number>();
+    const tapAlerts = async (draftId: string): Promise<string[]> => {
+      const action = { id: cardIds.get(draftId) ?? getPendingActionForDraft(draftId)!.id };
+      cardIds.set(draftId, action.id);
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        action.id,
+      );
+      return alerts;
+    };
+    const replyCard = async (address: string, thread: string): Promise<string> => {
+      mail({ threadId: thread, from: `Rhea <${address}>`, to: ME, subject: "Question", body: "Hi?" });
+      written = { subject: "Hello", body: "Hi,\n\nA short note." };
+      const result = await sendEmailFromTool({ to: [address], instruction: "say hello", thread_id: thread }, own(`reply to ${address} saying hello`));
+      assert(result.startsWith(`New address: ${address}.`), `a reply card: ${result}`);
+      const draftId = draftsCreated.at(-1)!;
+      assert(getPendingActionForDraft(draftId)?.thread_id === thread, "it starts as a reply in its thread");
+      return draftId;
+    };
+
+    // a) He changes the subject, then taps Send: it goes once, as a new conversation.
+    const tapped = await replyCard("c.r20a@new-co.com", "c-thr20a");
+    await updateDraft({ draft_id: tapped, subject: "A new topic" }, own("change the subject to A new topic"));
+    assert(draftUpdateThreads.get(tapped) === null, "Gmail's draft left the thread");
+    assert(getPendingActionForDraft(tapped)?.thread_id === null, "and the card is a new email now");
+    const sentA = draftsSent.length;
+    const alertsA = await tapAlerts(tapped);
+    assert(draftsSent.length === sentA + 1 && draftsSent.at(-1) === tapped, `the tap sends it: ${alertsA.join(" | ")}`);
+    await tapAlerts(tapped);
+    assert(draftsSent.length === sentA + 1, "once");
+
+    // b) The same with his "send it".
+    const texted = await replyCard("c.r20b@new-co.com", "c-thr20b");
+    await updateDraft({ draft_id: texted, subject: "Another topic" }, own("change the subject to Another topic"));
+    const sentB = draftsSent.length;
+    const viaText = await sendPendingDraftByText(ownMessage(), texted, { ownTurn: true });
+    assert(viaText.ok && draftsSent.length === sentB + 1 && draftsSent.at(-1) === texted, `"send it" sends it: ${viaText.message}`);
+    const textAgain = await sendPendingDraftByText(ownMessage(), texted, { ownTurn: true });
+    assert(!textAgain.ok && draftsSent.length === sentB + 1, "once");
+
+    // c) Reply headers lost in Gmail with no subject change: still refused.
+    const lost = await replyCard("c.r20c@new-co.com", "c-thr20c");
+    draftHeaders.set(lost, (draftHeaders.get(lost) ?? []).filter((header) => header.name !== "In-Reply-To"));
+    const sentC = draftsSent.length;
+    const alertsC = await tapAlerts(lost);
+    assert(draftsSent.length === sentC && alertsC.some((text) => text.includes("lost its reply headers")), `refused: ${alertsC.join(" | ")}`);
+    assert(getPendingActionForDraft(lost)?.thread_id === "c-thr20c", "it is still a reply in its thread");
+
+    // d) An unchanged reply sends in its thread.
+    const kept = await replyCard("c.r20d@new-co.com", "c-thr20d");
+    const sentD = draftsSent.length;
+    await tapAlerts(kept);
+    assert(draftsSent.length === sentD + 1 && draftsSent.at(-1) === kept, "an unchanged reply sends");
+    written = { subject: "Quick note", body: "Hi,\n\nThe note he asked for." };
+  }
+
+  // 21. A held schedule whose people are corrected, then the command replayed (Codex, the
+  //     stop-rule class): the replacement Confirm card shows the corrected people, and its
+  //     tap confirms exactly them.
+  {
+    const confirmOn = (entries: typeof told) =>
+      [...entries].reverse().find((entry) => entry.markup !== undefined && buttons(entry).some((button) => button.text === "Confirm"));
+    const turnS = own("email c.sch21@new-co.com on Monday saying hello");
+    const args = { to: ["c.sch21@new-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" };
+    const first = await sendEmailFromTool(args, turnS);
+    assert(first.startsWith("New address: c.sch21@new-co.com. Tap Confirm to schedule for "), `held: ${first}`);
+    const row = listOpenScheduledSends().find((item) => item.request.includes("c.sch21@new-co.com"))!;
+    const firstCard = confirmOn(told)!;
+    assert(firstCard.text.includes("c.sch21@new-co.com"), `the first card shows who: ${firstCard.text}`);
+    const originalConfirm = buttons(firstCard).find((button) => button.text === "Confirm")!.callback_data;
+
+    // He corrects who it goes to while it is held.
+    const corrected = writeScheduledCopy(row.id, { to: [{ name: "Fay Fix", email: "c.fix21@new-co.com" }] });
+    assert(corrected.ok, "the correction is saved");
+    // The original card's Confirm no longer confirms anything.
+    await handleScheduledSendCallback(cardCtx(originalConfirm));
+    assert(getScheduledSend(row.id)!.status === "held", "the original card's Confirm leaves it held");
+
+    // The original command is replayed: the replacement card shows the corrected people.
+    const toldBefore = told.length;
+    await sendEmailFromTool(args, turnS);
+    const replacement = confirmOn(told.slice(toldBefore));
+    assert(replacement !== undefined, "a replacement Confirm card is posted");
+    assert(replacement!.text.includes("c.fix21@new-co.com"), `it shows the corrected address: ${replacement!.text}`);
+    assert(replacement!.text.includes("To: Fay Fix <c.fix21@new-co.com>"), `as the To: ${replacement!.text}`);
+
+    // Its tap confirms exactly the people it shows.
+    await handleScheduledSendCallback(cardCtx(buttons(replacement!).find((button) => button.text === "Confirm")!.callback_data));
+    const after = getScheduledSend(row.id)!;
+    const stored = JSON.parse(after.request) as { to: Array<{ mailbox: { email: string } }>; cc: unknown[]; confirmedRecipients?: string[] };
+    assert(after.status === "scheduled", `the tap schedules it: ${after.status}`);
+    assert(stored.to.map((slot) => slot.mailbox.email).join(",") === "c.fix21@new-co.com" && stored.cc.length === 0, "to the corrected person only");
+    assert((stored.confirmedRecipients ?? []).join(",") === "c.fix21@new-co.com", `and confirms exactly them: ${stored.confirmedRecipients}`);
+  }
+
+  // 13. Unchanged: resolution still marks the contact confirmed (cross-turn reuse), and
+  // the greeting is grounded the same way on the card path as on a direct send.
+  {
+    const selvaraj = listCanonicalContacts().find((row) => row.display_name.toLowerCase().includes("selvaraj"));
+    assert(selvaraj?.confirmed === 1, "a resolved recipient is still remembered as confirmed");
+    written = { subject: "Hi", body: "Hi Priya,\n\nA short note." };
+    await sendEmailFromTool({ to: ["c.greet@new-co.com"], instruction: "say hello" }, own("email c.greet@new-co.com saying hello"));
+    const draftBody = draftBodies.at(-1) ?? "";
+    assert(draftBody !== "" && !/Hi Priya/.test(draftBody), `the greeting is grounded on the card path too: ${draftBody.slice(0, 40)}`);
+  }
+
+  draftUsers.drafts.create = realCreate;
+  draftUsers.drafts.send = realSend;
+  listUsers.messages.list = cList;
   setDomainLookupForTests(undefined);
 }
 

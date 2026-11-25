@@ -17,6 +17,7 @@ import {
   clearPendingAction,
   getPendingAction,
   holdEmailToolTurn,
+  linkPublishedDraft,
   matchOwnerSupplied,
   pendingResolvedEmails,
   rememberBookedMeeting,
@@ -28,6 +29,9 @@ import { rememberContactChoice, resolveContact } from "./contacts.js";
 import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
+import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
+import { cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
+import { choiceCardKey, postConfirmCard } from "./confirm_cards.js";
 import { withoutFollowupClause } from "./command_intent.js";
 import { followupsAfterSend } from "./sequences.js";
 import { mailDomainRefusal } from "./email_grounding.js";
@@ -42,18 +46,30 @@ import {
   sentMessageForDraft,
   setCommandSendTelegramMessage,
   listOpenCommandChoices,
+  setPendingActionFollowups,
+  draftRecipientsShownBefore,
+  claimCommandSend,
+  releaseCommandSend,
+  setPendingActionCommandKey,
+  pendingActionForCommandKey,
+  getPendingActionForDraft,
+  scheduledSendByKey,
+  cardRecipientsForMessage,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
 import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
-import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
+import { getGoogleAccount, type GoogleAccountId, type LoadedGoogleAccount } from "./google/auth.js";
 import {
+  createNewEmailDraft,
+  createThreadReplyDraft,
   gmailClient,
   messageHeader as draftHeader,
   plainTextBody,
   resolveGmailDraft,
   signatureHtmlFor,
+  signaturePlainText,
   stripSignature,
 } from "./google/mail.js";
 import { isSelfEmail } from "./mom_logic.js";
@@ -62,12 +78,13 @@ import {
   CommandSendRefusedError,
   CommandSendRejectedError,
   CommandSendUnconfirmedError,
+  evaluateCommandSendGate,
   sendCommandEmail,
 } from "./security/command_send.js";
 import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
-import { sendPendingDraftByText } from "./approvals.js";
+import { DRAFT_REREAD_FAILED, queueDraftApproval, repostPendingCard, sendPendingDraftByText } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -84,6 +101,8 @@ export interface Outcome {
   shown?: boolean;
   result?: "sent" | "not_sent" | "unknown" | "write_failed" | "cancelled";
   messageId?: string;
+  /** The same command again: its follow-ups were handled the first time. */
+  repeat?: boolean;
 }
 
 function asToolResult(outcome: Outcome): string {
@@ -119,6 +138,13 @@ export interface CommandRequest {
   finalSubject?: string;
   /** The thread's subject when a reply was scheduled. */
   threadSubject?: string;
+  /** It came straight from his own chat turn (dispatch's mark), not a delegated goal. */
+  ownTurn?: boolean;
+  /** Addresses he confirmed by a tap (an offered address button, or Confirm on a held
+   *  schedule), or that were known when he scheduled it. */
+  confirmedRecipients?: string[];
+  /** His whole message, when it also asked for follow-ups: they ride on the card. */
+  followupWords?: string;
 }
 
 let telegram: Api | undefined;
@@ -215,6 +241,202 @@ function shown(body: string): string {
 
 /** Writes the email and sends it. Everything that decides who gets it is already
  *  settled, and the writer can't change it. */
+/**
+ * The same send command again (Telegram redelivery, or his message replayed later):
+ * at most one email per command. A command that became a card is answered from that
+ * card: still waiting (the same card again, never a second draft), sent, or discarded
+ * (he is asked before anything new is made). Undefined: this command is new.
+ */
+async function repeatedCommand(key: string): Promise<Outcome | undefined> {
+  if (!getCommandSendByKey(key)) {
+    return undefined;
+  }
+  const card = pendingActionForCommandKey(key);
+  if (!card || card.status === "sent") {
+    return { text: "Not sent again: this command was already handled.", result: "not_sent", repeat: true };
+  }
+  let status = card.status;
+  if (status === "pending") {
+    const reposted = await repostPendingCard(card);
+    if (reposted.state === "reposted") {
+      console.log(`Command send: repeat of a command waiting on card ${card.id}; same card again`);
+      const fresh = reposted.newAddresses.length > 0 ? ` New address: ${reposted.newAddresses.join(", ")}.` : "";
+      return {
+        text: `Not sent yet: it's waiting on the card I've posted again for ${reposted.to || card.to_header || "them"}.${fresh} Tap Send to confirm.`,
+        hint: "Nothing has been sent and no new draft was made. Answer in one short line.",
+        shown: true,
+        repeat: true,
+      };
+    }
+    if (reposted.state === "read_failed") {
+      return { text: DRAFT_REREAD_FAILED, result: "not_sent", repeat: true };
+    }
+    if (reposted.state === "failed") {
+      return {
+        text: "Not sent yet: it's still waiting on its card above. Tap Send to confirm.",
+        result: "not_sent", repeat: true,
+      };
+    }
+    status = "expired";
+  }
+  return {
+    text: status === "expired"
+      ? "Not sent: the draft from this message expired, so nothing went out. Want me to make a new one?"
+      : "Not sent: you discarded the draft from this message, so nothing went out. Want me to make a new one?",
+    hint: "Ask him before making a new draft; don't make one now.",
+    result: "not_sent", repeat: true,
+  };
+}
+
+/** What he's told when the content gate (or a send check) refuses: the same words
+ *  whether the email would have gone out directly or as a card. */
+function gateRefusal(reason: string): Outcome {
+  if (reason === "refers_to_attachment") {
+    return {
+      text: "Not sent: the email it wrote mentions an attachment and I can't attach anything, so nothing went out.",
+      hint: "Ask Vishnu how he wants to handle the file.",
+      result: "not_sent",
+    };
+  }
+  return {
+    text:
+      reason === "already_handled"
+        ? "Not sent again: this command was already handled."
+        : `Not sent: a delivery check refused it (${reason}), so nothing went out.`,
+    result: "not_sent",
+    ...(reason === "already_handled" ? { repeat: true } : {}),
+  };
+}
+
+/** The written email as a Gmail draft on its Send card. The tap sends it. */
+async function showSendCard(input: {
+  /** The command's key: claimed here exactly as a direct send would claim it. */
+  key: string;
+  request: CommandRequest;
+  account: LoadedGoogleAccount;
+  confirmation: { chatId: number; messageId: number } | undefined;
+  verdict: Exclude<SendVerdict, { action: "send" }>;
+  toHeader: string;
+  ccHeader: string;
+  subject: string;
+  body: string;
+  reply?: { threadId: string; inReplyTo: string; references: string };
+}): Promise<Outcome> {
+  // One command, at most one email: the key is claimed before any draft exists, so a
+  // repeat of this command finds this card instead of making another.
+  if (!claimCommandSend({ key: input.key, account: input.account.id, threadId: input.request.threadId })) {
+    return (await repeatedCommand(input.key)) ?? { text: "Not sent again: this command was already handled.", result: "not_sent" };
+  }
+  const signatureHtml = await signatureHtmlFor(input.account);
+  let draftId: string;
+  try {
+    draftId = input.reply
+      ? (
+          await createThreadReplyDraft({
+            account: input.account,
+            threadId: input.reply.threadId,
+            to: input.toHeader,
+            cc: input.ccHeader || undefined,
+            subject: input.subject,
+            inReplyTo: input.reply.inReplyTo,
+            references: input.reply.references,
+            body: input.body,
+            signatureHtml,
+          })
+        ).draftId
+      : (
+          await createNewEmailDraft({
+            account: input.account,
+            to: [input.toHeader],
+            cc: input.ccHeader ? [input.ccHeader] : undefined,
+            subject: input.subject,
+            body: input.body,
+            signatureHtml,
+          })
+        ).draftId;
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Command send: card draft failed (${errorType})`);
+    // No draft was made, so the same command may try again.
+    releaseCommandSend(input.key);
+    return { text: "Not sent: I couldn't save it as a draft for you to check, so nothing went out. Try again.", result: "not_sent" };
+  }
+  const signature = signaturePlainText(signatureHtml);
+  let actionId: number;
+  try {
+    actionId = await queueDraftApproval({
+    draftId,
+    threadId: input.reply?.threadId ?? null,
+    to: input.toHeader,
+    cc: input.ccHeader || undefined,
+    subject: input.subject,
+    body: input.body,
+    googleAccount: input.account.id === "personal" ? "personal" : "work",
+    ...(signature ? { signature } : {}),
+    });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Command send: card post failed (${errorType})`);
+    const saved = getPendingActionForDraft(draftId);
+    if (!saved) {
+      releaseCommandSend(input.key);
+      return { text: "Not sent: I saved a draft but couldn't show its card, so nothing went out. Try again.", result: "not_sent" };
+    }
+    // The card exists but wasn't shown: a repeat of this command shows it.
+    setPendingActionCommandKey(saved.id, input.key);
+    return { text: "Not sent: I couldn't show its card. Ask me again and I'll show the same draft.", result: "not_sent" };
+  }
+  setPendingActionCommandKey(actionId, input.key);
+  if (input.request.followupWords && input.confirmation) {
+    setPendingActionFollowups(
+      actionId,
+      input.request.followupWords,
+      `msg:${input.confirmation.chatId}:${input.confirmation.messageId}`,
+    );
+  }
+  if (input.confirmation) {
+    linkPublishedDraft({
+      chatId: input.confirmation.chatId,
+      draftId,
+      to: input.toHeader,
+      cc: input.ccHeader,
+      subject: input.subject,
+      body: input.body,
+      account: input.account.id === "personal" ? "personal" : "work",
+    });
+  }
+  console.log(`Command send: card instead of a send new=${input.verdict.action === "card" ? input.verdict.newAddresses.length : 0}`);
+  const followups = input.request.followupWords ? " The follow-ups come as a Start card once it goes out." : "";
+  return {
+    text: `${cardReason(input.verdict, input.toHeader)}${followups}`,
+    hint: "Nothing has been sent. He has the card; answer in one short line.",
+    shown: true,
+  };
+}
+
+/** The decision for an email he asked to send now: known or confirmed people only.
+ *  Sending or scheduling a draft he was shown: whoever its card showed before this
+ *  message counts as confirmed. */
+async function sendVerdictFor(
+  request: CommandRequest,
+  confirmation: { chatId: number; messageId: number } | undefined,
+): Promise<SendVerdict> {
+  const recipients = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email] : []));
+  const confirmed = new Set((request.confirmedRecipients ?? []).map((email) => email.toLowerCase()));
+  if (request.draftId && confirmation) {
+    for (const email of draftRecipientsShownBefore(request.draftId, confirmation.messageId)) {
+      confirmed.add(email);
+    }
+  }
+  return decideSendAction({
+    intent: "send",
+    ownTurn: request.ownTurn === true,
+    recipients,
+    known: await knownRecipients(recipients),
+    confirmed,
+  });
+}
+
 export async function writeAndSend(
   request: CommandRequest,
   base: string,
@@ -229,7 +451,10 @@ export async function writeAndSend(
     /** A subject he changed himself. On a reply it wins over the thread's, and if it no
      *  longer matches the thread the email goes out as a new conversation. */
     explicitSubject?: string;
-  } = {},
+    /** decideSendAction's answer for these recipients. Anything but "send" leaves the
+     *  written email as a draft with its card. */
+    verdict: SendVerdict;
+  },
 ): Promise<Outcome> {
   const to = request.to.map((slot) => slot.mailbox!);
   const cc = request.cc.map((slot) => slot.mailbox!);
@@ -238,8 +463,9 @@ export async function writeAndSend(
     return { text: domainRefusal, result: "not_sent" };
   }
   const key = sendKey(base, to);
-  if (getCommandSendByKey(key)) {
-    return { text: "Not sent again: this command was already handled.", result: "not_sent" };
+  const repeat = await repeatedCommand(key);
+  if (repeat) {
+    return repeat;
   }
   const account = await getGoogleAccount(request.account);
   const gmail = gmailClient(account);
@@ -310,12 +536,44 @@ export async function writeAndSend(
       !isSelfEmail(item.email) &&
       !isAutomatedAddress(item.email),
   );
+  // One content gate for both routes, on the written email, before it can go out
+  // directly or become a card: a refusal here makes no draft and no card.
+  const gate = evaluateCommandSendGate({
+    enabled: config.sendOnCommandEnabled,
+    to: toHeader,
+    cc: ccHeader,
+    resolved: named,
+    subject,
+    body: written.body,
+    threadId: newConversation ? null : request.threadId,
+    inReplyTo: newConversation ? "" : thread?.inReplyTo ?? "",
+  });
+  if (!gate.ok) {
+    console.log(`Command send: content gate refused reason=${gate.reason}`);
+    return gateRefusal(gate.reason);
+  }
+  if (options.verdict.action !== "send") {
+    // Nothing goes out: the email he asked for waits as a draft on its card.
+    return showSendCard({
+      key,
+      request,
+      account,
+      confirmation,
+      verdict: options.verdict,
+      toHeader,
+      ccHeader,
+      subject,
+      body: written.body,
+      reply: !newConversation && thread ? { threadId: request.threadId!, inReplyTo: thread.inReplyTo, references: thread.references } : undefined,
+    });
+  }
   if (options.beforeSend && !options.beforeSend()) {
     return { text: "Not sent: it was cancelled.", result: "cancelled" };
   }
   let messageId: string;
   try {
     ({ messageId } = await sendCommandEmail({
+      decision: options.verdict,
       key,
       confirmation,
       account,
@@ -331,20 +589,7 @@ export async function writeAndSend(
     }));
   } catch (error) {
     if (error instanceof CommandSendRefusedError) {
-      if (error.reason === "refers_to_attachment") {
-        return {
-          text: "Not sent: the email it wrote mentions an attachment and I can't attach anything, so nothing went out.",
-          hint: "Ask Vishnu how he wants to handle the file.",
-          result: "not_sent",
-        };
-      }
-      return {
-        text:
-          error.reason === "already_handled"
-            ? "Not sent again: this command was already handled."
-            : `Not sent: a delivery check refused it (${error.reason}), so nothing went out.`,
-        result: "not_sent",
-      };
+      return gateRefusal(error.reason);
     }
     if (error instanceof CommandSendRejectedError) {
       return {
@@ -367,6 +612,7 @@ export async function writeAndSend(
     throw error;
   }
 
+  markRecipientsKnown([...to, ...cc].map((item) => item.email));
   const lines = [
     `Sent to ${toHeader}.`,
     ...(ccHeader ? [`Cc: ${ccHeader}`] : []),
@@ -407,14 +653,6 @@ export async function writeAndSend(
       messageId,
     };
   }
-}
-
-function choiceKeyboard(choiceId: number, options: readonly ParsedMailbox[]): InlineKeyboard {
-  const keyboard = new InlineKeyboard();
-  options.forEach((option, index) => {
-    keyboard.text(formatMailbox(option).slice(0, 60), `cmdsend:pick:${choiceId}:${index}`).row();
-  });
-  return keyboard.text("Don't send", `cmdsend:drop:${choiceId}`);
 }
 
 function notDone(request: CommandRequest): string {
@@ -538,8 +776,17 @@ async function scheduleRequest(
   const shownSubject = subject || request.instruction.split(/\s+/).slice(0, 8).join(" ");
   const names = request.to.map((slot) => slot.mailbox!.name || slot.query).join(", ");
   const itemText = `Send email to ${names} — ${shownSubject} — ${scheduledWhen(request.sendAt!)}`;
+  // Known people (or ones he tapped) are scheduled; a new address waits on his Confirm.
+  const verdict = await sendVerdictFor(request, confirmation);
+  const recipients = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : []));
+  const held = verdict.action !== "send";
+  if (!held) {
+    request = { ...request, confirmedRecipients: [...new Set([...(request.confirmedRecipients ?? []), ...recipients])] };
+  }
+  const scheduleKey = `${sendKey(base, to)}:${request.sendAt}`;
   const row = createScheduledSend({
-    key: `${sendKey(base, to)}:${request.sendAt}`,
+    held,
+    key: scheduleKey,
     sendAt: request.sendAt!,
     itemText,
     tag: request.account === "personal" ? "personal" : "work",
@@ -552,9 +799,35 @@ async function scheduleRequest(
     confirmMessage: confirmation.messageId,
   });
   if (!row) {
-    return { text: "Not scheduled again: this command was already handled." };
+    // The same command again: one schedule per command. One still held for his Confirm
+    // gets its Confirm card again, bound to the people it goes to now.
+    const existing = scheduledSendByKey(scheduleKey);
+    if (existing?.status === "held") {
+      // The card shows, and its Confirm confirms, who the schedule goes to NOW (he may
+      // have corrected it since): never the original wording alone.
+      let current: Pick<CommandRequest, "to" | "cc">;
+      try {
+        current = JSON.parse(existing.request) as Pick<CommandRequest, "to" | "cc">;
+      } catch {
+        return { text: "Not scheduled again: this command was already handled.", repeat: true };
+      }
+      const text = `Not scheduled yet: ${existing.item_text}\nIt's waiting on your Confirm. Tap Confirm to schedule for ${scheduledWhen(existing.send_at)}.`;
+      await postConfirmCard(
+        {
+          kind: "schedule_confirm",
+          scheduleId: existing.id,
+          to: formatMailboxList(current.to.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []))),
+          cc: formatMailboxList(current.cc.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []))),
+          headline: text,
+        },
+        { api: api() },
+      );
+      console.log(`Scheduled send ${existing.id}: repeat of a held command; Confirm card posted again`);
+      return { text, hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.", shown: true, repeat: true };
+    }
+    return { text: "Not scheduled again: this command was already handled.", repeat: true };
   }
-  console.log(`Scheduled send ${row.id}: status -> scheduled`);
+  console.log(`Scheduled send ${row.id}: status -> ${held ? "held for confirm" : "scheduled"}`);
   rememberScheduledSend({
     chatId: confirmation.chatId,
     scheduledSendId: row.id,
@@ -565,6 +838,28 @@ async function scheduleRequest(
     draftId: request.draftId,
     body: draft?.body,
   });
+  if (held) {
+    // Nothing is scheduled until his tap: the card says why and what it would do.
+    const heldText =
+      verdict.action === "card" && verdict.newAddresses.length > 0
+        ? `New address: ${verdict.newAddresses.join(", ")}. Tap Confirm to schedule for ${scheduledWhen(request.sendAt!)}.`
+        : `Ready to schedule for ${scheduledWhen(request.sendAt!)}, but this didn't come straight from your own message. Tap Confirm to schedule it.`;
+    await postConfirmCard(
+      {
+        kind: "schedule_confirm",
+        scheduleId: row.id,
+        to: formatMailboxList(to),
+        cc: formatMailboxList(request.cc.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []))),
+        headline: heldText,
+      },
+      { api: api() },
+    );
+    return {
+      text: heldText,
+      hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.",
+      shown: true,
+    };
+  }
   const scheduledCard = {
     text: `Scheduled: ${itemText}`,
     caption: `Scheduled: ${itemText}`,
@@ -582,6 +877,19 @@ async function scheduleRequest(
   };
 }
 
+/** At send time: the people he confirmed when he scheduled it pass; anyone else must
+ *  be known now. A schedule only exists once he asked for it himself. */
+export async function scheduledSendVerdict(request: CommandRequest): Promise<SendVerdict> {
+  const recipients = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email] : []));
+  return decideSendAction({
+    intent: "send",
+    ownTurn: true,
+    recipients,
+    known: await knownRecipients(recipients),
+    confirmed: new Set((request.confirmedRecipients ?? []).map((email) => email.toLowerCase())),
+  });
+}
+
 async function finishRequest(
   request: CommandRequest,
   base: string,
@@ -592,7 +900,7 @@ async function finishRequest(
     return scheduleRequest(request, base, confirmation);
   }
   if (request.kind !== "meeting") {
-    return writeAndSend(request, base, confirmation, now);
+    return writeAndSend(request, base, confirmation, now, { verdict: await sendVerdictFor(request, confirmation) });
   }
   const attendees = request.to.map((slot) => slot.mailbox!);
   const result = await bookResolvedMeeting({
@@ -716,16 +1024,15 @@ async function resolveAndContinue(
         : "";
     const found =
       resolved.length > 0 ? `I resolved ${resolved.join(", ")}. ` : "";
-    const choiceCard = {
-      text: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
-      caption: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
-      keyboard: choiceKeyboard(choiceId, first.options),
-    };
-    if (!holdForVoiceNote(choiceCard)) {
-      await api().sendMessage(config.ownerTelegramId, choiceCard.text, {
-        reply_markup: choiceCard.keyboard,
-      });
-    }
+    await postConfirmCard(
+      {
+        kind: "address_choice",
+        choiceId,
+        options: first.options,
+        headline: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
+      },
+      { api: api() },
+    );
     return {
       text: `${notDone(request)} yet: ${found}"${first.slot.query}" matches ${first.options.length} people and I've asked with buttons.${extra}`,
       hint: "Tell him to tap one, and don't pick one yourself.",
@@ -924,7 +1231,7 @@ export async function sendEmailFromTool(
     pendingEmail?.draftId &&
     pendingEmail.scheduledSendId
   ) {
-    const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId);
+    const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId, { ownTurn: turn.ownTurn === true });
     return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok));
   }
   let toQueries = stringList(values.to);
@@ -990,6 +1297,8 @@ export async function sendEmailFromTool(
     instruction,
     // The email writer never sees a follow-up clause: only what the email should say.
     ownWords: withoutFollowupClause(ownWords),
+    ownTurn: turn.ownTurn === true,
+    ...(withoutFollowupClause(ownWords) !== ownWords ? { followupWords: ownWords } : {}),
     account: values.account === "personal" ? "personal" : "work",
     ...(when ? { sendAt: when } : {}),
     ...(typeof values.subject === "string" && values.subject.trim()
@@ -1006,6 +1315,10 @@ export async function sendEmailFromTool(
     confirmation,
     now,
   );
+  if (outcome.repeat) {
+    // The same command again: nothing new went out, and its follow-ups were handled then.
+    return asToolResult(outcome);
+  }
   // Follow-ups he asked for in the same message start only after this send went out.
   const first = request.to[0];
   const followups = await followupsAfterSend({
@@ -1314,9 +1627,18 @@ export async function handleCommandSendCallback(ctx: Context): Promise<void> {
     await finish(expired);
     return;
   }
+  // The tap confirms only an address its card message showed (when that was recorded).
+  const tappedCard = ctx.callbackQuery?.message?.message_id;
+  const shownThere = tappedCard === undefined ? new Set<string>() : cardRecipientsForMessage(choiceCardKey(choice.id), tappedCard);
+  if (shownThere.size > 0 && !shownThere.has(picked.email.toLowerCase())) {
+    await finish(expired);
+    return;
+  }
   slot.mailbox = picked;
   slot.seen = slot.options;
   delete slot.options;
+  // His tap on an offered address confirms it, even a new one.
+  request.confirmedRecipients = [...(request.confirmedRecipients ?? []), picked.email.toLowerCase()];
   await finish(`Picked ${formatMailbox(picked)}.`);
   const message = ctx.callbackQuery?.message;
   try {

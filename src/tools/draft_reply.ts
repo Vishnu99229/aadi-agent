@@ -204,6 +204,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("Gmail created the draft without returning a draft ID.");
   }
 
+  let cardNote = "";
   const sendImmediately =
     values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
   if (sendImmediately) {
@@ -211,9 +212,14 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       draftId: result.data.id,
       googleAccount: account.id,
       confirmation: turn.confirmation,
+      ownTurn: turn.ownTurn === true,
+      userText: turn.userText,
     });
     if (sent.ok) {
       return `Sent to ${to}.`;
+    }
+    if (sent.reason === "card") {
+      cardNote = sent.message;
     }
   }
 
@@ -245,5 +251,6 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     tag: account.tag,
     to,
     cc: cc || null,
+    ...(cardNote ? { not_sent: cardNote } : {}),
   });
 }

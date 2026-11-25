@@ -44,6 +44,8 @@ export interface PendingAction {
   to_header: string | null;
   cc_header: string | null;
   subject: string | null;
+  /** The send command this card stands for, when a command became a card. */
+  command_key: string | null;
 }
 
 export type ItemTag = "work" | "personal";
@@ -1176,6 +1178,11 @@ if (!tableHasColumn("pending_actions", "to_header")) {
 if (!tableHasColumn("pending_actions", "cc_header")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN cc_header TEXT`);
 }
+// The send command a Send card stands for: one command, at most one email.
+if (!tableHasColumn("pending_actions", "command_key")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN command_key TEXT`);
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_actions_command_key ON pending_actions (command_key)`);
 if (!tableHasColumn("pending_actions", "subject")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN subject TEXT`);
 }
@@ -1463,6 +1470,35 @@ if (!tableHasColumn("pending_actions", "event_title")) {
 if (!tableHasColumn("pending_actions", "sent_message_id")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN sent_message_id TEXT`);
 }
+// A "send then follow-ups" request rides on the card of an email that needs his tap.
+if (!tableHasColumn("pending_actions", "followup_words")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN followup_words TEXT`);
+}
+if (!tableHasColumn("pending_actions", "followup_key")) {
+  db.exec(`ALTER TABLE pending_actions ADD COLUMN followup_key TEXT`);
+}
+db.exec(`
+  -- Addresses he has sent to (Gmail Sent, either account) or Aadi sent to on his
+  -- confirmation. Only "known" is ever stored; "new" is never cached.
+  CREATE TABLE IF NOT EXISTS known_recipients (
+    email TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+  );
+  -- Each address a draft's card has shown him, and the newest of his messages that had
+  -- arrived by then. Shown before message M means that watermark is below M.
+  -- Who each posted card message shows, written only once Telegram confirmed the
+  -- post or edit. shown_watermark: his newest message when it was shown.
+  CREATE TABLE IF NOT EXISTS card_message_recipients (
+    message_id INTEGER NOT NULL,
+    draft_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    shown_watermark INTEGER NOT NULL,
+    shown_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, draft_id, email)
+  );
+  CREATE INDEX IF NOT EXISTS idx_card_message_recipients_draft ON card_message_recipients (draft_id);
+`);
 
 /**
  * Pre-fix NiCE HQ caches stored Asia/Jerusalem on sales_sequences.prospect_timezone,
@@ -1811,7 +1847,7 @@ export function insertMessageEmbedding(row: {
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
               telegram_message_id, event_title, event_start, event_end,
               event_attendees, event_description, created_at, auto_send_at,
-              updated_at, to_header, cc_header, subject`;
+              updated_at, to_header, cc_header, subject, command_key`;
 
 export function createPendingAction(
   draftId: string,
@@ -1866,6 +1902,29 @@ export function getPendingAction(id: number): PendingAction | undefined {
        WHERE id = ?`,
     )
     .get(id) as PendingAction | undefined;
+}
+
+/** The card's draft is now a reply in this thread, or (null) a new conversation. */
+export function setPendingActionThread(id: number, threadId: string | null): void {
+  db.prepare(`UPDATE pending_actions SET thread_id = ? WHERE id = ?`).run(threadId, id);
+}
+
+/** A send command became this card: its key lives with the card from now on. */
+export function setPendingActionCommandKey(id: number, key: string): void {
+  db.prepare(`UPDATE pending_actions SET command_key = ? WHERE id = ?`).run(key, id);
+}
+
+/** The card a send command became, whatever has happened to it since. */
+export function pendingActionForCommandKey(key: string): PendingAction | undefined {
+  return db
+    .prepare(
+      `SELECT ${PENDING_ACTION_COLUMNS}
+       FROM pending_actions
+       WHERE command_key = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+    .get(key) as PendingAction | undefined;
 }
 
 export function getPendingActionForDraft(
@@ -2030,6 +2089,87 @@ export function setPendingActionDraftMeta(
      SET to_header = ?, cc_header = ?, subject = ?, updated_at = datetime('now')
      WHERE id = ?`,
   ).run(meta.toHeader, meta.ccHeader, meta.subject, id);
+  // Who the posted card shows is recorded by the card builder (confirm_cards.ts), for
+  // the message Telegram confirmed: the only writer of card_message_recipients.
+}
+
+/** Telegram confirmed this card message shows these people (posted, or edited to show
+ *  them): it now confirms exactly them. Called only by the card builder. The key is the
+ *  card's Gmail draft id, or schedule:<id> / choice:<id> for those cards. Someone still on it keeps the time they were
+ *  first shown; someone taken off it no longer counts for this message. */
+export const recordCardRecipients = db.transaction((messageId: number, draftId: string, header: string): void => {
+  const people = headerAddresses(header);
+  const current = db
+    .prepare(`SELECT email FROM card_message_recipients WHERE message_id = ? AND draft_id = ?`)
+    .all(messageId, draftId) as Array<{ email: string }>;
+  const remove = db.prepare(`DELETE FROM card_message_recipients WHERE message_id = ? AND draft_id = ? AND email = ?`);
+  for (const { email } of current) {
+    if (!people.includes(email)) {
+      remove.run(messageId, draftId, email);
+    }
+  }
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO card_message_recipients (message_id, draft_id, email, shown_watermark, shown_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  const watermark = latestProcessedMessageId();
+  for (const email of people) {
+    insert.run(messageId, draftId, email, watermark, new Date().toISOString());
+  }
+});
+
+/** Who this one card message showed: what a tap on it confirms. */
+export function cardRecipientsForMessage(draftId: string, messageId: number): Set<string> {
+  const rows = db
+    .prepare(`SELECT email FROM card_message_recipients WHERE draft_id = ? AND message_id = ?`)
+    .all(draftId, messageId) as Array<{ email: string }>;
+  return new Set(rows.map((row) => row.email));
+}
+
+/** False for a card posted before recipients were recorded per card message. */
+export function draftHasCardRecords(draftId: string): boolean {
+  return db.prepare(`SELECT 1 FROM card_message_recipients WHERE draft_id = ? LIMIT 1`).get(draftId) !== undefined;
+}
+
+const HEADER_ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+
+function headerAddresses(header: string): string[] {
+  return [...new Set((header.match(HEADER_ADDRESS) ?? []).map((item) => item.toLowerCase()))];
+}
+
+/** The newest of his messages already taken for processing. */
+export function latestProcessedMessageId(): number {
+  return (db.prepare(`SELECT MAX(message_id) AS id FROM processed_messages`).get() as { id: number | null }).id ?? 0;
+}
+
+/** Addresses on a card for this draft that was posted before his message `messageId`. */
+export function draftRecipientsShownBefore(draftId: string, messageId: number): Set<string> {
+  const rows = db
+    .prepare(`SELECT DISTINCT email FROM card_message_recipients WHERE draft_id = ? AND shown_watermark < ?`)
+    .all(draftId, messageId) as Array<{ email: string }>;
+  return new Set(rows.map((row) => row.email));
+}
+
+export function isKnownRecipientCached(email: string): boolean {
+  return db.prepare(`SELECT 1 FROM known_recipients WHERE email = ?`).get(email.trim().toLowerCase()) !== undefined;
+}
+
+export function recordKnownRecipient(email: string, source: string): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO known_recipients (email, source, checked_at) VALUES (?, ?, ?)`,
+  ).run(email.trim().toLowerCase(), source, new Date().toISOString());
+}
+
+/** A "send then follow-ups" request waiting on this card's Send tap. */
+export function setPendingActionFollowups(id: number, words: string, key: string): void {
+  db.prepare(`UPDATE pending_actions SET followup_words = ?, followup_key = ? WHERE id = ?`).run(words, key, id);
+}
+
+export function pendingActionFollowups(id: number): { words: string; key: string } | undefined {
+  const row = db
+    .prepare(`SELECT followup_words, followup_key FROM pending_actions WHERE id = ?`)
+    .get(id) as { followup_words: string | null; followup_key: string | null } | undefined;
+  return row?.followup_words && row.followup_key ? { words: row.followup_words, key: row.followup_key } : undefined;
 }
 
 /** Tests only: pin created/updated so recency and 3-hour expiry are deterministic. */
@@ -5898,6 +6038,8 @@ export function createScheduledSend(input: {
   request: string;
   confirmChat: number;
   confirmMessage: number;
+  /** Held: waiting on his Confirm tap (a new address). */
+  held?: boolean;
 }): ScheduledSendRecord | undefined {
   return db.transaction(() => {
     if (db.prepare("SELECT 1 FROM scheduled_sends WHERE idem_key = ?").get(input.key)) {
@@ -5907,10 +6049,19 @@ export function createScheduledSend(input: {
     const result = db
       .prepare(
         `INSERT INTO scheduled_sends
-           (idem_key, send_at, task_id, item_text, request, confirm_chat, confirm_message)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (idem_key, send_at, task_id, item_text, request, confirm_chat, confirm_message, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.key, input.sendAt, task.id, input.itemText, input.request, input.confirmChat, input.confirmMessage);
+      .run(
+        input.key,
+        input.sendAt,
+        task.id,
+        input.itemText,
+        input.request,
+        input.confirmChat,
+        input.confirmMessage,
+        input.held ? "held" : "scheduled",
+      );
     return getScheduledSend(Number(result.lastInsertRowid));
   })();
 }
@@ -6262,7 +6413,30 @@ export function holdScheduledSend(id: number, request: string, checkedRequest: s
   );
 }
 
-export function releaseHeldScheduledSend(id: number, request: string): boolean {
+/** A scheduled email whose recipients now include a new address waits on his Confirm. */
+export function holdScheduledSendForConfirm(id: number): boolean {
+  return (
+    db.prepare("UPDATE scheduled_sends SET status = 'held' WHERE id = ? AND status = 'scheduled'").run(id).changes === 1
+  );
+}
+
+/** The schedule a command made, by its key. */
+export function scheduledSendByKey(key: string): ScheduledSendRecord | undefined {
+  const row = db.prepare("SELECT id FROM scheduled_sends WHERE idem_key = ?").get(key) as { id: number } | undefined;
+  return row ? getScheduledSend(row.id) : undefined;
+}
+
+export function releaseHeldScheduledSend(id: number, request: string, expectedRequest?: string): boolean {
+  if (expectedRequest !== undefined) {
+    // Only the version he was shown: an edit since then wins and nothing is released.
+    return (
+      db
+        .prepare(
+          "UPDATE scheduled_sends SET status = 'scheduled', request = ?, retry_at = NULL WHERE id = ? AND status = 'held' AND request = ?",
+        )
+        .run(request, id, expectedRequest).changes === 1
+    );
+  }
   return (
     db
       .prepare(

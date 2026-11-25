@@ -20,6 +20,11 @@ import {
   type GoogleAccountId,
   type PendingAction,
   type PendingEventInput,
+  draftRecipientsShownBefore,
+  pendingActionFollowups,
+  recordCommandSendSent,
+  cardRecipientsForMessage,
+  draftHasCardRecords,
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import {
@@ -30,7 +35,14 @@ import {
 import { parseAddressList } from "./mail_helpers.js";
 import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
+import { draftSendCallback, postConfirmCard, type ConfirmCardSpec } from "./confirm_cards.js";
+import { classifyOwnerEmailIntent } from "./email_references.js";
+import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
+import { followupsAfterSend } from "./sequences.js";
+import { assertSendDecision, cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
 import { plainTextBody, stripSignature } from "./google/mail.js";
+import { collectAttachmentParts } from "./gmail_attachments.js";
+import { evaluateCommandSendGate } from "./security/command_send.js";
 import { assertTestSeam } from "./test_seam.js";
 
 const PREVIEW_LIMIT = 3800;
@@ -117,23 +129,6 @@ export async function readDraftSnapshot(
   };
 }
 
-function keyboard(actionId: number, sendOnly = false, showFull = false): InlineKeyboard {
-  const keys = new InlineKeyboard();
-  if (showFull) {
-    keys.text("📄 Show Full Draft", `approval:draft:${actionId}`).row();
-  }
-  if (sendOnly) {
-    return keys
-      .text("Send", `approval:send:${actionId}`)
-      .row()
-      .text("Cancel", `approval:discard:${actionId}`);
-  }
-  return keys
-    .text("Send", `approval:send:${actionId}`)
-    .text("Edit", `approval:edit:${actionId}`)
-    .text("Discard", `approval:discard:${actionId}`);
-}
-
 function recipientLabel(to: string): string {
   return parseAddressList(to)[0]?.name?.trim() || to.trim() || "them";
 }
@@ -157,41 +152,43 @@ function truncate(text: string, limit: number): string {
     : `${characters.slice(0, limit).join("")}\n[preview truncated]`;
 }
 
-function previewText(preview: DraftApprovalPreview): string {
+/** The draft card's parts: the builder writes To and Cc between them and posts it. */
+function draftCardSpec(
+  actionId: number,
+  preview: DraftApprovalPreview,
+  sendOnly: boolean,
+): Extract<ConfirmCardSpec, { kind: "draft_send" }> {
   const mailbox =
     preview.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
   const extra = (preview.extraLines ?? []).filter(
     (line) => line.trim() && !/^cc:/i.test(line.trim()),
   );
   const signature = preview.signature?.trim();
-  const prefix = [
-    "Draft waiting for approval",
-    "",
-    `Account: ${mailbox}`,
-    `To: ${preview.to}`,
-    ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : ["Cc: none"]),
-    `Subject: ${preview.subject}`,
-    ...(extra.length ? ["", ...extra] : []),
-    "",
-  ].join("\n");
-
+  const cc = preview.cc?.trim() ?? "";
   const bodyChars = Array.from(preview.body).length;
-  if (bodyChars > DRAFT_SUMMARY_CHARS) {
+  const long = bodyChars > DRAFT_SUMMARY_CHARS;
+  const captionTail = [`Subject: ${preview.subject}`, "", preview.body];
+  const base = { kind: "draft_send" as const, key: preview.draftId, actionId, sendOnly, showFull: long, to: preview.to, cc, captionTail };
+  if (long) {
     const count = bodyChars.toLocaleString("en-US");
-    return [
-      `Draft ready for ${recipientLabel(preview.to)}. The email is ${count} characters long.`,
-      "",
-      `Account: ${mailbox}`,
-      `To: ${preview.to}`,
-      ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : []),
-      `Subject: ${preview.subject}`,
-      ...(extra.length ? ["", ...extra] : []),
-    ].join("\n");
+    return {
+      ...base,
+      ccWhenEmpty: "omit",
+      head: [`Draft ready for ${recipientLabel(preview.to)}. The email is ${count} characters long.`, "", `Account: ${mailbox}`],
+      tail: [`Subject: ${preview.subject}`, ...(extra.length ? ["", ...extra] : [])].join("\n"),
+    };
   }
-
+  const head = ["Draft waiting for approval", "", `Account: ${mailbox}`];
+  const middle = [`Subject: ${preview.subject}`, ...(extra.length ? ["", ...extra] : []), ""].join("\n");
+  const prefixLength = [...head, `To: ${preview.to}`, cc ? `Cc: ${cc}` : "Cc: none"].join("\n").length + 1 + middle.length;
   const signatureBlock = signature ? `\n\n-- \n${signature}` : "\n\nSignature: appended from the mailbox when this is sent.";
-  const room = PREVIEW_LIMIT - prefix.length - signatureBlock.length;
-  return `${prefix}${truncate(preview.body, Math.max(200, room))}${signatureBlock}`;
+  const room = PREVIEW_LIMIT - prefixLength - signatureBlock.length;
+  return {
+    ...base,
+    ccWhenEmpty: "none",
+    head,
+    tail: `${middle}${truncate(preview.body, Math.max(200, room))}${signatureBlock}`,
+  };
 }
 
 const DRAFT_STALE_MS = 3 * 60 * 60 * 1000;
@@ -356,7 +353,13 @@ export async function queueEventApproval(
 
 export async function queueDraftApproval(
   preview: DraftApprovalPreview,
-  options: { sendOnly?: boolean; newCard?: boolean; touch?: boolean } = {},
+  options: {
+    sendOnly?: boolean;
+    newCard?: boolean;
+    touch?: boolean;
+    /** Runs once the card is really posted (after a voice note, if it waits for one). */
+    onShown?: (actionId: number) => void;
+  } = {},
 ): Promise<number> {
   let action = getPendingActionForDraft(preview.draftId);
 
@@ -373,33 +376,29 @@ export async function queueDraftApproval(
     );
   }
 
-  if (options.touch !== false) {
-    setPendingActionDraftMeta(action.id, {
-      toHeader: preview.to,
-      ccHeader: preview.cc?.trim() ?? "",
-      subject: preview.subject,
-    });
-  }
+  // The people on this card count as shown only once Telegram has confirmed the card
+  // that shows them: then the card's To/Cc and its message's record are written.
+  // (The card builder records who the posted card shows, for that message.)
+  const shown = (actionId: number): void => {
+    if (options.touch !== false) {
+      setPendingActionDraftMeta(actionId, {
+        toHeader: preview.to,
+        ccHeader: preview.cc?.trim() ?? "",
+        subject: preview.subject,
+      });
+    }
+    options.onShown?.(actionId);
+  };
 
   const sendOnly = options.sendOnly ?? false;
   if (sendOnly) sendOnlyActions.add(action.id);
   else sendOnlyActions.delete(action.id);
 
-  const text = previewText(preview);
-  const markup = keyboard(
-    action.id,
-    sendOnlyActions.has(action.id),
-    Array.from(preview.body).length > DRAFT_SUMMARY_CHARS,
-  );
+  const spec = draftCardSpec(action.id, preview, sendOnlyActions.has(action.id));
 
   if (action.telegram_message_id && options.newCard !== true) {
     try {
-      await telegram.editMessageText(
-        config.ownerTelegramId,
-        action.telegram_message_id,
-        text,
-        { reply_markup: markup },
-      );
+      await postConfirmCard(spec, { api: telegram, editMessageId: action.telegram_message_id, onShown: () => shown(action!.id) });
       console.log(`Approval action ${action.id}: preview updated`);
       return action.id;
     } catch {
@@ -408,31 +407,81 @@ export async function queueDraftApproval(
   }
 
   const draftActionId = action.id;
-  if (
-    holdForVoiceNote({
-      text,
-      caption: shortCardText(
-        [
-          `Draft to ${preview.to}`,
-          ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : []),
-          `Subject: ${preview.subject}`,
-          "",
-          preview.body,
-        ].join("\n"),
-      ),
-      keyboard: markup,
-      onPosted: (messageId) => setPendingActionTelegramMessage(draftActionId, messageId),
-    })
-  ) {
-    console.log(`Approval action ${action.id}: preview held for voice note`);
-    return action.id;
-  }
-  const message = await telegram.sendMessage(config.ownerTelegramId, text, {
-    reply_markup: markup,
+  const posted = await postConfirmCard(spec, {
+    api: telegram,
+    onShown: (messageId) => {
+      setPendingActionTelegramMessage(draftActionId, messageId);
+      shown(draftActionId);
+    },
   });
-  setPendingActionTelegramMessage(action.id, message.message_id);
-  console.log(`Approval action ${action.id}: preview sent`);
+  console.log(`Approval action ${action.id}: ${posted === undefined ? "preview held for voice note" : "preview sent"}`);
   return action.id;
+}
+
+/** Said whenever a draft can't be re-read from Gmail: nothing is shown stale, nothing sent. */
+export const DRAFT_REREAD_FAILED = "I couldn't re-read the draft from Gmail, so I didn't send it. Try again.";
+
+/**
+ * A replacement card for a pending draft, from the draft as it is in Gmail now: its To
+ * and Cc re-read and known-checked (any new address is named on the card), and its body.
+ * The card's recipients and its shown-recipients record are updated only once this card
+ * is posted, so a tap or a "send it" handled before it still can't reach the new people.
+ */
+async function postRefreshedCard(
+  action: PendingAction,
+): Promise<{ ok: true; to: string; cc: string; newAddresses: string[] } | { ok: false; reason: "read_failed" | "failed" }> {
+  if (!action.draft_id) {
+    return { ok: false, reason: "failed" };
+  }
+  let snapshot: Awaited<ReturnType<typeof readDraftSnapshot>>;
+  try {
+    snapshot = await readDraftSnapshot(action.draft_id, action.google_account);
+  } catch {
+    console.log(`Approval action ${action.id}: replacement card not posted, draft unreadable`);
+    return { ok: false, reason: "read_failed" };
+  }
+  const to = snapshot.to.trim();
+  const cc = snapshot.cc.trim();
+  const subject = snapshot.subject.trim() || action.subject?.trim() || "(no subject)";
+  const people = [...new Set([...parseAddressList(to), ...parseAddressList(cc)].map((item) => item.email.toLowerCase()))];
+  const known = await knownRecipients(people);
+  const newAddresses = people.filter((email) => !known.has(email));
+  const oldCard = action.telegram_message_id;
+  let posted: number | undefined;
+  try {
+    await queueDraftApproval(
+      {
+        draftId: action.draft_id,
+        threadId: action.thread_id,
+        to: to || "(no To address)",
+        cc: cc || undefined,
+        subject,
+        body: snapshot.body,
+        googleAccount: action.google_account,
+        extraLines: newAddresses.length > 0 ? [`New address: ${newAddresses.join(", ")}. Tap Send to confirm.`] : undefined,
+      },
+      {
+        newCard: true,
+        onShown: (actionId) => {
+          posted = actionId;
+        },
+      },
+    );
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Approval action ${action.id}: replacement card failed (${errorType})`);
+    return { ok: false, reason: "failed" };
+  }
+  if (posted !== undefined && oldCard && getPendingAction(posted)?.telegram_message_id !== oldCard) {
+    // The old card is out of date: take its buttons away.
+    await telegram
+      .editMessageText(config.ownerTelegramId, oldCard, "Draft approval\n\nReplaced by the newer card below.", {
+        reply_markup: new InlineKeyboard(),
+      })
+      .catch(() => undefined);
+  }
+  console.log(`Approval action ${action.id}: replacement card posted from Gmail new=${newAddresses.length}`);
+  return { ok: true, to, cc, newAddresses };
 }
 
 async function currentPendingAction(
@@ -474,10 +523,106 @@ async function currentPendingAction(
 }
 
 type SendOutcome =
-  | { ok: true }
-  | { ok: false; reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" };
+  | { ok: true; sentMessageId?: string }
+  | {
+      ok: false;
+      reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused";
+      /** The content gate's reason, for gate_refused. */
+      detail?: string;
+    };
 
-function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"]): string {
+/** The draft as Gmail has it now, for the content gate at delivery. */
+async function readDraftForGate(
+  account: GoogleAccountId,
+  draftId: string,
+): Promise<{ to: string; cc: string; bcc: string; subject: string; body: string; inReplyTo: string; hasAttachment: boolean }> {
+  const gmail = await gmailFor(account);
+  const draft = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "full" });
+  const payload = draft.data.message?.payload;
+  const headers = payload?.headers ?? [];
+  const header = (name: string) =>
+    headers.find((item: { name?: string | null; value?: string | null }) => (item.name ?? "").toLowerCase() === name.toLowerCase())?.value?.trim() ?? "";
+  return {
+    to: header("To"),
+    cc: header("Cc"),
+    bcc: header("Bcc"),
+    subject: header("Subject"),
+    inReplyTo: header("In-Reply-To"),
+    body: payload ? stripSignature(plainTextBody(payload).trim()).body.trim() : "",
+    hasAttachment: collectAttachmentParts(payload).length > 0,
+  };
+}
+
+/** Why the content gate stopped a card's Send, in his words. */
+function deliveryGateText(reason: string): string {
+  switch (reason) {
+    case "refers_to_attachment":
+      return "Not sent: the email mentions an attachment, but the draft has none. Attach the file in Gmail or take out the mention, then tap Send.";
+    case "no_subject":
+      return "Not sent: the draft has no subject now, so nothing went out.";
+    case "empty_body":
+      return "Not sent: the draft's body is empty now, so nothing went out.";
+    case "no_recipient":
+      return "Not sent: the draft has no To address now, so nothing went out.";
+    case "bcc_not_allowed":
+      return "Not sent: the draft has a Bcc now, and I don't send Bcc. Nothing went out.";
+    case "no_thread_headers":
+      return "Not sent: the draft lost its reply headers, so it wouldn't stay in its thread. Nothing went out.";
+    case "recipient_not_resolved":
+      return "Not sent: the people on the draft changed, so nothing went out. Check the card and tap Send again.";
+    default:
+      return `Not sent: a delivery check refused it (${reason}), so nothing went out.`;
+  }
+}
+
+/** The people a draft goes to right now, from Gmail itself: what drafts.send would use. */
+async function draftRecipients(account: GoogleAccountId, draftId: string): Promise<string[]> {
+  const gmail = await gmailFor(account);
+  const draft = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "metadata" });
+  const headers = draft.data.message?.payload?.headers ?? [];
+  const value = (name: string) =>
+    headers.find((item: { name?: string | null; value?: string | null }) => (item.name ?? "").toLowerCase() === name)?.value ?? "";
+  return [...new Set([...parseAddressList(value("to")), ...parseAddressList(value("cc"))].map((item) => item.email.toLowerCase()))];
+}
+
+/** Who the tapped card message showed: all a tap on it can confirm. A card posted
+ *  before cards were recorded per message still confirms its stored To and Cc. */
+function shownOnTappedCard(action: PendingAction, messageId: number | undefined): Set<string> {
+  if (!action.draft_id) {
+    return new Set();
+  }
+  if (!draftHasCardRecords(action.draft_id)) {
+    return new Set(
+      [...parseAddressList(action.to_header ?? ""), ...parseAddressList(action.cc_header ?? "")].map((item) => item.email.toLowerCase()),
+    );
+  }
+  return messageId === undefined ? new Set() : cardRecipientsForMessage(action.draft_id, messageId);
+}
+
+/** His own "send it" for a draft he was shown: only addresses its card showed before
+ *  his message, or that he's sent to before, go out with no further tap. */
+async function textSendVerdict(action: PendingAction, messageId: number, ownTurn: boolean): Promise<{ verdict: SendVerdict; to: string }> {
+  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id).catch(() => []) : [];
+  const verdict = decideSendAction({
+    intent: "send",
+    ownTurn,
+    recipients,
+    known: await knownRecipients(recipients),
+    confirmed: action.draft_id ? draftRecipientsShownBefore(action.draft_id, messageId) : new Set(),
+  });
+  return { verdict, to: action.to_header ?? recipients.join(", ") };
+}
+
+function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], detail?: string): string {
+  if (reason === "gate_refused") {
+    return deliveryGateText(detail ?? "");
+  }
+  if (reason === "reread_failed") {
+    return DRAFT_REREAD_FAILED;
+  }
+  if (reason === "not_decided") {
+    return "Not sent: the people on it changed, so check the card and tap Send again.";
+  }
   if (reason === "already_sent") {
     return "That email was already delivered. I didn't send it again.";
   }
@@ -492,10 +637,49 @@ function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"]): 
     : "The draft was sent, but its approval status could not be updated.";
 }
 
-async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
+async function performDraftSend(action: PendingAction, decision: SendVerdict): Promise<SendOutcome> {
   const draftId = action.draft_id;
   if (!draftId) {
     return { ok: false, reason: "send_failed" };
+  }
+  // The decision must cover exactly who the draft goes to now.
+  let recipients: string[];
+  try {
+    recipients = await draftRecipients(action.google_account, draftId);
+    assertSendDecision(decision, recipients);
+  } catch {
+    console.log(`Approval action ${action.id}: send refused reason=not_decided`);
+    return { ok: false, reason: "not_decided" };
+  }
+  // A card made from a send command passes the same content gate as a direct send, on
+  // the draft as Gmail has it now (he may have edited it there). An attachment it
+  // mentions is fine only if the file is really attached. Plain draft cards are not
+  // gated: these checks would refuse drafts that send fine today.
+  if (action.command_key) {
+    let current: Awaited<ReturnType<typeof readDraftForGate>>;
+    try {
+      current = await readDraftForGate(action.google_account, draftId);
+    } catch {
+      console.log(`Approval action ${action.id}: send refused, draft unreadable for the gate`);
+      return { ok: false, reason: "reread_failed" };
+    }
+    const gate = evaluateCommandSendGate({
+      // The tap is his approval; the on/off switch is for sends with no tap.
+      enabled: true,
+      to: current.to,
+      cc: current.cc,
+      bcc: current.bcc,
+      resolved: new Set(recipients),
+      subject: current.subject,
+      body: current.body,
+      threadId: action.thread_id,
+      inReplyTo: current.inReplyTo,
+      hasAttachment: current.hasAttachment,
+    });
+    if (!gate.ok) {
+      console.log(`Approval action ${action.id}: send refused by the content gate reason=${gate.reason}`);
+      return { ok: false, reason: "gate_refused", detail: gate.reason };
+    }
   }
   const claim = claimDraftDelivery(draftId, action.google_account, new Date().toISOString());
   if (claim.state === "already_sent" || claim.state === "unconfirmed" || claim.state === "in_progress") {
@@ -513,6 +697,7 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
       requestBody: { id: draftId },
     });
     sentMessageId = sent.data.id ?? undefined;
+    markRecipientsKnown(recipients);
   } catch {
     if (claim.state === "claimed") {
       console.log(`Approval action ${action.id}: send unconfirmed; schedule ${claim.id} stays claimed`);
@@ -542,12 +727,39 @@ async function performDraftSend(action: PendingAction): Promise<SendOutcome> {
       console.log(`Approval action ${action.id}: sent message not recorded`);
     }
   }
+  if (action.command_key) {
+    // The send command this card stood for is done, exactly like a direct send.
+    recordCommandSendSent(action.command_key, sentMessageId ?? "unknown");
+  }
   if (!transitionPendingAction(action.id, "pending", "sent")) {
     console.log(`Approval action ${action.id}: sent; status update failed`);
     return { ok: false, reason: "status_update_failed" };
   }
   console.log(`Approval action ${action.id}: status -> sent`);
-  return { ok: true };
+  // Follow-ups he asked for with a send command come now, whether his tap or his own
+  // "send it" sent it: always as the pre-filled Start card.
+  await followupsAfterCardSend(action, sentMessageId, recipients);
+  return { ok: true, sentMessageId };
+}
+
+/** A repeat of the command a card stands for: the same card again (never a new draft).
+ *  It shows the people the card showed, with the draft's body as it is in Gmail. */
+export async function repostPendingCard(
+  action: PendingAction,
+): Promise<{ state: "reposted"; to: string; newAddresses: string[] } | { state: "expired" | "failed" | "read_failed" }> {
+  if (action.status !== "pending" || !action.draft_id) {
+    return { state: "failed" };
+  }
+  if (isStale(action)) {
+    await expireAction(action);
+    return { state: "expired" };
+  }
+  const refreshed = await postRefreshedCard(action);
+  if (!refreshed.ok) {
+    return { state: refreshed.reason };
+  }
+  console.log(`Approval action ${action.id}: card posted again for a repeated command`);
+  return { state: "reposted", to: refreshed.to, newAddresses: refreshed.newAddresses };
 }
 
 /** Send a Gmail draft now. No Telegram card and no pending_actions row.
@@ -556,7 +768,15 @@ export async function sendCreatedDraftNow(params: {
   draftId: string;
   googleAccount: GoogleAccountId;
   confirmation: SendConfirmation | undefined;
-}): Promise<{ ok: true } | { ok: false; reason: "not_approved" | "send_failed" }> {
+  /** Straight from his own chat turn (dispatch's mark). */
+  ownTurn?: boolean;
+  /** His own words: "draft ..." never sends. */
+  userText?: string;
+}): Promise<
+  | { ok: true }
+  | { ok: false; reason: "not_approved" | "send_failed" }
+  | { ok: false; reason: "card"; message: string }
+> {
   // While send_email is on it is the only no-tap path, so its recipient check can't
   // be bypassed. The draft tools fall through to their Send card.
   if (config.sendOnCommandEnabled) {
@@ -566,6 +786,27 @@ export async function sendCreatedDraftNow(params: {
     allowOwnerChatSendDraft(params.confirmation);
   } catch {
     return { ok: false, reason: "not_approved" };
+  }
+  // Only known people, on his own turn, for a send he asked for: anything else is the card.
+  let recipients: string[];
+  try {
+    recipients = await draftRecipients(params.googleAccount, params.draftId);
+  } catch {
+    return { ok: false, reason: "send_failed" };
+  }
+  const verdict = decideSendAction({
+    intent: classifyOwnerEmailIntent(params.userText ?? "") === "draft" ? "draft" : "send",
+    ownTurn: params.ownTurn === true,
+    recipients,
+    known: await knownRecipients(recipients),
+  });
+  if (verdict.action !== "send") {
+    return { ok: false, reason: "card", message: cardReason(verdict, recipients.join(", ")) };
+  }
+  try {
+    assertSendDecision(verdict, recipients);
+  } catch {
+    return { ok: false, reason: "send_failed" };
   }
   const claim = claimDraftDelivery(params.draftId, params.googleAccount, new Date().toISOString());
   if (claim.state === "already_sent" || claim.state === "in_progress" || claim.state === "unconfirmed") {
@@ -580,6 +821,7 @@ export async function sendCreatedDraftNow(params: {
       requestBody: { id: params.draftId },
     });
     sentMessageId = sent.data.id ?? undefined;
+    markRecipientsKnown(recipients);
   } catch {
     console.log(`Draft ${params.draftId}: immediate send failed`);
     return { ok: false, reason: "send_failed" };
@@ -693,18 +935,86 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     actionId: action.id,
     actionStatus: action.status,
   });
-  const outcome = await performDraftSend(action);
+  // His tap on the card's own Send confirms the people the card showed. Anyone else on
+  // the Gmail draft now (changed outside Aadi) must be someone he has emailed before.
+  let recipients: string[] = [];
+  if (action.draft_id) {
+    try {
+      recipients = await draftRecipients(action.google_account, action.draft_id);
+    } catch {
+      console.log(`Approval action ${action.id}: send refused, draft unreadable`);
+      await ctx.answerCallbackQuery({ text: DRAFT_REREAD_FAILED, show_alert: true });
+      return;
+    }
+  }
+  const tappedMessage = ctx.callbackQuery?.message?.message_id;
+  const shown = shownOnTappedCard(action, tappedMessage);
+  const verdict = decideSendAction({
+    intent: "send",
+    ownTurn: true,
+    recipients,
+    known: await knownRecipients(recipients.filter((email) => !shown.has(email))),
+    confirmed: shown,
+  });
+  if (verdict.action === "card" && verdict.newAddresses.length > 0) {
+    console.log(`Approval action ${action.id}: send refused, draft has addresses the card didn't show`);
+    await ctx.answerCallbackQuery({
+      text: `Not sent: ${verdict.newAddresses.join(", ")} is on the draft now but wasn't on this card. ${
+        tappedMessage !== undefined && action.telegram_message_id && action.telegram_message_id !== tappedMessage
+          ? "Tap Send on the newer card."
+          : "Ask me to show the card again (it will show who it goes to now), then tap Send."
+      }`,
+      show_alert: true,
+    });
+    return;
+  }
+  const outcome = await performDraftSend(action, verdict);
   if (!outcome.ok) {
     if (outcome.reason === "already_sent") {
       await showStatus(ctx, "Sent").catch(() => undefined);
     }
-    await ctx.answerCallbackQuery({ text: sendFailureText(outcome.reason), show_alert: true });
+    await ctx.answerCallbackQuery({ text: sendFailureText(outcome.reason, outcome.detail), show_alert: true });
     return;
   }
   await showStatus(ctx, "Sent").catch(() => {
     console.log(`Approval action ${action.id}: sent preview update failed`);
   });
   await ctx.answerCallbackQuery("Sent").catch(() => undefined);
+}
+
+/** "Email a new address saying ... and start follow-ups": the email went out on his tap,
+ *  so the follow-ups come now, as a pre-filled Start card (never enrolled directly). */
+async function followupsAfterCardSend(action: PendingAction, sentMessageId: string | undefined, recipients: string[]): Promise<void> {
+  const followups = pendingActionFollowups(action.id);
+  if (!followups || !sentMessageId) {
+    return;
+  }
+  const key = /^msg:(-?\d+):(\d+)$/.exec(followups.key);
+  if (!key) {
+    return;
+  }
+  try {
+    const to = parseAddressList(action.to_header ?? "")[0];
+    const result = await followupsAfterSend({
+      turn: {
+        confirmation: { chatId: Number(key[1]), messageId: Number(key[2]) },
+        userText: followups.words,
+        ownTurn: true,
+        directSend: true,
+      },
+      result: "sent",
+      sentMessageId,
+      account: action.google_account,
+      recipient: to?.name.trim().split(/\s+/)[0] || to?.email || recipients[0] || "them",
+      recipientMailbox: to ? { name: to.name, email: to.email } : undefined,
+    });
+    if (result.text) {
+      await telegram.sendMessage(config.ownerTelegramId, result.text);
+    }
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Approval action ${action.id}: follow-ups after send failed (${errorType})`);
+  }
 }
 
 function recipientLabelFromHeader(header: string): string {
@@ -882,6 +1192,8 @@ function askedWhichMessage(
 export async function sendPendingDraftByText(
   confirmation: SendConfirmation,
   draftId?: string,
+  /** ownTurn: straight from his own chat turn. Anything else is never a send. */
+  options: { ownTurn?: boolean } = {},
 ): Promise<TextSendDraftResult> {
   const shown = await shownPendingDrafts(confirmation);
   if (shown.length === 0) {
@@ -922,14 +1234,19 @@ export async function sendPendingDraftByText(
     // The same token the card's Send button carries, minted only for a draft
     // whose card was posted before Vishnu's confirming message.
     allowSendDraft({
-      callbackData: `approval:send:${action.id}`,
+      callbackData: draftSendCallback(action.id),
       actionId: action.id,
       actionStatus: action.status,
     });
     const recipient = await fetchDraftRecipientLabel(action);
-    const outcome = await performDraftSend(action);
+    const { verdict, to } = await textSendVerdict(action, confirmation.messageId, options.ownTurn === true);
+    if (verdict.action !== "send") {
+      console.log(`Approval action ${action.id}: card, not sent (${verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
+      return { ok: false, message: cardReason(verdict, to) };
+    }
+    const outcome = await performDraftSend(action, verdict);
     if (!outcome.ok) {
-      return { ok: false, message: sendFailureText(outcome.reason) };
+      return { ok: false, message: sendFailureText(outcome.reason, outcome.detail) };
     }
     if (action.telegram_message_id) {
       try {
@@ -1082,38 +1399,21 @@ export async function resendDraftCard(
         "Not resent: that draft_id is not in the pending set you were shown before this message.",
     };
   }
-  let body = "";
-  try {
-    const gmail = await gmailFor(action.google_account);
-    const draft = await gmail.users.drafts.get({
-      userId: "me",
-      id: action.draft_id,
-      format: "full",
-    });
-    body = draft.data.message?.payload
-      ? stripSignature(plainTextBody(draft.data.message.payload).trim()).body
-      : "";
-  } catch {
+  // The draft as it is in Gmail now (he may have changed its people there).
+  const refreshed = await postRefreshedCard(action);
+  if (!refreshed.ok) {
     return {
       ok: false,
-      message:
-        "Could not read the Gmail draft, so I did not post a new card.",
+      message: refreshed.reason === "read_failed" ? DRAFT_REREAD_FAILED : "Not resent: I couldn't post the card. Try again.",
     };
   }
-  await queueDraftApproval(
-    {
-      draftId: action.draft_id,
-      threadId: action.thread_id,
-      to: action.to_header?.trim() || "unknown",
-      cc: action.cc_header?.trim() || undefined,
-      subject: action.subject?.trim() || "(no subject)",
-      body,
-      googleAccount: action.google_account,
-    },
-    { newCard: true, touch: false },
-  );
   console.log(`Approval action ${action.id}: card resent`);
-  return { ok: true, message: "Posted a fresh approval card for that draft." };
+  return {
+    ok: true,
+    message: `Posted a fresh approval card for that draft.${
+      refreshed.newAddresses.length > 0 ? ` New address: ${refreshed.newAddresses.join(", ")}. Tap Send to confirm.` : ""
+    }`,
+  };
 }
 
 async function discardDraft(
