@@ -81,7 +81,7 @@ import {
 import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
-import { queueDraftApproval, repostPendingCard, sendPendingDraftByText } from "./approvals.js";
+import { DRAFT_REREAD_FAILED, queueDraftApproval, repostPendingCard, sendPendingDraftByText } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -253,15 +253,19 @@ async function repeatedCommand(key: string): Promise<Outcome | undefined> {
   let status = card.status;
   if (status === "pending") {
     const reposted = await repostPendingCard(card);
-    if (reposted === "reposted") {
+    if (reposted.state === "reposted") {
       console.log(`Command send: repeat of a command waiting on card ${card.id}; same card again`);
+      const fresh = reposted.newAddresses.length > 0 ? ` New address: ${reposted.newAddresses.join(", ")}.` : "";
       return {
-        text: `Not sent yet: it's waiting on the card I've posted again for ${card.to_header ?? "them"}. Tap Send to confirm.`,
+        text: `Not sent yet: it's waiting on the card I've posted again for ${reposted.to || card.to_header || "them"}.${fresh} Tap Send to confirm.`,
         hint: "Nothing has been sent and no new draft was made. Answer in one short line.",
         shown: true,
       };
     }
-    if (reposted === "failed") {
+    if (reposted.state === "read_failed") {
+      return { text: DRAFT_REREAD_FAILED, result: "not_sent" };
+    }
+    if (reposted.state === "failed") {
       return {
         text: "Not sent yet: it's still waiting on its card above. Tap Send to confirm.",
         result: "not_sent",

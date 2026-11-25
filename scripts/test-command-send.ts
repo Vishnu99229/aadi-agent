@@ -2,7 +2,7 @@
 // Fake Gmail, fake Telegram, stub models. Nothing real is sent.
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import { handleApprovalCallback, queueDraftApproval, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
+import { handleApprovalCallback, queueDraftApproval, resendDraftCard, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
 import { clearPendingAction } from "../src/action_context.ts";
 import { defaultToolNames, runAgent } from "../src/agent.ts";
 import { handleCommandSendCallback, sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
@@ -202,6 +202,8 @@ const sends: Sent[] = [];
 let sendFails: number | "network" | undefined;
 const draftsCreated: string[] = [];
 const draftHeaders = new Map<string, Array<{ name: string; value: string }>>();
+/** Drafts Gmail fails to read (drafts.get throws). */
+const unreadableDrafts = new Set<string>();
 const draftsSent: string[] = [];
 
 function headerOf(block: string, name: string): string {
@@ -265,7 +267,12 @@ const gmail = {
         draftsSent.push(requestBody.id);
         return { data: { id: `sent-${requestBody.id}` } };
       },
-      get: async ({ id }: { id?: string } = {}) => ({ data: { message: { payload: { headers: draftHeaders.get(id ?? "") ?? [] } } } }),
+      get: async ({ id }: { id?: string } = {}) => {
+        if (unreadableDrafts.has(id ?? "")) {
+          throw new Error("gmail unavailable");
+        }
+        return { data: { message: { payload: { headers: draftHeaders.get(id ?? "") ?? [] } } } };
+      },
       // Discard deletes the Gmail draft.
       delete: async () => ({ data: {} }),
     },
@@ -2065,11 +2072,15 @@ await expectCancelled("delete_task", async (row) => {
       }
     }
     draftThreads += 1;
+    // Gmail sends the draft as it is now: its current To and Cc.
+    const live = draftHeaders.get(input.requestBody.id);
+    const liveHeader = (name: string) => live?.find((header) => header.name === name)?.value ?? "";
     world.push({
       id: result.data.id,
       threadId: `c-draft-thread-${draftThreads}`,
       from: `Vishnu <${ME}>`,
-      to: draftTo.get(input.requestBody.id) ?? "",
+      to: (live ? liveHeader("To") : draftTo.get(input.requestBody.id)) ?? "",
+      cc: live ? liveHeader("Cc") : undefined,
       subject: "Hello",
       body: "Hi",
       at: Date.now(),
@@ -2492,6 +2503,94 @@ await expectCancelled("delete_task", async (row) => {
     assert(knownFirst.startsWith("Sent to") && sends.length === beforeKnown + 1, knownFirst);
     const knownAgain = await sendEmailFromTool({ to: ["c.idemknown@known-co.com"], instruction: "say hello" }, turnK);
     assert(sends.length === beforeKnown + 1 && knownAgain === "Not sent again: this command was already handled.", knownAgain);
+  }
+
+  // 16. A draft changed directly in Gmail: the replacement card re-reads its people
+  //     (Codex P2). Refreshed addresses count as shown only once that card is posted.
+  {
+    const posts = () => told.filter((entry) => entry.markup !== undefined).length;
+    const lastCardText = () => [...told].reverse().find((entry) => entry.markup !== undefined)?.text ?? "";
+    const alertingTap = async (draftId: string): Promise<string[]> => {
+      const action = getPendingActionForDraft(draftId)!;
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        action.id,
+      );
+      return alerts;
+    };
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    const sentCopy = (draftId: string) => world.find((item) => item.id === `sent-${draftId}`);
+    sentTo("c.k16@known-co.com");
+    sentTo("c.k16b@known-co.com");
+
+    // a) A new Cc added in Gmail: Send and "send it" are refused before a new card.
+    await queueDraftApproval({ draftId: "c-refresh", threadId: null, to: "c.k16@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    draftHeaders.set("c-refresh", [
+      { name: "To", value: "c.k16@known-co.com" },
+      { name: "Cc", value: "c.newcc16@new-co.com" },
+    ]);
+    const sentBefore = draftsSent.length;
+    const refused = await alertingTap("c-refresh");
+    assert(draftsSent.length === sentBefore, "the tap is refused");
+    assert(refused.some((text) => text.includes("c.newcc16@new-co.com is on the draft now")), `he's told who: ${refused.join(" | ")}`);
+    const early = await sendPendingDraftByText(ownMessage(), "c-refresh", { ownTurn: true });
+    assert(!early.ok && draftsSent.length === sentBefore, `"send it" before the new card can't send to it: ${early.message}`);
+
+    // b) The replacement card re-reads To and Cc, known-checks them, and names the new one.
+    const asking = ownMessage();
+    const postsBefore = posts();
+    const resent = await resendDraftCard(asking, "c-refresh");
+    assert(resent.ok && posts() === postsBefore + 1, `a replacement card is posted: ${resent.message}`);
+    assert(lastCardText().includes("c.newcc16@new-co.com"), `it shows the new Cc: ${lastCardText()}`);
+    assert(lastCardText().includes("New address: c.newcc16@new-co.com. Tap Send to confirm."), `and says it's new: ${lastCardText()}`);
+    assert((getPendingActionForDraft("c-refresh")?.cc_header ?? "").includes("c.newcc16@new-co.com"), "the card's recipients are updated");
+    // His "send it" in the same message that asked for the card came before it: no send.
+    const sameMessage = await sendPendingDraftByText(asking, "c-refresh", { ownTurn: true });
+    assert(!sameMessage.ok && draftsSent.length === sentBefore, `a "send it" from before the card still can't: ${sameMessage.message}`);
+
+    // c) Tapping Send on the replacement sends once, to the refreshed people.
+    const refreshCard = getPendingActionForDraft("c-refresh")!.id;
+    await alertingTap("c-refresh");
+    assert(draftsSent.length === sentBefore + 1 && draftsSent.at(-1) === "c-refresh", "the tap on the new card sends it");
+    assert((sentCopy("c-refresh")?.cc ?? "").includes("c.newcc16@new-co.com"), `to the refreshed people: ${sentCopy("c-refresh")?.cc}`);
+    await handleApprovalCallback(cardCtx(`approval:send:${refreshCard}`), "send", refreshCard);
+    assert(draftsSent.length === sentBefore + 1, "once");
+
+    // d) Someone removed in Gmail is gone from the new card and from the send.
+    await queueDraftApproval({ draftId: "c-removed", threadId: null, to: "c.k16@known-co.com", cc: "c.k16b@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    draftHeaders.set("c-removed", [{ name: "To", value: "c.k16@known-co.com" }]);
+    const resentRemoved = await resendDraftCard(ownMessage(), "c-removed");
+    assert(resentRemoved.ok && !lastCardText().includes("c.k16b@known-co.com"), `the removed Cc is gone from the card: ${lastCardText()}`);
+    assert(!(getPendingActionForDraft("c-removed")?.cc_header ?? "").includes("c.k16b@known-co.com"), "and from its recipients");
+    const removedSends = draftsSent.length;
+    await alertingTap("c-removed");
+    assert(draftsSent.length === removedSends + 1, "the tap sends it");
+    assert(!(sentCopy("c-removed")?.cc ?? "").includes("c.k16b@known-co.com"), `and not to the removed Cc: ${sentCopy("c-removed")?.cc}`);
+
+    // e) Gmail can't be read: no card with stale people, and no send.
+    await queueDraftApproval({ draftId: "c-unreadable", threadId: null, to: "c.k16@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    unreadableDrafts.add("c-unreadable");
+    const failedPosts = posts();
+    const unreadable = await resendDraftCard(ownMessage(), "c-unreadable");
+    assert(!unreadable.ok && unreadable.message === "I couldn't re-read the draft from Gmail, so I didn't send it. Try again.", unreadable.message);
+    assert(posts() === failedPosts, "no card is posted");
+    const unreadSends = draftsSent.length;
+    const unreadTap = await alertingTap("c-unreadable");
+    assert(draftsSent.length === unreadSends, "the tap sends nothing");
+    assert(unreadTap.includes("I couldn't re-read the draft from Gmail, so I didn't send it. Try again."), `the tap says why: ${unreadTap.join(" | ")}`);
+    unreadableDrafts.delete("c-unreadable");
   }
 
   // 13. Unchanged: resolution still marks the contact confirmed (cross-turn reuse), and

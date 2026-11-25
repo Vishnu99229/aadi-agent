@@ -363,7 +363,13 @@ export async function queueEventApproval(
 
 export async function queueDraftApproval(
   preview: DraftApprovalPreview,
-  options: { sendOnly?: boolean; newCard?: boolean; touch?: boolean } = {},
+  options: {
+    sendOnly?: boolean;
+    newCard?: boolean;
+    touch?: boolean;
+    /** Runs once the card is really posted (after a voice note, if it waits for one). */
+    onShown?: (actionId: number) => void;
+  } = {},
 ): Promise<number> {
   let action = getPendingActionForDraft(preview.draftId);
 
@@ -408,6 +414,7 @@ export async function queueDraftApproval(
         { reply_markup: markup },
       );
       console.log(`Approval action ${action.id}: preview updated`);
+      options.onShown?.(action.id);
       return action.id;
     } catch {
       console.log(`Approval action ${action.id}: preview replacement failed`);
@@ -428,7 +435,10 @@ export async function queueDraftApproval(
         ].join("\n"),
       ),
       keyboard: markup,
-      onPosted: (messageId) => setPendingActionTelegramMessage(draftActionId, messageId),
+      onPosted: (messageId) => {
+        setPendingActionTelegramMessage(draftActionId, messageId);
+        options.onShown?.(draftActionId);
+      },
     })
   ) {
     console.log(`Approval action ${action.id}: preview held for voice note`);
@@ -438,8 +448,77 @@ export async function queueDraftApproval(
     reply_markup: markup,
   });
   setPendingActionTelegramMessage(action.id, message.message_id);
+  options.onShown?.(action.id);
   console.log(`Approval action ${action.id}: preview sent`);
   return action.id;
+}
+
+/** Said whenever a draft can't be re-read from Gmail: nothing is shown stale, nothing sent. */
+export const DRAFT_REREAD_FAILED = "I couldn't re-read the draft from Gmail, so I didn't send it. Try again.";
+
+/**
+ * A replacement card for a pending draft, from the draft as it is in Gmail now: its To
+ * and Cc re-read and known-checked (any new address is named on the card), and its body.
+ * The card's recipients and its shown-recipients record are updated only once this card
+ * is posted, so a tap or a "send it" handled before it still can't reach the new people.
+ */
+async function postRefreshedCard(
+  action: PendingAction,
+): Promise<{ ok: true; to: string; cc: string; newAddresses: string[] } | { ok: false; reason: "read_failed" | "failed" }> {
+  if (!action.draft_id) {
+    return { ok: false, reason: "failed" };
+  }
+  let snapshot: Awaited<ReturnType<typeof readDraftSnapshot>>;
+  try {
+    snapshot = await readDraftSnapshot(action.draft_id, action.google_account);
+  } catch {
+    console.log(`Approval action ${action.id}: replacement card not posted, draft unreadable`);
+    return { ok: false, reason: "read_failed" };
+  }
+  const to = snapshot.to.trim();
+  const cc = snapshot.cc.trim();
+  const subject = snapshot.subject.trim() || action.subject?.trim() || "(no subject)";
+  const people = [...new Set([...parseAddressList(to), ...parseAddressList(cc)].map((item) => item.email.toLowerCase()))];
+  const known = await knownRecipients(people);
+  const newAddresses = people.filter((email) => !known.has(email));
+  const oldCard = action.telegram_message_id;
+  let posted: number | undefined;
+  try {
+    await queueDraftApproval(
+      {
+        draftId: action.draft_id,
+        threadId: action.thread_id,
+        to: to || "(no To address)",
+        cc: cc || undefined,
+        subject,
+        body: snapshot.body,
+        googleAccount: action.google_account,
+        extraLines: newAddresses.length > 0 ? [`New address: ${newAddresses.join(", ")}. Tap Send to confirm.`] : undefined,
+      },
+      {
+        newCard: true,
+        touch: false,
+        onShown: (actionId) => {
+          posted = actionId;
+          setPendingActionDraftMeta(actionId, { toHeader: to, ccHeader: cc, subject });
+        },
+      },
+    );
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Approval action ${action.id}: replacement card failed (${errorType})`);
+    return { ok: false, reason: "failed" };
+  }
+  if (posted !== undefined && oldCard && getPendingAction(posted)?.telegram_message_id !== oldCard) {
+    // The old card is out of date: take its buttons away.
+    await telegram
+      .editMessageText(config.ownerTelegramId, oldCard, "Draft approval\n\nReplaced by the newer card below.", {
+        reply_markup: new InlineKeyboard(),
+      })
+      .catch(() => undefined);
+  }
+  console.log(`Approval action ${action.id}: replacement card posted from Gmail new=${newAddresses.length}`);
+  return { ok: true, to, cc, newAddresses };
 }
 
 async function currentPendingAction(
@@ -614,35 +693,22 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
 
 /** A repeat of the command a card stands for: the same card again (never a new draft).
  *  It shows the people the card showed, with the draft's body as it is in Gmail. */
-export async function repostPendingCard(action: PendingAction): Promise<"reposted" | "expired" | "failed"> {
+export async function repostPendingCard(
+  action: PendingAction,
+): Promise<{ state: "reposted"; to: string; newAddresses: string[] } | { state: "expired" | "failed" | "read_failed" }> {
   if (action.status !== "pending" || !action.draft_id) {
-    return "failed";
+    return { state: "failed" };
   }
   if (isStale(action)) {
     await expireAction(action);
-    return "expired";
+    return { state: "expired" };
   }
-  try {
-    const snapshot = await readDraftSnapshot(action.draft_id, action.google_account);
-    await queueDraftApproval(
-      {
-        draftId: action.draft_id,
-        threadId: action.thread_id,
-        to: action.to_header ?? snapshot.to,
-        cc: (action.to_header ? action.cc_header : snapshot.cc) || undefined,
-        subject: action.subject ?? snapshot.subject,
-        body: snapshot.body,
-        googleAccount: action.google_account,
-      },
-      { newCard: true, touch: false },
-    );
-    console.log(`Approval action ${action.id}: card posted again for a repeated command`);
-    return "reposted";
-  } catch (error) {
-    const errorType = error instanceof Error ? error.name : "UnknownError";
-    console.error(`Approval action ${action.id}: repost failed (${errorType})`);
-    return "failed";
+  const refreshed = await postRefreshedCard(action);
+  if (!refreshed.ok) {
+    return { state: refreshed.reason };
   }
+  console.log(`Approval action ${action.id}: card posted again for a repeated command`);
+  return { state: "reposted", to: refreshed.to, newAddresses: refreshed.newAddresses };
 }
 
 /** Send a Gmail draft now. No Telegram card and no pending_actions row.
@@ -820,7 +886,16 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   });
   // His tap on the card's own Send confirms the people the card showed. Anyone else on
   // the Gmail draft now (changed outside Aadi) must be someone he has emailed before.
-  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id).catch(() => []) : [];
+  let recipients: string[] = [];
+  if (action.draft_id) {
+    try {
+      recipients = await draftRecipients(action.google_account, action.draft_id);
+    } catch {
+      console.log(`Approval action ${action.id}: send refused, draft unreadable`);
+      await ctx.answerCallbackQuery({ text: DRAFT_REREAD_FAILED, show_alert: true });
+      return;
+    }
+  }
   const shown = shownOnCard(action);
   const verdict = decideSendAction({
     intent: "send",
@@ -832,7 +907,7 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   if (verdict.action === "card" && verdict.newAddresses.length > 0) {
     console.log(`Approval action ${action.id}: send refused, draft has addresses the card didn't show`);
     await ctx.answerCallbackQuery({
-      text: `Not sent: ${verdict.newAddresses.join(", ")} is on the draft now but wasn't on this card. Ask me to show it again, then tap Send.`,
+      text: `Not sent: ${verdict.newAddresses.join(", ")} is on the draft now but wasn't on this card. Ask me to show the card again (it will show who it goes to now), then tap Send.`,
       show_alert: true,
     });
     return;
@@ -1269,38 +1344,21 @@ export async function resendDraftCard(
         "Not resent: that draft_id is not in the pending set you were shown before this message.",
     };
   }
-  let body = "";
-  try {
-    const gmail = await gmailFor(action.google_account);
-    const draft = await gmail.users.drafts.get({
-      userId: "me",
-      id: action.draft_id,
-      format: "full",
-    });
-    body = draft.data.message?.payload
-      ? stripSignature(plainTextBody(draft.data.message.payload).trim()).body
-      : "";
-  } catch {
+  // The draft as it is in Gmail now (he may have changed its people there).
+  const refreshed = await postRefreshedCard(action);
+  if (!refreshed.ok) {
     return {
       ok: false,
-      message:
-        "Could not read the Gmail draft, so I did not post a new card.",
+      message: refreshed.reason === "read_failed" ? DRAFT_REREAD_FAILED : "Not resent: I couldn't post the card. Try again.",
     };
   }
-  await queueDraftApproval(
-    {
-      draftId: action.draft_id,
-      threadId: action.thread_id,
-      to: action.to_header?.trim() || "unknown",
-      cc: action.cc_header?.trim() || undefined,
-      subject: action.subject?.trim() || "(no subject)",
-      body,
-      googleAccount: action.google_account,
-    },
-    { newCard: true, touch: false },
-  );
   console.log(`Approval action ${action.id}: card resent`);
-  return { ok: true, message: "Posted a fresh approval card for that draft." };
+  return {
+    ok: true,
+    message: `Posted a fresh approval card for that draft.${
+      refreshed.newAddresses.length > 0 ? ` New address: ${refreshed.newAddresses.join(", ")}. Tap Send to confirm.` : ""
+    }`,
+  };
 }
 
 async function discardDraft(
