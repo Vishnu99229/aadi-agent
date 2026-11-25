@@ -41,6 +41,8 @@ import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
 import { followupsAfterSend } from "./sequences.js";
 import { assertSendDecision, cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
 import { plainTextBody, stripSignature } from "./google/mail.js";
+import { collectAttachmentParts } from "./gmail_attachments.js";
+import { evaluateCommandSendGate } from "./security/command_send.js";
 import { assertTestSeam } from "./test_seam.js";
 
 const PREVIEW_LIMIT = 3800;
@@ -573,7 +575,56 @@ async function currentPendingAction(
 
 type SendOutcome =
   | { ok: true; sentMessageId?: string }
-  | { ok: false; reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" };
+  | {
+      ok: false;
+      reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused";
+      /** The content gate's reason, for gate_refused. */
+      detail?: string;
+    };
+
+/** The draft as Gmail has it now, for the content gate at delivery. */
+async function readDraftForGate(
+  account: GoogleAccountId,
+  draftId: string,
+): Promise<{ to: string; cc: string; bcc: string; subject: string; body: string; inReplyTo: string; hasAttachment: boolean }> {
+  const gmail = await gmailFor(account);
+  const draft = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "full" });
+  const payload = draft.data.message?.payload;
+  const headers = payload?.headers ?? [];
+  const header = (name: string) =>
+    headers.find((item: { name?: string | null; value?: string | null }) => (item.name ?? "").toLowerCase() === name.toLowerCase())?.value?.trim() ?? "";
+  return {
+    to: header("To"),
+    cc: header("Cc"),
+    bcc: header("Bcc"),
+    subject: header("Subject"),
+    inReplyTo: header("In-Reply-To"),
+    body: payload ? stripSignature(plainTextBody(payload).trim()).body.trim() : "",
+    hasAttachment: collectAttachmentParts(payload).length > 0,
+  };
+}
+
+/** Why the content gate stopped a card's Send, in his words. */
+function deliveryGateText(reason: string): string {
+  switch (reason) {
+    case "refers_to_attachment":
+      return "Not sent: the email mentions an attachment, but the draft has none. Attach the file in Gmail or take out the mention, then tap Send.";
+    case "no_subject":
+      return "Not sent: the draft has no subject now, so nothing went out.";
+    case "empty_body":
+      return "Not sent: the draft's body is empty now, so nothing went out.";
+    case "no_recipient":
+      return "Not sent: the draft has no To address now, so nothing went out.";
+    case "bcc_not_allowed":
+      return "Not sent: the draft has a Bcc now, and I don't send Bcc. Nothing went out.";
+    case "no_thread_headers":
+      return "Not sent: the draft lost its reply headers, so it wouldn't stay in its thread. Nothing went out.";
+    case "recipient_not_resolved":
+      return "Not sent: the people on the draft changed, so nothing went out. Check the card and tap Send again.";
+    default:
+      return `Not sent: a delivery check refused it (${reason}), so nothing went out.`;
+  }
+}
 
 /** The people a draft goes to right now, from Gmail itself: what drafts.send would use. */
 async function draftRecipients(account: GoogleAccountId, draftId: string): Promise<string[]> {
@@ -613,7 +664,13 @@ async function textSendVerdict(action: PendingAction, messageId: number, ownTurn
   return { verdict, to: action.to_header ?? recipients.join(", ") };
 }
 
-function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"]): string {
+function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], detail?: string): string {
+  if (reason === "gate_refused") {
+    return deliveryGateText(detail ?? "");
+  }
+  if (reason === "reread_failed") {
+    return DRAFT_REREAD_FAILED;
+  }
   if (reason === "not_decided") {
     return "Not sent: the people on it changed, so check the card and tap Send again.";
   }
@@ -644,6 +701,36 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
   } catch {
     console.log(`Approval action ${action.id}: send refused reason=not_decided`);
     return { ok: false, reason: "not_decided" };
+  }
+  // A card made from a send command passes the same content gate as a direct send, on
+  // the draft as Gmail has it now (he may have edited it there). An attachment it
+  // mentions is fine only if the file is really attached. Plain draft cards are not
+  // gated: these checks would refuse drafts that send fine today.
+  if (action.command_key) {
+    let current: Awaited<ReturnType<typeof readDraftForGate>>;
+    try {
+      current = await readDraftForGate(action.google_account, draftId);
+    } catch {
+      console.log(`Approval action ${action.id}: send refused, draft unreadable for the gate`);
+      return { ok: false, reason: "reread_failed" };
+    }
+    const gate = evaluateCommandSendGate({
+      // The tap is his approval; the on/off switch is for sends with no tap.
+      enabled: true,
+      to: current.to,
+      cc: current.cc,
+      bcc: current.bcc,
+      resolved: new Set(recipients),
+      subject: current.subject,
+      body: current.body,
+      threadId: action.thread_id,
+      inReplyTo: current.inReplyTo,
+      hasAttachment: current.hasAttachment,
+    });
+    if (!gate.ok) {
+      console.log(`Approval action ${action.id}: send refused by the content gate reason=${gate.reason}`);
+      return { ok: false, reason: "gate_refused", detail: gate.reason };
+    }
   }
   const claim = claimDraftDelivery(draftId, action.google_account, new Date().toISOString());
   if (claim.state === "already_sent" || claim.state === "unconfirmed" || claim.state === "in_progress") {
@@ -934,7 +1021,7 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     if (outcome.reason === "already_sent") {
       await showStatus(ctx, "Sent").catch(() => undefined);
     }
-    await ctx.answerCallbackQuery({ text: sendFailureText(outcome.reason), show_alert: true });
+    await ctx.answerCallbackQuery({ text: sendFailureText(outcome.reason, outcome.detail), show_alert: true });
     return;
   }
   await showStatus(ctx, "Sent").catch(() => {
@@ -1208,7 +1295,7 @@ export async function sendPendingDraftByText(
     }
     const outcome = await performDraftSend(action, verdict);
     if (!outcome.ok) {
-      return { ok: false, message: sendFailureText(outcome.reason) };
+      return { ok: false, message: sendFailureText(outcome.reason, outcome.detail) };
     }
     if (action.telegram_message_id) {
       try {

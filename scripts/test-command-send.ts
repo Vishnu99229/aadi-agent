@@ -206,6 +206,19 @@ const draftsCreated: string[] = [];
 const draftHeaders = new Map<string, Array<{ name: string; value: string }>>();
 /** Drafts Gmail fails to read (drafts.get throws). */
 const unreadableDrafts = new Set<string>();
+/** Each draft's plain body as Gmail has it, and drafts with a real file attached. */
+const draftBodyById = new Map<string, string>();
+const draftAttachments = new Set<string>();
+function draftBodyOf(raw: string): string {
+  const base64 = /Content-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(raw)?.[1];
+  return base64 ? Buffer.from(base64.replace(/\s/g, ""), "base64").toString("utf8") : raw.split("\r\n\r\n").slice(1).join("\r\n\r\n");
+}
+function rawHeaders(raw: string): Array<{ name: string; value: string }> {
+  const block = raw.split("\r\n\r\n")[0]!;
+  return ["To", "Cc", "Bcc", "Subject", "In-Reply-To"]
+    .map((name) => ({ name, value: new RegExp(`^${name}: (.*)$`, "im").exec(block)?.[1]?.trim() ?? "" }))
+    .filter((header) => header.value !== "");
+}
 const draftsSent: string[] = [];
 
 function headerOf(block: string, name: string): string {
@@ -259,10 +272,8 @@ const gmail = {
         draftsCreated.push(id);
         // Like Gmail, the draft goes to whoever its MIME says.
         const raw = Buffer.from(input?.requestBody?.message?.raw ?? "", "base64url").toString("utf8");
-        draftHeaders.set(id, [
-          { name: "To", value: /^To: (.*)$/im.exec(raw)?.[1]?.trim() ?? "" },
-          { name: "Cc", value: /^Cc: (.*)$/im.exec(raw)?.[1]?.trim() ?? "" },
-        ]);
+        draftHeaders.set(id, rawHeaders(raw));
+        draftBodyById.set(id, draftBodyOf(raw));
         return { data: { id, message: { id: "d", threadId: "t" } } };
       },
       send: async ({ requestBody }: { requestBody: { id: string } }) => {
@@ -279,11 +290,20 @@ const gmail = {
             message: {
               id: `m-${id}`,
               threadId: `t-${id}`,
-              payload: {
-                headers: draftHeaders.get(id ?? "") ?? [],
-                mimeType: "text/plain",
-                body: { data: Buffer.from("Hi,\n\nA short note.", "utf8").toString("base64url") },
-              },
+              payload: draftAttachments.has(id ?? "")
+                ? {
+                    headers: draftHeaders.get(id ?? "") ?? [],
+                    mimeType: "multipart/mixed",
+                    parts: [
+                      { mimeType: "text/plain", body: { data: Buffer.from(draftBodyById.get(id ?? "") ?? "Hi,\n\nA short note.", "utf8").toString("base64url") } },
+                      { mimeType: "application/pdf", filename: "deck.pdf", body: { attachmentId: "att-1", size: 1200 } },
+                    ],
+                  }
+                : {
+                    headers: draftHeaders.get(id ?? "") ?? [],
+                    mimeType: "text/plain",
+                    body: { data: Buffer.from(draftBodyById.get(id ?? "") ?? "Hi,\n\nA short note.", "utf8").toString("base64url") },
+                  },
             },
           },
         };
@@ -291,12 +311,8 @@ const gmail = {
       // An edit replaces the draft; Gmail keeps its id and its new headers.
       update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string } } }) => {
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
-        const block = raw.split("\r\n\r\n")[0]!;
-        draftHeaders.set(id, [
-          { name: "To", value: headerOf(block, "To") },
-          { name: "Cc", value: headerOf(block, "Cc") },
-          { name: "Subject", value: headerOf(block, "Subject") },
-        ]);
+        draftHeaders.set(id, rawHeaders(raw));
+        draftBodyById.set(id, draftBodyOf(raw));
         return { data: { id, message: { id: `m-${id}`, threadId: `t-${id}` } } };
       },
       // Discard deletes the Gmail draft.
@@ -2702,6 +2718,130 @@ await expectCancelled("delete_task", async (row) => {
     assert(draftsSent.length === sent0 + 1 && draftsSent.at(-1) === "c-edit17", "the tap on the new card sends it");
     await tapMessage(card.id, newCard);
     assert(draftsSent.length === sent0 + 1, "once");
+  }
+
+  // 18. One content gate for both routes (Codex P2): the written email is checked before
+  //     direct vs card, and a command's card is checked again at delivery on the draft
+  //     as Gmail has it now.
+  {
+    const tapAlerts = async (draftId: string): Promise<string[]> => {
+      const action = getPendingActionForDraft(draftId)!;
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${action.id}`) as unknown as Record<string, unknown>),
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        action.id,
+      );
+      return alerts;
+    };
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    const setHeader = (draftId: string, name: string, value: string) => {
+      const headers = (draftHeaders.get(draftId) ?? []).filter((header) => header.name !== name);
+      draftHeaders.set(draftId, value ? [...headers, { name, value }] : headers);
+    };
+    const cardFor = async (address: string, extra: Record<string, unknown> = {}): Promise<string> => {
+      written = { subject: "Hello", body: "Hi,\n\nA short note." };
+      const result = await sendEmailFromTool({ to: [address], instruction: "say hello", ...extra }, own(`email ${address} saying hello`));
+      assert(result.startsWith(`New address: ${address}.`), `a card for ${address}: ${result}`);
+      return draftsCreated.at(-1)!;
+    };
+    const ATTACHMENT_REFUSAL = "Not sent: the email it wrote mentions an attachment and I can't attach anything, so nothing went out.";
+
+    // a) A new recipient and a written "please find attached" with no file: no card,
+    //    refused exactly as the direct route refuses it.
+    sentTo("c.k18@known-co.com");
+    written = { subject: "Deck", body: "Hi,\n\nPlease find attached the deck." };
+    const directBefore = sends.length;
+    const direct = await sendEmailFromTool({ to: ["c.k18@known-co.com"], instruction: "send the deck" }, own("email c.k18@known-co.com the deck"));
+    assert(direct.startsWith(ATTACHMENT_REFUSAL) && sends.length === directBefore, `the direct route refuses it: ${direct}`);
+    const draftsBeforeA = draftsCreated.length;
+    const turnA = own("email c.att18@new-co.com the deck");
+    const carded = await sendEmailFromTool({ to: ["c.att18@new-co.com"], instruction: "send the deck" }, turnA);
+    assert(carded === direct, `the card route refuses it the same way: ${carded}`);
+    assert(draftsCreated.length === draftsBeforeA, "and makes no draft or card");
+    assert(getCommandSendByKey(`msg:1:${turnA.confirmation.messageId}:c.att18@new-co.com`) === undefined, "nor claims the command");
+
+    // b) The card's text, edited in Gmail to mention a file that is really attached: the tap sends.
+    const withFile = await cardFor("c.att18b@new-co.com");
+    draftBodyById.set(withFile, "Hi,\n\nPlease find attached the deck.");
+    draftAttachments.add(withFile);
+    const sentB = draftsSent.length;
+    await tapAlerts(withFile);
+    assert(draftsSent.length === sentB + 1 && draftsSent.at(-1) === withFile, "an attachment mention with the file attached sends");
+
+    // c) Edited in Gmail to mention an attachment that isn't there: the tap and "send it" refuse.
+    const noFile = await cardFor("c.att18c@new-co.com");
+    draftBodyById.set(noFile, "Hi,\n\nPlease find attached the deck.");
+    const sentC = draftsSent.length;
+    const refusedC = await tapAlerts(noFile);
+    assert(draftsSent.length === sentC, "the tap sends nothing");
+    assert(refusedC.some((text) => text.includes("mentions an attachment, but the draft has none")), `and says why: ${refusedC.join(" | ")}`);
+    const textC = await sendPendingDraftByText(ownMessage(), noFile, { ownTurn: true });
+    assert(!textC.ok && draftsSent.length === sentC && textC.message.includes("mentions an attachment, but the draft has none"), `"send it" too: ${textC.message}`);
+
+    // d) The other checks, at creation.
+    written = { subject: "", body: "Hi,\n\nA short note." };
+    const draftsBeforeD = draftsCreated.length;
+    const noSubject = await sendEmailFromTool({ to: ["c.subj18@new-co.com"], instruction: "say hello" }, own("email c.subj18@new-co.com saying hello"));
+    assert(noSubject.startsWith("Not sent: a delivery check refused it (no_subject), so nothing went out."), `no subject: ${noSubject}`);
+    written = { subject: "Hello", body: "" };
+    const noBody = await sendEmailFromTool({ to: ["c.body18@new-co.com"], instruction: "say hello" }, own("email c.body18@new-co.com saying hello"));
+    assert(noBody.startsWith("Not sent"), `no body (the writer refuses it before the gate): ${noBody}`);
+    written = { subject: "Hello", body: "Hi,\n\nA short note." };
+    mail({ threadId: "c-nohdr", from: "Thea <c.thr18@new-co.com>", to: ME, subject: "Question", body: "Hi?", messageId: "" });
+    const noHeaders = await sendEmailFromTool(
+      { to: ["c.thr18@new-co.com"], instruction: "say hello", thread_id: "c-nohdr" },
+      own("reply to c.thr18@new-co.com saying hello"),
+    );
+    assert(noHeaders.startsWith("Not sent: a delivery check refused it (no_thread_headers), so nothing went out."), `no thread headers: ${noHeaders}`);
+    assert(draftsCreated.length === draftsBeforeD, "none of them made a draft or card");
+    const badRecipient = evaluateCommandSendGate({
+      enabled: true,
+      to: "c.rc18@new-co.com",
+      cc: "",
+      resolved: new Set(["someone.else@new-co.com"]),
+      subject: "Hello",
+      body: "Hi",
+      threadId: null,
+      inReplyTo: "",
+    });
+    assert(!badRecipient.ok && badRecipient.reason === "recipient_not_resolved", "a recipient code didn't resolve is refused by the same gate");
+
+    // e) The other checks, at delivery, on the draft as Gmail has it now.
+    const deliveryRefuses = async (address: string, change: (draftId: string) => void, words: string, extra: Record<string, unknown> = {}) => {
+      const draftId = await cardFor(address, extra);
+      change(draftId);
+      const before = draftsSent.length;
+      const alerts = await tapAlerts(draftId);
+      assert(draftsSent.length === before, `${words}: the tap sends nothing`);
+      assert(alerts.some((text) => text.includes(words)), `${words}: ${alerts.join(" | ")}`);
+      const viaText = await sendPendingDraftByText(ownMessage(), draftId, { ownTurn: true });
+      assert(!viaText.ok && draftsSent.length === before && viaText.message.includes(words), `${words}, by "send it": ${viaText.message}`);
+    };
+    await deliveryRefuses("c.d18a@new-co.com", (id) => setHeader(id, "Subject", ""), "has no subject");
+    await deliveryRefuses("c.d18b@new-co.com", (id) => draftBodyById.set(id, ""), "body is empty");
+    await deliveryRefuses(
+      "c.d18c@new-co.com",
+      (id) => {
+        setHeader(id, "Cc", getPendingActionForDraft(id)!.to_header!);
+        setHeader(id, "To", "");
+      },
+      "has no To address",
+    );
+    await deliveryRefuses("c.d18d@new-co.com", (id) => setHeader(id, "Bcc", "c.hidden18@new-co.com"), "has a Bcc");
+    mail({ threadId: "c-hdr", from: "Ola <c.d18e@new-co.com>", to: ME, subject: "Question", body: "Hi?" });
+    await deliveryRefuses("c.d18e@new-co.com", (id) => setHeader(id, "In-Reply-To", ""), "lost its reply headers", { thread_id: "c-hdr" });
+    written = { subject: "Quick note", body: "Hi,\n\nThe note he asked for." };
   }
 
   // 13. Unchanged: resolution still marks the contact confirmed (cross-turn reuse), and

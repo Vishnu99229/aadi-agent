@@ -76,6 +76,7 @@ import {
   CommandSendRefusedError,
   CommandSendRejectedError,
   CommandSendUnconfirmedError,
+  evaluateCommandSendGate,
   sendCommandEmail,
 } from "./security/command_send.js";
 import { SendNotApprovedError } from "./security/send_approval.js";
@@ -278,6 +279,25 @@ async function repeatedCommand(key: string): Promise<Outcome | undefined> {
       ? "Not sent: the draft from this message expired, so nothing went out. Want me to make a new one?"
       : "Not sent: you discarded the draft from this message, so nothing went out. Want me to make a new one?",
     hint: "Ask him before making a new draft; don't make one now.",
+    result: "not_sent",
+  };
+}
+
+/** What he's told when the content gate (or a send check) refuses: the same words
+ *  whether the email would have gone out directly or as a card. */
+function gateRefusal(reason: string): Outcome {
+  if (reason === "refers_to_attachment") {
+    return {
+      text: "Not sent: the email it wrote mentions an attachment and I can't attach anything, so nothing went out.",
+      hint: "Ask Vishnu how he wants to handle the file.",
+      result: "not_sent",
+    };
+  }
+  return {
+    text:
+      reason === "already_handled"
+        ? "Not sent again: this command was already handled."
+        : `Not sent: a delivery check refused it (${reason}), so nothing went out.`,
     result: "not_sent",
   };
 }
@@ -510,6 +530,22 @@ export async function writeAndSend(
       !isSelfEmail(item.email) &&
       !isAutomatedAddress(item.email),
   );
+  // One content gate for both routes, on the written email, before it can go out
+  // directly or become a card: a refusal here makes no draft and no card.
+  const gate = evaluateCommandSendGate({
+    enabled: config.sendOnCommandEnabled,
+    to: toHeader,
+    cc: ccHeader,
+    resolved: named,
+    subject,
+    body: written.body,
+    threadId: newConversation ? null : request.threadId,
+    inReplyTo: newConversation ? "" : thread?.inReplyTo ?? "",
+  });
+  if (!gate.ok) {
+    console.log(`Command send: content gate refused reason=${gate.reason}`);
+    return gateRefusal(gate.reason);
+  }
   if (options.verdict.action !== "send") {
     // Nothing goes out: the email he asked for waits as a draft on its card.
     return showSendCard({
@@ -547,20 +583,7 @@ export async function writeAndSend(
     }));
   } catch (error) {
     if (error instanceof CommandSendRefusedError) {
-      if (error.reason === "refers_to_attachment") {
-        return {
-          text: "Not sent: the email it wrote mentions an attachment and I can't attach anything, so nothing went out.",
-          hint: "Ask Vishnu how he wants to handle the file.",
-          result: "not_sent",
-        };
-      }
-      return {
-        text:
-          error.reason === "already_handled"
-            ? "Not sent again: this command was already handled."
-            : `Not sent: a delivery check refused it (${error.reason}), so nothing went out.`,
-        result: "not_sent",
-      };
+      return gateRefusal(error.reason);
     }
     if (error instanceof CommandSendRejectedError) {
       return {

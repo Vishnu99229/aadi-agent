@@ -775,6 +775,23 @@ assert(
     }
   }
   assert(sendSites === 3, `the three checked send sites: command_send.ts and two in approvals.ts, got ${sendSites}`);
+  // One content gate: the card route's Gmail send runs the same gate as the direct route,
+  // and the command path runs it on the written email before choosing direct or card.
+  const approvalsGateSrc = await readFile(join(root, "src/approvals.ts"), "utf8");
+  const performStart = approvalsGateSrc.indexOf("async function performDraftSend(");
+  const performBody = approvalsGateSrc.slice(performStart, approvalsGateSrc.indexOf("\n}\n", performStart));
+  assert(performStart !== -1 && performBody.includes(".drafts.send("), "performDraftSend is the card route's Gmail send");
+  assert(
+    performBody.indexOf("evaluateCommandSendGate(") !== -1 && performBody.indexOf("evaluateCommandSendGate(") < performBody.indexOf(".drafts.send("),
+    "the card route's drafts.send runs the shared gate first",
+  );
+  const commandEmailSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
+  const writeStart = commandEmailSrc.indexOf("export async function writeAndSend(");
+  const writeBody = commandEmailSrc.slice(writeStart, commandEmailSrc.indexOf("\n}\n", writeStart));
+  assert(
+    writeBody.indexOf("evaluateCommandSendGate(") !== -1 && writeBody.indexOf("evaluateCommandSendGate(") < writeBody.indexOf("showSendCard("),
+    "the written email passes the shared gate before it can become a card",
+  );
   const decisionSrc = await readFile(join(root, "src/security/send_decision.ts"), "utf8");
   assert(decisionSrc.includes("export function decideSendAction("), "one decision point");
   assert(decisionSrc.includes("export function assertSendDecision("), "and one check of it");

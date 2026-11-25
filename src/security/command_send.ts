@@ -50,14 +50,20 @@ export interface CommandSendGateInput {
   body: string;
   threadId: string | null;
   inReplyTo: string;
+  /** The card route only: Gmail's draft really has a file attached, so a mention of an
+   *  attachment is fine. The direct route can't attach anything and never sets it. */
+  hasAttachment?: boolean;
+  /** The card route only: the draft's Bcc as Gmail has it now. Bcc is never sent. */
+  bcc?: string;
 }
 
 function addresses(header: string): string[] {
   return parseAddressList(header).map((item) => item.email.toLowerCase());
 }
 
-/** Delivery safety only. There is no check on what the email says, except that it
- *  can't refer to an attachment, because this path can't add one. */
+/** Delivery safety only, the one gate for both routes (a direct send, and a command's
+ *  Send card at creation and at delivery). There is no check on what the email says,
+ *  except that it can't promise an attachment it doesn't have. */
 export function evaluateCommandSendGate(
   input: CommandSendGateInput,
 ): { ok: true } | { ok: false; reason: string } {
@@ -78,8 +84,11 @@ export function evaluateCommandSendGate(
   if (!input.body.trim()) {
     return refuse("empty_body");
   }
-  if (referencesAttachment(`${input.subject}\n${input.body}`)) {
+  if (!input.hasAttachment && referencesAttachment(`${input.subject}\n${input.body}`)) {
     return refuse("refers_to_attachment");
+  }
+  if (input.bcc !== undefined && addresses(input.bcc).length > 0) {
+    return refuse("bcc_not_allowed");
   }
   if (input.threadId && !input.inReplyTo.trim()) {
     return refuse("no_thread_headers");
