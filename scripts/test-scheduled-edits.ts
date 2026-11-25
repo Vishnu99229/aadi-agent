@@ -256,9 +256,16 @@ setGoogleAccountForTests((id) => {
 setGmailClientForTests((account) => (account.id === "personal" ? personalGmail : gmail));
 
 const told: string[] = [];
+/** Every Confirm button posted, newest last, as its callback data. */
+const confirmButtons: string[] = [];
 const telegram = {
-  sendMessage: async (_chat: unknown, text: string) => {
+  sendMessage: async (_chat: unknown, text: string, extra?: { reply_markup?: { inline_keyboard?: Array<Array<{ callback_data?: string }>> } }) => {
     told.push(text);
+    for (const button of (extra?.reply_markup?.inline_keyboard ?? []).flat()) {
+      if (button.callback_data?.startsWith("cmdsend:confirmsched:")) {
+        confirmButtons.push(button.callback_data);
+      }
+    }
     return { message_id: 900 + told.length, date: 0, chat: { id: 1, type: "private" }, text };
   },
   editMessageText: async (_chat: unknown, _id: unknown, text: string) => {
@@ -380,13 +387,25 @@ async function fire(): Promise<void> {
   await runScheduledSendTick(FIRE);
 }
 
-/** His tap on Confirm for a send held for a new address. */
-async function tapConfirmFor(id: number): Promise<void> {
+/** The newest Confirm button posted for this scheduled send. */
+function latestConfirm(id: number): string {
+  const data = confirmButtons.filter((item) => item.startsWith(`cmdsend:confirmsched:${id}:`)).at(-1);
+  assert(data, `a Confirm card was posted for ${id}`);
+  return data!;
+}
+
+/** His tap on a Confirm button (by default the newest card's). */
+async function tapConfirmFor(id: number, data = latestConfirm(id)): Promise<string[]> {
+  const edits: string[] = [];
   await handleScheduledSendCallback({
-    callbackQuery: { data: `cmdsend:confirmsched:${id}` },
+    callbackQuery: { data },
     answerCallbackQuery: async () => true,
-    editMessageText: async () => true,
+    editMessageText: async (text: string) => {
+      edits.push(text);
+      return true;
+    },
   } as unknown as Context);
+  return edits;
 }
 
 // 1. The example: schedule for 10, change the subject, then mention Friday, then edit the
@@ -464,7 +483,25 @@ async function tapConfirmFor(id: number): Promise<void> {
     told.slice(toldBefore).some((text) => text.includes("New address: carol@example.com, dave@example.com. Tap Confirm to send it.")),
     `he is told why: ${told.slice(toldBefore).join(" | ")}`,
   );
-  // His Confirm tap puts it back on the schedule, once; a second tap does nothing.
+  // Codex P1: the people change while it's held (another edit adds Erin). The card he was
+  // shown named Carol and Dave only, so its Confirm confirms nothing and sends nothing.
+  const shownCard = latestConfirm(row.id);
+  const addedErin = await updateDraft({ draft_id: draftId, cc: ["dave@example.com", "erin@example.com"] });
+  assert(JSON.parse(addedErin).schedule === "synced", "the held schedule takes the edit");
+  assert(requestOf(row.id).cc.some((slot) => slot.mailbox.email === "erin@example.com"), "Erin is on it now");
+  const toldBeforeStale = told.length;
+  const staleEdits = await tapConfirmFor(row.id, shownCard);
+  assert(getScheduledSend(row.id)!.status === "held", "the old card's Confirm leaves it held");
+  assert(sends.length === before, "and sends nothing");
+  assert(staleEdits.some((text) => text.startsWith("Not confirmed: the people on it changed")), `the old card says why: ${staleEdits.join(" | ")}`);
+  assert(
+    told.slice(toldBeforeStale).some((text) => text.includes("It now goes to carol@example.com, dave@example.com, erin@example.com.") && text.includes("New address: carol@example.com, dave@example.com, erin@example.com.")),
+    `a fresh card shows who now: ${told.slice(toldBeforeStale).join(" | ")}`,
+  );
+  assert(latestConfirm(row.id) !== shownCard, "with its own Confirm");
+  await tapConfirmFor(row.id, shownCard);
+  assert(getScheduledSend(row.id)!.status === "held", "the old card stays out of date");
+  // His Confirm tap on the fresh card puts it back on the schedule, once; a second tap does nothing.
   const tapConfirm = () => tapConfirmFor(row.id);
   await tapConfirm();
   assert(getScheduledSend(row.id)!.status === "scheduled", "Confirm schedules it again");
@@ -473,7 +510,7 @@ async function tapConfirmFor(id: number): Promise<void> {
   assert(sends.length === before + 1, "one email goes out");
   const sent = sends.at(-1)!;
   assert(sent.to.includes("carol@example.com") && !sent.to.includes("bob@example.com"), `only to Carol, got ${sent.to}`);
-  assert(sent.cc.includes("dave@example.com"), "Cc Dave");
+  assert(sent.cc.includes("dave@example.com") && sent.cc.includes("erin@example.com"), `Cc Dave and Erin, got ${sent.cc}`);
   assert(sent.subject === "Invoice due date" && sent.body.startsWith(tapBody), "with the edited subject and body");
 }
 

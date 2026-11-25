@@ -37,6 +37,7 @@ import { everyMs, type IntervalJob } from "./scheduler.js";
 import { retireDraftApproval } from "./approvals.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { allowOwnerChatCancelScheduledSend } from "./security/send_approval.js";
+import { recipientFingerprint, scheduleConfirmData } from "./security/send_decision.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const TICK_INTERVAL_MS = 60 * 1000;
@@ -132,6 +133,11 @@ async function recheckRecipients(request: CommandRequest): Promise<RecheckResult
   return { ok: true };
 }
 
+/** Everyone a scheduled email would go to now (To and Cc), lowercased. */
+function recipientsOf(request: CommandRequest): string[] {
+  return [...new Set([...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : [])))];
+}
+
 /** False when the row changed or ended while its recipients were being checked. */
 async function hold(row: ScheduledSendRecord, request: CommandRequest, check: Extract<RecheckResult, { ok: false }>): Promise<boolean> {
   const slots = [...request.to, ...request.cc];
@@ -185,7 +191,7 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
       await tell(
         `Held, not sent: ${row.item_text}\nNew address: ${newAddresses.join(", ") || "unconfirmed"}. Tap Confirm to send it.`,
         new InlineKeyboard()
-          .text("Confirm", `cmdsend:confirmsched:${row.id}`)
+          .text("Confirm", scheduleConfirmData(row.id, recipientsOf(request)))
           .text("Cancel", `cmdsend:cancelsched:${row.id}`),
       );
     }
@@ -396,8 +402,9 @@ export async function handleScheduledSendCallback(ctx: Context): Promise<void> {
       .catch(() => undefined);
     return;
   }
-  // Confirm on a held send to a new address: his tap confirms everyone on it, once.
-  const confirm = /^cmdsend:confirmsched:(\d+)$/.exec(data);
+  // Confirm on a held send to a new address: his tap confirms the people that card
+  // showed, once, and only while the schedule still goes to exactly them.
+  const confirm = /^cmdsend:confirmsched:(\d+)(?::([0-9a-f]{12}))?$/.exec(data);
   if (confirm) {
     const held = getScheduledSend(Number(confirm[1]));
     if (!held || held.status !== "held") {
@@ -405,10 +412,26 @@ export async function handleScheduledSendCallback(ctx: Context): Promise<void> {
       return;
     }
     const request = requestOf(held);
-    const everyone = [...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : []));
+    const everyone = recipientsOf(request);
+    if (!confirm[2] || confirm[2] !== recipientFingerprint(everyone)) {
+      // The people changed after that card: nothing is confirmed. A fresh card shows who now.
+      console.log(`Scheduled send ${held.id}: confirm refused, recipients changed since the card`);
+      await ctx
+        .editMessageText("Not confirmed: the people on it changed since this card. I've sent a new one.", { reply_markup: undefined })
+        .catch(() => undefined);
+      const verdict = await scheduledSendVerdict(request);
+      const newAddresses = verdict.action === "card" ? verdict.newAddresses : [];
+      await tell(
+        `Held, not sent: ${held.item_text}\nIt now goes to ${everyone.join(", ")}.${newAddresses.length > 0 ? ` New address: ${newAddresses.join(", ")}.` : ""} Tap Confirm to send it to them.`,
+        new InlineKeyboard()
+          .text("Confirm", scheduleConfirmData(held.id, everyone))
+          .text("Cancel", `cmdsend:cancelsched:${held.id}`),
+      );
+      return;
+    }
     request.confirmedRecipients = [...new Set([...(request.confirmedRecipients ?? []), ...everyone])];
-    if (!releaseHeldScheduledSend(held.id, JSON.stringify(request))) {
-      await ctx.editMessageText("That's already been handled.", { reply_markup: undefined }).catch(() => undefined);
+    if (!releaseHeldScheduledSend(held.id, JSON.stringify(request), held.request)) {
+      await ctx.editMessageText("Not confirmed: it changed while you tapped. Check the newest card.", { reply_markup: undefined }).catch(() => undefined);
       return;
     }
     console.log(`Scheduled send ${held.id}: status -> scheduled (confirmed)`);

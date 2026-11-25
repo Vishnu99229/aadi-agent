@@ -4,6 +4,8 @@
  * from facts code gathered: anything uncertain is a card, never a send.
  */
 
+import { createHash } from "node:crypto";
+
 const DECIDED = Symbol("send-decision");
 
 /** Only decideSendAction makes one of these, and every Gmail send checks it. */
@@ -89,4 +91,16 @@ export function cardReason(verdict: Exclude<SendVerdict, SendDecision>, to: stri
     return "I couldn't confirm who it goes to, so nothing was sent. Check the card and tap Send to confirm.";
   }
   return `Ready to send to ${to}, but this didn't come straight from your own message. Tap Send to confirm.`;
+}
+
+/** Who a card showed, as a short fingerprint: the same people give the same value. */
+export function recipientFingerprint(recipients: readonly string[]): string {
+  const people = [...new Set(recipients.map(normalize).filter(Boolean))].sort();
+  return createHash("sha256").update(people.join(",")).digest("hex").slice(0, 12);
+}
+
+/** A Confirm button for a held schedule, bound to the people its card shows: a tap
+ *  confirms them only while the schedule still goes to exactly those people. */
+export function scheduleConfirmData(id: number, recipients: readonly string[]): string {
+  return `cmdsend:confirmsched:${id}:${recipientFingerprint(recipients)}`;
 }

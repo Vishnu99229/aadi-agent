@@ -6359,7 +6359,17 @@ export function holdScheduledSendForConfirm(id: number): boolean {
   );
 }
 
-export function releaseHeldScheduledSend(id: number, request: string): boolean {
+export function releaseHeldScheduledSend(id: number, request: string, expectedRequest?: string): boolean {
+  if (expectedRequest !== undefined) {
+    // Only the version he was shown: an edit since then wins and nothing is released.
+    return (
+      db
+        .prepare(
+          "UPDATE scheduled_sends SET status = 'scheduled', request = ?, retry_at = NULL WHERE id = ? AND status = 'held' AND request = ?",
+        )
+        .run(request, id, expectedRequest).changes === 1
+    );
+  }
   return (
     db
       .prepare(

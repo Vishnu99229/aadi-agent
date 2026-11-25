@@ -30,7 +30,7 @@ import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
-import { cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
+import { cardReason, decideSendAction, scheduleConfirmData, type SendVerdict } from "./security/send_decision.js";
 import { withoutFollowupClause } from "./command_intent.js";
 import { followupsAfterSend } from "./sequences.js";
 import { mailDomainRefusal } from "./email_grounding.js";
@@ -722,7 +722,7 @@ async function scheduleRequest(
       text: heldText,
       caption: heldText,
       keyboard: new InlineKeyboard()
-        .text("Confirm", `cmdsend:confirmsched:${row.id}`)
+        .text("Confirm", scheduleConfirmData(row.id, recipients))
         .text("Cancel", `cmdsend:cancelsched:${row.id}`),
     };
     if (!holdForVoiceNote(heldCard)) {
