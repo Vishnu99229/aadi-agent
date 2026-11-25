@@ -23,6 +23,9 @@ import {
   draftRecipientsShownBefore,
   pendingActionFollowups,
   recordCommandSendSent,
+  cardRecipientsForMessage,
+  draftHasCardRecords,
+  recordCardRecipients,
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import {
@@ -386,13 +389,24 @@ export async function queueDraftApproval(
     );
   }
 
-  if (options.touch !== false) {
-    setPendingActionDraftMeta(action.id, {
-      toHeader: preview.to,
-      ccHeader: preview.cc?.trim() ?? "",
-      subject: preview.subject,
-    });
-  }
+  // The people on this card count as shown only once Telegram has confirmed the card
+  // that shows them: then the card's To/Cc and its message's record are written.
+  const draftIdForCard = preview.draftId;
+  const shown = (actionId: number): void => {
+    if (options.touch !== false) {
+      setPendingActionDraftMeta(actionId, {
+        toHeader: preview.to,
+        ccHeader: preview.cc?.trim() ?? "",
+        subject: preview.subject,
+      });
+    } else {
+      const messageId = getPendingAction(actionId)?.telegram_message_id;
+      if (messageId) {
+        recordCardRecipients(messageId, draftIdForCard, `${preview.to},${preview.cc ?? ""}`);
+      }
+    }
+    options.onShown?.(actionId);
+  };
 
   const sendOnly = options.sendOnly ?? false;
   if (sendOnly) sendOnlyActions.add(action.id);
@@ -414,7 +428,7 @@ export async function queueDraftApproval(
         { reply_markup: markup },
       );
       console.log(`Approval action ${action.id}: preview updated`);
-      options.onShown?.(action.id);
+      shown(action.id);
       return action.id;
     } catch {
       console.log(`Approval action ${action.id}: preview replacement failed`);
@@ -437,7 +451,7 @@ export async function queueDraftApproval(
       keyboard: markup,
       onPosted: (messageId) => {
         setPendingActionTelegramMessage(draftActionId, messageId);
-        options.onShown?.(draftActionId);
+        shown(draftActionId);
       },
     })
   ) {
@@ -448,7 +462,7 @@ export async function queueDraftApproval(
     reply_markup: markup,
   });
   setPendingActionTelegramMessage(action.id, message.message_id);
-  options.onShown?.(action.id);
+  shown(action.id);
   console.log(`Approval action ${action.id}: preview sent`);
   return action.id;
 }
@@ -497,10 +511,8 @@ async function postRefreshedCard(
       },
       {
         newCard: true,
-        touch: false,
         onShown: (actionId) => {
           posted = actionId;
-          setPendingActionDraftMeta(actionId, { toHeader: to, ccHeader: cc, subject });
         },
       },
     );
@@ -573,18 +585,18 @@ async function draftRecipients(account: GoogleAccountId, draftId: string): Promi
   return [...new Set([...parseAddressList(value("to")), ...parseAddressList(value("cc"))].map((item) => item.email.toLowerCase()))];
 }
 
-/** Everyone this card has shown: its current To and Cc, and any address it showed
- *  earlier (cards from before the log existed still have their To and Cc). */
-function shownOnCard(action: PendingAction): Set<string> {
-  const shown = new Set(
-    [...parseAddressList(action.to_header ?? ""), ...parseAddressList(action.cc_header ?? "")].map((item) => item.email.toLowerCase()),
-  );
-  if (action.draft_id) {
-    for (const email of draftRecipientsShownBefore(action.draft_id, Number.MAX_SAFE_INTEGER)) {
-      shown.add(email);
-    }
+/** Who the tapped card message showed: all a tap on it can confirm. A card posted
+ *  before cards were recorded per message still confirms its stored To and Cc. */
+function shownOnTappedCard(action: PendingAction, messageId: number | undefined): Set<string> {
+  if (!action.draft_id) {
+    return new Set();
   }
-  return shown;
+  if (!draftHasCardRecords(action.draft_id)) {
+    return new Set(
+      [...parseAddressList(action.to_header ?? ""), ...parseAddressList(action.cc_header ?? "")].map((item) => item.email.toLowerCase()),
+    );
+  }
+  return messageId === undefined ? new Set() : cardRecipientsForMessage(action.draft_id, messageId);
 }
 
 /** His own "send it" for a draft he was shown: only addresses its card showed before
@@ -896,7 +908,8 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
       return;
     }
   }
-  const shown = shownOnCard(action);
+  const tappedMessage = ctx.callbackQuery?.message?.message_id;
+  const shown = shownOnTappedCard(action, tappedMessage);
   const verdict = decideSendAction({
     intent: "send",
     ownTurn: true,
@@ -907,7 +920,11 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   if (verdict.action === "card" && verdict.newAddresses.length > 0) {
     console.log(`Approval action ${action.id}: send refused, draft has addresses the card didn't show`);
     await ctx.answerCallbackQuery({
-      text: `Not sent: ${verdict.newAddresses.join(", ")} is on the draft now but wasn't on this card. Ask me to show the card again (it will show who it goes to now), then tap Send.`,
+      text: `Not sent: ${verdict.newAddresses.join(", ")} is on the draft now but wasn't on this card. ${
+        tappedMessage !== undefined && action.telegram_message_id && action.telegram_message_id !== tappedMessage
+          ? "Tap Send on the newer card."
+          : "Ask me to show the card again (it will show who it goes to now), then tap Send."
+      }`,
       show_alert: true,
     });
     return;

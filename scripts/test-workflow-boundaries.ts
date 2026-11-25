@@ -28,6 +28,7 @@ import {
   saveMessage,
   transitionScheduledSend,
   upsertCalendarEventRef,
+  getPendingAction as approvalAction,
 } from "../src/db.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
@@ -319,7 +320,11 @@ function schedule(input: { draftId: string; account: "work" | "personal"; to: st
 async function tap(operation: "send" | "discard" | "edit", actionId: number): Promise<string[]> {
   const answers: string[] = [];
   await handleApprovalCallback({
-    callbackQuery: { data: `approval:${operation}:${actionId}` },
+    // A tap comes from the card message that carries the button.
+    callbackQuery: {
+      data: `approval:${operation}:${actionId}`,
+      message: { chat: { id: 1 }, message_id: approvalAction(actionId)?.telegram_message_id ?? 0 },
+    },
     answerCallbackQuery: async (text?: unknown) => {
       if (typeof text === "string") answers.push(text);
       else if (text && typeof text === "object" && "text" in text) answers.push(String((text as { text: unknown }).text));

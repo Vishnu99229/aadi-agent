@@ -43,6 +43,7 @@ import {
   createMemory,
   db,
   getCommandSendByKey,
+  getPendingAction as approvalAction,
   latestProcessedMessageId,
   setChatTurnRetryText,
   getPendingActionForDraft,
@@ -64,6 +65,7 @@ import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
 import { evaluateCommandSendGate } from "../src/security/command_send.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
+import { handler as updateDraft } from "../src/tools/update_draft.ts";
 import { setOwnerCalendarTestHooks, type OwnerCalendarEvent } from "../src/owner_calendar.ts";
 import {
   createOwnerCalendarEvent,
@@ -271,7 +273,31 @@ const gmail = {
         if (unreadableDrafts.has(id ?? "")) {
           throw new Error("gmail unavailable");
         }
-        return { data: { message: { payload: { headers: draftHeaders.get(id ?? "") ?? [] } } } };
+        return {
+          data: {
+            id,
+            message: {
+              id: `m-${id}`,
+              threadId: `t-${id}`,
+              payload: {
+                headers: draftHeaders.get(id ?? "") ?? [],
+                mimeType: "text/plain",
+                body: { data: Buffer.from("Hi,\n\nA short note.", "utf8").toString("base64url") },
+              },
+            },
+          },
+        };
+      },
+      // An edit replaces the draft; Gmail keeps its id and its new headers.
+      update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string } } }) => {
+        const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
+        const block = raw.split("\r\n\r\n")[0]!;
+        draftHeaders.set(id, [
+          { name: "To", value: headerOf(block, "To") },
+          { name: "Cc", value: headerOf(block, "Cc") },
+          { name: "Subject", value: headerOf(block, "Subject") },
+        ]);
+        return { data: { id, message: { id: `m-${id}`, threadId: `t-${id}` } } };
       },
       // Discard deletes the Gmail draft.
       delete: async () => ({ data: {} }),
@@ -285,12 +311,22 @@ setGoogleAccountForTests((id) => (id === "work" ? workAccount : personalAccount)
 setGmailClientForTests(() => gmail);
 
 const told: Array<{ text: string; markup?: unknown }> = [];
+/** Telegram refusing to post a message or edit one, for the cases that need it. */
+const telegramFails = { send: false, edit: false };
 const telegram = {
   sendMessage: async (_chat: unknown, text: string, extra?: { reply_markup?: unknown }) => {
+    if (telegramFails.send) {
+      throw new Error("telegram down");
+    }
     told.push({ text, markup: extra?.reply_markup });
     return { message_id: 900 + told.length, date: 0, chat: { id: 1, type: "private" }, text };
   },
-  editMessageText: async () => true,
+  editMessageText: async () => {
+    if (telegramFails.edit) {
+      throw new Error("telegram down");
+    }
+    return true;
+  },
 } as unknown as Api;
 setCommandEmailTestHooks({ telegram });
 setSequenceTestHooks({ telegram });
@@ -2018,9 +2054,15 @@ await expectCancelled("delete_task", async (row) => {
   const own = (userText: string, messageId = nextTurn()) => ({ ...turn(userText, messageId), ownTurn: true });
   const sentTo = (address: string) =>
     mail({ threadId: `c-known-${address}`, from: `Vishnu <${ME}>`, to: address, subject: "Earlier", body: "Hi", sent: true });
+  // A tap comes from the card message that carries the button: by default the card's
+  // own (latest) Telegram message.
+  const cardMessageOf = (data: string): number => {
+    const id = /^approval:\w+:(\d+)$/.exec(data)?.[1];
+    return (id ? approvalAction(Number(id))?.telegram_message_id : undefined) ?? 1;
+  };
   const cardCtx = (data: string, log: string[] = []) =>
     ({
-      callbackQuery: { data, message: { chat: { id: config.ownerTelegramId }, message_id: 1 } },
+      callbackQuery: { data, message: { chat: { id: config.ownerTelegramId }, message_id: cardMessageOf(data) } },
       from: { id: config.ownerTelegramId },
       chat: { id: config.ownerTelegramId },
       answerCallbackQuery: async () => true,
@@ -2591,6 +2633,75 @@ await expectCancelled("delete_task", async (row) => {
     assert(draftsSent.length === unreadSends, "the tap sends nothing");
     assert(unreadTap.includes("I couldn't re-read the draft from Gmail, so I didn't send it. Try again."), `the tap says why: ${unreadTap.join(" | ")}`);
     unreadableDrafts.delete("c-unreadable");
+  }
+
+  // 17. Recipients count as shown only once Telegram confirms the card that shows them
+  //     (Codex P1), and a tap confirms only what that card message rendered.
+  {
+    const ownMessage = () => {
+      const id = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, id);
+      return { chatId: 1, messageId: id };
+    };
+    const tapMessage = async (actionId: number, messageId: number): Promise<string[]> => {
+      const alerts: string[] = [];
+      await handleApprovalCallback(
+        {
+          ...(cardCtx(`approval:send:${actionId}`) as unknown as Record<string, unknown>),
+          callbackQuery: { data: `approval:send:${actionId}`, message: { chat: { id: config.ownerTelegramId }, message_id: messageId } },
+          answerCallbackQuery: async (input?: string | { text?: string }) => {
+            alerts.push(typeof input === "string" ? input : (input?.text ?? ""));
+            return true;
+          },
+        } as unknown as Context,
+        "send",
+        actionId,
+      );
+      return alerts;
+    };
+    const gmailCc = (draftId: string) => draftHeaders.get(draftId)?.find((header) => header.name === "Cc")?.value ?? "";
+    sentTo("c.k17@known-co.com");
+    await queueDraftApproval({ draftId: "c-edit17", threadId: null, to: "c.k17@known-co.com", subject: "Hi", body: "Hi", googleAccount: "work" });
+    draftHeaders.set("c-edit17", [
+      { name: "To", value: "c.k17@known-co.com" },
+      { name: "Subject", value: "Hi" },
+    ]);
+    const card = getPendingActionForDraft("c-edit17")!;
+    const oldCard = card.telegram_message_id!;
+    const sent0 = draftsSent.length;
+
+    // a) update_draft adds a new Cc, and Telegram can neither edit nor post the card.
+    telegramFails.edit = true;
+    telegramFails.send = true;
+    try {
+      await updateDraft({ draft_id: "c-edit17", cc: ["c.new17@new-co.com"] }, own("cc c.new17@new-co.com"));
+    } catch {
+      // The tool may report the failed card; what matters is what counts as shown.
+    }
+    telegramFails.edit = false;
+    telegramFails.send = false;
+    assert(gmailCc("c-edit17").includes("c.new17@new-co.com"), `Gmail has the new Cc: ${gmailCc("c-edit17")}`);
+    assert(!(getPendingActionForDraft("c-edit17")?.cc_header ?? "").includes("c.new17@new-co.com"), "the card's recipients don't take an unshown Cc");
+    const sendIt = await sendPendingDraftByText(ownMessage(), "c-edit17", { ownTurn: true });
+    assert(!sendIt.ok && draftsSent.length === sent0, `"send it" refuses the unshown Cc: ${sendIt.message}`);
+    assert(sendIt.message.startsWith("New address: c.new17@new-co.com."), `as a new address: ${sendIt.message}`);
+    const oldTap = await tapMessage(card.id, oldCard);
+    assert(draftsSent.length === sent0, "a tap on the old card sends nothing");
+    assert(oldTap.some((text) => text.includes("c.new17@new-co.com is on the draft now")), `and says why: ${oldTap.join(" | ")}`);
+
+    // b) The edit fails but a new card is posted: only that new card confirms the Cc.
+    telegramFails.edit = true;
+    await updateDraft({ draft_id: "c-edit17", cc: ["c.new17@new-co.com"] }, own("cc c.new17@new-co.com"));
+    telegramFails.edit = false;
+    const newCard = getPendingActionForDraft("c-edit17")!.telegram_message_id!;
+    assert(newCard !== oldCard, "a new card was posted");
+    const oldAfter = await tapMessage(card.id, oldCard);
+    assert(draftsSent.length === sent0, "the old card still can't confirm the new Cc");
+    assert(oldAfter.some((text) => text.includes("c.new17@new-co.com is on the draft now")), `and says why: ${oldAfter.join(" | ")}`);
+    await tapMessage(card.id, newCard);
+    assert(draftsSent.length === sent0 + 1 && draftsSent.at(-1) === "c-edit17", "the tap on the new card sends it");
+    await tapMessage(card.id, newCard);
+    assert(draftsSent.length === sent0 + 1, "once");
   }
 
   // 13. Unchanged: resolution still marks the contact confirmed (cross-turn reuse), and

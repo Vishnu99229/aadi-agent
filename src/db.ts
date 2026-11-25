@@ -1487,13 +1487,17 @@ db.exec(`
   );
   -- Each address a draft's card has shown him, and the newest of his messages that had
   -- arrived by then. Shown before message M means that watermark is below M.
-  CREATE TABLE IF NOT EXISTS draft_card_recipients (
+  -- Who each posted card message shows, written only once Telegram confirmed the
+  -- post or edit. shown_watermark: his newest message when it was shown.
+  CREATE TABLE IF NOT EXISTS card_message_recipients (
+    message_id INTEGER NOT NULL,
     draft_id TEXT NOT NULL,
     email TEXT NOT NULL,
     shown_watermark INTEGER NOT NULL,
     shown_at TEXT NOT NULL,
-    PRIMARY KEY (draft_id, email)
+    PRIMARY KEY (message_id, draft_id, email)
   );
+  CREATE INDEX IF NOT EXISTS idx_card_message_recipients_draft ON card_message_recipients (draft_id);
 `);
 
 /**
@@ -2080,19 +2084,51 @@ export function setPendingActionDraftMeta(
      SET to_header = ?, cc_header = ?, subject = ?, updated_at = datetime('now')
      WHERE id = ?`,
   ).run(meta.toHeader, meta.ccHeader, meta.subject, id);
-  // The card now shows these people. Record when, against his messages, so "send it"
-  // only counts addresses that were on the card before he said it.
-  const row = db.prepare(`SELECT draft_id FROM pending_actions WHERE id = ?`).get(id) as { draft_id: string | null } | undefined;
-  if (row?.draft_id) {
-    const watermark = latestProcessedMessageId();
-    const insert = db.prepare(
-      `INSERT OR IGNORE INTO draft_card_recipients (draft_id, email, shown_watermark, shown_at)
-       VALUES (?, ?, ?, ?)`,
-    );
-    for (const email of headerAddresses(`${meta.toHeader},${meta.ccHeader}`)) {
-      insert.run(row.draft_id, email, watermark, new Date().toISOString());
+  // Called only once the card showing these people is posted: record them against that
+  // card message.
+  const row = db
+    .prepare(`SELECT draft_id, telegram_message_id FROM pending_actions WHERE id = ?`)
+    .get(id) as { draft_id: string | null; telegram_message_id: number | null } | undefined;
+  if (row?.draft_id && row.telegram_message_id) {
+    recordCardRecipients(row.telegram_message_id, row.draft_id, `${meta.toHeader},${meta.ccHeader}`);
+  }
+}
+
+/** Telegram confirmed this card message shows these people (posted, or edited to show
+ *  them): it now confirms exactly them. Someone still on it keeps the time they were
+ *  first shown; someone taken off it no longer counts for this message. */
+export const recordCardRecipients = db.transaction((messageId: number, draftId: string, header: string): void => {
+  const people = headerAddresses(header);
+  const current = db
+    .prepare(`SELECT email FROM card_message_recipients WHERE message_id = ? AND draft_id = ?`)
+    .all(messageId, draftId) as Array<{ email: string }>;
+  const remove = db.prepare(`DELETE FROM card_message_recipients WHERE message_id = ? AND draft_id = ? AND email = ?`);
+  for (const { email } of current) {
+    if (!people.includes(email)) {
+      remove.run(messageId, draftId, email);
     }
   }
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO card_message_recipients (message_id, draft_id, email, shown_watermark, shown_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  const watermark = latestProcessedMessageId();
+  for (const email of people) {
+    insert.run(messageId, draftId, email, watermark, new Date().toISOString());
+  }
+});
+
+/** Who this one card message showed: what a tap on it confirms. */
+export function cardRecipientsForMessage(draftId: string, messageId: number): Set<string> {
+  const rows = db
+    .prepare(`SELECT email FROM card_message_recipients WHERE draft_id = ? AND message_id = ?`)
+    .all(draftId, messageId) as Array<{ email: string }>;
+  return new Set(rows.map((row) => row.email));
+}
+
+/** False for a card posted before recipients were recorded per card message. */
+export function draftHasCardRecords(draftId: string): boolean {
+  return db.prepare(`SELECT 1 FROM card_message_recipients WHERE draft_id = ? LIMIT 1`).get(draftId) !== undefined;
 }
 
 const HEADER_ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
@@ -2106,10 +2142,10 @@ export function latestProcessedMessageId(): number {
   return (db.prepare(`SELECT MAX(message_id) AS id FROM processed_messages`).get() as { id: number | null }).id ?? 0;
 }
 
-/** Addresses this draft's card showed him before his message `messageId` arrived. */
+/** Addresses on a card for this draft that was posted before his message `messageId`. */
 export function draftRecipientsShownBefore(draftId: string, messageId: number): Set<string> {
   const rows = db
-    .prepare(`SELECT email FROM draft_card_recipients WHERE draft_id = ? AND shown_watermark < ?`)
+    .prepare(`SELECT DISTINCT email FROM card_message_recipients WHERE draft_id = ? AND shown_watermark < ?`)
     .all(draftId, messageId) as Array<{ email: string }>;
   return new Set(rows.map((row) => row.email));
 }
