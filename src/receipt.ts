@@ -1,4 +1,4 @@
-import { COMMAND_TOOLS, commandIntents } from "./command_intent.js";
+import { COMMAND_TOOLS, REQUEST_TO_AADI, commandIntents } from "./command_intent.js";
 import { mentionsSendDate, splitOwnerEmailCommand } from "./command_logic.js";
 import { isSendDraftCommand } from "./send_triggers.js";
 
@@ -212,9 +212,17 @@ const ASKS_TO_LOOK =
 
 /** "Did Hardik reply?" and "has it been sent?" ask what happened, not for it to happen. */
 const ASKS_WHAT_HAPPENED = /^\s*(?:(?:thanks|thank you|please|hey|aadi)[,\s]+)*(?:how|why|any|did|does|has|have|had|was|were|is|are|when|where|who|what|which)\b/i;
+const REQUESTED_ACTION_VERB = /^(?:send|e-?mail|mail|reply|respond|start|begin|stop|set|pause|add|book|schedule|create|move|cancel|delete|remove|remember|forget|draft|write|compose|update|change|mark|complete|discard|learn|remind|block|arrange|prepare|follow)\b/i;
 
 export function isLookupQuestion(ownerText: string): boolean {
-  return ASKS_WHAT_HAPPENED.test(ownerText) || /\?\s*$/.test(ownerText);
+  if (ASKS_WHAT_HAPPENED.test(ownerText)) return true;
+  const text = ownerText.trim();
+  if (!text.endsWith("?")) return false;
+  if (REQUEST_TO_AADI.test(text)) {
+    const instruction = text.replace(REQUEST_TO_AADI, "").trim().replace(/^please\s+/i, "");
+    if (REQUESTED_ACTION_VERB.test(instruction) && commandIntents(text).length > 0) return false;
+  }
+  return true;
 }
 
 function instructionClauses(ownerText: string): string[] {

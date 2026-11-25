@@ -87,6 +87,8 @@ await test("retry instructions follow current command intent", () => {
   assert.equal(receiptRetryPrompt(["sent"], "Draft an email to Mukesh"), READ_RETRY);
   assert.equal(receiptRetryPrompt(["sent", "deleted"], "Send Mukesh an email"), READ_RETRY);
   assert.equal(receiptRetryPrompt(["deleted"], "Book a meeting to delete an event"), READ_RETRY);
+  assert.match(receiptRetryPrompt(["sent"], `Can you send another email to ${ADDRESS}?`), /Do it now/);
+  assert.equal(receiptRetryPrompt(["sent"], `Can you check whether to send the email to ${ADDRESS}?`), READ_RETRY);
 });
 
 await test("incident question accepts the earlier send without touching pending draft 42", async () => {
@@ -105,7 +107,7 @@ await test("sequence instruction can mention a receipted earlier send", async ()
   incident();
   const result = await replay(`Start a sequence for ${ADDRESS}`, [
     { tools: [{ name: "start_sequence", input: { prospect: ADDRESS } }] },
-    { text: `I sent the email to ${ADDRESS} earlier. Sequence offer posted.` },
+    { text: `I sent the email to ${ADDRESS} earlier (sent43). Sequence offer posted.` },
   ]);
   assert.deepEqual(result.ran, ["start_sequence"]);
   assert.equal(result.calls.length, 2);
@@ -113,7 +115,7 @@ await test("sequence instruction can mention a receipted earlier send", async ()
 
 await test("a current send claim still gets an action retry", async () => {
   incident();
-  const result = await replay(`Send another email to ${ADDRESS}`, [
+  const result = await replay(`Can you send another email to ${ADDRESS}?`, [
     { text: "Sent." }, { tools: [{ name: "draft_reply", input: { send_immediately: true } }] }, { text: "Sent." },
   ], { confirmation: false });
   assert(result.calls.some(call => call.messages.some(m => m.role === "user" && String(m.content).includes("Do it now"))));
@@ -141,7 +143,7 @@ await test("unknown historical claim restricts offered and executed tools includ
 await test("retry denial is replaced by the completed record", async () => {
   incident();
   const result = await replay(QUESTION, [
-    { text: `I sent the email to ${ADDRESS}. I deleted the draft.` },
+    { text: `I sent the email to ${ADDRESS} (sent43). I deleted the draft.` },
     { text: "It didn't happen. No send tool confirmed anything. Say send it." },
   ]);
   assert(result.reply.startsWith(`Sent to ${ADDRESS} at `));
@@ -167,6 +169,7 @@ await test("card, draft, thread and Gmail IDs distinguish sent and pending mail"
     assert.deepEqual(record?.actions, ["sent"], subject);
   }
   assert.equal(recordedReceipt({ ownerText: "Was card #1946 sent?", reply: `I sent the email to ${ADDRESS}.`, turnStartedAt: Date.now() }), undefined);
+  assert.equal(recordedReceipt({ ownerText: `Was the invoice email to ${ADDRESS} sent?`, reply: "It didn't happen.", turnStartedAt: Date.now() }), undefined);
 });
 
 await test("a schedule becomes a delivery receipt only after it is marked sent", () => {

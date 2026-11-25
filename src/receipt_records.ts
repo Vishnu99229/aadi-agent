@@ -17,7 +17,7 @@ interface SendRecord {
 /** Metadata only. Pending rows also participate in matching so an explicit pending
  * draft cannot accidentally resolve to an older send to the same person. */
 function sendRecords(): SendRecord[] {
-  const drafts = db.prepare(`SELECT p.status, p.google_account AS account,
+  const drafts = db.prepare(`SELECT COALESCE(c.status, p.status) AS status, p.google_account AS account,
       COALESCE(NULLIF(p.to_header, ''), c.idem_key, '') AS recipients, p.id AS action_id, p.draft_id,
       p.telegram_message_id AS card_id, COALESCE(p.thread_id, c.thread_id) AS thread_id,
       COALESCE(p.sent_message_id, c.sent_message_id) AS sent_message_id,
@@ -28,7 +28,7 @@ function sendRecords(): SendRecord[] {
       NULL AS action_id, NULL AS draft_id, c.telegram_message_id AS card_id, c.thread_id,
       c.sent_message_id, c.sent_at, NULL AS scheduled_at
     FROM command_sends c WHERE NOT EXISTS
-      (SELECT 1 FROM pending_actions p WHERE p.command_key = c.idem_key AND p.status = 'sent')`).all() as SendRecord[];
+      (SELECT 1 FROM pending_actions p WHERE p.command_key = c.idem_key)`).all() as SendRecord[];
   const schedules = db.prepare(`SELECT s.status,
       COALESCE(json_extract(s.request, '$.account'), 'work') AS account,
       COALESCE((SELECT group_concat(json_extract(value, '$.mailbox.email'), ',')
@@ -106,29 +106,35 @@ export function recordedReceipt(context: ReceiptRecordContext): RecordedReceipt 
   if (replyMatch && ownerMatch) {
     selected = replyMatch.filter(record => ownerMatch.includes(record));
   }
-  if (selected === undefined) {
-    for (const read of context.reads ?? []) {
-      // Tool output can include snippets and bodies. Only explicit metadata is evidence.
-      try {
-        const parsed = JSON.parse(read);
-        const items = Array.isArray(parsed) ? parsed : [parsed];
-        const matches = items.flatMap(item => records.filter(record =>
-          (!item?.account || record.account === item.account) &&
+  const readMatches = new Set<SendRecord>();
+  for (const read of context.reads ?? []) {
+    try {
+      // Tool output can include snippets. Only identifiers and mailbox metadata count.
+      const parsed = JSON.parse(read);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      for (const record of selected ?? records) {
+        if (items.some(item => (!item?.account || record.account === item.account) &&
           ((item?.id && record.sent_message_id === item.id) ||
             (item?.draft_id && record.draft_id === item.draft_id) ||
-            (item?.threadId && record.thread_id === item.threadId)),
-        ));
-        selected = matches.length ? matches : undefined;
-        if (selected !== undefined) break;
-      } catch { /* A prose tool result supplies no structured send evidence. */ }
-    }
+            (item?.threadId && record.thread_id === item.threadId)))) {
+          readMatches.add(record);
+        }
+      }
+    } catch { /* A prose tool result supplies no structured send evidence. */ }
   }
+  if (readMatches.size > 0) selected = [...readMatches];
   const previousReply = context.history?.at(-1);
   if (selected === undefined && previousReply && /\b(?:it|this|that|earlier|previous|last)\b/i.test(context.ownerText) &&
       detectClaimedActions(previousReply).includes("sent")) {
     selected = matching(records, previousReply);
   }
   if (!selected?.length) return undefined;
+  // Different drafts for the same recipient can have different outcomes. Check
+  // ambiguity before dropping pending rows, and collapse only linked deliveries.
+  const identities = new Set(selected.map(record => record.sent_message_id
+    ? `${record.account}:${record.sent_message_id}`
+    : record));
+  if (identities.size !== 1) return undefined;
   const completed = selected.filter(record =>
     (sent && record.status === "sent" && (!record.sent_at || recordTime(record.sent_at).getTime() <= context.turnStartedAt)) ||
     (scheduled && record.status === "scheduled" && record.scheduled_at),
@@ -139,8 +145,6 @@ export function recordedReceipt(context: ReceiptRecordContext): RecordedReceipt 
   const record = completed[0]!;
   const recipients = addresses(record.recipients);
   if (!recipients.length) return undefined;
-  // Do not guess which of several different conversations a lookup meant.
-  if (completed.some(item => addresses(item.recipients).join(",") !== recipients.join(","))) return undefined;
   if (record.status === "scheduled") return { actions: ["scheduled"], summary: "" };
   const time = record.sent_at ? recordTime(record.sent_at) : undefined;
   const summary = time && Number.isFinite(time.getTime())
