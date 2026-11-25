@@ -28,7 +28,7 @@ import {
   type ScheduledSendRecord,
   holdScheduledSendForConfirm,
 } from "./db.js";
-import { formatMailbox } from "./draft_recipients.js";
+import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
 import type { ParsedMailbox } from "./mail_helpers.js";
 import { loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { getGoogleAccount } from "./google/auth.js";
@@ -37,7 +37,9 @@ import { everyMs, type IntervalJob } from "./scheduler.js";
 import { retireDraftApproval } from "./approvals.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { allowOwnerChatCancelScheduledSend } from "./security/send_approval.js";
-import { recipientFingerprint, scheduleConfirmData } from "./security/send_decision.js";
+import { recipientFingerprint } from "./security/send_decision.js";
+import { cardRecipientsForMessage } from "./db.js";
+import { postConfirmCard, scheduleCardKey, type ConfirmCardSpec } from "./confirm_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const TICK_INTERVAL_MS = 60 * 1000;
@@ -133,6 +135,22 @@ async function recheckRecipients(request: CommandRequest): Promise<RecheckResult
   return { ok: true };
 }
 
+/** The schedule's current To and Cc, as a card shows them. */
+function peopleOf(request: CommandRequest): { to: string; cc: string } {
+  const mailboxes = (slots: readonly RecipientSlot[]) => slots.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []));
+  return { to: formatMailboxList(mailboxes(request.to)), cc: formatMailboxList(mailboxes(request.cc)) };
+}
+
+/** A card whose buttons confirm who it goes to, through the one card builder. */
+async function tellCard(spec: ConfirmCardSpec): Promise<void> {
+  try {
+    await postConfirmCard(spec, { api: commandApi() });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Scheduled sends: card not posted (${errorType})`);
+  }
+}
+
 /** Everyone a scheduled email would go to now (To and Cc), lowercased. */
 function recipientsOf(request: CommandRequest): string[] {
   return [...new Set([...request.to, ...request.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : [])))];
@@ -146,15 +164,13 @@ async function hold(row: ScheduledSendRecord, request: CommandRequest, check: Ex
     return false;
   }
   console.log(`Scheduled send ${row.id}: status -> held`);
-  const keyboard = new InlineKeyboard();
-  check.options.slice(0, MAX_HOLD_BUTTONS).forEach((option, index) => {
-    keyboard.text(formatMailbox(option).slice(0, 60), `cmdsend:hold:${row.id}:${check.slotIndex}:${index}`).row();
+  await tellCard({
+    kind: "schedule_pick",
+    scheduleId: row.id,
+    slotIndex: check.slotIndex,
+    options: check.options.slice(0, MAX_HOLD_BUTTONS),
+    headline: `Held, not sent: ${row.item_text}\n${check.reason}. Who should it go to?`,
   });
-  keyboard.text("Cancel", `cmdsend:cancelsched:${row.id}`);
-  await tell(
-    `Held, not sent: ${row.item_text}\n${check.reason}. Who should it go to?`,
-    keyboard,
-  );
   return true;
 }
 
@@ -188,12 +204,12 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
     if (holdScheduledSendForConfirm(row.id)) {
       const newAddresses = verdict.action === "card" ? verdict.newAddresses : [];
       console.log(`Scheduled send ${row.id}: status -> held for confirm`);
-      await tell(
-        `Held, not sent: ${row.item_text}\nNew address: ${newAddresses.join(", ") || "unconfirmed"}. Tap Confirm to send it.`,
-        new InlineKeyboard()
-          .text("Confirm", scheduleConfirmData(row.id, recipientsOf(request)))
-          .text("Cancel", `cmdsend:cancelsched:${row.id}`),
-      );
+      await tellCard({
+        kind: "schedule_confirm",
+        scheduleId: row.id,
+        ...peopleOf(request),
+        headline: `Held, not sent: ${row.item_text}\nNew address: ${newAddresses.join(", ") || "unconfirmed"}. Tap Confirm to send it.`,
+      });
     }
     return;
   }
@@ -413,7 +429,11 @@ export async function handleScheduledSendCallback(ctx: Context): Promise<void> {
     }
     const request = requestOf(held);
     const everyone = recipientsOf(request);
-    if (!confirm[2] || confirm[2] !== recipientFingerprint(everyone)) {
+    // Who the tapped card message showed (when it was recorded): the tap can't confirm more.
+    const tapped = ctx.callbackQuery?.message?.message_id;
+    const shownThere = tapped === undefined ? new Set<string>() : cardRecipientsForMessage(scheduleCardKey(held.id), tapped);
+    const beyondCard = shownThere.size > 0 && everyone.some((email) => !shownThere.has(email));
+    if (!confirm[2] || confirm[2] !== recipientFingerprint(everyone) || beyondCard) {
       // The people changed after that card: nothing is confirmed. A fresh card shows who now.
       console.log(`Scheduled send ${held.id}: confirm refused, recipients changed since the card`);
       await ctx
@@ -421,12 +441,12 @@ export async function handleScheduledSendCallback(ctx: Context): Promise<void> {
         .catch(() => undefined);
       const verdict = await scheduledSendVerdict(request);
       const newAddresses = verdict.action === "card" ? verdict.newAddresses : [];
-      await tell(
-        `Held, not sent: ${held.item_text}\nIt now goes to ${everyone.join(", ")}.${newAddresses.length > 0 ? ` New address: ${newAddresses.join(", ")}.` : ""} Tap Confirm to send it to them.`,
-        new InlineKeyboard()
-          .text("Confirm", scheduleConfirmData(held.id, everyone))
-          .text("Cancel", `cmdsend:cancelsched:${held.id}`),
-      );
+      await tellCard({
+        kind: "schedule_confirm",
+        scheduleId: held.id,
+        ...peopleOf(request),
+        headline: `Held, not sent: ${held.item_text}\nIt now goes to ${everyone.join(", ")}.${newAddresses.length > 0 ? ` New address: ${newAddresses.join(", ")}.` : ""} Tap Confirm to send it to them.`,
+      });
       return;
     }
     request.confirmedRecipients = [...new Set([...(request.confirmedRecipients ?? []), ...everyone])];

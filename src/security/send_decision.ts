@@ -99,8 +99,3 @@ export function recipientFingerprint(recipients: readonly string[]): string {
   return createHash("sha256").update(people.join(",")).digest("hex").slice(0, 12);
 }
 
-/** A Confirm button for a held schedule, bound to the people its card shows: a tap
- *  confirms them only while the schedule still goes to exactly those people. */
-export function scheduleConfirmData(id: number, recipients: readonly string[]): string {
-  return `cmdsend:confirmsched:${id}:${recipientFingerprint(recipients)}`;
-}

@@ -303,7 +303,9 @@ export async function deliverVoiceTurn(input: {
 }): Promise<{ sentVoice: boolean; sentText: boolean }> {
   const cards = input.cards ?? [];
   const withButtons = cards.filter((card) => card.keyboard);
-  const onVoice = [...cards.filter((card) => !card.keyboard), ...withButtons.slice(0, 1)];
+  // The card whose buttons ride on the voice note comes first, so its caption (which
+  // names everyone those buttons confirm) is never the part a long caption loses.
+  const onVoice = [...withButtons.slice(0, 1), ...cards.filter((card) => !card.keyboard)];
   const spoken = speechText(input.replyText);
   const messageId = spoken
     ? await sendSpokenReply({

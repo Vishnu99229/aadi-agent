@@ -2089,18 +2089,13 @@ export function setPendingActionDraftMeta(
      SET to_header = ?, cc_header = ?, subject = ?, updated_at = datetime('now')
      WHERE id = ?`,
   ).run(meta.toHeader, meta.ccHeader, meta.subject, id);
-  // Called only once the card showing these people is posted: record them against that
-  // card message.
-  const row = db
-    .prepare(`SELECT draft_id, telegram_message_id FROM pending_actions WHERE id = ?`)
-    .get(id) as { draft_id: string | null; telegram_message_id: number | null } | undefined;
-  if (row?.draft_id && row.telegram_message_id) {
-    recordCardRecipients(row.telegram_message_id, row.draft_id, `${meta.toHeader},${meta.ccHeader}`);
-  }
+  // Who the posted card shows is recorded by the card builder (confirm_cards.ts), for
+  // the message Telegram confirmed: the only writer of card_message_recipients.
 }
 
 /** Telegram confirmed this card message shows these people (posted, or edited to show
- *  them): it now confirms exactly them. Someone still on it keeps the time they were
+ *  them): it now confirms exactly them. Called only by the card builder. The key is the
+ *  card's Gmail draft id, or schedule:<id> / choice:<id> for those cards. Someone still on it keeps the time they were
  *  first shown; someone taken off it no longer counts for this message. */
 export const recordCardRecipients = db.transaction((messageId: number, draftId: string, header: string): void => {
   const people = headerAddresses(header);

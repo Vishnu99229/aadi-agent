@@ -39,6 +39,7 @@ import {
   setMeetingProposalStatus,
   transitionMeetingPendingBooking,
   setPendingActionDraftMeta,
+  recordCardRecipients,
 } from "../src/db.ts";
 import {
   claimTelegramMessage,
@@ -775,6 +776,49 @@ assert(
     }
   }
   assert(sendSites === 3, `the three checked send sites: command_send.ts and two in approvals.ts, got ${sendSites}`);
+  // One card builder: only src/confirm_cards.ts makes a button that can confirm who an
+  // email goes to (a draft's Send, a held schedule's Confirm, an address choice), and only
+  // it records who a posted card showed. Every other file can only parse those buttons.
+  const builderFile = "confirm_cards.ts";
+  const confirmingButton = /[`"'](?:approval:send|cmdsend:confirmsched|cmdsend:pick|cmdsend:hold):/;
+  let builderSeen = false;
+  for (const file of files) {
+    const src = await readFile(join(root, "src", file), "utf8");
+    if (file === builderFile) {
+      builderSeen = true;
+      continue;
+    }
+    assert(!confirmingButton.test(src), `${file}: a confirming button is built outside the card builder`);
+    assert(!/\.text\(\s*["'`](?:Send|Confirm)["'`]/.test(src), `${file}: a Send or Confirm button is built outside the card builder`);
+    if (file !== "db.ts") {
+      assert(!src.includes("recordCardRecipients("), `${file}: only the card builder records who a card showed`);
+    }
+  }
+  assert(builderSeen, "src/confirm_cards.ts is the card builder");
+  const builderSrc = builderSeen ? await readFile(join(root, "src", builderFile), "utf8") : "";
+  assert(builderSrc.includes("export async function postConfirmCard("), "it posts every confirming card");
+  assert(!/export\s+(?:async\s+)?function\s+\w*[Kk]eyboard/.test(builderSrc), "its keyboards are not exported");
+  // Every address a card's button confirms is written in that card's own text and caption.
+  const builder = builderSeen ? await import("../src/confirm_cards.ts") : undefined;
+  if (builder) {
+    const people = { name: "Pia Person", email: "pia@new-co.com" };
+    const other = { name: "Ola Other", email: "ola.other.long.address.for.labels@long-domain-example.com" };
+    const specs = [
+      { kind: "draft_send", key: "d-1", actionId: 7, sendOnly: false, showFull: false, to: "Pia Person <pia@new-co.com>", cc: "Ola <ola.other.long.address.for.labels@long-domain-example.com>", ccWhenEmpty: "none", head: ["Draft waiting for approval", ""], tail: "Subject: Hi\n\nBody", captionTail: ["Subject: Hi", "", "Body ".repeat(200)] },
+      { kind: "draft_send", key: "d-2", actionId: 8, sendOnly: true, showFull: true, to: "pia@new-co.com", cc: "", ccWhenEmpty: "omit", head: ["Draft ready."], tail: "Subject: Hi", captionTail: [] },
+      { kind: "schedule_confirm", scheduleId: 3, to: "Pia Person <pia@new-co.com>", cc: "ola.other.long.address.for.labels@long-domain-example.com", headline: "X".repeat(600) },
+      { kind: "address_choice", choiceId: 4, options: [people, other], headline: "Which Pia?" },
+      { kind: "schedule_pick", scheduleId: 5, slotIndex: 0, options: [people, other], headline: "Held, not sent. Who should it go to?" },
+    ] as const;
+    for (const spec of specs) {
+      const card = builder.renderConfirmCard(spec as never);
+      assert(card.confirms.length > 0, `${spec.kind}: it says who its buttons confirm`);
+      for (const email of card.confirms) {
+        assert(card.text.includes(email), `${spec.kind}: ${email} is in the card's text`);
+        assert(card.caption.includes(email), `${spec.kind}: ${email} is in the card's caption`);
+      }
+    }
+  }
   // One content gate: the card route's Gmail send runs the same gate as the direct route,
   // and the command path runs it on the written email before choosing direct or card.
   const approvalsGateSrc = await readFile(join(root, "src/approvals.ts"), "utf8");
@@ -1435,8 +1479,10 @@ function draftWithCard(cardId: number | null): number {
   const action = createPendingAction(`confirm-${nextMessageId()}`, null, "work");
   if (cardId !== null) {
     setPendingActionTelegramMessage(action.id, cardId);
-    // A posted card shows the draft's people (the fake draft goes to Priya).
+    // A posted card shows the draft's people (the fake draft goes to Priya), recorded
+    // for its message as the card builder records it.
     setPendingActionDraftMeta(action.id, { toHeader: "Priya <priya@acme.com>", ccHeader: "", subject: "Demo" });
+    recordCardRecipients(cardId, action.draft_id!, "Priya <priya@acme.com>");
   }
   confirmDrafts.push(action.id);
   return action.id;

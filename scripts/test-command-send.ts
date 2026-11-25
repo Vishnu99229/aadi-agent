@@ -46,6 +46,7 @@ import {
   getPendingAction as approvalAction,
   latestProcessedMessageId,
   setChatTurnRetryText,
+  writeScheduledCopy,
   getPendingActionForDraft,
   getSalesSequenceByThread,
   listCanonicalContacts,
@@ -2947,6 +2948,45 @@ await expectCancelled("delete_task", async (row) => {
     await tapAlerts(kept);
     assert(draftsSent.length === sentD + 1 && draftsSent.at(-1) === kept, "an unchanged reply sends");
     written = { subject: "Quick note", body: "Hi,\n\nThe note he asked for." };
+  }
+
+  // 21. A held schedule whose people are corrected, then the command replayed (Codex, the
+  //     stop-rule class): the replacement Confirm card shows the corrected people, and its
+  //     tap confirms exactly them.
+  {
+    const confirmOn = (entries: typeof told) =>
+      [...entries].reverse().find((entry) => entry.markup !== undefined && buttons(entry).some((button) => button.text === "Confirm"));
+    const turnS = own("email c.sch21@new-co.com on Monday saying hello");
+    const args = { to: ["c.sch21@new-co.com"], instruction: "say hello", send_on: SOON, subject: "Hello" };
+    const first = await sendEmailFromTool(args, turnS);
+    assert(first.startsWith("New address: c.sch21@new-co.com. Tap Confirm to schedule for "), `held: ${first}`);
+    const row = listOpenScheduledSends().find((item) => item.request.includes("c.sch21@new-co.com"))!;
+    const firstCard = confirmOn(told)!;
+    assert(firstCard.text.includes("c.sch21@new-co.com"), `the first card shows who: ${firstCard.text}`);
+    const originalConfirm = buttons(firstCard).find((button) => button.text === "Confirm")!.callback_data;
+
+    // He corrects who it goes to while it is held.
+    const corrected = writeScheduledCopy(row.id, { to: [{ name: "Fay Fix", email: "c.fix21@new-co.com" }] });
+    assert(corrected.ok, "the correction is saved");
+    // The original card's Confirm no longer confirms anything.
+    await handleScheduledSendCallback(cardCtx(originalConfirm));
+    assert(getScheduledSend(row.id)!.status === "held", "the original card's Confirm leaves it held");
+
+    // The original command is replayed: the replacement card shows the corrected people.
+    const toldBefore = told.length;
+    await sendEmailFromTool(args, turnS);
+    const replacement = confirmOn(told.slice(toldBefore));
+    assert(replacement !== undefined, "a replacement Confirm card is posted");
+    assert(replacement!.text.includes("c.fix21@new-co.com"), `it shows the corrected address: ${replacement!.text}`);
+    assert(replacement!.text.includes("To: Fay Fix <c.fix21@new-co.com>"), `as the To: ${replacement!.text}`);
+
+    // Its tap confirms exactly the people it shows.
+    await handleScheduledSendCallback(cardCtx(buttons(replacement!).find((button) => button.text === "Confirm")!.callback_data));
+    const after = getScheduledSend(row.id)!;
+    const stored = JSON.parse(after.request) as { to: Array<{ mailbox: { email: string } }>; cc: unknown[]; confirmedRecipients?: string[] };
+    assert(after.status === "scheduled", `the tap schedules it: ${after.status}`);
+    assert(stored.to.map((slot) => slot.mailbox.email).join(",") === "c.fix21@new-co.com" && stored.cc.length === 0, "to the corrected person only");
+    assert((stored.confirmedRecipients ?? []).join(",") === "c.fix21@new-co.com", `and confirms exactly them: ${stored.confirmedRecipients}`);
   }
 
   // 13. Unchanged: resolution still marks the contact confirmed (cross-turn reuse), and

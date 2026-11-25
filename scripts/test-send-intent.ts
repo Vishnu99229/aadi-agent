@@ -13,6 +13,7 @@ import {
   setPendingActionDraftMeta,
   setPendingActionTelegramMessage,
   transitionPendingAction,
+  recordCardRecipients,
 } from "../src/db.ts";
 import { setCompleteForTests } from "../src/llm.ts";
 import { isSendDraftCommand } from "../src/send_triggers.ts";
@@ -118,9 +119,12 @@ const created: number[] = [];
 function shownDraft(): number {
   claimTelegramMessage(1, nextMessageId());
   const action = createPendingAction(`draft-${nextMessageId()}`, null, "work");
-  setPendingActionTelegramMessage(action.id, nextMessageId());
-  // A posted card shows the draft's people (the fake draft goes to Priya).
+  const cardMessage = nextMessageId();
+  setPendingActionTelegramMessage(action.id, cardMessage);
+  // A posted card shows the draft's people (the fake draft goes to Priya), recorded for
+  // its message as the card builder records it.
   setPendingActionDraftMeta(action.id, { toHeader: "Priya <priya@acme.com>", ccHeader: "", subject: "Demo" });
+  recordCardRecipients(cardMessage, action.draft_id!, "Priya <priya@acme.com>");
   created.push(action.id);
   return action.id;
 }

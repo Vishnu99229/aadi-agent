@@ -30,7 +30,8 @@ import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
-import { cardReason, decideSendAction, scheduleConfirmData, type SendVerdict } from "./security/send_decision.js";
+import { cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
+import { choiceCardKey, postConfirmCard } from "./confirm_cards.js";
 import { withoutFollowupClause } from "./command_intent.js";
 import { followupsAfterSend } from "./sequences.js";
 import { mailDomainRefusal } from "./email_grounding.js";
@@ -53,6 +54,7 @@ import {
   pendingActionForCommandKey,
   getPendingActionForDraft,
   scheduledSendByKey,
+  cardRecipientsForMessage,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
 import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
@@ -653,14 +655,6 @@ export async function writeAndSend(
   }
 }
 
-function choiceKeyboard(choiceId: number, options: readonly ParsedMailbox[]): InlineKeyboard {
-  const keyboard = new InlineKeyboard();
-  options.forEach((option, index) => {
-    keyboard.text(formatMailbox(option).slice(0, 60), `cmdsend:pick:${choiceId}:${index}`).row();
-  });
-  return keyboard.text("Don't send", `cmdsend:drop:${choiceId}`);
-}
-
 function notDone(request: CommandRequest): string {
   if (request.sendAt) {
     return "Not scheduled";
@@ -809,24 +803,25 @@ async function scheduleRequest(
     // gets its Confirm card again, bound to the people it goes to now.
     const existing = scheduledSendByKey(scheduleKey);
     if (existing?.status === "held") {
-      let people: string[] = [];
+      // The card shows, and its Confirm confirms, who the schedule goes to NOW (he may
+      // have corrected it since): never the original wording alone.
+      let current: Pick<CommandRequest, "to" | "cc">;
       try {
-        const stored = JSON.parse(existing.request) as Pick<CommandRequest, "to" | "cc">;
-        people = [...new Set([...stored.to, ...stored.cc].flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : [])))];
+        current = JSON.parse(existing.request) as Pick<CommandRequest, "to" | "cc">;
       } catch {
-        people = [];
+        return { text: "Not scheduled again: this command was already handled.", repeat: true };
       }
       const text = `Not scheduled yet: ${existing.item_text}\nIt's waiting on your Confirm. Tap Confirm to schedule for ${scheduledWhen(existing.send_at)}.`;
-      const card = {
-        text,
-        caption: text,
-        keyboard: new InlineKeyboard()
-          .text("Confirm", scheduleConfirmData(existing.id, people))
-          .text("Cancel", `cmdsend:cancelsched:${existing.id}`),
-      };
-      if (!holdForVoiceNote(card)) {
-        await api().sendMessage(config.ownerTelegramId, card.text, { reply_markup: card.keyboard });
-      }
+      await postConfirmCard(
+        {
+          kind: "schedule_confirm",
+          scheduleId: existing.id,
+          to: formatMailboxList(current.to.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []))),
+          cc: formatMailboxList(current.cc.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []))),
+          headline: text,
+        },
+        { api: api() },
+      );
       console.log(`Scheduled send ${existing.id}: repeat of a held command; Confirm card posted again`);
       return { text, hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.", shown: true, repeat: true };
     }
@@ -849,16 +844,16 @@ async function scheduleRequest(
       verdict.action === "card" && verdict.newAddresses.length > 0
         ? `New address: ${verdict.newAddresses.join(", ")}. Tap Confirm to schedule for ${scheduledWhen(request.sendAt!)}.`
         : `Ready to schedule for ${scheduledWhen(request.sendAt!)}, but this didn't come straight from your own message. Tap Confirm to schedule it.`;
-    const heldCard = {
-      text: heldText,
-      caption: heldText,
-      keyboard: new InlineKeyboard()
-        .text("Confirm", scheduleConfirmData(row.id, recipients))
-        .text("Cancel", `cmdsend:cancelsched:${row.id}`),
-    };
-    if (!holdForVoiceNote(heldCard)) {
-      await api().sendMessage(config.ownerTelegramId, heldCard.text, { reply_markup: heldCard.keyboard });
-    }
+    await postConfirmCard(
+      {
+        kind: "schedule_confirm",
+        scheduleId: row.id,
+        to: formatMailboxList(to),
+        cc: formatMailboxList(request.cc.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []))),
+        headline: heldText,
+      },
+      { api: api() },
+    );
     return {
       text: heldText,
       hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.",
@@ -1029,16 +1024,15 @@ async function resolveAndContinue(
         : "";
     const found =
       resolved.length > 0 ? `I resolved ${resolved.join(", ")}. ` : "";
-    const choiceCard = {
-      text: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
-      caption: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
-      keyboard: choiceKeyboard(choiceId, first.options),
-    };
-    if (!holdForVoiceNote(choiceCard)) {
-      await api().sendMessage(config.ownerTelegramId, choiceCard.text, {
-        reply_markup: choiceCard.keyboard,
-      });
-    }
+    await postConfirmCard(
+      {
+        kind: "address_choice",
+        choiceId,
+        options: first.options,
+        headline: `${found}Which ${first.slot.query}? Nothing has gone out.${extra}`,
+      },
+      { api: api() },
+    );
     return {
       text: `${notDone(request)} yet: ${found}"${first.slot.query}" matches ${first.options.length} people and I've asked with buttons.${extra}`,
       hint: "Tell him to tap one, and don't pick one yourself.",
@@ -1630,6 +1624,13 @@ export async function handleCommandSendCallback(ctx: Context): Promise<void> {
   const slot = [...request.to, ...request.cc].find((item) => !item.mailbox && item.options);
   const picked = slot?.options?.[Number(match[3])];
   if (!slot || !picked) {
+    await finish(expired);
+    return;
+  }
+  // The tap confirms only an address its card message showed (when that was recorded).
+  const tappedCard = ctx.callbackQuery?.message?.message_id;
+  const shownThere = tappedCard === undefined ? new Set<string>() : cardRecipientsForMessage(choiceCardKey(choice.id), tappedCard);
+  if (shownThere.size > 0 && !shownThere.has(picked.email.toLowerCase())) {
     await finish(expired);
     return;
   }

@@ -22,6 +22,7 @@ import {
   setPendingActionTimestampsForTests,
   transitionPendingAction,
   claimTelegramMessage,
+  recordCardRecipients,
 } from "../src/db.ts";
 import {
   fakeGmail,
@@ -37,6 +38,17 @@ import {
 import { handler as discardHandler } from "../src/tools/discard_pending_draft.ts";
 import { handler as resendHandler } from "../src/tools/resend_draft_card.ts";
 import type { ToolTurn } from "../src/tools/index.ts";
+
+
+/** A posted card shows these people: its To/Cc, and the record for its message, as the
+ *  card builder writes them once Telegram confirms the card. */
+function showOnCard(id: number, meta: { toHeader: string; ccHeader: string; subject: string }): void {
+  setPendingActionDraftMeta(id, meta);
+  const action = getPendingAction(id)!;
+  if (action.telegram_message_id && action.draft_id) {
+    recordCardRecipients(action.telegram_message_id, action.draft_id, `${meta.toHeader},${meta.ccHeader}`);
+  }
+}
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -70,7 +82,7 @@ function showDraft(
   const action = createPendingAction(draftId, null, "work");
   draftMeta[draftId] = { to: meta.to, cc: meta.cc, subject: meta.subject };
   setPendingActionTelegramMessage(action.id, nextMessageId());
-  setPendingActionDraftMeta(action.id, {
+  showOnCard(action.id, {
     toHeader: meta.to,
     ccHeader: meta.cc ?? "",
     subject: meta.subject,
@@ -302,7 +314,7 @@ const aspirare = {
   const createdThisTurn = createPendingAction("this-turn", null, "work");
   created.push(createdThisTurn.id);
   setPendingActionTelegramMessage(createdThisTurn.id, nextMessageId());
-  setPendingActionDraftMeta(createdThisTurn.id, {
+  showOnCard(createdThisTurn.id, {
     toHeader: "x@y.com",
     ccHeader: "",
     subject: "Nope",
@@ -425,7 +437,7 @@ assert(
   const thisMessage = nextMessageId();
   claimTelegramMessage(chatId, thisMessage);
   draftMeta["c-newcc"] = { to: "Ravi <ravi@shown-co.com>", cc: "brand.new@new-co.com", subject: "Edit" };
-  setPendingActionDraftMeta(edited, { toHeader: "Ravi <ravi@shown-co.com>", ccHeader: "brand.new@new-co.com", subject: "Edit" });
+  showOnCard(edited, { toHeader: "Ravi <ravi@shown-co.com>", ccHeader: "brand.new@new-co.com", subject: "Edit" });
   const blocked = await sendPendingDraftByText({ chatId, messageId: thisMessage }, "c-newcc", { ownTurn: true });
   assert(!blocked.ok && blocked.message.startsWith("New address: brand.new@new-co.com. Tap Send to confirm."), `the card comes back: ${blocked.message}`);
   assert(gmail.sent.at(-1) !== "c-newcc", "and nothing was sent");
@@ -435,7 +447,7 @@ assert(
   const ccMessage = nextMessageId();
   claimTelegramMessage(chatId, ccMessage);
   draftMeta["c-knowncc"] = { to: "Ravi <ravi@shown-co.com>", cc: "Ashwini <ashwini@known-co.com>", subject: "Known" };
-  setPendingActionDraftMeta(cc, { toHeader: "Ravi <ravi@shown-co.com>", ccHeader: "Ashwini <ashwini@known-co.com>", subject: "Known" });
+  showOnCard(cc, { toHeader: "Ravi <ravi@shown-co.com>", ccHeader: "Ashwini <ashwini@known-co.com>", subject: "Known" });
   noteDraftEditedThisTurn({ chatId, messageId: ccMessage }, "c-knowncc");
   const confirmTurn = {
     iteration: 2,

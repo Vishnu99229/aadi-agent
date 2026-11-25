@@ -25,7 +25,6 @@ import {
   recordCommandSendSent,
   cardRecipientsForMessage,
   draftHasCardRecords,
-  recordCardRecipients,
 } from "./db.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import {
@@ -36,6 +35,7 @@ import {
 import { parseAddressList } from "./mail_helpers.js";
 import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
+import { draftSendCallback, postConfirmCard, type ConfirmCardSpec } from "./confirm_cards.js";
 import { classifyOwnerEmailIntent } from "./email_references.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
 import { followupsAfterSend } from "./sequences.js";
@@ -129,23 +129,6 @@ export async function readDraftSnapshot(
   };
 }
 
-function keyboard(actionId: number, sendOnly = false, showFull = false): InlineKeyboard {
-  const keys = new InlineKeyboard();
-  if (showFull) {
-    keys.text("📄 Show Full Draft", `approval:draft:${actionId}`).row();
-  }
-  if (sendOnly) {
-    return keys
-      .text("Send", `approval:send:${actionId}`)
-      .row()
-      .text("Cancel", `approval:discard:${actionId}`);
-  }
-  return keys
-    .text("Send", `approval:send:${actionId}`)
-    .text("Edit", `approval:edit:${actionId}`)
-    .text("Discard", `approval:discard:${actionId}`);
-}
-
 function recipientLabel(to: string): string {
   return parseAddressList(to)[0]?.name?.trim() || to.trim() || "them";
 }
@@ -169,41 +152,43 @@ function truncate(text: string, limit: number): string {
     : `${characters.slice(0, limit).join("")}\n[preview truncated]`;
 }
 
-function previewText(preview: DraftApprovalPreview): string {
+/** The draft card's parts: the builder writes To and Cc between them and posts it. */
+function draftCardSpec(
+  actionId: number,
+  preview: DraftApprovalPreview,
+  sendOnly: boolean,
+): Extract<ConfirmCardSpec, { kind: "draft_send" }> {
   const mailbox =
     preview.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
   const extra = (preview.extraLines ?? []).filter(
     (line) => line.trim() && !/^cc:/i.test(line.trim()),
   );
   const signature = preview.signature?.trim();
-  const prefix = [
-    "Draft waiting for approval",
-    "",
-    `Account: ${mailbox}`,
-    `To: ${preview.to}`,
-    ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : ["Cc: none"]),
-    `Subject: ${preview.subject}`,
-    ...(extra.length ? ["", ...extra] : []),
-    "",
-  ].join("\n");
-
+  const cc = preview.cc?.trim() ?? "";
   const bodyChars = Array.from(preview.body).length;
-  if (bodyChars > DRAFT_SUMMARY_CHARS) {
+  const long = bodyChars > DRAFT_SUMMARY_CHARS;
+  const captionTail = [`Subject: ${preview.subject}`, "", preview.body];
+  const base = { kind: "draft_send" as const, key: preview.draftId, actionId, sendOnly, showFull: long, to: preview.to, cc, captionTail };
+  if (long) {
     const count = bodyChars.toLocaleString("en-US");
-    return [
-      `Draft ready for ${recipientLabel(preview.to)}. The email is ${count} characters long.`,
-      "",
-      `Account: ${mailbox}`,
-      `To: ${preview.to}`,
-      ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : []),
-      `Subject: ${preview.subject}`,
-      ...(extra.length ? ["", ...extra] : []),
-    ].join("\n");
+    return {
+      ...base,
+      ccWhenEmpty: "omit",
+      head: [`Draft ready for ${recipientLabel(preview.to)}. The email is ${count} characters long.`, "", `Account: ${mailbox}`],
+      tail: [`Subject: ${preview.subject}`, ...(extra.length ? ["", ...extra] : [])].join("\n"),
+    };
   }
-
+  const head = ["Draft waiting for approval", "", `Account: ${mailbox}`];
+  const middle = [`Subject: ${preview.subject}`, ...(extra.length ? ["", ...extra] : []), ""].join("\n");
+  const prefixLength = [...head, `To: ${preview.to}`, cc ? `Cc: ${cc}` : "Cc: none"].join("\n").length + 1 + middle.length;
   const signatureBlock = signature ? `\n\n-- \n${signature}` : "\n\nSignature: appended from the mailbox when this is sent.";
-  const room = PREVIEW_LIMIT - prefix.length - signatureBlock.length;
-  return `${prefix}${truncate(preview.body, Math.max(200, room))}${signatureBlock}`;
+  const room = PREVIEW_LIMIT - prefixLength - signatureBlock.length;
+  return {
+    ...base,
+    ccWhenEmpty: "none",
+    head,
+    tail: `${middle}${truncate(preview.body, Math.max(200, room))}${signatureBlock}`,
+  };
 }
 
 const DRAFT_STALE_MS = 3 * 60 * 60 * 1000;
@@ -393,7 +378,7 @@ export async function queueDraftApproval(
 
   // The people on this card count as shown only once Telegram has confirmed the card
   // that shows them: then the card's To/Cc and its message's record are written.
-  const draftIdForCard = preview.draftId;
+  // (The card builder records who the posted card shows, for that message.)
   const shown = (actionId: number): void => {
     if (options.touch !== false) {
       setPendingActionDraftMeta(actionId, {
@@ -401,11 +386,6 @@ export async function queueDraftApproval(
         ccHeader: preview.cc?.trim() ?? "",
         subject: preview.subject,
       });
-    } else {
-      const messageId = getPendingAction(actionId)?.telegram_message_id;
-      if (messageId) {
-        recordCardRecipients(messageId, draftIdForCard, `${preview.to},${preview.cc ?? ""}`);
-      }
     }
     options.onShown?.(actionId);
   };
@@ -414,23 +394,12 @@ export async function queueDraftApproval(
   if (sendOnly) sendOnlyActions.add(action.id);
   else sendOnlyActions.delete(action.id);
 
-  const text = previewText(preview);
-  const markup = keyboard(
-    action.id,
-    sendOnlyActions.has(action.id),
-    Array.from(preview.body).length > DRAFT_SUMMARY_CHARS,
-  );
+  const spec = draftCardSpec(action.id, preview, sendOnlyActions.has(action.id));
 
   if (action.telegram_message_id && options.newCard !== true) {
     try {
-      await telegram.editMessageText(
-        config.ownerTelegramId,
-        action.telegram_message_id,
-        text,
-        { reply_markup: markup },
-      );
+      await postConfirmCard(spec, { api: telegram, editMessageId: action.telegram_message_id, onShown: () => shown(action!.id) });
       console.log(`Approval action ${action.id}: preview updated`);
-      shown(action.id);
       return action.id;
     } catch {
       console.log(`Approval action ${action.id}: preview replacement failed`);
@@ -438,34 +407,14 @@ export async function queueDraftApproval(
   }
 
   const draftActionId = action.id;
-  if (
-    holdForVoiceNote({
-      text,
-      caption: shortCardText(
-        [
-          `Draft to ${preview.to}`,
-          ...(preview.cc?.trim() ? [`Cc: ${preview.cc.trim()}`] : []),
-          `Subject: ${preview.subject}`,
-          "",
-          preview.body,
-        ].join("\n"),
-      ),
-      keyboard: markup,
-      onPosted: (messageId) => {
-        setPendingActionTelegramMessage(draftActionId, messageId);
-        shown(draftActionId);
-      },
-    })
-  ) {
-    console.log(`Approval action ${action.id}: preview held for voice note`);
-    return action.id;
-  }
-  const message = await telegram.sendMessage(config.ownerTelegramId, text, {
-    reply_markup: markup,
+  const posted = await postConfirmCard(spec, {
+    api: telegram,
+    onShown: (messageId) => {
+      setPendingActionTelegramMessage(draftActionId, messageId);
+      shown(draftActionId);
+    },
   });
-  setPendingActionTelegramMessage(action.id, message.message_id);
-  shown(action.id);
-  console.log(`Approval action ${action.id}: preview sent`);
+  console.log(`Approval action ${action.id}: ${posted === undefined ? "preview held for voice note" : "preview sent"}`);
   return action.id;
 }
 
@@ -1285,7 +1234,7 @@ export async function sendPendingDraftByText(
     // The same token the card's Send button carries, minted only for a draft
     // whose card was posted before Vishnu's confirming message.
     allowSendDraft({
-      callbackData: `approval:send:${action.id}`,
+      callbackData: draftSendCallback(action.id),
       actionId: action.id,
       actionStatus: action.status,
     });
