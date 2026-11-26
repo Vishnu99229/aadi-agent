@@ -9,7 +9,7 @@ import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import {
   createScheduledSend,
   getScheduledSend,
-  getPendingActionForDraft as getDraftApproval,
+  getPendingAction as getApprovalActionById,
   getTask,
   listOpenScheduledSends,
   listScheduledSendsForDraft,
@@ -828,13 +828,13 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
       draftId: created.data.id!, threadId: null, to, subject,
       body: "Hi,\n\nA note.", googleAccount: "work",
     });
-    return { actionId, draftId: created.data.id! };
+    return { actionId };
   };
   const actualRecipient = await queueRawTo("current@example.net", "Current recipient");
   const quotedDraft = await queueRawTo('"former@example.com" <current@example.net>', "Quoted name");
   assert(getScheduledSend(formerSchedule.id)?.status === "scheduled" &&
-    getDraftApproval(actualRecipient.draftId)?.status === "superseded" && getDraftApproval(quotedDraft.draftId)?.status === "pending",
-    `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getDraftApproval(actualRecipient.draftId)?.status}, quoted=${getDraftApproval(quotedDraft.draftId)?.status}`);
+    getApprovalActionById(actualRecipient.actionId)?.status === "superseded" && getApprovalActionById(quotedDraft.actionId)?.status === "pending",
+    `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getApprovalActionById(actualRecipient.actionId)?.status}, quoted=${getApprovalActionById(quotedDraft.actionId)?.status}`);
 }
 
 // 12. Edits made before scheduling are what the scheduled email sends.
