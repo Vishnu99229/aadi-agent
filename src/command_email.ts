@@ -582,7 +582,10 @@ export async function writeAndSend(
   }
   const signatureHtml = await signatureHtmlFor(account);
   const release = claimRecipientDelivery(account.id, toHeader);
-  if (!release) return { text: "Not sent: another email to that recipient is already going out.", result: "cancelled" };
+  if (!release) {
+    if (getCommandSendByKey(key)) return gateRefusal("already_handled");
+    return { text: "Not sent: another email to that recipient is already going out.", result: "cancelled" };
+  }
   let messageId: string;
   let replacedDrafts: PendingAction[];
   try {
