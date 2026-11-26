@@ -824,18 +824,17 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
       userId: "me",
       requestBody: { message: { raw: Buffer.from(`To: ${to}\r\nSubject: ${subject}\r\n\r\nHi,\n\nA note.`).toString("base64url") } },
     });
-    const queued = await queueDraftApproval({
+    const actionId = await queueDraftApproval({
       draftId: created.data.id!, threadId: null, to, subject,
       body: "Hi,\n\nA note.", googleAccount: "work",
     });
-    assert(queued.action, `the raw To draft is queued for ${to}`);
-    return queued.action;
+    return { actionId, draftId: created.data.id! };
   };
   const actualRecipient = await queueRawTo("current@example.net", "Current recipient");
   const quotedDraft = await queueRawTo('"former@example.com" <current@example.net>', "Quoted name");
   assert(getScheduledSend(formerSchedule.id)?.status === "scheduled" &&
-    getDraftApproval(actualRecipient.draft_id!)?.status === "superseded" && getDraftApproval(quotedDraft.action!.draft_id!)?.status === "pending",
-    `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getDraftApproval(actualRecipient.draft_id!)?.status}, quoted=${getDraftApproval(quotedDraft.action!.draft_id!)?.status}`);
+    getDraftApproval(actualRecipient.draftId)?.status === "superseded" && getDraftApproval(quotedDraft.draftId)?.status === "pending",
+    `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getDraftApproval(actualRecipient.draftId)?.status}, quoted=${getDraftApproval(quotedDraft.draftId)?.status}`);
 }
 
 // 12. Edits made before scheduling are what the scheduled email sends.
