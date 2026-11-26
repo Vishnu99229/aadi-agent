@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { fakeTelegramApi, type TelegramLog } from "./fakes.ts";
+import { config } from "../src/config.ts";
 import {
   addSalesDoNotContact,
   getSalesSequence,
@@ -15,6 +16,7 @@ import {
   createPendingAction,
   createProposedSalesSequence,
   getSalesSequenceByThread,
+  getSalesPitchScan,
   createAccount,
   listSalesSequenceSteps,
   migrateSalesSequenceLimits,
@@ -62,6 +64,7 @@ import {
   type SequenceDecision,
   type SequenceFacts,
   handleSequenceCommand,
+  registerSequenceDetection,
   requestSequenceCard,
   runSequenceDetection,
   startSequenceFromTool,
@@ -81,6 +84,7 @@ if (process.env.AADI_DB_PATH !== ":memory:") {
 
 const ME = "vishnu.rajan@epicode.in";
 const DAY = 24 * 60 * 60 * 1000;
+const settings = config as { sequenceDetectionEnabled: boolean; sequencesEnabled: boolean };
 
 // ---- pure exclusion logic ----
 function mailbox(email: string, name = "Priya") {
@@ -271,6 +275,7 @@ interface FakeMessage {
 
 const threads = new Map<string, FakeMessage[]>();
 const mailCalls: string[] = [];
+let sentMailScans = 0;
 
 function toGmailMessage(threadId: string, message: FakeMessage): gmail_v1.Schema$Message {
   return {
@@ -316,6 +321,7 @@ const gmailStub = {
         throw new Error("no such message");
       },
       list: async ({ q }: { q: string }) => {
+        if (/^in:sent newer_than:\d+d$/.test(q)) sentMailScans += 1;
         const from = /from:(\S+)/.exec(q)?.[1];
         if (from) {
           const after = Number(/after:(\d+)/.exec(q)?.[1] ?? 0) * 1000;
@@ -461,6 +467,23 @@ createAccount({
 pitch("t-client", "Zed <zed@zeta.com>", "Dialer");
 
 {
+  const sendingWasEnabled = settings.sequencesEnabled;
+  settings.sequencesEnabled = true;
+  assert(!config.sequenceDetectionEnabled, "detection defaults to off with the flag unset in CI");
+  assert(registerSequenceDetection(api) === undefined, "sending alone does not register detection");
+  assert(await runSequenceDetection(api) === 0, "disabled detection offers nothing");
+  assert(sentMailScans === 0 && modelCalls === 0, "disabled detection does not scan or classify mail");
+  assert(telegram.sent.length === 0 && getSalesSequenceByThread("t-lone") === undefined, "disabled detection creates no row or card");
+  assert(getSalesPitchScan("t-lone-m1") === undefined, "disabled detection writes no scan record");
+
+  settings.sequenceDetectionEnabled = true;
+  const job = registerSequenceDetection(api);
+  assert(job?.name === "sequence-detect", "the opt-in registers the detection job");
+  job?.stop();
+  settings.sequencesEnabled = sendingWasEnabled;
+}
+
+{
   const rows = await detectPitches({ lookbackDays: 21 });
   const byThread = new Map(rows.map((row) => [row.threadId, row]));
   assert(byThread.get("t-lone")?.exclusion === null, "lone prospect is offerable");
@@ -504,6 +527,13 @@ modelCalls = 0;
   assert((await runSequenceDetection(api)) === 0, "the card is not repeated");
   assert(telegram.sent.length === 1, "one card only across scans");
   assert(modelCalls === 1, "a proposed thread is not classified again");
+
+  settings.sequenceDetectionEnabled = false;
+  const scansBefore = sentMailScans;
+  assert(await runSequenceDetection(api) === 0, "explicitly disabling detection stops scans");
+  assert(sentMailScans === scansBefore && telegram.sent.length === 1, "no further scan or card after disabling");
+  assert(JSON.stringify(getSalesSequenceByThread("t-lone")) === JSON.stringify(row), "an existing proposal is preserved");
+  settings.sequenceDetectionEnabled = true;
 }
 
 // ---- a low-confidence or negative verdict gets no card ----
@@ -1581,6 +1611,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
 
 // ---- follow-ups by his own command: what actually happens ----
 {
+  settings.sequenceDetectionEnabled = false;
   let ownMessage = 300;
   const owner = (userText: string, extra: { modelCalled?: boolean; ownTurn?: boolean; messageId?: number } = {}) => ({
     confirmation: { chatId: 1, messageId: extra.messageId ?? ++ownMessage },
@@ -1853,6 +1884,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const early = await startSequenceFromTool("Xiaoming", owner("email Xiaoming saying hi and start 3 follow-ups"), api);
   assert(early === "Not started yet: follow-ups start only once the email has gone out.", early);
   assert(getSalesSequenceByThread("t-cmd-combined") === undefined, "nothing before the send");
+  settings.sequenceDetectionEnabled = true;
 }
 
 {
