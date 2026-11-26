@@ -1485,21 +1485,22 @@ assert(missHits.length === 0, "no match returns empty");
 // ---------------------------------------------------------------------------
 const confirmGmail: GmailLog = { sent: [], created: [] };
 const confirmCards: TelegramLog = { sent: [], edited: [] };
+const confirmDraftRecipients: Record<string, { to: string }> = {};
 setApprovalsTestHooks({
   telegram: fakeTelegramApi(confirmCards),
-  gmailFor: () => fakeGmail(confirmGmail),
+  gmailFor: () => fakeGmail(confirmGmail, confirmDraftRecipients),
 });
 const ownerChat = 1;
 const confirmDrafts: number[] = [];
 
-function draftWithCard(cardId: number | null): number {
+function draftWithCard(cardId: number | null, to = "Priya <priya@acme.com>"): number {
   const action = createPendingAction(`confirm-${nextMessageId()}`, null, "work");
+  confirmDraftRecipients[action.draft_id!] = { to };
   if (cardId !== null) {
     setPendingActionTelegramMessage(action.id, cardId);
-    // A posted card shows the draft's people (the fake draft goes to Priya), recorded
-    // for its message as the card builder records it.
-    setPendingActionDraftMeta(action.id, { toHeader: "Priya <priya@acme.com>", ccHeader: "", subject: "Demo" });
-    recordCardRecipients(cardId, action.draft_id!, "Priya <priya@acme.com>");
+    // A posted card's recipients are recorded for that message.
+    setPendingActionDraftMeta(action.id, { toHeader: to, ccHeader: "", subject: "Demo" });
+    recordCardRecipients(cardId, action.draft_id!, to);
   }
   confirmDrafts.push(action.id);
   return action.id;
@@ -1636,7 +1637,7 @@ function hoursAgo(hours: number): string {
 // Recency: most recently created or edited wins; two equal timestamps ask.
 {
   discardConfirmDrafts();
-  const older = draftWithCard(nextMessageId());
+  const older = draftWithCard(nextMessageId(), "other@acme.com");
   const recent = draftWithCard(nextMessageId());
   setPendingActionTimestampsForTests(older, {
     createdAt: hoursAgo(2),
@@ -1658,7 +1659,7 @@ function hoursAgo(hours: number): string {
   assert(getPendingAction(older)!.status === "pending", "the older draft is untouched");
 
   discardConfirmDrafts();
-  const left = draftWithCard(nextMessageId());
+  const left = draftWithCard(nextMessageId(), "other@acme.com");
   const right = draftWithCard(nextMessageId());
   const tied = hoursAgo(0.3);
   setPendingActionTimestampsForTests(left, {

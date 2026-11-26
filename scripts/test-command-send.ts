@@ -3099,6 +3099,13 @@ await expectCancelled("delete_task", async (row) => {
     const delivered = await sendEmailFromTool({ to: [deliveredTo], instruction: "send a separate email" }, own(`email ${deliveredTo} saying hello`));
     assert(delivered.startsWith("Sent to") && delivered.includes("Replaced your earlier draft to Customer."), `delivery reports retiring the pending draft: ${delivered}`);
     assert(approvalAction(orphan)?.status === "superseded" && approvalAction(personal)?.status === "pending", "successful delivery retires overlapping To only in the same mailbox");
+
+    const changedInGmail = await cardFor("incident-gmail-edit@new-co.com");
+    draftHeaders.set(changedInGmail.draft_id!, [
+      { name: "To", value: deliveredTo }, { name: "Subject", value: changedInGmail.subject! },
+    ]);
+    const textRefusal = await sendPendingDraftByText(messageTurn(), changedInGmail.draft_id!, { ownTurn: true });
+    assert(!textRefusal.ok && textRefusal.message.includes("To addresses changed"), "an out-of-band To change cannot use a card for different addresses after delivery");
   }
 
   draftUsers.drafts.create = realCreate;

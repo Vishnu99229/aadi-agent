@@ -573,7 +573,7 @@ type SendOutcome =
   | { ok: true; sentMessageId?: string; replacementNotice: string }
   | {
       ok: false;
-      reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused" | "superseded";
+      reason: "send_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused" | "superseded" | "to_changed";
       /** The content gate's reason, for gate_refused. */
       detail?: string;
     };
@@ -662,11 +662,12 @@ async function textSendVerdict(action: PendingAction, messageId: number, ownTurn
     known: await knownRecipients(recipients),
     confirmed: action.draft_id ? draftRecipientsShownBefore(action.draft_id, messageId) : new Set(),
   });
-  return { verdict, to: action.to_header ?? recipients.join(", ") };
+  return { verdict, to: action.live_to_header ?? action.to_header ?? recipients.join(", ") };
 }
 
 function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], detail?: string): string {
   if (reason === "superseded") return [DRAFT_REPLACED, detail].filter(Boolean).join("\n");
+  if (reason === "to_changed") return "The draft's To addresses changed in Gmail. Ask me to show the updated card before sending.";
   if (reason === "gate_refused") {
     return deliveryGateText(detail ?? "");
   }
@@ -685,9 +686,11 @@ function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], d
   if (reason === "unconfirmed") {
     return "Gmail didn't confirm an earlier send, so I won't try again. Check your Sent mail.";
   }
-  return reason === "send_failed"
-    ? "Sending failed. The draft is still pending; please try again."
-    : "The draft was sent, but its approval status could not be updated.";
+  return "Sending failed. The draft is still pending; please try again.";
+}
+
+function recipientKey(header: string): string {
+  return parseAddressList(header).map(({ email }) => email).sort().join(",");
 }
 
 async function performDraftSend(action: PendingAction, decision: SendVerdict): Promise<SendOutcome> {
@@ -743,6 +746,10 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
     return { ok: false, reason: "superseded", detail: await showReplacedDrafts(replaced) };
   }
   if (current?.status !== "pending") return { ok: false, reason: "not_decided" };
+  const registeredTo = current.live_to_header ?? current.to_header;
+  if (registeredTo && recipientKey(registeredTo) !== recipientKey(to)) {
+    return { ok: false, reason: "to_changed" };
+  }
   const release = claimRecipientDelivery(action.google_account, to);
   if (!release) return { ok: false, reason: "in_progress" };
   let sentMessageId: string | undefined;
@@ -1084,8 +1091,9 @@ function recipientLabelFromHeader(header: string): string {
 async function fetchDraftRecipientLabel(
   action: PendingAction,
 ): Promise<string> {
-  if (action.to_header?.trim()) {
-    return recipientLabelFromHeader(action.to_header);
+  const header = action.live_to_header ?? action.to_header;
+  if (header?.trim()) {
+    return recipientLabelFromHeader(header);
   }
   if (!action.draft_id) {
     return "the recipient";

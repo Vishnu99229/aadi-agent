@@ -806,6 +806,9 @@ async function scheduleRequest(
   if (!held) {
     request = { ...request, confirmedRecipients: [...new Set([...(request.confirmedRecipients ?? []), ...recipients])] };
   }
+  if (request.draftId && latestDraftAction(request.draftId, request.account)?.status === "superseded") {
+    return { text: DRAFT_REPLACED };
+  }
   const scheduleKey = `${sendKey(base, to)}:${request.sendAt}`;
   const row = createScheduledSend({
     held,

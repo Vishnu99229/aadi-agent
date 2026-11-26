@@ -2185,7 +2185,7 @@ export function sentMessageForDraft(
 ): { google_account: GoogleAccountId; sent_message_id: string | null; to_header: string | null } | undefined {
   return db
     .prepare(
-      `SELECT google_account, sent_message_id, to_header FROM pending_actions
+      `SELECT google_account, sent_message_id, COALESCE(live_to_header, to_header) AS to_header FROM pending_actions
        WHERE type = 'send_draft' AND draft_id = ? AND status = 'sent'
        ORDER BY id DESC LIMIT 1`,
     )
