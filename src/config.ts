@@ -254,6 +254,8 @@ const meetingTestSenders = (process.env.MEETING_TEST_SENDERS ?? "")
 const sendOnCommandEnabled =
   process.env.SEND_ON_COMMAND_ENABLED?.trim().toLowerCase() === "true";
 const sequencesEnabled = process.env.SEQUENCES_ENABLED?.trim().toLowerCase() === "true";
+const sequenceDetectionEnabled =
+  process.env.SEQUENCE_DETECTION_ENABLED?.trim().toLowerCase() === "true";
 const sequenceStepDays = parsePositiveNumber(
   process.env.SEQUENCE_STEP_DAYS,
   2,
@@ -756,6 +758,7 @@ export const config = {
   autoSendDailyCap,
   sendOnCommandEnabled,
   sequencesEnabled,
+  sequenceDetectionEnabled,
   sequenceStepDays,
   sequencePitchMinConfidence,
   sequenceDailySendCap,

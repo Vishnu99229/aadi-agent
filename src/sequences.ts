@@ -439,6 +439,8 @@ async function sendPitchCard(api: Api, row: SalesSequenceRecord, cardText?: stri
 
 /** Finds new pitches and offers one card each. Creates no active sequence. */
 export async function runSequenceDetection(api: Api): Promise<number> {
+  if (!config.sequenceDetectionEnabled) return 0;
+
   const rows = await detectPitches({
     lookbackDays: DETECT_LOOKBACK_DAYS,
     useScanCache: true,
@@ -1378,6 +1380,10 @@ export async function handleSequenceCommand(ctx: Context): Promise<void> {
 export function registerSequenceDetection(api: Api): IntervalJob | undefined {
   if (!config.sequencesEnabled) {
     console.log("Sequence detection off (SEQUENCES_ENABLED).");
+    return undefined;
+  }
+  if (!config.sequenceDetectionEnabled) {
+    console.log("Sequence detection off (SEQUENCE_DETECTION_ENABLED).");
     return undefined;
   }
   const job = everyMs("sequence-detect", DETECT_INTERVAL_MS, async () => {

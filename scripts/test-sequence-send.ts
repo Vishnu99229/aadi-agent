@@ -84,7 +84,7 @@ import {
   SLOTS_TOKEN,
   WRITER_SYSTEM,
 } from "../src/sequence_writer.ts";
-import { handleSequenceCallback, startSequenceFromTool } from "../src/sequences.ts";
+import { handleSequenceCallback, registerSequenceDetection, startSequenceFromTool } from "../src/sequences.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
 import { fakeTelegramApi } from "./fakes.ts";
 
@@ -128,6 +128,7 @@ interface Msg {
 
 const world = new Map<string, Msg[]>();
 const drafts = new Map<string, { raw: string; threadId: string }>();
+let detectionQueries = 0;
 let idCounter = 0;
 let clock = new Date();
 
@@ -274,6 +275,7 @@ const gmail = {
     },
     messages: {
       list: async ({ q }: { q: string }) => {
+        if (/^in:sent newer_than:\d+d$/.test(q)) detectionQueries += 1;
         gmailCalls += 1;
         return {
           data: { messages: search(q).map((item) => ({ id: item.id, threadId: item.threadId })) },
@@ -1081,6 +1083,12 @@ assert(
 // ======== a whole sequence: threading, timing, silence, no checker ========
 {
   nextScenario();
+  assert(!config.sequenceDetectionEnabled, "the send suite runs with detection off by default");
+  assert(registerSequenceDetection(api) === undefined, "only the send job is registered with detection off");
+  const sendJob = registerSequenceSend(api);
+  assert(sendJob?.name === "sequence-send", "the send job stays registered");
+  sendJob?.stop();
+  const queriesBefore = detectionQueries;
   const before = sends.length;
   const item = enrol();
   const result = await tick();
@@ -1130,6 +1138,7 @@ assert(
   assert(!three.parsed.plain.includes(SLOTS_TOKEN), "the token is replaced");
   assert(getSalesSequence(item.id)!.status === "completed", "the sequence completes");
   assert((await tick(after(3 * DAY))).sent === 0, "a finished sequence never sends a fifth");
+  assert(detectionQueries === queriesBefore, "sending due steps never runs the unsolicited sent-mail scan");
   assert(telegram.sent.length === 0, "no per-send messages and no digest");
 }
 
