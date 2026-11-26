@@ -9,6 +9,7 @@ import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import {
   createScheduledSend,
   getScheduledSend,
+  getPendingActionForDraft as getDraftApproval,
   getTask,
   listOpenScheduledSends,
   listScheduledSendsForDraft,
@@ -811,6 +812,33 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
   assert(replaced.includes("Replaced your earlier draft to Dan."), `replacement is visible, got ${replaced}`);
   assert(getScheduledSend(row.id)?.status === "cancelled", "the replaced draft's schedule cannot still deliver it");
   assert((await updateDraft({ draft_id: draftId, body: "An old copy." })) === "That draft was replaced by a newer one.", "the older draft cannot be revived by editing it");
+}
+
+// Recipient overlap uses parsed mailboxes, so an email in a display name cannot
+// cancel an unrelated scheduled delivery.
+{
+  const chat = 11;
+  const { row: formerSchedule } = await draftThenSchedule(chat, "former@example.com", "Former recipient");
+  const actualRecipientDraft = await draftNewEmail(
+    { to: "current@example.net", subject: "Current recipient", body: "Hi,\n\nA note." },
+    turnIn(chat, "Draft an email to current@example.net"),
+  );
+  const actualDraftId = /draft_id:\s*(\S+)/.exec(actualRecipientDraft)?.[1];
+  assert(actualDraftId, `the current-recipient draft is created, got ${actualRecipientDraft}`);
+  const quotedDraft = await gmail.users.drafts.create({
+    userId: "me",
+    requestBody: { message: { raw: Buffer.from(
+      'To: "former@example.com" <current@example.net>\r\nSubject: Quoted name\r\n\r\nHi,\n\nA note.',
+    ).toString("base64url") } },
+  });
+  const quotedDraftId = quotedDraft.data.id!;
+  await queueDraftApproval({
+    draftId: quotedDraftId, threadId: null, to: '"former@example.com" <current@example.net>',
+    subject: "Quoted name", body: "Hi,\n\nA note.", googleAccount: "work",
+  });
+  assert(getScheduledSend(formerSchedule.id)?.status === "scheduled" &&
+    getDraftApproval(actualDraftId)?.status === "superseded" && getDraftApproval(quotedDraftId)?.status === "pending",
+    "the real current mailbox is replaced, while the former address in its display name and schedule stay untouched");
 }
 
 // 12. Edits made before scheduling are what the scheduled email sends.

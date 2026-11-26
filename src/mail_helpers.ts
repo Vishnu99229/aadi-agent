@@ -4,6 +4,9 @@ import { config } from "./config.js";
 import { loadGoogleAccounts, type LoadedGoogleAccount } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
 import { isSelfEmail } from "./mom_logic.js";
+import { parseAddressList, type ParsedMailbox } from "./address_list.js";
+
+export { parseAddressList, type ParsedMailbox } from "./address_list.js";
 
 /** Mail helpers shared by sequences, sends, drafts, meetings and promises.
  *  Moved unchanged out of the old follow-up tracker (followups.ts and
@@ -19,47 +22,6 @@ const CONSUMER_DOMAINS = new Set([
   "me.com",
   "live.com",
 ]);
-
-export interface ParsedMailbox {
-  name: string;
-  email: string;
-}
-
-export function parseAddressList(raw: string): ParsedMailbox[] {
-  const results: ParsedMailbox[] = [];
-  const seen = new Set<string>();
-  const pattern =
-    /(?:"([^"]+)"|([^,<>]+?))?\s*<([^>]+)>|([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(raw)) !== null) {
-    const email = (match[3] ?? match[4] ?? "").trim().toLowerCase();
-    if (!email || seen.has(email)) {
-      continue;
-    }
-    seen.add(email);
-    const quoted = match[1]?.trim() ?? "";
-    const unquoted = match[2]?.trim() ?? "";
-    const display = quoted || unquoted;
-    results.push({
-      name: displayName(display, email),
-      email,
-    });
-  }
-  return results;
-}
-
-function displayName(rawName: string, email: string): string {
-  const cleaned = rawName.replace(/^["']|["']$/g, "").trim();
-  if (cleaned && !cleaned.includes("@")) {
-    return cleaned.replace(/\s+/g, " ");
-  }
-  const local = email.split("@")[0] ?? "";
-  return local
-    .split(/[._-]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
 
 function titleCaseDomainLabel(domain: string): string {
   const label = domain.split(".")[0] ?? "";

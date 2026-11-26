@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { addOneMonthYmd } from "./bill_cycle.js";
 import { sameConversation } from "./subject_logic.js";
 import { assertTestSeam } from "./test_seam.js";
+import { parseAddressList } from "./address_list.js";
 
 export type MessageRole = "user" | "assistant" | "tool";
 
@@ -1993,7 +1994,7 @@ function pendingDrafts(account?: GoogleAccountId): PendingAction[] {
 }
 
 function draftToAddresses(action: PendingAction): string[] {
-  return headerAddresses(action.live_to_header ?? action.to_header ?? "");
+  return parseAddressList(action.live_to_header ?? action.to_header ?? "").map(({ email }) => email);
 }
 
 function supersedeDraft(action: PendingAction): boolean {
@@ -2003,7 +2004,7 @@ function supersedeDraft(action: PendingAction): boolean {
 }
 
 function supersedeOverlappingDrafts(account: GoogleAccountId, to: string, exceptId?: number): PendingAction[] {
-  const addresses = new Set(headerAddresses(to));
+  const addresses = new Set(parseAddressList(to).map(({ email }) => email));
   return pendingDrafts(account).filter((other) =>
     other.id !== exceptId && draftToAddresses(other).some((email) => addresses.has(email)) && supersedeDraft(other),
   );
@@ -2025,7 +2026,7 @@ export function reconcilePendingDrafts(): PendingAction[] {
 }
 
 export function supersedeDraftIfReplaced(action: PendingAction, liveTo: string): PendingAction[] {
-  const addresses = new Set(headerAddresses(liveTo));
+  const addresses = new Set(parseAddressList(liveTo).map(({ email }) => email));
   return db.transaction(() => {
     const replaced = pendingDrafts(action.google_account).some((other) =>
       other.id > action.id && draftToAddresses(other).some((email) => addresses.has(email)),
@@ -2233,7 +2234,7 @@ export function setPendingActionDraftMeta(
  *  card's Gmail draft id, or schedule:<id> / choice:<id> for those cards. Someone still on it keeps the time they were
  *  first shown; someone taken off it no longer counts for this message. */
 export const recordCardRecipients = db.transaction((messageId: number, draftId: string, header: string): void => {
-  const people = headerAddresses(header);
+  const people = parseAddressList(header).map(({ email }) => email);
   const current = db
     .prepare(`SELECT email FROM card_message_recipients WHERE message_id = ? AND draft_id = ?`)
     .all(messageId, draftId) as Array<{ email: string }>;
@@ -2264,19 +2265,6 @@ export function cardRecipientsForMessage(draftId: string, messageId: number): Se
 /** False for a card posted before recipients were recorded per card message. */
 export function draftHasCardRecords(draftId: string): boolean {
   return db.prepare(`SELECT 1 FROM card_message_recipients WHERE draft_id = ? LIMIT 1`).get(draftId) !== undefined;
-}
-
-function headerAddresses(header: string): string[] {
-  // Only collect mailbox tokens. An address-like string in a quoted display
-  // name is not a recipient and must not supersede that mailbox's draft.
-  const addresses = new Set<string>();
-  const pattern = /(?:"([^"]+)"|([^,<>]+?))?\s*<([^>]+)>|([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(header)) !== null) {
-    const email = (match[3] ?? match[4] ?? "").trim().toLowerCase();
-    if (email) addresses.add(email);
-  }
-  return [...addresses];
 }
 
 /** The newest of his messages already taken for processing. */

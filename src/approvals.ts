@@ -34,7 +34,7 @@ import {
   allowOwnerChatSendDraft,
   allowSendDraft,
 } from "./security/send_approval.js";
-import { parseAddressList } from "./mail_helpers.js";
+import { parseAddressList } from "./address_list.js";
 import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import { draftSendCallback, postConfirmCard, type ConfirmCardSpec } from "./confirm_cards.js";

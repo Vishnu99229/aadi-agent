@@ -7,7 +7,7 @@ import {
   settleDraftDelivery,
   type PendingAction,
 } from "../db.js";
-import { parseAddressList } from "../mail_helpers.js";
+import { parseAddressList } from "../address_list.js";
 import type { LoadedGoogleAccount } from "../google/auth.js";
 import {
   buildMimeMessage,

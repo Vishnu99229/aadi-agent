@@ -3090,10 +3090,25 @@ await expectCancelled("delete_task", async (row) => {
     await handleApprovalCallback(supersededTap, "send", older.id);
     assert(draftsSent.length === beforeTap && alerts.at(-1) === "That draft was replaced by a newer one.", "Telegram edit failure cannot revive a stale button");
 
-    const quotedNameDraft = await cardFor("\"incident-former@new-co.com\" <incident-current@new-co.com>");
     const formerRecipient = await cardFor("incident-former@new-co.com");
-    assert(approvalAction(quotedNameDraft.id)?.status === "pending" && approvalAction(formerRecipient.id)?.status === "pending",
-      "an address in a quoted display name does not supersede a draft for that address");
+    const actualRecipient = await cardFor("incident-current@new-co.com");
+    const quotedNameDraft = await cardFor("\"incident-former@new-co.com\" <incident-current@new-co.com>");
+    assert(approvalAction(quotedNameDraft.id)?.status === "pending" && approvalAction(formerRecipient.id)?.status === "pending" &&
+      approvalAction(actualRecipient.id)?.status === "superseded",
+      "a quoted-name address stays unrelated while the actual mailbox is superseded");
+    const plainMukesh = await cardFor("mukesh@excellentcyber.in");
+    const namedMukeshDraft = await gmail.users.drafts.create({
+      userId: "me",
+      requestBody: { message: { raw: Buffer.from(
+        'To: "Mukesh" <mukesh@excellentcyber.in>\r\nSubject: Named recipient\r\n\r\nHi,\n\nA note.',
+      ).toString("base64url") } },
+    });
+    const namedMukesh = await queueDraftApproval({
+      draftId: namedMukeshDraft.data.id!, threadId: null, to: '"Mukesh" <mukesh@excellentcyber.in>',
+      subject: "Named recipient", body: "Hi,\n\nA note.", googleAccount: "work",
+    });
+    assert(approvalAction(plainMukesh.id)?.status === "superseded" && namedMukesh.action?.status === "pending",
+      "plain addresses and normal display names match the same recipient");
 
     const seed = (draftId: string, to: string, account: "work" | "personal" = "work") => {
       const action = createPendingAction(draftId, null, account);
