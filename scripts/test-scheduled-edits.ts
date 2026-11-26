@@ -819,26 +819,23 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
 {
   const chat = 11;
   const { row: formerSchedule } = await draftThenSchedule(chat, "former@example.com", "Former recipient");
-  const actualRecipientDraft = await draftNewEmail(
-    { to: "current@example.net", subject: "Current recipient", body: "Hi,\n\nA note." },
-    turnIn(chat, "Draft an email to current@example.net"),
-  );
-  const actualDraftId = /draft_id:\s*(\S+)/.exec(actualRecipientDraft)?.[1];
-  assert(actualDraftId, `the current-recipient draft is created, got ${actualRecipientDraft}`);
-  const quotedDraft = await gmail.users.drafts.create({
-    userId: "me",
-    requestBody: { message: { raw: Buffer.from(
-      'To: "former@example.com" <current@example.net>\r\nSubject: Quoted name\r\n\r\nHi,\n\nA note.',
-    ).toString("base64url") } },
-  });
-  const quotedDraftId = quotedDraft.data.id!;
-  await queueDraftApproval({
-    draftId: quotedDraftId, threadId: null, to: '"former@example.com" <current@example.net>',
-    subject: "Quoted name", body: "Hi,\n\nA note.", googleAccount: "work",
-  });
+  const queueRawTo = async (to: string, subject: string) => {
+    const created = await gmail.users.drafts.create({
+      userId: "me",
+      requestBody: { message: { raw: Buffer.from(`To: ${to}\r\nSubject: ${subject}\r\n\r\nHi,\n\nA note.`).toString("base64url") } },
+    });
+    const queued = await queueDraftApproval({
+      draftId: created.data.id!, threadId: null, to, subject,
+      body: "Hi,\n\nA note.", googleAccount: "work",
+    });
+    assert(queued.action, `the raw To draft is queued for ${to}`);
+    return queued.action;
+  };
+  const actualRecipient = await queueRawTo("current@example.net", "Current recipient");
+  const quotedDraft = await queueRawTo('"former@example.com" <current@example.net>', "Quoted name");
   assert(getScheduledSend(formerSchedule.id)?.status === "scheduled" &&
-    getDraftApproval(actualDraftId)?.status === "superseded" && getDraftApproval(quotedDraftId)?.status === "pending",
-    "the real current mailbox is replaced, while the former address in its display name and schedule stay untouched");
+    getDraftApproval(actualRecipient.draft_id!)?.status === "superseded" && getDraftApproval(quotedDraft.action!.draft_id!)?.status === "pending",
+    `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getDraftApproval(actualRecipient.draft_id!)?.status}, quoted=${getDraftApproval(quotedDraft.action!.draft_id!)?.status}`);
 }
 
 // 12. Edits made before scheduling are what the scheduled email sends.
