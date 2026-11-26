@@ -216,13 +216,14 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       userText: turn.userText,
     });
     if (sent.ok) {
-      return `Sent to ${to}.`;
+      return [`Sent to ${to}.`, sent.replacementNotice].filter(Boolean).join("\n");
     }
     if (sent.reason === "card") {
       cardNote = sent.message;
     }
   }
 
+  let replacementNotice = "";
   await queueDraftApproval({
     draftId: result.data.id,
     threadId,
@@ -232,7 +233,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     body,
     googleAccount: account.id,
     extraLines: cc ? [`Cc: ${cc}`] : undefined,
-  });
+  }, { onReplaced: (notice) => { replacementNotice = notice; } });
   if (turn.confirmation) {
     linkPublishedDraft({
       chatId: turn.confirmation.chatId,
@@ -252,5 +253,6 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     to,
     cc: cc || null,
     ...(cardNote ? { not_sent: cardNote } : {}),
+    ...(replacementNotice ? { replacement_notice: replacementNotice } : {}),
   });
 }

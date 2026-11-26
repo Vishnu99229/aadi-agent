@@ -9,6 +9,7 @@ import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import {
   createScheduledSend,
   getScheduledSend,
+  getPendingAction as getApprovalActionById,
   getTask,
   listOpenScheduledSends,
   listScheduledSendsForDraft,
@@ -785,19 +786,56 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
   assert(listOpenScheduledSends().length === open, "neither made a schedule");
 }
 
-// 11. Two drafts to the same person in one mailbox: only the scheduled one follows its edits.
+// 11. Independent drafts: only the scheduled draft follows edits to its Gmail id.
 {
   const chat = 11;
   const { draftId: first, row } = await draftThenSchedule(chat, "dan@example.com", "Offer");
   const second = /draft_id:\s*(\S+)/.exec(
-    await draftNewEmail({ to: "dan@example.com", subject: "Lunch", body: "Hi Dan,\n\nLunch on Friday?" }, turnIn(chat, "Draft an email to dan@example.com about lunch")),
+    await draftNewEmail({ to: "lunch@example.com", subject: "Lunch", body: "Hi,\n\nLunch on Friday?" }, turnIn(chat, "Draft an email to lunch@example.com about lunch")),
   )![1]!;
   const kept = getScheduledSend(row.id)!.request;
-  await updateDraft({ draft_id: second, body: "Hi Dan,\n\nLunch on Saturday?" });
-  assert(getScheduledSend(row.id)!.request === kept, "editing the other draft to Dan leaves the schedule alone");
+  await updateDraft({ draft_id: second, body: "Hi,\n\nLunch on Saturday?" });
+  assert(getScheduledSend(row.id)!.request === kept, "editing the other draft leaves the schedule alone");
   await updateDraft({ draft_id: first, body: "Hi Dan,\n\nThe offer is attached below in text." });
   assert(requestOf(row.id).finalBody === "Hi Dan,\n\nThe offer is attached below in text.", "editing the scheduled draft reaches it");
   transitionScheduledSend(row.id, ["scheduled"], "cancelled");
+}
+
+// Replacing a pending draft also cancels any queued delivery of that draft.
+{
+  const chat = 11;
+  const { draftId, row } = await draftThenSchedule(chat, "dan@example.com", "First note");
+  const replaced = await draftNewEmail(
+    { to: "dan@example.com", subject: "New note", body: "Hi Dan,\n\nHere is the latest note." },
+    turnIn(chat, "Draft an email to dan@example.com with the latest note"),
+  );
+  assert(replaced.includes("Replaced your earlier draft to Dan."), `replacement is visible, got ${replaced}`);
+  assert(getScheduledSend(row.id)?.status === "cancelled", "the replaced draft's schedule cannot still deliver it");
+  assert((await updateDraft({ draft_id: draftId, body: "An old copy." })) === "That draft was replaced by a newer one.", "the older draft cannot be revived by editing it");
+}
+
+// Recipient overlap uses parsed mailboxes, so an email in a display name cannot
+// cancel an unrelated scheduled delivery.
+{
+  const chat = 11;
+  const { row: formerSchedule } = await draftThenSchedule(chat, "former@example.com", "Former recipient");
+  const queueRawTo = async (to: string, subject: string) => {
+    const created = await gmail.users.drafts.create({
+      userId: "me",
+      requestBody: { message: { raw: Buffer.from(`To: ${to}\r\nSubject: ${subject}\r\n\r\nHi,\n\nA note.`).toString("base64url") } },
+    });
+    const actionId = await queueDraftApproval({
+      draftId: created.data.id!, threadId: null, to, subject,
+      body: "Hi,\n\nA note.", googleAccount: "work",
+    });
+    return { actionId };
+  };
+  const actualRecipient = await queueRawTo("current@example.net", "Current recipient");
+  const quotedDraft = await queueRawTo('"former@example.com" <current@example.net>', "Quoted name");
+  assert(getScheduledSend(formerSchedule.id)?.status === "scheduled" &&
+    getApprovalActionById(actualRecipient.actionId)?.status === "superseded" && getApprovalActionById(quotedDraft.actionId)?.status === "pending",
+    `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getApprovalActionById(actualRecipient.actionId)?.status}, quoted=${getApprovalActionById(quotedDraft.actionId)?.status}`);
+  transitionScheduledSend(formerSchedule.id, ["scheduled"], "cancelled");
 }
 
 // 12. Edits made before scheduling are what the scheduled email sends.

@@ -4,25 +4,27 @@ import { config } from "./config.js";
 import {
   cancelOpenDraftSchedules,
   claimDraftDelivery,
-  createPendingAction,
   createPendingEventAction,
+  draftCardMessageIds,
   draftDeliveryBlocksDiscard,
   getExpiredPendingActions,
   getPendingAction,
   getPendingActionForDraft,
+  latestDraftAction,
   listDraftsShownBefore,
-  markTaskDone,
-  recordScheduledSendSent,
   setPendingActionDraftMeta,
   setPendingActionTelegramMessage,
-  setPendingActionSentMessage,
+  pendingDraftActionForMessage,
+  reconcilePendingDrafts,
+  registerPendingDraft,
+  settleDraftDelivery,
+  supersedeDraftIfReplaced,
   transitionPendingAction,
   type GoogleAccountId,
   type PendingAction,
   type PendingEventInput,
   draftRecipientsShownBefore,
   pendingActionFollowups,
-  recordCommandSendSent,
   cardRecipientsForMessage,
   draftHasCardRecords,
 } from "./db.js";
@@ -32,7 +34,7 @@ import {
   allowOwnerChatSendDraft,
   allowSendDraft,
 } from "./security/send_approval.js";
-import { parseAddressList } from "./mail_helpers.js";
+import { parseAddressList } from "./address_list.js";
 import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import { draftSendCallback, postConfirmCard, type ConfirmCardSpec } from "./confirm_cards.js";
@@ -75,6 +77,24 @@ async function gmailFor(account: GoogleAccountId): Promise<gmail_v1.Gmail> {
 const activeActions = new Set<number>();
 const editingActionByUser = new Map<number, number>();
 const sendOnlyActions = new Set<number>();
+const deliveringTo = new Set<string>();
+const OWNER_TO_EDIT = Symbol("owner To edit");
+
+interface OwnerToEdit {
+  actionId: number;
+  to: string;
+}
+
+/** The bot and scheduled worker share a process. A card and a new command cannot
+ * both enter Gmail for the same mailbox and To address while either is in flight. */
+export function claimRecipientDelivery(account: GoogleAccountId, to: string): (() => void) | undefined {
+  const keys = parseAddressList(to).map(({ email }) => `${account}:${email}`);
+  if (keys.some((key) => deliveringTo.has(key))) return undefined;
+  keys.forEach((key) => deliveringTo.add(key));
+  return () => keys.forEach((key) => deliveringTo.delete(key));
+}
+
+export const DRAFT_REPLACED = "That draft was replaced by a newer one.";
 
 type AfterDraftSend = (
   draftId: string,
@@ -133,6 +153,23 @@ function recipientLabel(to: string): string {
   return parseAddressList(to)[0]?.name?.trim() || to.trim() || "them";
 }
 
+export async function showReplacedDrafts(actions: readonly PendingAction[]): Promise<string> {
+  const notices = new Set<string>();
+  await Promise.all(actions.flatMap((action) => {
+    const notice = `Replaced your earlier draft to ${recipientLabel(action.live_to_header ?? action.to_header ?? "")}.`;
+    notices.add(notice);
+    return draftCardMessageIds(action).map((messageId) => telegram.editMessageText(
+      config.ownerTelegramId, messageId, `${notice}\n\n${DRAFT_REPLACED}`, { reply_markup: new InlineKeyboard() },
+    ).catch(() => undefined));
+  }));
+  return [...notices].join("\n");
+}
+
+async function reconcileAndAnnounceReplacedDrafts(): Promise<void> {
+  const notice = await showReplacedDrafts(reconcilePendingDrafts());
+  if (notice) await telegram.sendMessage(config.ownerTelegramId, notice).catch(() => undefined);
+}
+
 export function splitTelegramText(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
   const characters = Array.from(text);
   if (characters.length <= limit) {
@@ -167,7 +204,7 @@ function draftCardSpec(
   const cc = preview.cc?.trim() ?? "";
   const bodyChars = Array.from(preview.body).length;
   const long = bodyChars > DRAFT_SUMMARY_CHARS;
-  const captionTail = [`Subject: ${preview.subject}`, "", preview.body];
+  const captionTail = [...extra, `Subject: ${preview.subject}`, "", preview.body];
   const base = { kind: "draft_send" as const, key: preview.draftId, actionId, sendOnly, showFull: long, to: preview.to, cc, captionTail };
   if (long) {
     const count = bodyChars.toLocaleString("en-US");
@@ -359,27 +396,35 @@ export async function queueDraftApproval(
     touch?: boolean;
     /** Runs once the card is really posted (after a voice note, if it waits for one). */
     onShown?: (actionId: number) => void;
+    commandKey?: string;
+    onReplaced?: (notice: string) => void;
   } = {},
 ): Promise<number> {
-  let action = getPendingActionForDraft(preview.draftId);
-
-  if (action && isStale(action)) {
-    await expireAction(action);
-    action = undefined;
+  const previous = getPendingActionForDraft(preview.draftId, preview.googleAccount);
+  if (previous && isStale(previous)) {
+    await reconcileAndAnnounceReplacedDrafts();
+    await expireAction(previous);
   }
-
+  const { action, replaced } = registerPendingDraft({
+    draftId: preview.draftId, threadId: preview.threadId, account: preview.googleAccount,
+    to: preview.to, commandKey: options.commandKey,
+  });
+  const notice = await showReplacedDrafts(replaced);
+  if (notice) options.onReplaced?.(notice);
   if (!action) {
-    action = createPendingAction(
-      preview.draftId,
-      preview.threadId,
-      preview.googleAccount,
-    );
+    if (notice && !options.onReplaced) await telegram.sendMessage(config.ownerTelegramId, notice).catch(() => undefined);
+    throw new Error(DRAFT_REPLACED);
   }
 
   // The people on this card count as shown only once Telegram has confirmed the card
   // that shows them: then the card's To/Cc and its message's record are written.
   // (The card builder records who the posted card shows, for that message.)
   const shown = (actionId: number): void => {
+    const current = getPendingAction(actionId);
+    if (current?.status === "superseded") {
+      void showReplacedDrafts([current]);
+      return;
+    }
     if (options.touch !== false) {
       setPendingActionDraftMeta(actionId, {
         toHeader: preview.to,
@@ -394,11 +439,14 @@ export async function queueDraftApproval(
   if (sendOnly) sendOnlyActions.add(action.id);
   else sendOnlyActions.delete(action.id);
 
-  const spec = draftCardSpec(action.id, preview, sendOnlyActions.has(action.id));
+  const spec = draftCardSpec(action.id, {
+    ...preview,
+    extraLines: [...(preview.extraLines ?? []), ...(notice ? notice.split("\n") : [])],
+  }, sendOnlyActions.has(action.id));
 
   if (action.telegram_message_id && options.newCard !== true) {
     try {
-      await postConfirmCard(spec, { api: telegram, editMessageId: action.telegram_message_id, onShown: () => shown(action!.id) });
+      await postConfirmCard(spec, { api: telegram, editMessageId: action.telegram_message_id, onShown: () => shown(action.id) });
       console.log(`Approval action ${action.id}: preview updated`);
       return action.id;
     } catch {
@@ -429,6 +477,7 @@ export const DRAFT_REREAD_FAILED = "I couldn't re-read the draft from Gmail, so 
  */
 async function postRefreshedCard(
   action: PendingAction,
+  confirmed: ReadonlySet<string> = new Set<string>(),
 ): Promise<{ ok: true; to: string; cc: string; newAddresses: string[] } | { ok: false; reason: "read_failed" | "failed" }> {
   if (!action.draft_id) {
     return { ok: false, reason: "failed" };
@@ -444,8 +493,9 @@ async function postRefreshedCard(
   const cc = snapshot.cc.trim();
   const subject = snapshot.subject.trim() || action.subject?.trim() || "(no subject)";
   const people = [...new Set([...parseAddressList(to), ...parseAddressList(cc)].map((item) => item.email.toLowerCase()))];
-  const known = await knownRecipients(people);
-  const newAddresses = people.filter((email) => !known.has(email));
+  const unconfirmed = people.filter((email) => !confirmed.has(email));
+  const known = await knownRecipients(unconfirmed);
+  const newAddresses = unconfirmed.filter((email) => !known.has(email));
   const oldCard = action.telegram_message_id;
   let posted: number | undefined;
   try {
@@ -488,6 +538,7 @@ async function currentPendingAction(
   ctx: Context,
   actionId: number,
 ): Promise<PendingAction | undefined> {
+  await reconcileAndAnnounceReplacedDrafts();
   const action = getPendingAction(actionId);
 
   if (!action) {
@@ -505,6 +556,10 @@ async function currentPendingAction(
     return undefined;
   }
 
+  if (action.status === "superseded") {
+    await ctx.answerCallbackQuery({ text: DRAFT_REPLACED, show_alert: true });
+    return undefined;
+  }
   if (action.status !== "pending") {
     const statusMap = {
       sent: "Sent",
@@ -523,10 +578,10 @@ async function currentPendingAction(
 }
 
 type SendOutcome =
-  | { ok: true; sentMessageId?: string }
+  | { ok: true; sentMessageId?: string; replacementNotice: string }
   | {
       ok: false;
-      reason: "send_failed" | "status_update_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused";
+      reason: "send_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused" | "superseded" | "to_changed";
       /** The content gate's reason, for gate_refused. */
       detail?: string;
     };
@@ -576,13 +631,18 @@ function deliveryGateText(reason: string): string {
 }
 
 /** The people a draft goes to right now, from Gmail itself: what drafts.send would use. */
-async function draftRecipients(account: GoogleAccountId, draftId: string): Promise<string[]> {
+async function readDraftRecipients(account: GoogleAccountId, draftId: string): Promise<{ to: string; recipients: string[] }> {
   const gmail = await gmailFor(account);
   const draft = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "metadata" });
   const headers = draft.data.message?.payload?.headers ?? [];
   const value = (name: string) =>
     headers.find((item: { name?: string | null; value?: string | null }) => (item.name ?? "").toLowerCase() === name)?.value ?? "";
-  return [...new Set([...parseAddressList(value("to")), ...parseAddressList(value("cc"))].map((item) => item.email.toLowerCase()))];
+  const to = value("to");
+  return { to, recipients: [...new Set([...parseAddressList(to), ...parseAddressList(value("cc"))].map((item) => item.email))] };
+}
+
+async function draftRecipients(account: GoogleAccountId, draftId: string): Promise<string[]> {
+  return (await readDraftRecipients(account, draftId)).recipients;
 }
 
 /** Who the tapped card message showed: all a tap on it can confirm. A card posted
@@ -610,10 +670,12 @@ async function textSendVerdict(action: PendingAction, messageId: number, ownTurn
     known: await knownRecipients(recipients),
     confirmed: action.draft_id ? draftRecipientsShownBefore(action.draft_id, messageId) : new Set(),
   });
-  return { verdict, to: action.to_header ?? recipients.join(", ") };
+  return { verdict, to: action.live_to_header ?? action.to_header ?? recipients.join(", ") };
 }
 
 function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], detail?: string): string {
+  if (reason === "superseded") return [DRAFT_REPLACED, detail].filter(Boolean).join("\n");
+  if (reason === "to_changed") return "The draft's To addresses changed in Gmail. Ask me to show the updated card before sending.";
   if (reason === "gate_refused") {
     return deliveryGateText(detail ?? "");
   }
@@ -632,20 +694,33 @@ function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], d
   if (reason === "unconfirmed") {
     return "Gmail didn't confirm an earlier send, so I won't try again. Check your Sent mail.";
   }
-  return reason === "send_failed"
-    ? "Sending failed. The draft is still pending; please try again."
-    : "The draft was sent, but its approval status could not be updated.";
+  return "Sending failed. The draft is still pending; please try again.";
 }
 
-async function performDraftSend(action: PendingAction, decision: SendVerdict): Promise<SendOutcome> {
+function recipientKey(header: string): string {
+  return parseAddressList(header).map(({ email }) => email).sort().join(",");
+}
+
+function draftToMatchesApproval(action: PendingAction, to: string, ownerEdit?: OwnerToEdit): boolean {
+  const registered = action.live_to_header ?? action.to_header;
+  if (registered === null) return true; // Older cards may have no stored header.
+  const actual = recipientKey(to);
+  return actual === recipientKey(registered) && (
+    actual === recipientKey(action.to_header ?? "") ||
+    (ownerEdit?.actionId === action.id && actual === recipientKey(ownerEdit.to))
+  );
+}
+
+async function performDraftSend(action: PendingAction, decision: SendVerdict, ownerEdit?: OwnerToEdit): Promise<SendOutcome> {
   const draftId = action.draft_id;
   if (!draftId) {
     return { ok: false, reason: "send_failed" };
   }
   // The decision must cover exactly who the draft goes to now.
   let recipients: string[];
+  let to: string;
   try {
-    recipients = await draftRecipients(action.google_account, draftId);
+    ({ to, recipients } = await readDraftRecipients(action.google_account, draftId));
     assertSendDecision(decision, recipients);
   } catch {
     console.log(`Approval action ${action.id}: send refused reason=not_decided`);
@@ -680,36 +755,46 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
       console.log(`Approval action ${action.id}: send refused by the content gate reason=${gate.reason}`);
       return { ok: false, reason: "gate_refused", detail: gate.reason };
     }
+    to = current.to;
   }
-  const claim = claimDraftDelivery(draftId, action.google_account, new Date().toISOString());
-  if (claim.state === "already_sent" || claim.state === "unconfirmed" || claim.state === "in_progress") {
-    if (claim.state === "already_sent") {
-      transitionPendingAction(action.id, "pending", "sent");
-    }
-    console.log(`Approval action ${action.id}: send blocked reason=${claim.state}`);
-    return { ok: false, reason: claim.state };
+  const gmail = await gmailFor(action.google_account);
+  const replaced = supersedeDraftIfReplaced(action, to);
+  const current = getPendingAction(action.id);
+  if (current?.status === "superseded") {
+    return { ok: false, reason: "superseded", detail: await showReplacedDrafts(replaced) };
   }
+  if (current?.status !== "pending") return { ok: false, reason: "not_decided" };
+  if (!draftToMatchesApproval(current, to, ownerEdit)) return { ok: false, reason: "to_changed" };
+  const release = claimRecipientDelivery(action.google_account, to);
+  if (!release) return { ok: false, reason: "in_progress" };
   let sentMessageId: string | undefined;
+  let replacedOnSend: PendingAction[];
   try {
-    const gmail = await gmailFor(action.google_account);
-    const sent = await gmail.users.drafts.send({
-      userId: "me",
-      requestBody: { id: draftId },
-    });
-    sentMessageId = sent.data.id ?? undefined;
-    markRecipientsKnown(recipients);
-  } catch {
-    if (claim.state === "claimed") {
-      console.log(`Approval action ${action.id}: send unconfirmed; schedule ${claim.id} stays claimed`);
-      return { ok: false, reason: "unconfirmed" };
+    const claim = claimDraftDelivery(draftId, action.google_account, new Date().toISOString());
+    if (claim.state === "superseded") return { ok: false, reason: "superseded" };
+    if (claim.state === "already_sent" || claim.state === "unconfirmed" || claim.state === "in_progress") {
+      if (claim.state === "already_sent") transitionPendingAction(action.id, "pending", "sent");
+      console.log(`Approval action ${action.id}: send blocked reason=${claim.state}`);
+      return { ok: false, reason: claim.state };
     }
-    console.log(`Approval action ${action.id}: send failed; status -> pending`);
-    return { ok: false, reason: "send_failed" };
-  }
-  if (claim.state === "claimed") {
-    recordScheduledSendSent(claim.id, sentMessageId ?? null);
-    markTaskDone(claim.taskId);
-    console.log(`Scheduled send ${claim.id}: status -> sent reason=manual_draft`);
+    try {
+      const sent = await gmail.users.drafts.send({ userId: "me", requestBody: { id: draftId } });
+      sentMessageId = sent.data.id ?? undefined;
+    } catch {
+      if (claim.state === "claimed") {
+        console.log(`Approval action ${action.id}: send unconfirmed; schedule ${claim.id} stays claimed`);
+        return { ok: false, reason: "unconfirmed" };
+      }
+      console.log(`Approval action ${action.id}: send failed; status -> pending`);
+      return { ok: false, reason: "send_failed" };
+    }
+    replacedOnSend = settleDraftDelivery({
+      account: action.google_account, to, actionId: action.id, sentMessageId,
+      commandKey: action.command_key, schedule: claim.state === "claimed" ? claim : undefined,
+    });
+    markRecipientsKnown(recipients);
+  } finally {
+    release();
   }
   if (sentMessageId && afterDraftSend) {
     try {
@@ -718,28 +803,12 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
       console.log(`Approval action ${action.id}: after-send hook failed`);
     }
   }
-  if (sentMessageId) {
-    // Recorded only, so "put this email in a follow-up sequence" can find it. It
-    // never decides a send, and a failure here never changes the outcome.
-    try {
-      setPendingActionSentMessage(action.id, sentMessageId);
-    } catch {
-      console.log(`Approval action ${action.id}: sent message not recorded`);
-    }
-  }
-  if (action.command_key) {
-    // The send command this card stood for is done, exactly like a direct send.
-    recordCommandSendSent(action.command_key, sentMessageId ?? "unknown");
-  }
-  if (!transitionPendingAction(action.id, "pending", "sent")) {
-    console.log(`Approval action ${action.id}: sent; status update failed`);
-    return { ok: false, reason: "status_update_failed" };
-  }
+  const replacementNotice = await showReplacedDrafts(replacedOnSend);
   console.log(`Approval action ${action.id}: status -> sent`);
   // Follow-ups he asked for with a send command come now, whether his tap or his own
   // "send it" sent it: always as the pre-filled Start card.
   await followupsAfterCardSend(action, sentMessageId, recipients);
-  return { ok: true, sentMessageId };
+  return { ok: true, sentMessageId, replacementNotice };
 }
 
 /** A repeat of the command a card stands for: the same card again (never a new draft).
@@ -773,7 +842,7 @@ export async function sendCreatedDraftNow(params: {
   /** His own words: "draft ..." never sends. */
   userText?: string;
 }): Promise<
-  | { ok: true }
+  | { ok: true; replacementNotice: string }
   | { ok: false; reason: "not_approved" | "send_failed" }
   | { ok: false; reason: "card"; message: string }
 > {
@@ -789,8 +858,9 @@ export async function sendCreatedDraftNow(params: {
   }
   // Only known people, on his own turn, for a send he asked for: anything else is the card.
   let recipients: string[];
+  let to: string;
   try {
-    recipients = await draftRecipients(params.googleAccount, params.draftId);
+    ({ to, recipients } = await readDraftRecipients(params.googleAccount, params.draftId));
   } catch {
     return { ok: false, reason: "send_failed" };
   }
@@ -808,27 +878,31 @@ export async function sendCreatedDraftNow(params: {
   } catch {
     return { ok: false, reason: "send_failed" };
   }
-  const claim = claimDraftDelivery(params.draftId, params.googleAccount, new Date().toISOString());
-  if (claim.state === "already_sent" || claim.state === "in_progress" || claim.state === "unconfirmed") {
-    console.log(`Draft ${params.draftId}: immediate send blocked reason=${claim.state}`);
-    return { ok: false, reason: "send_failed" };
-  }
+  const gmail = await gmailFor(params.googleAccount);
+  const release = claimRecipientDelivery(params.googleAccount, to);
+  if (!release) return { ok: false, reason: "send_failed" };
   let sentMessageId: string | undefined;
+  let replaced: PendingAction[];
   try {
-    const gmail = await gmailFor(params.googleAccount);
-    const sent = await gmail.users.drafts.send({
-      userId: "me",
-      requestBody: { id: params.draftId },
+    const claim = claimDraftDelivery(params.draftId, params.googleAccount, new Date().toISOString());
+    if (claim.state === "already_sent" || claim.state === "in_progress" || claim.state === "unconfirmed" || claim.state === "superseded") {
+      console.log(`Draft ${params.draftId}: immediate send blocked reason=${claim.state}`);
+      return { ok: false, reason: "send_failed" };
+    }
+    try {
+      const sent = await gmail.users.drafts.send({ userId: "me", requestBody: { id: params.draftId } });
+      sentMessageId = sent.data.id ?? undefined;
+    } catch {
+      console.log(`Draft ${params.draftId}: immediate send failed`);
+      return { ok: false, reason: "send_failed" };
+    }
+    replaced = settleDraftDelivery({
+      account: params.googleAccount, to, draftId: params.draftId, sentMessageId,
+      schedule: claim.state === "claimed" ? claim : undefined,
     });
-    sentMessageId = sent.data.id ?? undefined;
     markRecipientsKnown(recipients);
-  } catch {
-    console.log(`Draft ${params.draftId}: immediate send failed`);
-    return { ok: false, reason: "send_failed" };
-  }
-  if (claim.state === "claimed") {
-    recordScheduledSendSent(claim.id, sentMessageId ?? null);
-    markTaskDone(claim.taskId);
+  } finally {
+    release();
   }
   if (sentMessageId && afterDraftSend) {
     try {
@@ -838,7 +912,7 @@ export async function sendCreatedDraftNow(params: {
     }
   }
   console.log(`Draft ${params.draftId}: sent immediately`);
-  return { ok: true };
+  return { ok: true, replacementNotice: await showReplacedDrafts(replaced) };
 }
 
 type EventOutcome =
@@ -973,13 +1047,16 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     if (outcome.reason === "already_sent") {
       await showStatus(ctx, "Sent").catch(() => undefined);
     }
-    await ctx.answerCallbackQuery({ text: sendFailureText(outcome.reason, outcome.detail), show_alert: true });
+    const text = outcome.reason === "superseded" ? DRAFT_REPLACED : sendFailureText(outcome.reason, outcome.detail);
+    await ctx.answerCallbackQuery({ text, show_alert: true });
+    if (outcome.reason === "superseded" && outcome.detail) await ctx.reply(outcome.detail).catch(() => undefined);
     return;
   }
   await showStatus(ctx, "Sent").catch(() => {
     console.log(`Approval action ${action.id}: sent preview update failed`);
   });
   await ctx.answerCallbackQuery("Sent").catch(() => undefined);
+  if (outcome.replacementNotice) await ctx.reply(outcome.replacementNotice).catch(() => undefined);
 }
 
 /** "Email a new address saying ... and start follow-ups": the email went out on his tap,
@@ -1029,8 +1106,9 @@ function recipientLabelFromHeader(header: string): string {
 async function fetchDraftRecipientLabel(
   action: PendingAction,
 ): Promise<string> {
-  if (action.to_header?.trim()) {
-    return recipientLabelFromHeader(action.to_header);
+  const header = action.live_to_header ?? action.to_header;
+  if (header?.trim()) {
+    return recipientLabelFromHeader(header);
   }
   if (!action.draft_id) {
     return "the recipient";
@@ -1062,6 +1140,85 @@ export interface SendConfirmation {
   chatId: number;
   /** Telegram id of Vishnu's confirming message, typed or voice. */
   messageId: number;
+}
+
+/** Change the routing header in Gmail's original MIME. The subject, message parts,
+ * attachments, signature and reply headers stay byte-for-byte as they were. */
+export async function editAndSendPendingDraft(
+  confirmation: SendConfirmation,
+  action: PendingAction,
+  edit: { field: "to" | "cc"; email: string; replace: boolean },
+  onUpdated: (headers: { to: string; cc: string }) => string | undefined,
+): Promise<TextSendDraftResult> {
+  const draftId = action.draft_id;
+  if (!draftId || !eligibleDrafts(confirmation).some((draft) => draft.id === action.id)) {
+    return { ok: false, message: getPendingAction(action.id)?.status === "superseded" ? DRAFT_REPLACED
+      : "No draft is waiting for your approval, so nothing was sent." };
+  }
+  if (activeActions.has(action.id)) return { ok: false, message: "That draft is already being processed." };
+  activeActions.add(action.id);
+  let replacementNotice = "";
+  let scheduleNotice: string | undefined;
+  let ownerToEdit: OwnerToEdit | undefined;
+  try {
+    const gmail = await gmailFor(action.google_account);
+    const { data } = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "raw" });
+    const message = data.message;
+    if (!message?.raw) return { ok: false, message: DRAFT_REREAD_FAILED };
+    const raw = Buffer.from(message.raw, "base64url").toString("latin1");
+    const separator = /\r?\n\r?\n/.exec(raw);
+    if (!separator) return { ok: false, message: DRAFT_REREAD_FAILED };
+    const headers = raw.slice(0, separator.index);
+    const lineBreak = separator[0].startsWith("\r") ? "\r\n" : "\n";
+    const field = edit.field === "cc" ? "Cc" : "To";
+    const headerLine = (name: string) => new RegExp(`^${name}:[^\\r\\n]*(?:\\r?\\n[ \\t][^\\r\\n]*)*`, "im");
+    const value = (block: string, name: string) =>
+      block.match(headerLine(name))?.[0].slice(name.length + 1).replace(/\r?\n[ \t]+/g, " ").trim() ?? "";
+    const current = value(headers, field);
+    const alreadyIncluded = parseAddressList(current).some(({ email }) => email === edit.email);
+    const next = edit.replace || !current ? edit.email : `${current}, ${edit.email}`;
+    const updated = !edit.replace && alreadyIncluded ? headers : headerLine(field).test(headers)
+      ? headers.replace(headerLine(field), () => `${field}: ${next}`)
+      : `${headers}${lineBreak}${field}: ${next}`;
+    const to = value(updated, "To");
+    const cc = value(updated, "Cc");
+    const previousTo = value(headers, "To");
+    const release = claimRecipientDelivery(action.google_account, `${previousTo}, ${to}`);
+    if (!release) return { ok: false, message: "That draft's recipient already has an email going out." };
+    try {
+      const fresh = getPendingAction(action.id);
+      if (fresh?.status !== "pending") return { ok: false, message: fresh?.status === "superseded" ? DRAFT_REPLACED
+        : "That draft is no longer waiting for approval." };
+      if (!draftToMatchesApproval(fresh, previousTo)) return { ok: false, message: sendFailureText("to_changed") };
+      if (updated !== headers) {
+        await gmail.users.drafts.update({
+          userId: "me", id: draftId,
+          requestBody: { id: draftId, message: {
+            ...(message.threadId ? { threadId: message.threadId } : {}),
+            raw: Buffer.from(updated + raw.slice(separator.index), "latin1").toString("base64url"),
+          } },
+        });
+        const registered = registerPendingDraft({ draftId, threadId: action.thread_id, account: action.google_account, to });
+        replacementNotice = await showReplacedDrafts(registered.replaced);
+        if (!registered.action) return { ok: false, message: [DRAFT_REPLACED, replacementNotice].filter(Boolean).join("\n") };
+        scheduleNotice = onUpdated({ to, cc });
+        if (edit.field === "to") ownerToEdit = { actionId: action.id, to };
+      }
+    } finally {
+      release();
+    }
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Approval action ${action.id}: recipient edit failed (${errorType})`);
+    return { ok: false, message: ["I couldn't update the draft's recipients, so nothing was sent.", replacementNotice].filter(Boolean).join("\n") };
+  } finally {
+    activeActions.delete(action.id);
+  }
+  const result = await sendPendingDraftByText(confirmation, draftId, {
+    ownTurn: true, refreshOnCard: true, replyToMessageId: action.telegram_message_id ?? undefined,
+    [OWNER_TO_EDIT]: ownerToEdit,
+  });
+  return { ...result, message: [result.message, replacementNotice, scheduleNotice].filter(Boolean).join("\n") };
 }
 
 export function eligibleDrafts(confirmation: SendConfirmation): PendingAction[] {
@@ -1165,6 +1322,7 @@ export function formatPendingDraftContext(
 async function shownPendingDrafts(
   confirmation: SendConfirmation,
 ): Promise<PendingAction[]> {
+  await reconcileAndAnnounceReplacedDrafts();
   const shown: PendingAction[] = [];
   for (const action of listDraftsShownBefore(confirmation.messageId)) {
     if (isStale(action)) {
@@ -1193,9 +1351,18 @@ export async function sendPendingDraftByText(
   confirmation: SendConfirmation,
   draftId?: string,
   /** ownTurn: straight from his own chat turn. Anything else is never a send. */
-  options: { ownTurn?: boolean } = {},
+  options: { ownTurn?: boolean; replyToMessageId?: number; refreshOnCard?: boolean; [OWNER_TO_EDIT]?: OwnerToEdit } = {},
 ): Promise<TextSendDraftResult> {
   const shown = await shownPendingDrafts(confirmation);
+  const replyDraft = options.replyToMessageId === undefined ? undefined : pendingDraftActionForMessage(options.replyToMessageId);
+  if (replyDraft?.status === "superseded") return { ok: false, message: DRAFT_REPLACED };
+  if (replyDraft && draftId && draftId.trim() !== replyDraft.draft_id) {
+    return { ok: false, message: "Not sent: that draft is different from the card you replied to." };
+  }
+  if (replyDraft?.status !== undefined && replyDraft.status !== "pending") {
+    return { ok: false, message: "No draft is waiting for your approval, so nothing was sent." };
+  }
+  if (replyDraft) draftId = replyDraft.draft_id ?? undefined;
   if (shown.length === 0) {
     return {
       ok: false,
@@ -1204,7 +1371,7 @@ export async function sendPendingDraftByText(
   }
   let action: PendingAction | undefined;
   if (typeof draftId === "string" && draftId.trim()) {
-    action = shown.find((item) => item.draft_id === draftId.trim());
+    action = shown.find((item) => replyDraft ? item.id === replyDraft.id : item.draft_id === draftId?.trim());
     if (!action) {
       console.log(
         `Send confirmation: draft_id not in eligible set of ${shown.length}`,
@@ -1242,9 +1409,15 @@ export async function sendPendingDraftByText(
     const { verdict, to } = await textSendVerdict(action, confirmation.messageId, options.ownTurn === true);
     if (verdict.action !== "send") {
       console.log(`Approval action ${action.id}: card, not sent (${verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
+      if (options.refreshOnCard && verdict.action === "card") {
+        const confirmed = action.draft_id ? draftRecipientsShownBefore(action.draft_id, confirmation.messageId) : undefined;
+        const refreshed = await postRefreshedCard(action, confirmed);
+        if (!refreshed.ok) return { ok: false, message: refreshed.reason === "read_failed"
+          ? DRAFT_REREAD_FAILED : "I updated the draft, but couldn't show its refreshed card. Ask me to show it again." };
+      }
       return { ok: false, message: cardReason(verdict, to) };
     }
-    const outcome = await performDraftSend(action, verdict);
+    const outcome = await performDraftSend(action, verdict, options[OWNER_TO_EDIT]);
     if (!outcome.ok) {
       return { ok: false, message: sendFailureText(outcome.reason, outcome.detail) };
     }
@@ -1265,7 +1438,7 @@ export async function sendPendingDraftByText(
     console.log(`Approval action ${action.id}: sent on chat confirmation`);
     return {
       ok: true,
-      message: `Sent the draft to ${recipient}.`,
+      message: [`Sent the draft to ${recipient}.`, outcome.replacementNotice].filter(Boolean).join("\n"),
     };
   } finally {
     activeActions.delete(action.id);
@@ -1574,10 +1747,8 @@ export async function handleApprovalCallback(
 
 /** The scheduled worker delivered this draft's email. The Send card can no longer send it. */
 export async function retireDraftApproval(draftId: string, account: GoogleAccountId): Promise<void> {
-  const action = getPendingActionForDraft(draftId);
-  if (!action || action.google_account !== account) {
-    return;
-  }
+  const action = latestDraftAction(draftId, account);
+  if (action?.status !== "sent") return;
   if (action.telegram_message_id) {
     try {
       await telegram.editMessageText(
@@ -1589,9 +1760,6 @@ export async function retireDraftApproval(draftId: string, account: GoogleAccoun
     } catch {
       console.log(`Approval action ${action.id}: scheduled-send preview update failed`);
     }
-  }
-  if (transitionPendingAction(action.id, "pending", "sent")) {
-    console.log(`Approval action ${action.id}: status -> sent reason=scheduled_delivery`);
   }
 }
 
@@ -1632,6 +1800,7 @@ export async function consumeDraftEdit(
 }
 
 export async function expirePendingApprovals(): Promise<void> {
+  await reconcileAndAnnounceReplacedDrafts();
   for (const action of getExpiredPendingActions()) {
     await expireAction(action);
   }

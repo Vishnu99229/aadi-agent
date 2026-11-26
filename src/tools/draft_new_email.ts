@@ -8,7 +8,7 @@ import {
   formatMailboxList,
   splitDraftRecipients,
 } from "../draft_recipients.js";
-import { parseAddressList } from "../mail_helpers.js";
+import { parseAddressList } from "../address_list.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor, signaturePlainText } from "../google/mail.js";
 import { deliveryTimeHold, notASendCommand } from "../command_logic.js";
@@ -154,10 +154,11 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       cardNote = sent.message;
     }
     if (sent.ok) {
-      return `Sent to ${toHeader}.`;
+      return [`Sent to ${toHeader}.`, sent.replacementNotice].filter(Boolean).join("\n");
     }
   }
 
+  let replacementNotice = "";
   await queueDraftApproval({
     draftId,
     threadId: null,
@@ -167,7 +168,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     body: values.body,
     googleAccount: account.id,
     ...(signature ? { signature } : {}),
-  });
+  }, { onReplaced: (notice) => { replacementNotice = notice; } });
   if (turn.confirmation) {
     linkPublishedDraft({
       chatId: turn.confirmation.chatId,
@@ -180,5 +181,8 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     });
   }
 
-  return `${cardNote ? `${cardNote} ` : ""}Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`;
+  return [
+    `${cardNote ? `${cardNote} ` : ""}Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`,
+    replacementNotice,
+  ].filter(Boolean).join("\n");
 }

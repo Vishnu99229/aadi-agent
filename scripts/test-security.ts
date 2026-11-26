@@ -630,6 +630,22 @@ assert(
   `messages.send only allowed in auto_book.ts, security/sequence_send.ts and security/command_send.ts, found ${messageSendFiles.join(", ") || "none"}`,
 );
 const commandSendSrc = await readFile(join(root, "src/security/command_send.ts"), "utf8");
+const draftDbSrc = await readFile(join(root, "src/db.ts"), "utf8");
+const commandRecipientSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
+const commandLookupSrc = await readFile(join(root, "src/command_recipients.ts"), "utf8");
+const commandLogicSrc = await readFile(join(root, "src/command_logic.ts"), "utf8");
+const newDraftToolSrc = await readFile(join(root, "src/tools/draft_new_email.ts"), "utf8");
+const mailboxParserPath = '"./address_list.js"';
+assert(
+  draftDbSrc.includes(`from ${mailboxParserPath}`) && approvalsSrc.includes(`from ${mailboxParserPath}`) &&
+    commandSendSrc.includes('from "../address_list.js"') && draftDbSrc.includes("parseAddressList(action.live_to_header") &&
+    approvalsSrc.includes("parseAddressList(to).map(({ email }) => `${account}:${email}`)") &&
+    commandSendSrc.includes("parseAddressList(header).map((item) => item.email.toLowerCase())") &&
+    commandRecipientSrc.includes(`from ${mailboxParserPath}`) && commandRecipientSrc.includes("parseAddressList(query)[0]?.email") &&
+    commandLookupSrc.includes(`from ${mailboxParserPath}`) && commandLookupSrc.includes("parseAddressList(input.query)[0]?.email") &&
+    commandLogicSrc.includes(`from ${mailboxParserPath}`) && newDraftToolSrc.includes('from "../address_list.js"'),
+  "draft overlap, recipient resolution, delivery claims, and send gates use the same parsed mailbox helper",
+);
 assert(
   (commandSendSrc.match(/messages\.send/g) ?? []).length === 1,
   "command_send.ts has exactly one send call",
@@ -839,6 +855,23 @@ assert(
   const decisionSrc = await readFile(join(root, "src/security/send_decision.ts"), "utf8");
   assert(decisionSrc.includes("export function decideSendAction("), "one decision point");
   assert(decisionSrc.includes("export function assertSendDecision("), "and one check of it");
+  const bodyOf = (source: string, name: string) => {
+    const start = source.indexOf(`function ${name}(`);
+    assert(start >= 0, `found ${name}`);
+    return source.slice(start, source.indexOf("\n}\n", start));
+  };
+  const legacyImmediate = bodyOf(approvalsGateSrc, "sendCreatedDraftNow");
+  const gatedDraftSends = [performBody, legacyImmediate];
+  const gmailDraftSend = /\.users\.drafts\.send\s*\(/g;
+  assert((approvalsGateSrc.match(gmailDraftSend) ?? []).length === gatedDraftSends.length, "every draft Gmail call is in a gated delivery function");
+  for (const body of gatedDraftSends) {
+    const check = body.indexOf("assertSendDecision(");
+    assert(check >= 0 && check < body.indexOf(".users.drafts.send("), "each draft Gmail call checks the shared decision first");
+  }
+  const rawCommand = bodyOf(commandSendSrc, "sendCommandEmail");
+  assert(rawCommand.indexOf("assertSendDecision(") >= 0 && rawCommand.indexOf("assertSendDecision(") < rawCommand.indexOf(".users.messages.send("), "the direct and scheduled command Gmail call checks the same decision");
+  const editBody = bodyOf(approvalsGateSrc, "editAndSendPendingDraft");
+  assert(editBody.includes("sendPendingDraftByText(") && !editBody.includes("performDraftSend("), "recipient edits dispatch through the same approval and decision as text confirmations");
 }
 for (const tool of ["set_sequence_timezone", "add_sales_fact", "list_sales_facts", "remove_sales_fact"]) {
   assert(
@@ -1468,21 +1501,22 @@ assert(missHits.length === 0, "no match returns empty");
 // ---------------------------------------------------------------------------
 const confirmGmail: GmailLog = { sent: [], created: [] };
 const confirmCards: TelegramLog = { sent: [], edited: [] };
+const confirmDraftRecipients: Record<string, { to: string }> = {};
 setApprovalsTestHooks({
   telegram: fakeTelegramApi(confirmCards),
-  gmailFor: () => fakeGmail(confirmGmail),
+  gmailFor: () => fakeGmail(confirmGmail, confirmDraftRecipients),
 });
 const ownerChat = 1;
 const confirmDrafts: number[] = [];
 
-function draftWithCard(cardId: number | null): number {
+function draftWithCard(cardId: number | null, to = "Priya <priya@acme.com>"): number {
   const action = createPendingAction(`confirm-${nextMessageId()}`, null, "work");
+  confirmDraftRecipients[action.draft_id!] = { to };
   if (cardId !== null) {
     setPendingActionTelegramMessage(action.id, cardId);
-    // A posted card shows the draft's people (the fake draft goes to Priya), recorded
-    // for its message as the card builder records it.
-    setPendingActionDraftMeta(action.id, { toHeader: "Priya <priya@acme.com>", ccHeader: "", subject: "Demo" });
-    recordCardRecipients(cardId, action.draft_id!, "Priya <priya@acme.com>");
+    // A posted card's recipients are recorded for that message.
+    setPendingActionDraftMeta(action.id, { toHeader: to, ccHeader: "", subject: "Demo" });
+    recordCardRecipients(cardId, action.draft_id!, to);
   }
   confirmDrafts.push(action.id);
   return action.id;
@@ -1619,7 +1653,7 @@ function hoursAgo(hours: number): string {
 // Recency: most recently created or edited wins; two equal timestamps ask.
 {
   discardConfirmDrafts();
-  const older = draftWithCard(nextMessageId());
+  const older = draftWithCard(nextMessageId(), "other@acme.com");
   const recent = draftWithCard(nextMessageId());
   setPendingActionTimestampsForTests(older, {
     createdAt: hoursAgo(2),
@@ -1641,7 +1675,7 @@ function hoursAgo(hours: number): string {
   assert(getPendingAction(older)!.status === "pending", "the older draft is untouched");
 
   discardConfirmDrafts();
-  const left = draftWithCard(nextMessageId());
+  const left = draftWithCard(nextMessageId(), "other@acme.com");
   const right = draftWithCard(nextMessageId());
   const tied = hoursAgo(0.3);
   setPendingActionTimestampsForTests(left, {
@@ -1959,9 +1993,9 @@ for (const file of toolFiles) {
   const noConfirm = { iteration: 1, calledTools: ["draft_new_email"] };
   const created = await draftNewEmail(
     {
-      to: "priya@acme.com",
+      to: "alex@acme.com",
       subject: "Demo",
-      body: "Hi Priya, the demo is Thursday.",
+      body: "Hi Alex, the demo is Thursday.",
       send_immediately: true,
     },
     noConfirm,

@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { addOneMonthYmd } from "./bill_cycle.js";
 import { sameConversation } from "./subject_logic.js";
 import { assertTestSeam } from "./test_seam.js";
+import { parseAddressList } from "./address_list.js";
 
 export type MessageRole = "user" | "assistant" | "tool";
 
@@ -19,7 +20,8 @@ export type PendingActionStatus =
   | "discarded"
   | "expired"
   | "created"
-  | "cancelled";
+  | "cancelled"
+  | "superseded";
 
 export type PendingActionType = "send_draft" | "create_event";
 
@@ -42,6 +44,7 @@ export interface PendingAction {
   auto_send_at: string | null;
   updated_at: string | null;
   to_header: string | null;
+  live_to_header?: string | null;
   cc_header: string | null;
   subject: string | null;
   /** The send command this card stands for, when a command became a card. */
@@ -249,7 +252,7 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'pending'
       CHECK (status IN (
         'pending', 'sent', 'discarded', 'expired',
-        'created', 'cancelled'
+        'created', 'cancelled', 'superseded'
       )),
     telegram_message_id INTEGER,
     event_title TEXT,
@@ -1480,6 +1483,24 @@ if (!tableHasColumn("pending_actions", "followup_words")) {
 if (!tableHasColumn("pending_actions", "followup_key")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN followup_key TEXT`);
 }
+if (!tableHasColumn("pending_actions", "live_to_header")) {
+  // Keep the live recipient separate from the header Telegram has confirmed it showed.
+  // Rebuild older tables to widen their status CHECK and preserve every approval field.
+  db.transaction(() => {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'pending_actions'").get() as { sql: string };
+    if (!schema.sql.includes("'superseded'")) {
+      db.exec(`
+        ${schema.sql.replace(/^CREATE TABLE\s+["`]?pending_actions["`]?/i, "CREATE TABLE pending_actions_replacement").replace("'cancelled'", "'cancelled', 'superseded'")};
+        INSERT INTO pending_actions_replacement SELECT * FROM pending_actions;
+        DROP TABLE pending_actions;
+        ALTER TABLE pending_actions_replacement RENAME TO pending_actions;
+        CREATE INDEX idx_pending_actions_draft_status ON pending_actions (draft_id, status);
+        CREATE INDEX idx_pending_actions_command_key ON pending_actions (command_key);
+      `);
+    }
+    db.exec("ALTER TABLE pending_actions ADD COLUMN live_to_header TEXT");
+  }).immediate();
+}
 db.exec(`
   -- Addresses he has sent to (Gmail Sent, either account) or Aadi sent to on his
   -- confirmation. Only "known" is ever stored; "new" is never cached.
@@ -1850,7 +1871,7 @@ export function insertMessageEmbedding(row: {
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
               telegram_message_id, event_title, event_start, event_end,
               event_attendees, event_description, created_at, auto_send_at,
-              updated_at, to_header, cc_header, subject, command_key`;
+              updated_at, to_header, cc_header, subject, command_key, live_to_header`;
 
 export function createPendingAction(
   draftId: string,
@@ -1932,22 +1953,134 @@ export function pendingActionForCommandKey(key: string): PendingAction | undefin
 
 export function getPendingActionForDraft(
   draftId: string,
+  account?: GoogleAccountId,
 ): PendingAction | undefined {
   return db
     .prepare(
       `SELECT ${PENDING_ACTION_COLUMNS}
        FROM pending_actions
-       WHERE draft_id = ? AND status = 'pending'
+       WHERE draft_id = ? AND status = 'pending' AND (? IS NULL OR google_account = ?)
        ORDER BY id DESC
        LIMIT 1`,
     )
-    .get(draftId) as PendingAction | undefined;
+    .get(draftId, account ?? null, account ?? null) as PendingAction | undefined;
+}
+
+export function latestDraftAction(draftId: string, account?: GoogleAccountId): PendingAction | undefined {
+  return db.prepare(`SELECT ${PENDING_ACTION_COLUMNS} FROM pending_actions
+    WHERE draft_id = ? AND (? IS NULL OR google_account = ?) ORDER BY id DESC LIMIT 1`)
+    .get(draftId, account ?? null, account ?? null) as PendingAction | undefined;
+}
+
+export function pendingDraftActionForMessage(messageId: number): PendingAction | undefined {
+  return db.prepare(`SELECT ${PENDING_ACTION_COLUMNS} FROM pending_actions
+    WHERE type = 'send_draft' AND (telegram_message_id = ? OR EXISTS (
+      SELECT 1 FROM card_message_recipients AS shown
+      WHERE shown.message_id = ? AND shown.draft_id = pending_actions.draft_id
+    )) ORDER BY (telegram_message_id = ?) DESC, id DESC LIMIT 1`).get(messageId, messageId, messageId) as PendingAction | undefined;
+}
+
+export function draftCardMessageIds(action: PendingAction): number[] {
+  const rows = db.prepare("SELECT DISTINCT message_id FROM card_message_recipients WHERE draft_id = ?")
+    .all(action.draft_id) as Array<{ message_id: number }>;
+  return [...new Set([action.telegram_message_id, ...rows.map((row) => row.message_id)])]
+    .filter((messageId): messageId is number => messageId !== null);
+}
+
+function pendingDrafts(account?: GoogleAccountId): PendingAction[] {
+  return db.prepare(`SELECT ${PENDING_ACTION_COLUMNS} FROM pending_actions
+    WHERE type = 'send_draft' AND status = 'pending' AND (? IS NULL OR google_account = ?)
+    ORDER BY id DESC`).all(account ?? null, account ?? null) as PendingAction[];
+}
+
+function draftToAddresses(action: PendingAction): string[] {
+  return parseAddressList(action.live_to_header ?? action.to_header ?? "").map(({ email }) => email);
+}
+
+function supersedeDraft(action: PendingAction): boolean {
+  if (!transitionPendingAction(action.id, "pending", "superseded")) return false;
+  if (action.draft_id) cancelOpenDraftSchedules(action.draft_id, action.google_account);
+  return true;
+}
+
+function supersedeOverlappingDrafts(account: GoogleAccountId, to: string, exceptId?: number): PendingAction[] {
+  const addresses = new Set(parseAddressList(to).map(({ email }) => email));
+  return pendingDrafts(account).filter((other) =>
+    other.id !== exceptId && draftToAddresses(other).some((email) => addresses.has(email)) && supersedeDraft(other),
+  );
+}
+
+function olderDuplicateDrafts(): PendingAction[] {
+  const seen = new Set<string>();
+  return pendingDrafts().filter((action) => {
+    const keys = draftToAddresses(action).map((email) => `${action.google_account}:${email}`);
+    const duplicate = keys.some((key) => seen.has(key));
+    keys.forEach((key) => seen.add(key));
+    return duplicate;
+  });
+}
+
+/** Persist the winner for cards created before recipient uniqueness was enforced. */
+export function reconcilePendingDrafts(): PendingAction[] {
+  return db.transaction(() => olderDuplicateDrafts().filter(supersedeDraft)).immediate();
+}
+
+export function supersedeDraftIfReplaced(action: PendingAction, liveTo: string): PendingAction[] {
+  const addresses = new Set(parseAddressList(liveTo).map(({ email }) => email));
+  return db.transaction(() => {
+    const replaced = pendingDrafts(action.google_account).some((other) =>
+      other.id > action.id && draftToAddresses(other).some((email) => addresses.has(email)),
+    );
+    return replaced && supersedeDraft(action) ? [action] : [];
+  }).immediate();
+}
+
+export function registerPendingDraft(input: {
+  draftId: string; threadId: string | null; account: GoogleAccountId; to: string; commandKey?: string;
+}): { action?: PendingAction; replaced: PendingAction[] } {
+  return db.transaction(() => {
+    const existing = latestDraftAction(input.draftId, input.account);
+    if (existing?.status === "superseded" || existing?.status === "sent") return { replaced: [] };
+    if (existing?.status === "pending" && olderDuplicateDrafts().some((row) => row.id === existing.id)) {
+      return { replaced: supersedeDraft(existing) ? [existing] : [] };
+    }
+    const action = existing?.status === "pending" ? existing : createPendingAction(input.draftId, input.threadId, input.account);
+    db.prepare("UPDATE pending_actions SET live_to_header = ? WHERE id = ?").run(input.to, action.id);
+    if (input.commandKey) setPendingActionCommandKey(action.id, input.commandKey);
+    return { action, replaced: supersedeOverlappingDrafts(input.account, input.to, action.id) };
+  }).immediate();
+}
+
+/** Record delivery and retire any overlapping drafts in the same transaction. */
+export function settleDraftDelivery(input: {
+  account: GoogleAccountId; to: string; actionId?: number; draftId?: string;
+  commandKey?: string | null; sentMessageId?: string;
+  schedule?: { id: number; taskId: number };
+}): PendingAction[] {
+  return db.transaction(() => {
+    const action = input.actionId === undefined
+      ? input.draftId ? getPendingActionForDraft(input.draftId, input.account) : undefined
+      : getPendingAction(input.actionId);
+    const delivered = action && (transitionPendingAction(action.id, "pending", "sent") ||
+      // A new card may have replaced this one while Gmail was already delivering it.
+      transitionPendingAction(action.id, "superseded", "sent"));
+    if (action && delivered && input.sentMessageId) {
+      setPendingActionSentMessage(action.id, input.sentMessageId);
+    }
+    if (input.commandKey) recordCommandSendSent(input.commandKey, input.sentMessageId ?? "unknown");
+    if (input.schedule) {
+      recordScheduledSendSent(input.schedule.id, input.sentMessageId ?? null);
+      markTaskDone(input.schedule.taskId);
+    }
+    return supersedeOverlappingDrafts(input.account, input.to, action?.id);
+  }).immediate();
 }
 
 /** Pending email drafts whose approval card was posted before `messageId`.
  *  Telegram message ids in a chat only grow, so a lower card id means Vishnu
  *  saw the card before he sent that message. Newest card first. */
 export function listDraftsShownBefore(messageId: number): PendingAction[] {
+  const replaced = new Set(olderDuplicateDrafts().map((action) => action.id));
   return db
     .prepare(
       `SELECT ${PENDING_ACTION_COLUMNS}
@@ -1959,7 +2092,7 @@ export function listDraftsShownBefore(messageId: number): PendingAction[] {
          AND telegram_message_id < ?
        ORDER BY telegram_message_id DESC`,
     )
-    .all(messageId) as PendingAction[];
+    .all(messageId).map((row) => row as PendingAction).filter((action) => !replaced.has(action.id));
 }
 
 /** Vishnu's own message ids in `chatId` that came before `messageId`, newest
@@ -2053,7 +2186,7 @@ export function sentMessageForDraft(
 ): { google_account: GoogleAccountId; sent_message_id: string | null; to_header: string | null } | undefined {
   return db
     .prepare(
-      `SELECT google_account, sent_message_id, to_header FROM pending_actions
+      `SELECT google_account, sent_message_id, COALESCE(live_to_header, to_header) AS to_header FROM pending_actions
        WHERE type = 'send_draft' AND draft_id = ? AND status = 'sent'
        ORDER BY id DESC LIMIT 1`,
     )
@@ -2101,7 +2234,7 @@ export function setPendingActionDraftMeta(
  *  card's Gmail draft id, or schedule:<id> / choice:<id> for those cards. Someone still on it keeps the time they were
  *  first shown; someone taken off it no longer counts for this message. */
 export const recordCardRecipients = db.transaction((messageId: number, draftId: string, header: string): void => {
-  const people = headerAddresses(header);
+  const people = parseAddressList(header).map(({ email }) => email);
   const current = db
     .prepare(`SELECT email FROM card_message_recipients WHERE message_id = ? AND draft_id = ?`)
     .all(messageId, draftId) as Array<{ email: string }>;
@@ -2132,12 +2265,6 @@ export function cardRecipientsForMessage(draftId: string, messageId: number): Se
 /** False for a card posted before recipients were recorded per card message. */
 export function draftHasCardRecords(draftId: string): boolean {
   return db.prepare(`SELECT 1 FROM card_message_recipients WHERE draft_id = ? LIMIT 1`).get(draftId) !== undefined;
-}
-
-const HEADER_ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
-
-function headerAddresses(header: string): string[] {
-  return [...new Set((header.match(HEADER_ADDRESS) ?? []).map((item) => item.toLowerCase()))];
 }
 
 /** The newest of his messages already taken for processing. */
@@ -6210,6 +6337,7 @@ export function listScheduledSendsForDraft(draftId: string, account: string): Sc
 
 export type DraftDeliveryClaim =
   | { state: "none" }
+  | { state: "superseded" }
   | { state: "claimed"; id: number; taskId: number }
   | { state: "already_sent"; id: number; itemText: string }
   | { state: "in_progress"; id: number; itemText: string }
@@ -6290,7 +6418,13 @@ export function claimDraftDelivery(
     }
     return { state: "none" };
   };
-  return db.transaction(() => classify(0)).immediate();
+  return db.transaction((): DraftDeliveryClaim => {
+    const action = (account === "work" || account === "personal") ? latestDraftAction(draftId, account) : undefined;
+    if (action?.status === "superseded" || (action?.status === "pending" && olderDuplicateDrafts().some((row) => row.id === action.id))) {
+      return { state: "superseded" };
+    }
+    return classify(0);
+  }).immediate();
 }
 
 /** Drops queued deliveries for this draft. An attempt already underway is left alone. */

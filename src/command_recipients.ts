@@ -1,13 +1,12 @@
 import type { gmail_v1 } from "googleapis";
 import {
   addressesInMemory,
-  addressIn,
   isAutomatedAddress,
   mailboxMatches,
   nameTokens,
 } from "./command_logic.js";
 import { searchMemories } from "./db.js";
-import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
+import { parseAddressList, type ParsedMailbox } from "./address_list.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { isSelfEmail } from "./mom_logic.js";
 
@@ -111,7 +110,7 @@ export async function resolveRecipient(input: {
   selfAddresses: ReadonlySet<string>;
   threadMailboxes?: readonly ParsedMailbox[];
 }): Promise<RecipientMatch> {
-  const typed = addressIn(input.query);
+  const typed = parseAddressList(input.query)[0]?.email;
   if (typed) {
     return isSelf(typed, input.selfAddresses)
       ? { kind: "none" }

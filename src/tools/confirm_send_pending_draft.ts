@@ -4,7 +4,8 @@ import {
   eligibleDrafts,
   sendPendingDraftByText,
 } from "../approvals.js";
-import { followupsAfterDraftSend, withFollowups } from "../command_email.js";
+import { followupsAfterDraftSend, handlePendingRecipientEdit, withFollowups } from "../command_email.js";
+import { repliedMessageForTurn } from "../email_references.js";
 import { isAmbiguousSendAck } from "../send_triggers.js";
 import type { ToolTurn } from "./index.js";
 
@@ -81,6 +82,11 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   if (stop) return `Not sent: ${stop}. Confirm if you want this draft sent.`;
   const hold = deliveryTimeHold(words);
   if (hold) return hold;
+  const replyToMessageId = repliedMessageForTurn(turn.confirmation.chatId, turn.confirmation.messageId);
+  if (editedThisTurn.get(turnKey(turn.confirmation))?.draftId !== requested) {
+    const edited = await handlePendingRecipientEdit(turn, replyToMessageId);
+    if (edited !== undefined) return edited;
+  }
   const draftId =
     typeof input === "object" &&
     input !== null &&
@@ -93,7 +99,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       ? "No draft is waiting for your approval, so nothing was sent."
       : "Not sent: pass draft_id from the pending-draft list in your context.";
   }
-  const result = await sendPendingDraftByText(turn.confirmation, draftId, { ownTurn: turn.ownTurn === true });
+  const result = await sendPendingDraftByText(turn.confirmation, draftId, { ownTurn: turn.ownTurn === true, replyToMessageId });
   // "Send it and start 3 follow-ups": only if this exact draft went out.
   return withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok));
 }

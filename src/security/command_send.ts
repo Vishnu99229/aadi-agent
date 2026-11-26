@@ -2,11 +2,12 @@ import { referencesAttachment } from "../command_logic.js";
 import { config } from "../config.js";
 import {
   claimCommandSend,
-  recordCommandSendSent,
   releaseCommandSend,
   markCommandSendUnconfirmed,
+  settleDraftDelivery,
+  type PendingAction,
 } from "../db.js";
-import { parseAddressList } from "../mail_helpers.js";
+import { parseAddressList } from "../address_list.js";
 import type { LoadedGoogleAccount } from "../google/auth.js";
 import {
   buildMimeMessage,
@@ -121,6 +122,8 @@ export interface SendCommandEmailParams {
   threadId: string | null;
   inReplyTo: string;
   references: string;
+  /** For a scheduled delivery of a specific Gmail draft. */
+  sourceDraftId?: string;
   /** decideSendAction's "send" for exactly these To and Cc. Without it nothing goes out. */
   decision: SendDecision;
 }
@@ -128,7 +131,7 @@ export interface SendCommandEmailParams {
 /** The only way an email sent on Vishnu's command reaches Gmail. */
 export async function sendCommandEmail(
   params: SendCommandEmailParams,
-): Promise<{ messageId: string }> {
+): Promise<{ messageId: string; replacedDrafts: PendingAction[] }> {
   allowOwnerChatCommandSend(params.confirmation);
   try {
     assertSendDecision(params.decision, [...addresses(params.to), ...addresses(params.cc)]);
@@ -206,7 +209,10 @@ export async function sendCommandEmail(
     console.error(`${tag} status=unconfirmed`);
     throw new CommandSendUnconfirmedError();
   }
-  recordCommandSendSent(params.key, messageId);
+  const replacedDrafts = settleDraftDelivery({
+    account: params.account.id, to: params.to, draftId: params.sourceDraftId,
+    commandKey: params.key, sentMessageId: messageId,
+  });
   console.log(`${tag} status=sent`);
-  return { messageId };
+  return { messageId, replacedDrafts };
 }

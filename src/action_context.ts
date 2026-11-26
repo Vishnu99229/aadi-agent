@@ -482,7 +482,7 @@ export function syncDraftRecipient(input: {
   draftId: string;
   to: string;
   cc?: string;
-  subject: string;
+  subject?: string;
   body?: string;
   account: "work" | "personal";
 }): ScheduleSync {
@@ -492,7 +492,7 @@ export function syncDraftRecipient(input: {
     return syncBoundSchedules(input.draftId, input.account, change);
   }
   if (!pending?.email) {
-    linkPublishedDraft(input);
+    linkPublishedDraft({ ...input, subject: input.subject ?? "" });
     return syncBoundSchedules(input.draftId, input.account, change);
   }
   const to = (change.to ?? []).map((person) => ({

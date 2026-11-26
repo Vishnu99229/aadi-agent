@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import {
   discardPendingDraftByText,
+  eligibleDrafts,
   queueDraftApproval,
   resendDraftCard,
   sendPendingDraftByText,
@@ -471,6 +472,24 @@ assert(
 
   setGmailClientForTests(undefined);
   setGoogleAccountForTests(undefined);
+}
+
+// Legacy rows remain readable. The newest is the only eligible one, even if
+// an older row was edited more recently or was posted before the owner turn.
+{
+  clear();
+  const old = showDraft("legacy-older", { to: "Mukesh <MUKESH@EXAMPLE.COM>", subject: "Earlier" });
+  const latest = showDraft("legacy-newest", { to: "mukesh@example.com", subject: "Latest" });
+  setPendingActionTimestampsForTests(old, { updatedAt: sqliteHoursAgo(0.1) });
+  setPendingActionTimestampsForTests(latest, { updatedAt: sqliteHoursAgo(0.2) });
+  const confirmation = { chatId, messageId: nextMessageId() };
+  const shown = eligibleDrafts(confirmation);
+  assert(shown.length === 1 && shown[0]?.id === latest, "only the newest legacy approval is eligible");
+  const sent = await sendPendingDraftByText(confirmation, undefined, { ownTurn: true });
+  assert(sent.ok && gmail.sent.join() === "legacy-newest", "send it delivers the newest legacy draft once");
+  assert(getPendingAction(old)?.status === "superseded", "the older row is superseded permanently");
+  const after = await sendPendingDraftByText({ chatId, messageId: nextMessageId() }, undefined, { ownTurn: true });
+  assert(!after.ok && after.message.includes("No draft is waiting") && gmail.sent.length === 1, "another send it sends nothing");
 }
 
 console.log("Pending draft checks passed.");
