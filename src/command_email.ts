@@ -1192,6 +1192,7 @@ function parseSendAt(
 /** The owner's command, typed or spoken. */
 function recipientEditAndSend(words: string): { field: "to" | "cc" | "bcc"; person: string; replace: boolean } | undefined {
   const clean = withoutFollowupClause(words).trim();
+  if (/\bnew\s+(?:e-?mail|draft|message)\b/i.test(clean)) return undefined;
   const request = /^(.*?)\s*(?:,\s*|\s+)(?:and\s+then\s+|and\s+|then\s+)?send(?:\s+(?:it|(?:(?:this|that|the)\s+)?(?:e-?mail|draft|message|reply)))?(?:\s+now)?[.!]*$/i.exec(clean)?.[1]?.trim();
   if (!request) return undefined;
   const edit = request.replace(/^(?:please\s+)?(?:also\s+)?/i, "")

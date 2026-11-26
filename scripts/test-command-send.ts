@@ -3044,6 +3044,15 @@ await expectCancelled("delete_task", async (row) => {
     }, bodyEditDraft.telegram_message_id!);
     assert(bodyEditResult === undefined && draftsSent.length === beforeBodyEdit && !approvalAction(bodyEditDraft.id)?.cc_header?.includes("incident-body-bob@known-co.com"),
       "an email address inside a body-line edit does not become a Cc recipient");
+    const newEmailBoundaryDraft = await cardFor("incident-new-email-boundary@new-co.com");
+    const beforeNewEmailBoundary = draftsSent.length;
+    const newEmailBoundaryResult = await handlePendingRecipientEdit({
+      userText: "cc incident-body-bob@known-co.com on a new email and send it",
+      confirmation: messageTurn(), ownTurn: true,
+    }, newEmailBoundaryDraft.telegram_message_id!);
+    assert(newEmailBoundaryResult === undefined && draftsSent.length === beforeNewEmailBoundary &&
+      approvalAction(newEmailBoundaryDraft.id)?.status === "pending" && !approvalAction(newEmailBoundaryDraft.id)?.cc_header,
+      "an explicit new-email request does not mutate or send the open draft");
     const multiEditDraft = await cardFor("incident-multi-edit@new-co.com");
     sentTo("incident-multi-a@known-co.com");
     sentTo("incident-multi-b@known-co.com");
