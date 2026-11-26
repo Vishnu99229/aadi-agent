@@ -334,7 +334,7 @@ assert(
   "owner lock must not live inline in bot.ts",
 );
 
-const approvalsSrc = await readFile(join(root, "src/approvals.ts"), "utf8");
+const recipientApprovalSrc = await readFile(join(root, "src/approvals.ts"), "utf8");
 assert(
   approvalsSrc.includes('from "./security/send_approval.js"'),
   "approvals.ts must import the send gate",
@@ -634,9 +634,9 @@ const draftDbSrc = await readFile(join(root, "src/db.ts"), "utf8");
 const approvalsSrc = await readFile(join(root, "src/approvals.ts"), "utf8");
 const mailboxParserPath = '"./address_list.js"';
 assert(
-  draftDbSrc.includes(`from ${mailboxParserPath}`) && approvalsSrc.includes(`from ${mailboxParserPath}`) &&
+  draftDbSrc.includes(`from ${mailboxParserPath}`) && recipientApprovalSrc.includes(`from ${mailboxParserPath}`) &&
     commandSendSrc.includes('from "../address_list.js"') && draftDbSrc.includes("parseAddressList(action.live_to_header") &&
-    approvalsSrc.includes("parseAddressList(to).map(({ email }) => `${account}:${email}`)") &&
+    recipientApprovalSrc.includes("parseAddressList(to).map(({ email }) => `${account}:${email}`)") &&
     commandSendSrc.includes("parseAddressList(header).map((item) => item.email.toLowerCase())"),
   "draft overlap, delivery claims, and send gates use the same parsed mailbox helper",
 );
