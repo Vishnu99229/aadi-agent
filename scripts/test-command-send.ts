@@ -3128,7 +3128,7 @@ await expectCancelled("delete_task", async (row) => {
       draftId: namedMukeshDraft.data.id!, threadId: null, to: '"Mukesh" <mukesh@excellentcyber.in>',
       subject: "Named recipient", body: "Hi,\n\nA note.", googleAccount: "work",
     });
-    assert(approvalAction(plainMukesh.id)?.status === "superseded" && namedMukesh.action?.status === "pending",
+    assert(approvalAction(plainMukesh.id)?.status === "superseded" && approvalAction(namedMukesh)?.status === "pending",
       "plain addresses and normal display names match the same recipient");
 
     const seed = (draftId: string, to: string, account: "work" | "personal" = "work") => {
