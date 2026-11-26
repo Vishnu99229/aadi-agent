@@ -3115,6 +3115,8 @@ await expectCancelled("delete_task", async (row) => {
     assert(approvalAction(quotedNameDraft.id)?.status === "pending" && approvalAction(formerRecipient.id)?.status === "pending" &&
       approvalAction(actualRecipient.id)?.status === "superseded",
       "a quoted-name address stays unrelated while the actual mailbox is superseded");
+    assert(parseAddressList(approvalAction(quotedNameDraft.id)?.to_header ?? "").map(({ email }) => email).join() === "incident-current@new-co.com",
+      "the command draft sends to the angle-bracket mailbox instead of an email-looking display name");
     const plainMukesh = await cardFor("mukesh@excellentcyber.in");
     const namedMukeshDraft = await gmail.users.drafts.create({
       userId: "me",

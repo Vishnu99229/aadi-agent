@@ -1,7 +1,6 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import {
-  addressIn,
   asksForAttachment,
   deliveryTimeHold,
   isAutomatedAddress,
@@ -63,7 +62,7 @@ import {
   type PendingAction,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
-import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
+import { parseAddressList, type ParsedMailbox } from "./address_list.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { getGoogleAccount, type GoogleAccountId, type LoadedGoogleAccount } from "./google/auth.js";
@@ -969,7 +968,7 @@ async function resolveNamedRecipient(input: {
     return threadMatch;
   }
   // A typed address is already decided (including "that's me, don't send").
-  if (addressIn(input.query)) {
+  if (parseAddressList(input.query).length > 0) {
     return threadMatch;
   }
   const fromIndex = matchFromContact(await resolveContact(input.query));
@@ -1090,7 +1089,7 @@ function ownerNamed(
   }
   const said = (token: string) =>
     new RegExp(`(?<![\\p{L}\\p{N}])${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "iu").test(ownWords);
-  const typed = addressIn(query);
+  const typed = parseAddressList(query)[0]?.email;
   if (typed && ownWords.toLowerCase().includes(typed)) {
     return true;
   }
@@ -1125,7 +1124,7 @@ function recipientSlots(
   const referenced = emailReferenceForTurn(chatId, messageId, now.getTime());
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
-    const address = addressIn(query);
+    const address = parseAddressList(query)[0]?.email;
     if (address && referenced && address === referenced) {
       slots.push({ query, mailbox: { email: address, name: "" } });
       continue;
@@ -1253,7 +1252,7 @@ export async function handlePendingRecipientEdit(
   if (match.kind === "many") return `Which ${edit.person}? ${match.options.map(formatMailbox).join(", ")}`;
   if (match.kind === "none") return `I couldn't find an address for ${edit.person}. Which address should I add?`;
   const email = match.mailbox.email.trim().toLowerCase();
-  if (addressIn(email) !== email || isSelfEmail(email)) return "I couldn't use that address. Which address should I add?";
+  if (parseAddressList(email)[0]?.email !== email || isSelfEmail(email)) return "I couldn't use that address. Which address should I add?";
   const refusal = await mailDomainRefusal([email]);
   if (refusal) return refusal;
   const result = await editAndSendPendingDraft(confirmation, action, { ...edit, field: edit.field, email }, (headers) =>

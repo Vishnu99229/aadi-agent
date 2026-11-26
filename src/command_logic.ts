@@ -1,4 +1,4 @@
-import type { ParsedMailbox } from "./mail_helpers.js";
+import { parseAddressList, type ParsedMailbox } from "./address_list.js";
 
 const ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
 const NOT_NAME_WORDS = new Set([
@@ -273,9 +273,9 @@ function hasWord(text: string, word: string): boolean {
 /** The recipient has to come from his own message, not from anything Aadi read,
  *  so text inside an email can never choose who gets one. */
 export function namedInOwnWords(query: string, ownWords: string): boolean {
-  const address = addressIn(query);
+  const address = parseAddressList(query)[0]?.email;
   if (address) {
-    return ownWords.toLowerCase().includes(address);
+    return parseAddressList(ownWords).some((mailbox) => mailbox.email === address);
   }
   const tokens = nameTokens(query);
   return tokens.length > 0 && tokens.every((token) => hasWord(ownWords, token));
@@ -294,9 +294,9 @@ export function mailboxMatches(mailbox: ParsedMailbox, tokens: readonly string[]
 export function addressesInMemory(memory: string, tokens: readonly string[]): string[] {
   const found: string[] = [];
   for (const sentence of memory.split(/(?<=[.!?])\s+|\n+/)) {
-    const address = addressIn(sentence);
-    if (address && tokens.length > 0 && tokens.every((token) => hasWord(sentence, token))) {
-      found.push(address);
+    const addresses = parseAddressList(sentence).map(({ email }) => email);
+    if (tokens.length > 0 && tokens.every((token) => hasWord(sentence, token))) {
+      found.push(...addresses);
     }
   }
   return found;

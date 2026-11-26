@@ -631,13 +631,20 @@ assert(
 );
 const commandSendSrc = await readFile(join(root, "src/security/command_send.ts"), "utf8");
 const draftDbSrc = await readFile(join(root, "src/db.ts"), "utf8");
+const commandRecipientSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
+const commandLookupSrc = await readFile(join(root, "src/command_recipients.ts"), "utf8");
+const commandLogicSrc = await readFile(join(root, "src/command_logic.ts"), "utf8");
+const newDraftToolSrc = await readFile(join(root, "src/tools/draft_new_email.ts"), "utf8");
 const mailboxParserPath = '"./address_list.js"';
 assert(
   draftDbSrc.includes(`from ${mailboxParserPath}`) && approvalsSrc.includes(`from ${mailboxParserPath}`) &&
     commandSendSrc.includes('from "../address_list.js"') && draftDbSrc.includes("parseAddressList(action.live_to_header") &&
     approvalsSrc.includes("parseAddressList(to).map(({ email }) => `${account}:${email}`)") &&
-    commandSendSrc.includes("parseAddressList(header).map((item) => item.email.toLowerCase())"),
-  "draft overlap, delivery claims, and send gates use the same parsed mailbox helper",
+    commandSendSrc.includes("parseAddressList(header).map((item) => item.email.toLowerCase())") &&
+    commandRecipientSrc.includes(`from ${mailboxParserPath}`) && commandRecipientSrc.includes("parseAddressList(query)[0]?.email") &&
+    commandLookupSrc.includes(`from ${mailboxParserPath}`) && commandLookupSrc.includes("parseAddressList(input.query)[0]?.email") &&
+    commandLogicSrc.includes(`from ${mailboxParserPath}`) && newDraftToolSrc.includes('from "../address_list.js"'),
+  "draft overlap, recipient resolution, delivery claims, and send gates use the same parsed mailbox helper",
 );
 assert(
   (commandSendSrc.match(/messages\.send/g) ?? []).length === 1,
