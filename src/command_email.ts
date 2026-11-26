@@ -1202,7 +1202,7 @@ function recipientEditAndSend(words: string): { field: "to" | "cc" | "bcc"; pers
   const replacement = /^(?:change|switch|update)\s+(?:the\s+)?(?:to|recipient)\s+to\s+(.+)$/i.exec(edit)?.[1];
   if (replacement) return { field: "to", person: replacement, replace: true };
   const add = /^(cc|bcc|add)\s+(.+)$/i.exec(edit);
-  if (!add?.[2] || /\b(?:meeting|calendar|attendee|task|reminder|point|paragraph)\b/i.test(add[2])) return undefined;
+  if (!add?.[2] || /\b(?:meeting|calendar|attendee|task|reminder|point|paragraph|line|sentence|wording|phrase|bullet|section)\b|\b(?:saying|mention(?:ing)?|write|include)\b/i.test(add[2])) return undefined;
   return { field: add[1]?.toLowerCase() === "bcc" ? "bcc" : "cc", person: add[2], replace: false };
 }
 
@@ -1234,6 +1234,9 @@ export async function handlePendingRecipientEdit(
     if (target?.status === "superseded") return DRAFT_REPLACED;
     if (!target && replyToMessageId === undefined && shown.length > 1) return "Which draft should I update? Reply to its card.";
     return "No draft is waiting for your approval, so nothing was sent.";
+  }
+  if (parseAddressList(edit.person).length > 1) {
+    return "I found more than one address in that recipient edit. Tell me which single address to add.";
   }
   const draftId = action.draft_id;
   const account = action.google_account;

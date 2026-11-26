@@ -5,7 +5,7 @@ import type { gmail_v1 } from "googleapis";
 import { handleApprovalCallback, queueDraftApproval, resendDraftCard, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
 import { clearPendingAction } from "../src/action_context.ts";
 import { defaultToolNames, runAgent } from "../src/agent.ts";
-import { handleCommandSendCallback, sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
+import { handleCommandSendCallback, handlePendingRecipientEdit, sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import {
   addressesInMemory,
   looksLikeCommandTurn,
@@ -3035,6 +3035,25 @@ await expectCancelled("delete_task", async (row) => {
       FROM pending_actions WHERE type = 'send_draft' AND google_account = 'work' AND status = 'pending'`).all() as Array<{ id: number; header: string | null }>)
       .filter(({ header }) => parseAddressList(header ?? "").some(({ email }) => email === to))
       .map(({ id }) => id);
+    sentTo("incident-body-bob@known-co.com");
+    const bodyEditDraft = await cardFor("incident-body-edit@new-co.com");
+    const beforeBodyEdit = draftsSent.length;
+    const bodyEditResult = await handlePendingRecipientEdit({
+      userText: "add a line saying contact incident-body-bob@known-co.com and send it",
+      confirmation: messageTurn(), ownTurn: true,
+    }, bodyEditDraft.telegram_message_id!);
+    assert(bodyEditResult === undefined && draftsSent.length === beforeBodyEdit && !approvalAction(bodyEditDraft.id)?.cc_header?.includes("incident-body-bob@known-co.com"),
+      "an email address inside a body-line edit does not become a Cc recipient");
+    const multiEditDraft = await cardFor("incident-multi-edit@new-co.com");
+    sentTo("incident-multi-a@known-co.com");
+    sentTo("incident-multi-b@known-co.com");
+    const beforeMultiEdit = draftsSent.length;
+    const multiEditResult = await handlePendingRecipientEdit({
+      userText: "cc incident-multi-a@known-co.com and incident-multi-b@known-co.com and send it",
+      confirmation: messageTurn(), ownTurn: true,
+    }, multiEditDraft.telegram_message_id!);
+    assert(multiEditResult?.includes("more than one address") && draftsSent.length === beforeMultiEdit && !approvalAction(multiEditDraft.id)?.cc_header,
+      `a multi-address edit is refused without silently dropping one recipient: ${multiEditResult}`);
     written = { subject: "Original subject", body: "Hello,\n\nThis is the original message." };
     const address = "incident-to@new-co.com";
     const cc = "incident-teammate@epicode.in";
