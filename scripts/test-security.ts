@@ -1977,9 +1977,9 @@ for (const file of toolFiles) {
   const noConfirm = { iteration: 1, calledTools: ["draft_new_email"] };
   const created = await draftNewEmail(
     {
-      to: "priya@acme.com",
+      to: "alex@acme.com",
       subject: "Demo",
-      body: "Hi Priya, the demo is Thursday.",
+      body: "Hi Alex, the demo is Thursday.",
       send_immediately: true,
     },
     noConfirm,

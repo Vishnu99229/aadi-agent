@@ -471,6 +471,7 @@ export const DRAFT_REREAD_FAILED = "I couldn't re-read the draft from Gmail, so 
  */
 async function postRefreshedCard(
   action: PendingAction,
+  confirmed: ReadonlySet<string> = new Set<string>(),
 ): Promise<{ ok: true; to: string; cc: string; newAddresses: string[] } | { ok: false; reason: "read_failed" | "failed" }> {
   if (!action.draft_id) {
     return { ok: false, reason: "failed" };
@@ -486,8 +487,9 @@ async function postRefreshedCard(
   const cc = snapshot.cc.trim();
   const subject = snapshot.subject.trim() || action.subject?.trim() || "(no subject)";
   const people = [...new Set([...parseAddressList(to), ...parseAddressList(cc)].map((item) => item.email.toLowerCase()))];
-  const known = await knownRecipients(people);
-  const newAddresses = people.filter((email) => !known.has(email));
+  const unconfirmed = people.filter((email) => !confirmed.has(email));
+  const known = await knownRecipients(unconfirmed);
+  const newAddresses = unconfirmed.filter((email) => !known.has(email));
   const oldCard = action.telegram_message_id;
   let posted: number | undefined;
   try {
@@ -1390,7 +1392,8 @@ export async function sendPendingDraftByText(
     if (verdict.action !== "send") {
       console.log(`Approval action ${action.id}: card, not sent (${verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
       if (options.refreshOnCard && verdict.action === "card") {
-        const refreshed = await postRefreshedCard(action);
+        const confirmed = action.draft_id ? draftRecipientsShownBefore(action.draft_id, confirmation.messageId) : undefined;
+        const refreshed = await postRefreshedCard(action, confirmed);
         if (!refreshed.ok) return { ok: false, message: refreshed.reason === "read_failed"
           ? DRAFT_REREAD_FAILED : "I updated the draft, but couldn't show its refreshed card. Ask me to show it again." };
       }
