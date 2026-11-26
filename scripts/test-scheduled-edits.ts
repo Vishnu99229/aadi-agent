@@ -835,6 +835,7 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
   assert(getScheduledSend(formerSchedule.id)?.status === "scheduled" &&
     getApprovalActionById(actualRecipient.actionId)?.status === "superseded" && getApprovalActionById(quotedDraft.actionId)?.status === "pending",
     `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getApprovalActionById(actualRecipient.actionId)?.status}, quoted=${getApprovalActionById(quotedDraft.actionId)?.status}`);
+  transitionScheduledSend(formerSchedule.id, ["scheduled"], "cancelled");
 }
 
 // 12. Edits made before scheduling are what the scheduled email sends.
