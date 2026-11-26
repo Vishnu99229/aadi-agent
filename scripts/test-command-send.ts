@@ -67,6 +67,7 @@ import { setSequenceTestHooks, startSequenceFromTool } from "../src/sequences.ts
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
+import { parseAddressList } from "../src/mail_helpers.ts";
 import { evaluateCommandSendGate } from "../src/security/command_send.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { handler as updateDraft } from "../src/tools/update_draft.ts";
@@ -3030,8 +3031,10 @@ await expectCancelled("delete_task", async (row) => {
         reply_to_message: { message_id: card.telegram_message_id, date, chat, text: "Draft waiting for approval" },
       } } as never);
     };
-    const pendingTo = (to: string) => (db.prepare(`SELECT id FROM pending_actions
-      WHERE status = 'pending' AND lower(COALESCE(live_to_header, to_header)) = ?`).all(to) as Array<{ id: number }>).map(({ id }) => id);
+    const pendingTo = (to: string) => (db.prepare(`SELECT id, COALESCE(live_to_header, to_header) AS header
+      FROM pending_actions WHERE type = 'send_draft' AND google_account = 'work' AND status = 'pending'`).all() as Array<{ id: number; header: string | null }>)
+      .filter(({ header }) => parseAddressList(header ?? "").some(({ email }) => email === to))
+      .map(({ id }) => id);
     written = { subject: "Original subject", body: "Hello,\n\nThis is the original message." };
     const address = "incident-to@new-co.com";
     const cc = "incident-teammate@epicode.in";
@@ -3078,7 +3081,8 @@ await expectCancelled("delete_task", async (row) => {
     const replaced = await sendEmailFromTool({ to: [duplicate.toUpperCase()], instruction: "a separate email" }, own(`email ${duplicate} saying a separate email`));
     telegramFails.edit = false;
     const newest = getPendingActionForDraft(draftsCreated.at(-1)!)!;
-    assert(newest.id !== older.id && pendingTo(duplicate).join() === String(newest.id), "a separate command replaces an older draft to the normalized address");
+    assert(newest.id !== older.id && pendingTo(duplicate).join() === String(newest.id),
+      `a separate command replaces an older draft to the normalized address: ${replaced}`);
     assert(replaced.includes("Replaced your earlier draft to ") && approvalAction(older.id)?.status === "superseded", `the reply reports the replacement: ${replaced}`);
     const alerts: string[] = [];
     const supersededTap = { ...cardCtx(`approval:send:${older.id}`), answerCallbackQuery: async (alert: { text: string }) => { alerts.push(alert.text); return true; } } as unknown as Context;
