@@ -1193,8 +1193,6 @@ function parseSendAt(
 /** The owner's command, typed or spoken. */
 function recipientEditAndSend(words: string): { field: "to" | "cc" | "bcc"; person: string; replace: boolean } | undefined {
   const clean = withoutFollowupClause(words).trim();
-  const redirect = /^(?:please\s+)?send\s+(?:it|this email|that draft)\s+to\s+(.+?)\s+instead[.!]*$/i.exec(clean);
-  if (redirect?.[1]) return { field: "to", person: redirect[1], replace: true };
   const request = /^(.*?)\s*(?:,\s*|\s+)(?:and\s+then\s+|and\s+|then\s+)?send(?:\s+(?:it|(?:(?:this|that|the)\s+)?(?:e-?mail|draft|message|reply)))?(?:\s+now)?[.!]*$/i.exec(clean)?.[1]?.trim();
   if (!request) return undefined;
   const edit = request.replace(/^(?:please\s+)?(?:also\s+)?/i, "")
