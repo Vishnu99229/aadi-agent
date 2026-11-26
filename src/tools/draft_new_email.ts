@@ -158,6 +158,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     }
   }
 
+  let replacementNotice = "";
   await queueDraftApproval({
     draftId,
     threadId: null,
@@ -167,7 +168,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     body: values.body,
     googleAccount: account.id,
     ...(signature ? { signature } : {}),
-  });
+  }, { onReplaced: (notice) => { replacementNotice = notice; } });
   if (turn.confirmation) {
     linkPublishedDraft({
       chatId: turn.confirmation.chatId,
@@ -180,5 +181,8 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     });
   }
 
-  return `${cardNote ? `${cardNote} ` : ""}Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`;
+  return [
+    `${cardNote ? `${cardNote} ` : ""}Draft created for ${toHeader} (${account.tag}). Waiting for your Send tap. draft_id: ${draftId}`,
+    replacementNotice,
+  ].filter(Boolean).join("\n");
 }

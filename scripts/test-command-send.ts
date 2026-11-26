@@ -3106,6 +3106,24 @@ await expectCancelled("delete_task", async (row) => {
     ]);
     const textRefusal = await sendPendingDraftByText(messageTurn(), changedInGmail.draft_id!, { ownTurn: true });
     assert(!textRefusal.ok && textRefusal.message.includes("To addresses changed"), "an out-of-band To change cannot use a card for different addresses after delivery");
+    telegramFails.send = true;
+    const failedRefresh = await resendDraftCard(messageTurn(), changedInGmail.draft_id!);
+    telegramFails.send = false;
+    assert(!failedRefresh.ok && approvalAction(changedInGmail.id)?.to_header === changedInGmail.to_header, "a failed refresh keeps the displayed To on the old address");
+    const beforeFailedTap = draftsSent.length;
+    await tapSend(changedInGmail.draft_id!);
+    const afterFailedRefresh = await sendPendingDraftByText(messageTurn(), changedInGmail.draft_id!, { ownTurn: true });
+    assert(!afterFailedRefresh.ok && afterFailedRefresh.message.includes("To addresses changed") && draftsSent.length === beforeFailedTap,
+      "neither a stale tap nor text can send to the unshown To after the failed refresh");
+
+    const knownTo = "incident-known-to@known-co.com";
+    const explicitToEdit = await cardFor("incident-old-to@new-co.com");
+    sentTo(knownTo);
+    const toEdit = await sendEmailFromTool({}, {
+      userText: `change the recipient to ${knownTo} and send it`, confirmation: messageTurn(), ownTurn: true,
+    });
+    assert(toEdit.startsWith("Sent the draft") && draftsSent.at(-1) === explicitToEdit.draft_id,
+      `an owner-authorized edit to a known To sends the same draft: ${toEdit}`);
   }
 
   draftUsers.drafts.create = realCreate;

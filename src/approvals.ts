@@ -78,6 +78,12 @@ const activeActions = new Set<number>();
 const editingActionByUser = new Map<number, number>();
 const sendOnlyActions = new Set<number>();
 const deliveringTo = new Set<string>();
+const OWNER_TO_EDIT = Symbol("owner To edit");
+
+interface OwnerToEdit {
+  actionId: number;
+  to: string;
+}
 
 /** The bot and scheduled worker share a process. A card and a new command cannot
  * both enter Gmail for the same mailbox and To address while either is in flight. */
@@ -695,7 +701,17 @@ function recipientKey(header: string): string {
   return parseAddressList(header).map(({ email }) => email).sort().join(",");
 }
 
-async function performDraftSend(action: PendingAction, decision: SendVerdict): Promise<SendOutcome> {
+function draftToMatchesApproval(action: PendingAction, to: string, ownerEdit?: OwnerToEdit): boolean {
+  const registered = action.live_to_header ?? action.to_header;
+  if (registered === null) return true; // Older cards may have no stored header.
+  const actual = recipientKey(to);
+  return actual === recipientKey(registered) && (
+    actual === recipientKey(action.to_header ?? "") ||
+    (ownerEdit?.actionId === action.id && actual === recipientKey(ownerEdit.to))
+  );
+}
+
+async function performDraftSend(action: PendingAction, decision: SendVerdict, ownerEdit?: OwnerToEdit): Promise<SendOutcome> {
   const draftId = action.draft_id;
   if (!draftId) {
     return { ok: false, reason: "send_failed" };
@@ -748,10 +764,7 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict): P
     return { ok: false, reason: "superseded", detail: await showReplacedDrafts(replaced) };
   }
   if (current?.status !== "pending") return { ok: false, reason: "not_decided" };
-  const registeredTo = current.live_to_header ?? current.to_header;
-  if (registeredTo && recipientKey(registeredTo) !== recipientKey(to)) {
-    return { ok: false, reason: "to_changed" };
-  }
+  if (!draftToMatchesApproval(current, to, ownerEdit)) return { ok: false, reason: "to_changed" };
   const release = claimRecipientDelivery(action.google_account, to);
   if (!release) return { ok: false, reason: "in_progress" };
   let sentMessageId: string | undefined;
@@ -1146,6 +1159,7 @@ export async function editAndSendPendingDraft(
   activeActions.add(action.id);
   let replacementNotice = "";
   let scheduleNotice: string | undefined;
+  let ownerToEdit: OwnerToEdit | undefined;
   try {
     const gmail = await gmailFor(action.google_account);
     const { data } = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "raw" });
@@ -1168,12 +1182,14 @@ export async function editAndSendPendingDraft(
       : `${headers}${lineBreak}${field}: ${next}`;
     const to = value(updated, "To");
     const cc = value(updated, "Cc");
-    const release = claimRecipientDelivery(action.google_account, `${value(headers, "To")}, ${to}`);
+    const previousTo = value(headers, "To");
+    const release = claimRecipientDelivery(action.google_account, `${previousTo}, ${to}`);
     if (!release) return { ok: false, message: "That draft's recipient already has an email going out." };
     try {
       const fresh = getPendingAction(action.id);
       if (fresh?.status !== "pending") return { ok: false, message: fresh?.status === "superseded" ? DRAFT_REPLACED
         : "That draft is no longer waiting for approval." };
+      if (!draftToMatchesApproval(fresh, previousTo)) return { ok: false, message: sendFailureText("to_changed") };
       if (updated !== headers) {
         await gmail.users.drafts.update({
           userId: "me", id: draftId,
@@ -1186,6 +1202,7 @@ export async function editAndSendPendingDraft(
         replacementNotice = await showReplacedDrafts(registered.replaced);
         if (!registered.action) return { ok: false, message: [DRAFT_REPLACED, replacementNotice].filter(Boolean).join("\n") };
         scheduleNotice = onUpdated({ to, cc });
+        if (edit.field === "to") ownerToEdit = { actionId: action.id, to };
       }
     } finally {
       release();
@@ -1199,6 +1216,7 @@ export async function editAndSendPendingDraft(
   }
   const result = await sendPendingDraftByText(confirmation, draftId, {
     ownTurn: true, refreshOnCard: true, replyToMessageId: action.telegram_message_id ?? undefined,
+    [OWNER_TO_EDIT]: ownerToEdit,
   });
   return { ...result, message: [result.message, replacementNotice, scheduleNotice].filter(Boolean).join("\n") };
 }
@@ -1333,7 +1351,7 @@ export async function sendPendingDraftByText(
   confirmation: SendConfirmation,
   draftId?: string,
   /** ownTurn: straight from his own chat turn. Anything else is never a send. */
-  options: { ownTurn?: boolean; replyToMessageId?: number; refreshOnCard?: boolean } = {},
+  options: { ownTurn?: boolean; replyToMessageId?: number; refreshOnCard?: boolean; [OWNER_TO_EDIT]?: OwnerToEdit } = {},
 ): Promise<TextSendDraftResult> {
   const shown = await shownPendingDrafts(confirmation);
   const replyDraft = options.replyToMessageId === undefined ? undefined : pendingDraftActionForMessage(options.replyToMessageId);
@@ -1399,7 +1417,7 @@ export async function sendPendingDraftByText(
       }
       return { ok: false, message: cardReason(verdict, to) };
     }
-    const outcome = await performDraftSend(action, verdict);
+    const outcome = await performDraftSend(action, verdict, options[OWNER_TO_EDIT]);
     if (!outcome.ok) {
       return { ok: false, message: sendFailureText(outcome.reason, outcome.detail) };
     }

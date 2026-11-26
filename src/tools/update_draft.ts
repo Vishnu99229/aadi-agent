@@ -77,8 +77,9 @@ function safeHeader(value: string): string {
  *  or a scheduled copy that was stopped or was already going out. Undefined when it matches. */
 export function draftUpdateNotice(result: string): string | undefined {
   try {
-    const parsed = JSON.parse(result) as { schedule?: ScheduleSync["kind"]; scheduled_email?: string };
-    return parsed.schedule === "stopped" || parsed.schedule === "too_late" ? parsed.scheduled_email : undefined;
+    const parsed = JSON.parse(result) as { schedule?: ScheduleSync["kind"]; scheduled_email?: string; replacement_notice?: string };
+    const schedule = parsed.schedule === "stopped" || parsed.schedule === "too_late" ? parsed.scheduled_email : undefined;
+    return [schedule, parsed.replacement_notice].filter(Boolean).join("\n") || undefined;
   } catch {
     return result;
   }
@@ -231,6 +232,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   }
   const scheduleNote =
     sync.kind === "synced" ? "The scheduled email was updated to match this draft." : scheduleSyncNotice(sync);
+  let replacementNotice = "";
   await queueDraftApproval({
     draftId: savedDraftId,
     threadId: draftThread,
@@ -244,7 +246,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
       ...(conversationNote ? [conversationNote] : []),
       ...(scheduleNote ? [scheduleNote] : []),
     ],
-  });
+  }, { onReplaced: (notice) => { replacementNotice = notice; } });
   // His own edit this turn: a "send it" in the same message may now confirm this draft.
   noteDraftEditedThisTurn(turn?.confirmation, savedDraftId);
 
@@ -256,5 +258,6 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     cc: cc ? safeHeader(cc) : null,
     ...(leavesThread ? { new_conversation: conversationNote } : {}),
     ...(sync.kind === "none" ? {} : { schedule: sync.kind, scheduled_email: scheduleNote }),
+    ...(replacementNotice ? { replacement_notice: replacementNotice } : {}),
   });
 }
