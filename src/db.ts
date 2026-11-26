@@ -2266,10 +2266,17 @@ export function draftHasCardRecords(draftId: string): boolean {
   return db.prepare(`SELECT 1 FROM card_message_recipients WHERE draft_id = ? LIMIT 1`).get(draftId) !== undefined;
 }
 
-const HEADER_ADDRESS = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
-
 function headerAddresses(header: string): string[] {
-  return [...new Set((header.match(HEADER_ADDRESS) ?? []).map((item) => item.toLowerCase()))];
+  // Only collect mailbox tokens. An address-like string in a quoted display
+  // name is not a recipient and must not supersede that mailbox's draft.
+  const addresses = new Set<string>();
+  const pattern = /(?:"([^"]+)"|([^,<>]+?))?\s*<([^>]+)>|([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(header)) !== null) {
+    const email = (match[3] ?? match[4] ?? "").trim().toLowerCase();
+    if (email) addresses.add(email);
+  }
+  return [...addresses];
 }
 
 /** The newest of his messages already taken for processing. */

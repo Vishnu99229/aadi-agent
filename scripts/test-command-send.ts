@@ -3090,6 +3090,11 @@ await expectCancelled("delete_task", async (row) => {
     await handleApprovalCallback(supersededTap, "send", older.id);
     assert(draftsSent.length === beforeTap && alerts.at(-1) === "That draft was replaced by a newer one.", "Telegram edit failure cannot revive a stale button");
 
+    const quotedNameDraft = await cardFor("\"incident-former@new-co.com\" <incident-current@new-co.com>");
+    const formerRecipient = await cardFor("incident-former@new-co.com");
+    assert(approvalAction(quotedNameDraft.id)?.status === "pending" && approvalAction(formerRecipient.id)?.status === "pending",
+      "an address in a quoted display name does not supersede a draft for that address");
+
     const seed = (draftId: string, to: string, account: "work" | "personal" = "work") => {
       const action = createPendingAction(draftId, null, account);
       setPendingActionDraftMeta(action.id, { toHeader: to, ccHeader: "", subject: "Old draft" });
