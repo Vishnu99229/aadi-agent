@@ -8,9 +8,9 @@ import {
   tooLateText,
   type ScheduleSync,
 } from "../action_context.js";
-import { queueDraftApproval } from "../approvals.js";
+import { DRAFT_REPLACED, queueDraftApproval } from "../approvals.js";
 import { noteDraftEditedThisTurn } from "./confirm_send_pending_draft.js";
-import { accountBoundToDraft, getPendingActionForDraft,
+import { accountBoundToDraft, getPendingActionForDraft, latestDraftAction,
   setPendingActionThread,
 } from "../db.js";
 import {
@@ -115,6 +115,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   }
 
   const draftId = values.draft_id.trim();
+  if (latestDraftAction(draftId)?.status === "superseded") return DRAFT_REPLACED;
   const pending = getPendingActionForDraft(draftId);
   const hintedAccount = pending?.google_account ?? accountBoundToDraft(draftId);
   // The email this draft was scheduled as may already be going out, or gone. Its history
@@ -183,6 +184,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     body,
     current.signed ? await signatureHtmlFor(account) : "",
   );
+  if (latestDraftAction(draftId, account.id)?.status === "superseded") return DRAFT_REPLACED;
   const result = await gmail.users.drafts.update({
     userId: "me",
     id: values.draft_id,

@@ -216,7 +216,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       userText: turn.userText,
     });
     if (sent.ok) {
-      return `Sent to ${to}.`;
+      return [`Sent to ${to}.`, sent.replacementNotice].filter(Boolean).join("\n");
     }
     if (sent.reason === "card") {
       cardNote = sent.message;

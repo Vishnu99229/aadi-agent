@@ -31,7 +31,7 @@ import { composeWithEmailAgent, publishReadyDraft, reviseLinkedDraft } from "./c
 import { handler as draftNewEmailTool } from "./tools/draft_new_email.js";
 import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.js";
 import { stageExternalContext } from "./context_lookup.js";
-import { bookPendingMeetingAt, handleCommandSendCallback, sendEmailFromTool } from "./command_email.js";
+import { bookPendingMeetingAt, handleCommandSendCallback, handlePendingRecipientEdit, sendEmailFromTool } from "./command_email.js";
 import { looksLikeCommandTurn, parseOwnerEmailSendAt, splitOwnerEmailCommand } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
 import { FORWARDED_TOOLS } from "./tools/index.js";
@@ -1299,6 +1299,15 @@ async function handleSelectedDraftEdit(ctx: Context, userId: number, userText: s
   if (chatId !== undefined) {
     focusSelectedDraft(chatId, { ...edit, draftId: edit.draftId, account: edit.account });
   }
+  if (chatId !== undefined && ctx.message && !isForwardedMessage(ctx.message)) {
+    const result = await handlePendingRecipientEdit({
+      confirmation: { chatId, messageId: ctx.message.message_id }, userText, ownTurn: true, directSend: true,
+    });
+    if (result !== undefined) {
+      await ctx.reply(result);
+      return true;
+    }
+  }
   const session = reactionSessionFor(ctx);
   startContextualReaction(userText, session);
   const editInstruction = `Revise the existing Gmail draft with ID ${edit.draftId}.
@@ -1391,6 +1400,19 @@ async function handleUserText(
   // a different draft, a meeting, or the newest email instead.
   if (await handleSelectedDraftEdit(ctx, userId, userText)) {
     return;
+  }
+
+  if (ctx.chat && ctx.message && !options.forwarded && !options.retried && !isForwardedMessage(ctx.message)) {
+    const result = await handlePendingRecipientEdit({
+      confirmation: { chatId: ctx.chat.id, messageId: ctx.message.message_id },
+      userText, ownTurn: true, directSend: true,
+    }, ctx.message.reply_to_message?.message_id);
+    if (result !== undefined) {
+      saveMessage("user", userText);
+      saveMessage("assistant", result);
+      await ctx.reply(result);
+      return;
+    }
   }
 
   // Resolve references to the actual Telegram reply or latest OCR *in this chat*
@@ -1845,7 +1867,9 @@ async function handleUserText(
   const spoken = voiceIn && !inWriting;
   if (confirmation && isSendDraftCommand(userText)) {
     // His own typed or spoken "send it" (forwarded messages never reach here).
-    const result = await sendPendingDraftByText(confirmation, undefined, { ownTurn: true });
+    const result = await sendPendingDraftByText(confirmation, undefined, {
+      ownTurn: true, replyToMessageId: ctx.message?.reply_to_message?.message_id,
+    });
     await replyInKind(ctx, result.message, spoken, userText);
     return;
   }

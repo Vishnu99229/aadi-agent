@@ -40,12 +40,15 @@ import { config } from "../src/config.ts";
 import {
   beginChatTurn,
   claimTelegramMessage,
+  createPendingAction,
   createMemory,
   db,
   getCommandSendByKey,
   getPendingAction as approvalAction,
   latestProcessedMessageId,
   setChatTurnRetryText,
+  setPendingActionDraftMeta,
+  setPendingActionTelegramMessage,
   writeScheduledCopy,
   getPendingActionForDraft,
   getSalesSequenceByThread,
@@ -205,6 +208,7 @@ const sends: Sent[] = [];
 let sendFails: number | "network" | undefined;
 const draftsCreated: string[] = [];
 const draftHeaders = new Map<string, Array<{ name: string; value: string }>>();
+const draftRawById = new Map<string, string>();
 /** Drafts Gmail fails to read (drafts.get throws). */
 const unreadableDrafts = new Set<string>();
 /** Each draft's plain body as Gmail has it, and drafts with a real file attached. */
@@ -275,6 +279,7 @@ const gmail = {
         draftsCreated.push(id);
         // Like Gmail, the draft goes to whoever its MIME says.
         const raw = Buffer.from(input?.requestBody?.message?.raw ?? "", "base64url").toString("utf8");
+        draftRawById.set(id, raw);
         draftHeaders.set(id, rawHeaders(raw));
         draftBodyById.set(id, draftBodyOf(raw));
         return { data: { id, message: { id: "d", threadId: "t" } } };
@@ -293,6 +298,7 @@ const gmail = {
             message: {
               id: `m-${id}`,
               threadId: `t-${id}`,
+              raw: id && draftRawById.has(id) ? Buffer.from(draftRawById.get(id)!, "utf8").toString("base64url") : undefined,
               payload: draftAttachments.has(id ?? "")
                 ? {
                     headers: draftHeaders.get(id ?? "") ?? [],
@@ -315,6 +321,7 @@ const gmail = {
       update: async ({ id, requestBody }: { id: string; requestBody: { message: { raw: string; threadId?: string } } }) => {
         draftUpdateThreads.set(id, requestBody.message.threadId ?? null);
         const raw = Buffer.from(requestBody.message.raw, "base64url").toString("utf8");
+        draftRawById.set(id, raw);
         draftHeaders.set(id, rawHeaders(raw));
         draftBodyById.set(id, draftBodyOf(raw));
         return { data: { id, message: { id: `m-${id}`, threadId: `t-${id}` } } };
@@ -2998,6 +3005,100 @@ await expectCancelled("delete_task", async (row) => {
     await sendEmailFromTool({ to: ["c.greet@new-co.com"], instruction: "say hello" }, own("email c.greet@new-co.com saying hello"));
     const draftBody = draftBodies.at(-1) ?? "";
     assert(draftBody !== "" && !/Hi Priya/.test(draftBody), `the greeting is grounded on the card path too: ${draftBody.slice(0, 40)}`);
+  }
+
+  // An edit-and-send changes the draft already shown, including when the owner
+  // replies to its card after another recipient's card has been posted.
+  {
+    const messageTurn = () => {
+      const messageId = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      claimTelegramMessage(1, messageId);
+      return { chatId: 1, messageId };
+    };
+    const cardFor = async (to: string) => {
+      await sendEmailFromTool({ to: [to], instruction: "say hello" }, own(`email ${to} saying hello`));
+      const id = draftsCreated.at(-1)!;
+      return getPendingActionForDraft(id)!;
+    };
+    const chatReply = async (text: string, card: NonNullable<ReturnType<typeof getPendingActionForDraft>>) => {
+      const messageId = Math.max(latestProcessedMessageId(), 900 + told.length) + 10_000;
+      const chat = { id: config.ownerTelegramId, type: "private", first_name: "Vishnu" };
+      const date = Math.floor(Date.now() / 1000);
+      await bot.handleUpdate({ update_id: messageId, message: {
+        message_id: messageId, date, chat, text,
+        from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+        reply_to_message: { message_id: card.telegram_message_id, date, chat, text: "Draft waiting for approval" },
+      } } as never);
+    };
+    const pendingTo = (to: string) => (db.prepare(`SELECT id FROM pending_actions
+      WHERE status = 'pending' AND lower(COALESCE(live_to_header, to_header)) = ?`).all(to) as Array<{ id: number }>).map(({ id }) => id);
+    written = { subject: "Original subject", body: "Hello,\n\nThis is the original message." };
+    const address = "incident-to@new-co.com";
+    const cc = "incident-teammate@epicode.in";
+    mail({ threadId: "incident-contact", from: `Incident Teammate <${cc}>`, to: ME, subject: "Intro", body: "Hello" });
+    const first = await cardFor(address);
+    const other = await cardFor("incident-unrelated@new-co.com");
+    const originalRaw = draftRawById.get(first.draft_id!)!;
+    const before = { created: draftsCreated.length, sent: draftsSent.length, direct: sends.length, writer: writerCalls.length,
+      commands: db.prepare("SELECT count(*) AS count FROM command_sends").get() as { count: number } };
+    await chatReply("cc Incident Teammate in this email and send the email", first);
+    const edited = getPendingActionForDraft(first.draft_id!)!;
+    assert(draftsCreated.length === before.created && writerCalls.length === before.writer, "a recipient edit never writes a second draft");
+    assert((db.prepare("SELECT count(*) AS count FROM command_sends").get() as { count: number }).count === before.commands.count, "a recipient edit claims no new command");
+    assert(edited.id === first.id && pendingTo(address).join() === String(first.id), "the original remains the only sendable draft to this address");
+    assert(approvalAction(other.id)?.cc_header === "", "the unrelated draft was not changed");
+    assert(edited.cc_header?.includes(cc) && edited.telegram_message_id !== first.telegram_message_id, "the refreshed card shows the new Cc");
+    assert(told.some((entry) => entry.text.includes(`New address: ${cc}. Tap Send to confirm.`)), "the refreshed card asks for confirmation of the new Cc");
+    const editedRaw = draftRawById.get(first.draft_id!)!;
+    assert(headerOf(editedRaw.split("\r\n\r\n")[0]!, "Subject") === first.subject, "the original subject is preserved");
+    assert(editedRaw.slice(editedRaw.indexOf("\r\n\r\n")) === originalRaw.slice(originalRaw.indexOf("\r\n\r\n")), "the original MIME body is preserved exactly");
+    assert(draftsSent.length === before.sent && sends.length === before.direct, "adding a new address does not send yet");
+    const oldMessage = cardCtx(`approval:send:${first.id}`).callbackQuery?.message;
+    await handleApprovalCallback({ ...cardCtx(`approval:send:${first.id}`), callbackQuery: {
+      data: `approval:send:${first.id}`, message: { ...oldMessage, message_id: first.telegram_message_id },
+    } } as Context, "send", first.id);
+    assert(draftsSent.length === before.sent, "the old card never confirms the newly added Cc");
+    await tapSend(first.draft_id!);
+    await chatReply("send it", edited);
+    assert(draftsSent.length === before.sent + 1 && draftsSent.at(-1) === first.draft_id && sends.length === before.direct, "the refreshed card sends once and another 'send it' sends nothing");
+    assert(pendingTo(address).length === 0, "no stale draft survives delivery");
+
+    const known = await cardFor("incident-known-edit@new-co.com");
+    sentTo("incident-known-cc@known-co.com");
+    const knownBefore = draftsSent.length;
+    const result = await sendEmailFromTool({ to: ["unrelated@example.com"], instruction: "wrong draft" }, {
+      userText: "also cc incident-known-cc@known-co.com then send", confirmation: messageTurn(), ownTurn: true,
+    });
+    assert(result.startsWith("Sent the draft") && draftsSent.length === knownBefore + 1 && draftsSent.at(-1) === known.draft_id, `the existing decision sends the same draft for a known Cc: ${result}`);
+    assert(draftHeaders.get(known.draft_id!)?.some(({ name, value }) => name === "Cc" && value === "incident-known-cc@known-co.com"), "the known Cc is on the sent draft");
+
+    const duplicate = "incident-replace@new-co.com";
+    const older = await cardFor(duplicate);
+    telegramFails.edit = true;
+    const replaced = await sendEmailFromTool({ to: [duplicate.toUpperCase()], instruction: "a separate email" }, own(`email ${duplicate} saying a separate email`));
+    telegramFails.edit = false;
+    const newest = getPendingActionForDraft(draftsCreated.at(-1)!)!;
+    assert(newest.id !== older.id && pendingTo(duplicate).join() === String(newest.id), "a separate command replaces an older draft to the normalized address");
+    assert(replaced.includes("Replaced your earlier draft to ") && approvalAction(older.id)?.status === "superseded", `the reply reports the replacement: ${replaced}`);
+    const alerts: string[] = [];
+    const supersededTap = { ...cardCtx(`approval:send:${older.id}`), answerCallbackQuery: async (alert: { text: string }) => { alerts.push(alert.text); return true; } } as unknown as Context;
+    const beforeTap = draftsSent.length;
+    await handleApprovalCallback(supersededTap, "send", older.id);
+    assert(draftsSent.length === beforeTap && alerts.at(-1) === "That draft was replaced by a newer one.", "Telegram edit failure cannot revive a stale button");
+
+    const seed = (draftId: string, to: string, account: "work" | "personal" = "work") => {
+      const action = createPendingAction(draftId, null, account);
+      setPendingActionDraftMeta(action.id, { toHeader: to, ccHeader: "", subject: "Old draft" });
+      setPendingActionTelegramMessage(action.id, 900 + told.length);
+      return action.id;
+    };
+    const deliveredTo = "incident-delivery@known-co.com";
+    const orphan = seed("incident-legacy-delivery", `Customer <${deliveredTo.toUpperCase()}>`);
+    const personal = seed("incident-personal", deliveredTo, "personal");
+    sentTo(deliveredTo);
+    const delivered = await sendEmailFromTool({ to: [deliveredTo], instruction: "send a separate email" }, own(`email ${deliveredTo} saying hello`));
+    assert(delivered.startsWith("Sent to") && delivered.includes("Replaced your earlier draft to Customer."), `delivery reports retiring the pending draft: ${delivered}`);
+    assert(approvalAction(orphan)?.status === "superseded" && approvalAction(personal)?.status === "pending", "successful delivery retires overlapping To only in the same mailbox");
   }
 
   draftUsers.drafts.create = realCreate;

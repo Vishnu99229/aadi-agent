@@ -154,7 +154,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       cardNote = sent.message;
     }
     if (sent.ok) {
-      return `Sent to ${toHeader}.`;
+      return [`Sent to ${toHeader}.`, sent.replacementNotice].filter(Boolean).join("\n");
     }
   }
 

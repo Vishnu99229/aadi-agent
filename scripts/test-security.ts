@@ -839,6 +839,23 @@ assert(
   const decisionSrc = await readFile(join(root, "src/security/send_decision.ts"), "utf8");
   assert(decisionSrc.includes("export function decideSendAction("), "one decision point");
   assert(decisionSrc.includes("export function assertSendDecision("), "and one check of it");
+  const bodyOf = (source: string, name: string) => {
+    const start = source.indexOf(`function ${name}(`);
+    assert(start >= 0, `found ${name}`);
+    return source.slice(start, source.indexOf("\n}\n", start));
+  };
+  const legacyImmediate = bodyOf(approvalsGateSrc, "sendCreatedDraftNow");
+  const gatedDraftSends = [performBody, legacyImmediate];
+  const gmailDraftSend = /\.users\.drafts\.send\s*\(/g;
+  assert((approvalsGateSrc.match(gmailDraftSend) ?? []).length === gatedDraftSends.length, "every draft Gmail call is in a gated delivery function");
+  for (const body of gatedDraftSends) {
+    const check = body.indexOf("assertSendDecision(");
+    assert(check >= 0 && check < body.indexOf(".users.drafts.send("), "each draft Gmail call checks the shared decision first");
+  }
+  const rawCommand = bodyOf(commandSendSrc, "sendCommandEmail");
+  assert(rawCommand.indexOf("assertSendDecision(") >= 0 && rawCommand.indexOf("assertSendDecision(") < rawCommand.indexOf(".users.messages.send("), "the direct and scheduled command Gmail call checks the same decision");
+  const editBody = bodyOf(approvalsGateSrc, "editAndSendPendingDraft");
+  assert(editBody.includes("sendPendingDraftByText(") && !editBody.includes("performDraftSend("), "recipient edits dispatch through the same approval and decision as text confirmations");
 }
 for (const tool of ["set_sequence_timezone", "add_sales_fact", "list_sales_facts", "remove_sales_fact"]) {
   assert(
