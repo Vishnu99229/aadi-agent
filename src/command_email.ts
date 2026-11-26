@@ -1243,9 +1243,12 @@ export async function handlePendingRecipientEdit(
   if (locked) return tooLateText(locked);
   const supplied = matchOwnerSupplied(confirmation.chatId, edit.person, now);
   if (supplied.kind === "many") return `Which ${edit.person}? ${supplied.contacts.map((contact) => contact.email).join(", ")}`;
+  const explicitMailbox = parseAddressList(edit.person)[0];
   const match: RecipientMatch = supplied.kind === "one"
     ? { kind: "one", mailbox: { email: supplied.contact.email, name: supplied.contact.name } }
-    : await resolveNamedRecipient({
+    : explicitMailbox
+      ? { kind: "one", mailbox: explicitMailbox }
+      : await resolveNamedRecipient({
         gmail: gmailClient(await getGoogleAccount(account)),
         query: edit.person, selfAddresses: await loadFollowupSelfAddresses(),
       });

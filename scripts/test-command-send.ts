@@ -3054,6 +3054,21 @@ await expectCancelled("delete_task", async (row) => {
     }, multiEditDraft.telegram_message_id!);
     assert(multiEditResult?.includes("more than one address") && draftsSent.length === beforeMultiEdit && !approvalAction(multiEditDraft.id)?.cc_header,
       `a multi-address edit is refused without silently dropping one recipient: ${multiEditResult}`);
+    const quotedEditDraft = await cardFor("incident-quoted-edit@new-co.com");
+    const quotedFormer = "incident-edit-former@known-co.com";
+    const quotedCurrent = "incident-edit-current@known-co.com";
+    sentTo(quotedFormer);
+    sentTo(quotedCurrent);
+    const beforeQuotedEdit = draftsSent.length;
+    const quotedEditResult = await handlePendingRecipientEdit({
+      userText: `cc "${quotedFormer}" <${quotedCurrent}> and send it`,
+      confirmation: messageTurn(), ownTurn: true,
+    }, quotedEditDraft.telegram_message_id!);
+    const deliveredCc = draftHeaders.get(quotedEditDraft.draft_id!)?.find((header) => header.name === "Cc")?.value ?? "";
+    assert(quotedEditResult?.startsWith("Sent the draft") && draftsSent.length === beforeQuotedEdit + 1 &&
+      parseAddressList(deliveredCc).some(({ email }) => email === quotedCurrent) &&
+      !parseAddressList(deliveredCc).some(({ email }) => email === quotedFormer),
+      `a recipient edit resolves the angle-bracket mailbox, not its quoted display name: ${quotedEditResult} (${deliveredCc})`);
     written = { subject: "Original subject", body: "Hello,\n\nThis is the original message." };
     const address = "incident-to@new-co.com";
     const cc = "incident-teammate@epicode.in";
