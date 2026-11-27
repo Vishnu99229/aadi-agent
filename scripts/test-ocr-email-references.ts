@@ -569,6 +569,7 @@ const sentNow = await sendEmailFromTool(
 assert.match(sentNow, /Sent/i);
 assert.equal(draftSends + messageSends, beforeOnce + 1);
 assert.equal(getScheduledSend(onceSchedule!.id)?.status, "sent");
+assert.equal(getPendingAction(12)?.email, undefined, "the tool closes the chat link after delivering the scheduled draft");
 const again = await sendEmailFromTool(
   { to: ["once@example.com"], instruction: "Send this once" },
   { userText: "send it now", confirmation: { chatId: 12, messageId: nextMessageId() }, ownTurn: true },

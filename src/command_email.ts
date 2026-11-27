@@ -18,6 +18,7 @@ import {
   explicitEmailField,
   getPendingAction,
   holdEmailToolTurn,
+  lastEmailReference,
   linkPublishedDraft,
   lockedScheduleForDraft,
   matchOwnerSupplied,
@@ -1352,12 +1353,15 @@ export async function sendEmailFromTool(
   if (
     when === undefined &&
     confirmsExistingDraft(ownWords) &&
-    !referencedEmail &&
-    pendingEmail?.draftId &&
-    pendingEmail.scheduledSendId
+    !referencedEmail
   ) {
-    const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId, { ownTurn: turn.ownTurn === true });
-    return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok));
+    if (pendingEmail?.draftId && pendingEmail.scheduledSendId) {
+      const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId, { ownTurn: turn.ownTurn === true });
+      return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok));
+    }
+    if (!pendingEmail && lastEmailReference(confirmation.chatId, now)) {
+      return "No draft is waiting for your approval, so nothing was sent.";
+    }
   }
   let toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
