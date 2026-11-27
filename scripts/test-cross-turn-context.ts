@@ -25,6 +25,7 @@ import {
   createMemory,
   createScheduledSend,
   createTask,
+  getClosedEmailContext,
   getPendingActionForDraft,
   getScheduledSend,
   listOpenScheduledSends,
@@ -194,7 +195,7 @@ const say = (text: string, now = NOW) =>
     sendAt: "2026-11-18T04:30:00.000Z",
     itemText: "Send email to Raghavendra — BotCompose",
     tag: "work",
-    request: JSON.stringify({ instruction: "BotCompose", to: [] }),
+    request: JSON.stringify({ instruction: "BotCompose", to: [], account: "work" }),
     confirmChat: CHAT,
     confirmMessage: 3,
   });
@@ -270,6 +271,15 @@ const say = (text: string, now = NOW) =>
     editId,
   );
   assert.match(replies.join(" "), /change in this draft/i);
+  const draft = getPendingAction(CHAT, NOW);
+  assert.equal(draft?.status, "open");
+  assert.equal(draft?.email?.to[0]?.email, "raghavendra.kv@tenxpipe.com");
+  assert.match(draft?.email?.purpose ?? "", /dialer/i);
+  assert.equal(draft?.email?.scheduledSendId, undefined);
+  assert.equal(
+    holdEmailToolTurn(CHAT, "Raghavendra wants dialer and automated flows like KYC.", NOW),
+    "Not sent: this message adds context, and it does not send or schedule anything.",
+  );
   const discardData = buttons.find((item) => item.startsWith("approval:discard:"))!;
   await handleApprovalCallback(
     {
@@ -281,16 +291,9 @@ const say = (text: string, now = NOW) =>
     Number(discardData.split(":").pop()),
   );
   assert.equal(drafts.has(posted.draftId!), false);
-  const draft = getPendingAction(CHAT, NOW);
-  assert.equal(draft?.status, "open");
-  assert.equal(draft?.email?.to[0]?.email, "raghavendra.kv@tenxpipe.com");
-  assert.match(draft?.email?.purpose ?? "", /dialer/i);
-  assert.equal(draft?.email?.scheduledSendId, undefined);
+  assert.equal(getPendingAction(CHAT, NOW)?.email, undefined);
+  assert.equal(getClosedEmailContext(CHAT)?.status, "discarded");
   assert.equal(getScheduledSend(scheduled!.id)!.status, "cancelled");
-  assert.equal(
-    holdEmailToolTurn(CHAT, "Raghavendra wants dialer and automated flows like KYC.", NOW),
-    "Not sent: this message adds context, and it does not send or schedule anything.",
-  );
   assert.equal(listOpenScheduledSends().length, 0);
 }
 
