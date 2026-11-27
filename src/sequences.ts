@@ -1189,7 +1189,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     console.error(`Sequence command: thread check failed (${errorType})`);
     return noteEmailFailure(new EmailOperationError(
       "Not started: I couldn't check that thread. Read the latest sent email before requesting follow-ups.", "provider_read_failed",
-      { account: "work", messageId: carry.email?.sentMessageId, recipient: decision.person },
+      { account: "work", messageId: carry.email?.sentMessageId ?? undefined, recipient: decision.person ?? undefined },
     ));
   }
   noteEmailTarget("start_sequence", { recipient: chosen.prospect?.email, threadId: chosen.prospect ? undefined : chosen.threadId });

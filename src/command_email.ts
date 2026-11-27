@@ -611,6 +611,8 @@ export async function writeAndSend(
       reply: !newConversation && thread ? { threadId: request.threadId!, inReplyTo: thread.inReplyTo, references: thread.references } : undefined,
     });
   }
+  // Narrowed above; a closure below would lose the narrowing of options.verdict.
+  const decision = options.verdict;
   const signatureHtml = await signatureHtmlFor(account);
   const release = claimRecipientDelivery(account.id, toHeader);
   if (!release) {
@@ -624,7 +626,7 @@ export async function writeAndSend(
       return { text: "Not sent: it was cancelled.", result: "cancelled" };
     }
     ({ messageId, replacedDrafts } = await trackEmailProviderWrite(() => sendCommandEmail({
-      decision: options.verdict,
+      decision,
       key,
       confirmation,
       account,
