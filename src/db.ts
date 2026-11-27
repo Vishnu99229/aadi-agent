@@ -6165,8 +6165,13 @@ function closeEmailContext(ref: ClosedEmailContext, origin?: { chatId: number; m
     if (row.action === "draft_email" || row.action === "send_email") {
       delete state.authorizedAt;
       state.ownerWords = "";
-      state.action = state.meeting ? "create_meeting" : "note";
-      state.status = state.meeting ? "open" : "done";
+      if (state.meeting) {
+        state.action = "create_meeting";
+        state.status = "open";
+      } else if (state.status !== "cancelled") {
+        state.action = "note";
+        state.status = "done";
+      }
     }
     db.prepare("UPDATE pending_action_contexts SET state_json = ?, action = ?, owner_words = ? WHERE chat_id = ?")
       .run(JSON.stringify(state), state.action ?? row.action, state.ownerWords ?? row.owner_words, row.chat_id);
