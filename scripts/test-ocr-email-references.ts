@@ -228,6 +228,16 @@ async function say(text: string, quote?: { message_id: number; text: string }, c
     },
   } as never);
 }
+{
+  const unseenChat = 627;
+  const before = replies.length;
+  await say("What did he say in his latest email?", undefined, unseenChat);
+  await say("Show me the email address in the above message", undefined, unseenChat);
+  assert.equal(replies.slice(before).length, 2, "both requests without a real Telegram reference reach routing");
+  assert.ok(replies.slice(before).every(line => !line.includes("latest OCR photo")));
+  await say("Show me the email address in this message", { message_id: nextMessageId(), text: "No address here." }, unseenChat);
+  assert.match(replies.at(-1) ?? "", /couldn't find an email address in that message or the latest OCR photo/i);
+}
 await say("Get the email id from the above message, and draft the email");
 assert.match(replies.at(-1) ?? "", /info@msopsai\.com.*what should the email say/i);
 assert.equal(getPendingAction(1)?.email?.to[0]?.email, "info@msopsai.com");

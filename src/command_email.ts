@@ -1,4 +1,5 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
+import { routeMiss, type PreRouteResult } from "./pre_route.js";
 import type { gmail_v1 } from "googleapis";
 import {
   asksForAttachment,
@@ -111,6 +112,7 @@ export interface Outcome {
   messageId?: string;
   /** The same command again: its follow-ups were handled the first time. */
   repeat?: boolean;
+  recoverable?: boolean;
 }
 
 function asToolResult(outcome: Outcome): string {
@@ -368,7 +370,7 @@ async function showSendCard(input: {
     console.error(`Command send: card draft failed (${errorType})`);
     // No draft was made, so the same command may try again.
     releaseCommandSend(input.key);
-    return { text: "Not sent: I couldn't save it as a draft for you to check, so nothing went out. Try again.", result: "not_sent" };
+    return { text: "Not sent: I couldn't save it as a draft for you to check, so nothing went out. Try again.", result: "not_sent", recoverable: true };
   }
   const signature = signaturePlainText(signatureHtml);
   let actionId: number;
@@ -390,11 +392,11 @@ async function showSendCard(input: {
     const saved = latestDraftAction(draftId, input.account.id);
     if (!saved) {
       releaseCommandSend(input.key);
-      return { text: ["Not sent: I saved a draft but couldn't show its card, so nothing went out. Try again.", replacementNotice].filter(Boolean).join("\n"), result: "not_sent" };
+      return { text: ["Not sent: I saved a draft but couldn't show its card, so nothing went out. Try again.", replacementNotice].filter(Boolean).join("\n"), result: "not_sent", recoverable: true };
     }
     const text = saved.status === "superseded" ? DRAFT_REPLACED
       : "Not sent: I couldn't show its card. Ask me again and I'll show the same draft.";
-    return { text: [text, replacementNotice].filter(Boolean).join("\n"), result: "not_sent" };
+    return { text: [text, replacementNotice].filter(Boolean).join("\n"), result: "not_sent", recoverable: saved.status !== "superseded" };
   }
   if (latestDraftAction(draftId, input.account.id)?.status === "superseded") {
     return { text: [DRAFT_REPLACED, replacementNotice].filter(Boolean).join("\n"), result: "not_sent" };
@@ -494,6 +496,7 @@ export async function writeAndSend(
         text: "Not sent: I couldn't read that thread, so nothing went out.",
         hint: "Ask Vishnu which thread he means.",
         result: "not_sent",
+        recoverable: true,
       };
     }
     const onThread = new Set(thread.mailboxes.map((item) => item.email));
@@ -583,7 +586,7 @@ export async function writeAndSend(
   const release = claimRecipientDelivery(account.id, toHeader);
   if (!release) {
     if (getCommandSendByKey(key)) return gateRefusal("already_handled");
-    return { text: "Not sent: another email to that recipient is already going out.", result: "cancelled" };
+    return { text: "Not sent: another email to that recipient is already going out.", result: "cancelled", recoverable: true };
   }
   let messageId: string;
   let replacedDrafts: PendingAction[];
@@ -615,6 +618,7 @@ export async function writeAndSend(
       return {
         text: `Not sent: Gmail refused the email (${error.status}), so nothing went out.`,
         result: "not_sent",
+        recoverable: true,
       };
     }
     if (error instanceof CommandSendUnconfirmedError) {
@@ -1212,17 +1216,28 @@ export async function handlePendingRecipientEdit(
   replyToMessageId?: number,
   now = new Date(),
 ): Promise<string | undefined> {
+  const result = await tryPendingRecipientEdit(turn, replyToMessageId, now);
+  return result?.kind === "miss" ? result.notice ?? result.note : result?.text;
+}
+
+export async function tryPendingRecipientEdit(
+  turn: FollowupTurn,
+  replyToMessageId?: number,
+  now = new Date(),
+): Promise<PreRouteResult | undefined> {
+  const clarify = (text: string): PreRouteResult => ({ kind: "clarification", text });
+  const refuse = (text: string): PreRouteResult => ({ kind: "refusal", text });
   const words = turn.userText ?? "";
   const edit = recipientEditAndSend(words);
   if (!edit) return undefined;
   const confirmation = turn.confirmation;
-  if (!confirmation || turn.ownTurn !== true) return "Only your own message can change and send a pending draft.";
+  if (!confirmation || turn.ownTurn !== true) return refuse("Only your own message can change and send a pending draft.");
   const stop = notASendCommand(words);
-  if (stop) return `Not sent: ${stop}.`;
+  if (stop) return refuse(`Not sent: ${stop}.`);
   const hold = deliveryTimeHold(words);
-  if (hold) return hold;
-  if (edit.field === "bcc") return "I can add them on Cc. Tell me if you'd like that.";
-  if (asksForAttachment(words)) return "I haven't sent the draft. Add the attachment in Gmail first.";
+  if (hold) return refuse(hold);
+  if (edit.field === "bcc") return refuse("I can add them on Cc. Tell me if you'd like that.");
+  if (asksForAttachment(words)) return refuse("I haven't sent the draft. Add the attachment in Gmail first.");
 
   const shown = eligibleDrafts(confirmation);
   const replied = replyToMessageId === undefined ? undefined : pendingDraftActionForMessage(replyToMessageId);
@@ -1231,19 +1246,19 @@ export async function handlePendingRecipientEdit(
   const action = target ? shown.find((draft) => draft.id === target.id)
     : replyToMessageId === undefined ? pickLatestDraft(shown) : undefined;
   if (!action?.draft_id) {
-    if (target?.status === "superseded") return DRAFT_REPLACED;
-    if (!target && replyToMessageId === undefined && shown.length > 1) return "Which draft should I update? Reply to its card.";
-    return "No draft is waiting for your approval, so nothing was sent.";
+    if (target?.status === "superseded") return refuse(DRAFT_REPLACED);
+    if (!target && replyToMessageId === undefined && shown.length > 1) return clarify("Which draft should I update? Reply to its card.");
+    return routeMiss("No draft is waiting for your approval, so nothing was sent.", { scope: "read_only" });
   }
   if (parseAddressList(edit.person).length > 1) {
-    return "I found more than one address in that recipient edit. Tell me which single address to add.";
+    return clarify("I found more than one address in that recipient edit. Tell me which single address to add.");
   }
   const draftId = action.draft_id;
   const account = action.google_account;
   const locked = lockedScheduleForDraft(draftId, account);
-  if (locked) return tooLateText(locked);
+  if (locked) return routeMiss(tooLateText(locked), { scope: "read_only" });
   const supplied = matchOwnerSupplied(confirmation.chatId, edit.person, now);
-  if (supplied.kind === "many") return `Which ${edit.person}? ${supplied.contacts.map((contact) => contact.email).join(", ")}`;
+  if (supplied.kind === "many") return clarify(`Which ${edit.person}? ${supplied.contacts.map((contact) => contact.email).join(", ")}`);
   const explicitMailbox = parseAddressList(edit.person)[0];
   const match: RecipientMatch = supplied.kind === "one"
     ? { kind: "one", mailbox: { email: supplied.contact.email, name: supplied.contact.name } }
@@ -1253,22 +1268,27 @@ export async function handlePendingRecipientEdit(
         gmail: gmailClient(await getGoogleAccount(account)),
         query: edit.person, selfAddresses: await loadFollowupSelfAddresses(),
       });
-  if (match.kind === "many") return `Which ${edit.person}? ${match.options.map(formatMailbox).join(", ")}`;
-  if (match.kind === "none") return `I couldn't find an address for ${edit.person}. Which address should I add?`;
+  if (match.kind === "many") return clarify(`Which ${edit.person}? ${match.options.map(formatMailbox).join(", ")}`);
+  if (match.kind === "none") return routeMiss(`I couldn't find an address for ${edit.person}. Which address should I add?`, { scope: "read_only" });
   const email = match.mailbox.email.trim().toLowerCase();
-  if (parseAddressList(email)[0]?.email !== email || isSelfEmail(email)) return "I couldn't use that address. Which address should I add?";
+  if (parseAddressList(email)[0]?.email !== email || isSelfEmail(email)) return refuse("I couldn't use that address. Which address should I add?");
   const refusal = await mailDomainRefusal([email]);
-  if (refusal) return refusal;
+  if (refusal) return refuse(refusal);
   const result = await editAndSendPendingDraft(confirmation, action, { ...edit, field: edit.field, email }, (headers) =>
     scheduleSyncNotice(syncDraftRecipient({ chatId: confirmation.chatId, draftId, account, ...headers })),
   );
-  return withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok));
+  const text = withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok));
+  if (result.failure === "miss" || result.failure === "uncertain") return routeMiss(text, { scope: "read_only" });
+  return { kind: result.ok ? "handled" : result.failure === "clarification" ? "clarification" : "refusal", text };
 }
 
 export async function sendEmailFromTool(
   input: unknown,
   /** directSend: a path with no model after it (the referenced-email send in bot.ts). */
-  turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & { directSend?: boolean },
+  turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & {
+    directSend?: boolean;
+    onRecovery?: (note: string) => void;
+  },
   now = new Date(),
 ): Promise<string> {
   if (!config.sendOnCommandEnabled) {
@@ -1420,6 +1440,9 @@ export async function sendEmailFromTool(
     confirmation,
     now,
   );
+  if (outcome.recoverable || outcome.result === "write_failed" || outcome.result === "unknown") {
+    turn.onRecovery?.(outcome.text);
+  }
   if (outcome.repeat) {
     // The same command again: nothing new went out, and its follow-ups were handled then.
     return asToolResult(outcome);

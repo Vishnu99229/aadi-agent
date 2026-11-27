@@ -45,6 +45,8 @@ export interface PendingAction {
   updated_at: string | null;
   to_header: string | null;
   live_to_header?: string | null;
+  sent_at?: string | null;
+  sent_message_id?: string | null;
   cc_header: string | null;
   subject: string | null;
   /** The send command this card stands for, when a command became a card. */
@@ -565,6 +567,12 @@ db.exec(`
     confirm_chat INTEGER NOT NULL,
     confirm_message INTEGER NOT NULL,
     updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS closed_email_contexts (
+    chat_id INTEGER PRIMARY KEY,
+    detail TEXT NOT NULL,
+    closed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS presented_referents (
@@ -1871,7 +1879,7 @@ export function insertMessageEmbedding(row: {
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
               telegram_message_id, event_title, event_start, event_end,
               event_attendees, event_description, created_at, auto_send_at,
-              updated_at, to_header, cc_header, subject, command_key, live_to_header`;
+              updated_at, to_header, cc_header, subject, command_key, live_to_header, sent_at, sent_message_id`;
 
 export function createPendingAction(
   draftId: string,
@@ -2040,7 +2048,7 @@ export function registerPendingDraft(input: {
 }): { action?: PendingAction; replaced: PendingAction[] } {
   return db.transaction(() => {
     const existing = latestDraftAction(input.draftId, input.account);
-    if (existing?.status === "superseded" || existing?.status === "sent") return { replaced: [] };
+    if (existing && isClosedEmailStatus(existing.status) && existing.status !== "expired") return { replaced: [] };
     if (existing?.status === "pending" && olderDuplicateDrafts().some((row) => row.id === existing.id)) {
       return { replaced: supersedeDraft(existing) ? [existing] : [] };
     }
@@ -2061,13 +2069,22 @@ export function settleDraftDelivery(input: {
     const action = input.actionId === undefined
       ? input.draftId ? getPendingActionForDraft(input.draftId, input.account) : undefined
       : getPendingAction(input.actionId);
-    const delivered = action && (transitionPendingAction(action.id, "pending", "sent") ||
+    const delivery = { messageId: input.sentMessageId };
+    const delivered = action && (transitionPendingAction(action.id, "pending", "sent", delivery) ||
       // A new card may have replaced this one while Gmail was already delivering it.
-      transitionPendingAction(action.id, "superseded", "sent"));
-    if (action && delivered && input.sentMessageId) {
-      setPendingActionSentMessage(action.id, input.sentMessageId);
-    }
+      transitionPendingAction(action.id, "superseded", "sent", delivery));
     if (input.commandKey) recordCommandSendSent(input.commandKey, input.sentMessageId ?? "unknown");
+    const command = input.commandKey ? db.prepare(
+      "SELECT status, thread_id, sent_at FROM command_sends WHERE idem_key = ? AND account = ?",
+    ).get(input.commandKey, input.account) as { status: string; thread_id: string | null; sent_at: string | null } | undefined : undefined;
+    const origin = /^msg:(-?\d+):(\d+)(?::|$)/.exec(input.commandKey ?? "");
+    if (!delivered && (input.draftId || (origin && command?.status === "sent"))) {
+      closeEmailContext({
+        account: input.account, draftId: input.draftId, status: "sent", to: input.to,
+        threadId: command?.thread_id ?? undefined, sentAt: command?.sent_at ?? recordedNow(),
+        sentMessageId: input.sentMessageId,
+      }, origin ? { chatId: Number(origin[1]), messageId: Number(origin[2]) } : undefined);
+    }
     if (input.schedule) {
       recordScheduledSendSent(input.schedule.id, input.sentMessageId ?? null);
       markTaskDone(input.schedule.taskId);
@@ -2197,16 +2214,21 @@ export function transitionPendingAction(
   id: number,
   from: PendingActionStatus,
   to: PendingActionStatus,
+  delivery?: { messageId?: string },
 ): boolean {
-  const result = db
-    .prepare(
-      `UPDATE pending_actions
-       SET status = ?
-       WHERE id = ? AND status = ?`,
-    )
-    .run(to, id, from);
-
-  return result.changes === 1;
+  return db.transaction(() => {
+    const changed = db.prepare(
+      "UPDATE pending_actions SET status = ? WHERE id = ? AND status = ?",
+    ).run(to, id, from).changes === 1;
+    if (changed && isClosedEmailStatus(to)) {
+      if (to === "sent" && delivery) db.prepare(
+        "UPDATE pending_actions SET sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP), sent_message_id = COALESCE(?, sent_message_id) WHERE id = ?",
+      ).run(delivery.messageId ?? null, id);
+      const action = getPendingAction(id);
+      if (action?.draft_id) closeEmailContext(emailReferenceForAction(action, to));
+    }
+    return changed;
+  }).immediate();
 }
 
 /** Puts a finished approval back to pending. Tests use it to prove a stale Send
@@ -5999,8 +6021,17 @@ export function upsertPendingActionContext(input: {
   confirmMessage: number;
   updatedAt: string;
 }): void {
-  db.prepare(
-    `INSERT INTO pending_action_contexts (
+  db.transaction(() => {
+    const proposed = JSON.parse(input.stateJson) as { email?: EmailLink; status?: string };
+    if (proposed?.email && (proposed.status === "open" || proposed.status === undefined)) {
+      const last = getClosedEmailContext(input.chatId);
+      const matchedCommand = input.action === "send_email" && !proposed.email.draftId && !proposed.email.scheduledSendId &&
+        db.prepare("SELECT 1 FROM command_sends WHERE account = ? AND idem_key GLOB ? AND status = 'sent' LIMIT 1")
+          .get(proposed.email.account, `msg:${input.chatId}:${input.confirmMessage}:*`);
+      if (matchedCommand || recordedClosedEmail(proposed.email) || (last && sameEmailLink(proposed.email, last))) return;
+    }
+    db.prepare(
+      `INSERT INTO pending_action_contexts (
        chat_id, action, state_json, owner_words, confirm_chat, confirm_message, updated_at
      ) VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
@@ -6010,21 +6041,198 @@ export function upsertPendingActionContext(input: {
        confirm_chat = excluded.confirm_chat,
        confirm_message = excluded.confirm_message,
        updated_at = excluded.updated_at`,
-  ).run(
-    input.chatId,
-    input.action,
-    input.stateJson,
-    input.ownerWords,
-    input.confirmChat,
-    input.confirmMessage,
-    input.updatedAt,
-  );
+    ).run(
+      input.chatId,
+      input.action,
+      input.stateJson,
+      input.ownerWords,
+      input.confirmChat,
+      input.confirmMessage,
+      input.updatedAt,
+    );
+  }).immediate();
 }
 
 export function getPendingActionContext(chatId: number): PendingActionRow | undefined {
   return db
     .prepare("SELECT * FROM pending_action_contexts WHERE chat_id = ?")
     .get(chatId) as PendingActionRow | undefined;
+}
+
+type ClosedEmailStatus = "sent" | "superseded" | "discarded" | "cancelled" | "expired" | "unknown";
+
+export interface ClosedEmailContext {
+  account: GoogleAccountId;
+  draftId?: string;
+  scheduleId?: number;
+  threadId?: string;
+  to?: string;
+  status: ClosedEmailStatus;
+  sentAt?: string;
+  sentMessageId?: string;
+}
+
+function isClosedEmailStatus(status: PendingActionStatus): status is ClosedEmailStatus & PendingActionStatus {
+  return status === "sent" || status === "superseded" || status === "discarded" ||
+    status === "cancelled" || status === "expired";
+}
+
+function recordedNow(): string {
+  return new Date().toISOString();
+}
+
+type EmailLink = {
+  account: GoogleAccountId;
+  draftId?: string;
+  scheduledSendId?: number;
+  to?: Array<{ name?: string; email?: string }>;
+};
+
+function linkedRecipient(email: EmailLink): string | undefined {
+  return email.to?.flatMap(({ name, email }) => email ? [name ? `${name} <${email}>` : email] : []).join(", ") || undefined;
+}
+
+function emailReferenceForAction(action: PendingAction, status: ClosedEmailStatus): ClosedEmailContext {
+  const sentSchedule = status === "sent" && action.draft_id
+    ? listScheduledSendsForDraft(action.draft_id, action.google_account).find(row => row.status === "sent")
+    : undefined;
+  return {
+    account: action.google_account, draftId: action.draft_id ?? undefined, status,
+    threadId: action.thread_id ?? undefined, to: action.live_to_header ?? action.to_header ?? undefined,
+    sentAt: action.sent_at ?? sentSchedule?.sent_at ?? undefined,
+    sentMessageId: action.sent_message_id ?? sentSchedule?.sent_message_id ?? undefined,
+  };
+}
+
+function scheduleEmailReference(row: ScheduledSendRecord, status: "sent" | "cancelled"): ClosedEmailContext | undefined {
+  try {
+    const request = JSON.parse(row.request) as {
+      account?: GoogleAccountId; draftId?: string; threadId?: string;
+      to?: Array<{ mailbox?: { name?: string; email?: string } }>;
+    };
+    if (request.account !== "work" && request.account !== "personal") return undefined;
+    return {
+      account: request.account, scheduleId: row.id, draftId: request.draftId,
+      threadId: request.threadId ?? undefined, status,
+      to: linkedRecipient({ account: request.account, to: request.to?.flatMap(slot => slot.mailbox ? [slot.mailbox] : []) }),
+      sentAt: status === "sent" ? row.sent_at ?? undefined : undefined,
+      sentMessageId: status === "sent" ? row.sent_message_id ?? undefined : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function getClosedEmailContext(chatId: number): (ClosedEmailContext & { closedAt: string }) | undefined {
+  const row = db.prepare("SELECT detail, closed_at FROM closed_email_contexts WHERE chat_id = ?").get(chatId) as
+    { detail: string; closed_at: string } | undefined;
+  return row ? { ...JSON.parse(row.detail) as ClosedEmailContext, closedAt: row.closed_at } : undefined;
+}
+
+function sameEmailLink(email: EmailLink, ref: ClosedEmailContext): boolean {
+  return email.account === ref.account && (ref.status === "cancelled" && ref.scheduleId
+    ? email.scheduledSendId === ref.scheduleId
+    : Boolean((ref.draftId && email.draftId === ref.draftId) ||
+      (ref.scheduleId && email.scheduledSendId === ref.scheduleId)));
+}
+
+/** Called in the transition transaction. Only the email itself and its authority are closed. */
+function closeEmailContext(ref: ClosedEmailContext, origin?: { chatId: number; messageId: number }): void {
+  const rows = db.prepare("SELECT * FROM pending_action_contexts").all() as PendingActionRow[];
+  const store = db.prepare(`INSERT INTO closed_email_contexts (chat_id, detail)
+    VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET detail = excluded.detail, closed_at = CURRENT_TIMESTAMP`);
+  for (const row of rows) {
+    type State = {
+      email?: EmailLink; status?: string; action?: string; authorizedAt?: string; ownerWords?: string;
+      meeting?: unknown;
+    };
+    let state: State;
+    try { state = JSON.parse(row.state_json) as State; } catch { continue; }
+    if (!state) continue;
+    const email = state.email;
+    if (!email || email.account !== ref.account) continue;
+    const matchesCommand = !ref.draftId && !ref.scheduleId && !email.draftId && !email.scheduledSendId &&
+      row.chat_id === origin?.chatId && row.confirm_message === origin?.messageId && row.action === "send_email";
+    if (!sameEmailLink(email, ref) && !matchesCommand) continue;
+    store.run(row.chat_id, JSON.stringify({ ...ref, to: ref.to ?? linkedRecipient(email) }));
+    delete state.email;
+    if (row.action === "draft_email" || row.action === "send_email") {
+      delete state.authorizedAt;
+      state.ownerWords = "";
+      state.action = state.meeting ? "create_meeting" : "note";
+      state.status = state.meeting ? "open" : "done";
+    }
+    db.prepare("UPDATE pending_action_contexts SET state_json = ?, action = ?, owner_words = ? WHERE chat_id = ?")
+      .run(JSON.stringify(state), state.action ?? row.action, state.ownerWords ?? row.owner_words, row.chat_id);
+  }
+  // A delivery already in progress can settle after its approval was superseded.
+  // Update its last reference in place without disturbing any newer open email.
+  if (ref.status === "sent" && ref.draftId) {
+    const previous = db.prepare("SELECT chat_id, detail FROM closed_email_contexts WHERE json_extract(detail, '$.draftId') = ? AND json_extract(detail, '$.account') = ?").all(ref.draftId, ref.account) as
+      Array<{ chat_id: number; detail: string }>;
+    for (const row of previous) {
+      const old = JSON.parse(row.detail) as ClosedEmailContext;
+      store.run(row.chat_id, JSON.stringify({ ...ref, to: ref.to ?? old.to, threadId: ref.threadId ?? old.threadId }));
+    }
+  }
+}
+
+/** Resolve legacy links from records before a stale draft can be edited again. */
+export function recordedClosedEmail(email: EmailLink): ClosedEmailContext | undefined {
+  const action = email.draftId ? latestDraftAction(email.draftId, email.account) : undefined;
+  const bound = email.scheduledSendId ? getScheduledSend(email.scheduledSendId) : undefined;
+  const delivered = email.draftId
+    ? listScheduledSendsForDraft(email.draftId, email.account).find(row => row.status === "sent")
+    : undefined;
+  const schedule = delivered ?? bound;
+  if (schedule?.status === "sent" || schedule?.status === "cancelled") {
+    const ref = scheduleEmailReference(schedule, schedule.status);
+    if (ref && sameEmailLink(email, ref) && schedule.status === "sent") return ref;
+  }
+  if (action && isClosedEmailStatus(action.status)) return emailReferenceForAction(action, action.status);
+  if (action?.command_key) {
+    const command = db.prepare(
+      "SELECT sent_at, sent_message_id, thread_id FROM command_sends WHERE idem_key = ? AND account = ? AND status = 'sent'",
+    ).get(action.command_key, email.account) as
+      { sent_at: string | null; sent_message_id: string | null; thread_id: string | null } | undefined;
+    if (command) return {
+      ...emailReferenceForAction(action, "sent"),
+      sentAt: command.sent_at ?? undefined, sentMessageId: command.sent_message_id ?? undefined,
+      threadId: command.thread_id ?? action.thread_id ?? undefined,
+    };
+  }
+  if (bound?.status === "cancelled") {
+    const ref = scheduleEmailReference(bound, "cancelled");
+    if (ref && sameEmailLink(email, ref)) return ref;
+  }
+  return undefined;
+}
+
+export function emailDeliveryUnsettled(email: EmailLink): boolean {
+  const schedules = email.draftId ? draftDeliveryRows(email.draftId, email.account) : [];
+  const directSchedule = email.scheduledSendId ? getScheduledSend(email.scheduledSendId) : undefined;
+  if (directSchedule && scheduleEmailReference(directSchedule, "sent")?.account === email.account) schedules.push(directSchedule);
+  if (schedules.some(row => row.status === "sending" || (row.status === "failed" && row.claimed_at))) return true;
+  const key = email.draftId ? latestDraftAction(email.draftId, email.account)?.command_key : undefined;
+  const command = key ? getCommandSendByKey(key) : undefined;
+  // A pending command card also has a claim. Only an unconfirmed command here
+  // is evidence of an unresolved external attempt.
+  return command?.status === "unconfirmed";
+}
+
+export function reconcileClosedEmail(chatId: number, email: EmailLink, gmailMissing = false): ClosedEmailContext | undefined {
+  return db.transaction(() => {
+    const known = recordedClosedEmail(email);
+    if (!known && !gmailMissing) return undefined;
+    const action = email.draftId ? latestDraftAction(email.draftId, email.account) : undefined;
+    const ref: ClosedEmailContext = known ?? {
+      account: email.account, draftId: email.draftId, scheduleId: email.scheduledSendId,
+      threadId: action?.thread_id ?? undefined, to: linkedRecipient(email), status: "unknown",
+    };
+    closeEmailContext(ref);
+    const last = getClosedEmailContext(chatId);
+    return last && sameEmailLink(email, last) ? last : ref;
+  }).immediate();
 }
 
 export function deletePendingActionContext(chatId: number): void {
@@ -6156,6 +6364,7 @@ export interface ScheduledSendRecord {
   write_failures: number;
   claimed_at: string | null;
   sent_message_id: string | null;
+  sent_at?: string | null;
   created_at: string;
 }
 
@@ -6532,11 +6741,16 @@ export function transitionScheduledSend(
   to: ScheduledSendStatus,
 ): boolean {
   const places = from.map(() => "?").join(", ");
-  return (
-    db
-      .prepare(`UPDATE scheduled_sends SET status = ? WHERE id = ? AND status IN (${places})`)
-      .run(to, id, ...from).changes === 1
-  );
+  return db.transaction(() => {
+    const changed = db.prepare(`UPDATE scheduled_sends SET status = ? WHERE id = ? AND status IN (${places})`)
+      .run(to, id, ...from).changes === 1;
+    if (changed && to === "cancelled") {
+      const row = getScheduledSend(id);
+      const ref = row && scheduleEmailReference(row, "cancelled");
+      if (ref) closeEmailContext(ref);
+    }
+    return changed;
+  }).immediate();
 }
 
 /** Holds only the version the worker checked, so a correction saved meanwhile is kept. */
@@ -6584,10 +6798,15 @@ export function releaseHeldScheduledSend(id: number, request: string, expectedRe
 }
 
 export function recordScheduledSendSent(id: number, sentMessageId: string | null): void {
-  db.prepare("UPDATE scheduled_sends SET status = 'sent', sent_message_id = ?, sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP) WHERE id = ?").run(
-    sentMessageId,
-    id,
-  );
+  db.transaction(() => {
+    const changed = db.prepare("UPDATE scheduled_sends SET status = 'sent', sent_message_id = ?, sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP) WHERE id = ?").run(
+      sentMessageId, id,
+    ).changes === 1;
+    if (!changed) return;
+    const row = getScheduledSend(id);
+    const ref = row && scheduleEmailReference(row, "sent");
+    if (ref) closeEmailContext(ref);
+  }).immediate();
 }
 
 /** Retries a send that is still scheduled. A cancel that landed meanwhile stays cancelled. */

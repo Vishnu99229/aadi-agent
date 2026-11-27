@@ -9,6 +9,7 @@ import { config } from "./config.js";
 import { searchHistory } from "./embeddings.js";
 import { offerRelationshipMemory } from "./memory.js";
 import { buildRelationshipFact } from "./memory_logic.js";
+import { routeMiss, type PreRouteResult } from "./pre_route.js";
 import {
   countMeetingAutoSendsToday,
   createMeetingPendingBooking,
@@ -2345,17 +2346,17 @@ async function cancelSentBooking(ctx: Context, bookingId: number): Promise<void>
 export async function tryHandleMeetingChat(
   ctx: Context,
   text: string,
-): Promise<boolean> {
+): Promise<PreRouteResult | "completed" | undefined> {
   const propose = text.match(/^propose slots to\s+(\S+@\S+)/i);
   const find = text.match(
     /^find\s+(\d+)\s*min(?:utes)?\s+with\s+(\S+@\S+)(?:\s+(.+))?$/i,
   );
   if (!propose && !find) {
-    return false;
+    return undefined;
   }
   const email = normalizeEmail(propose?.[1] ?? find?.[2] ?? "");
   if (!email) {
-    return false;
+    return routeMiss("The meeting-card command did not contain a usable email address.", { scope: "read_only" });
   }
   const duration = find ? Number(find[1]) : config.meetingDefaultMinutes;
   const windowHint = find?.[3]?.trim() || "next week";
@@ -2365,8 +2366,7 @@ export async function tryHandleMeetingChat(
     processedAs: "card",
   });
   if (!inbound) {
-    await ctx.reply("Could not start that meeting card.");
-    return true;
+    return routeMiss("No meeting card could be created for this request.", { scope: "read_only" });
   }
   const card: CardPayload = {
     fromEmail: email,
@@ -2385,8 +2385,12 @@ export async function tryHandleMeetingChat(
     references: "",
     proposedTimes: [],
   };
-  await sendMeetingCard(ctx.api, inbound.id, card, "other");
-  return true;
+  try {
+    await sendMeetingCard(ctx.api, inbound.id, card, "other");
+    return "completed";
+  } catch {
+    return routeMiss("Meeting-card creation was not confirmed. Check its state without starting another.", { scope: "read_only" });
+  }
 }
 
 export function formatMeetingsReport(now = new Date()): string {

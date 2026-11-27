@@ -307,6 +307,7 @@ function saveAssistantReply(reply: string, saveAssistantMessage: boolean): strin
 }
 
 export interface RunAgentOptions {
+  replyDraftThread?: ToolTurn["replyDraftThread"];
   saveUserMessage?: boolean;
   saveAssistantMessage?: boolean;
   /** Per-job backend. Overrides task if both are set. */
@@ -828,7 +829,7 @@ async function runAgentLoop(
   };
   /** A specialist that needs another domain hands the turn back to Aadi. */
   const widenToAadi = async (): Promise<void> => {
-    if (!specialist || turnContext.allowed === undefined || options.delegation) {
+    if (!specialist || turnContext.allowed === undefined || options.delegation || options.toolNames) {
       return;
     }
     aadiPrompt ??= await readAadiPrompt();
@@ -1038,6 +1039,7 @@ async function runAgentLoop(
         confirmation: options.sendConfirmation,
         userText: options.guardText ?? userText,
         ctx: options.ctx,
+        replyDraftThread: options.replyDraftThread,
         // These calls came from the model's own response, not from code.
         modelCalled: true,
       };

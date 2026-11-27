@@ -8,8 +8,10 @@ import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_emai
 import { publishReadyDraft, reviseLinkedDraft } from "../src/context_draft.ts";
 import {
   createScheduledSend,
+  getClosedEmailContext,
   getScheduledSend,
   getPendingAction as getApprovalActionById,
+  latestDraftAction,
   getTask,
   listOpenScheduledSends,
   listScheduledSendsForDraft,
@@ -674,7 +676,8 @@ async function tapConfirmFor(id: number, data = latestConfirm(id)): Promise<stri
 
   const afterSent = await updateDraft({ draft_id: draftId, body: "later still" });
   assert(/^Too late/.test(afterSent) && /already went out/.test(afterSent), `after it went out, too, got ${afterSent}`);
-  assert(/already went out/.test(say(chat, "make it shorter").text ?? ""), "a rewrite after it went out is refused");
+  assert(!getPendingAction(chat)?.email, "delivery closes the scheduled draft in chat");
+  assert(getClosedEmailContext(chat)?.status === "sent" && getClosedEmailContext(chat)?.draftId === draftId, "delivery leaves a reference for a later reply");
   await runScheduledSendTick(new Date(FIRE.getTime() + 60_000));
   assert(sends.length === before + 1, "no second send");
 }
@@ -818,7 +821,7 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
 // cancel an unrelated scheduled delivery.
 {
   const chat = 11;
-  const { row: formerSchedule } = await draftThenSchedule(chat, "former@example.com", "Former recipient");
+  const { draftId: formerDraftId, row: formerSchedule } = await draftThenSchedule(chat, "former@example.com", "Former recipient");
   const queueRawTo = async (to: string, subject: string) => {
     const created = await gmail.users.drafts.create({
       userId: "me",
@@ -836,6 +839,8 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
     getApprovalActionById(actualRecipient.actionId)?.status === "superseded" && getApprovalActionById(quotedDraft.actionId)?.status === "pending",
     `parsed recipient matching keeps the former schedule and replaces current only: former schedule=${getScheduledSend(formerSchedule.id)?.status}, current=${getApprovalActionById(actualRecipient.actionId)?.status}, quoted=${getApprovalActionById(quotedDraft.actionId)?.status}`);
   transitionScheduledSend(formerSchedule.id, ["scheduled"], "cancelled");
+  assert(!getPendingAction(chat)?.email && getClosedEmailContext(chat)?.scheduleId === formerSchedule.id, "cancelling a scheduled copy closes its exact chat link");
+  assert(drafts.has(formerDraftId) && latestDraftAction(formerDraftId, "work")?.status === "pending", "the scheduled-copy cancel neither deletes the Gmail draft nor discards its approval");
 }
 
 // 12. Edits made before scheduling are what the scheduled email sends.

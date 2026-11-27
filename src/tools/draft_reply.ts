@@ -111,6 +111,7 @@ export function dropSelf(header: string): string {
 }
 
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
+  const recovery = turn.replyDraftThread;
   const referencedEmail = emailReferenceForTurn(turn.confirmation?.chatId, turn.confirmation?.messageId);
   if (referencedEmail) {
     return `Not drafted: ${referencedEmail} was selected from the OCR/photo or quoted message, not from a Gmail thread. Use draft_new_email for that address; no old reply was created.`;
@@ -130,13 +131,13 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("body must be a non-empty plain-text reply.");
   }
 
-  if (values.send_immediately === true) {
+  if (!recovery && values.send_immediately === true) {
     const hold = deliveryTimeHold(turn.userText ?? "");
     if (hold) return hold;
   }
   const { account, message: original } = await resolveGmailMessage(
     values.email_id.trim(),
-    parseGoogleAccountFilter(values.account),
+    recovery?.account ?? parseGoogleAccountFilter(values.account),
     "metadata",
     ["From", "To", "Cc", "Subject", "Message-ID", "References"],
   );
@@ -145,16 +146,18 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   const threadId = original.threadId;
   const from = header(headers, "From");
   const messageId = header(headers, "Message-ID");
+  const senders = parseAddressList(from);
 
-  if (!threadId || !from || !messageId) {
+  if (!threadId || !from || !messageId || (recovery && (threadId !== recovery.threadId ||
+    senders.length !== 1 || isSelfEmail(senders[0]!.email) || !recovery.recipients.includes(senders[0]!.email)))) {
     throw new Error(
       "The original email is missing threading or sender metadata.",
     );
   }
 
-  const explicitTo = toAddressList(values.to).join(", ");
-  const explicitCc = toAddressList(values.cc).join(", ");
-  const fromIsSelf = parseAddressList(from).every((item) =>
+  const explicitTo = recovery ? "" : toAddressList(values.to).join(", ");
+  const explicitCc = recovery ? "" : toAddressList(values.cc).join(", ");
+  const fromIsSelf = senders.every((item) =>
     isSelfEmail(item.email),
   );
 
@@ -189,6 +192,9 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     body,
     signatureHtml: await signatureHtmlFor(account),
   });
+  if (recovery && !recovery.claimWrite()) {
+    throw new Error("A reply draft write was already attempted for this request.");
+  }
   console.log(`Draft MIME headers: ${mimeHeaderNames(raw)}`);
   const result = await gmail.users.drafts.create({
     userId: "me",
@@ -206,7 +212,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   let cardNote = "";
   const sendImmediately =
-    values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
+    !recovery && values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({
       draftId: result.data.id,

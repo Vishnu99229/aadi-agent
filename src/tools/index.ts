@@ -78,6 +78,13 @@ import * as getRepoState from "./get_repo_state.js";
 import * as prepareBuild from "./prepare_build.js";
 
 export interface ToolTurn {
+  /** Target and one write attempt for a reply to a verified closed draft. */
+  replyDraftThread?: {
+    account: "work" | "personal";
+    threadId: string;
+    recipients: readonly string[];
+    claimWrite: () => boolean;
+  };
   /** 1 = the model's first step, decided from Vishnu's message alone. */
   iteration: number;
   /** Every tool the model called in this same step. */
