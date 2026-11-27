@@ -967,7 +967,7 @@ export interface OwnerTurnResult {
   publishDraft?: boolean;
   /** A published Gmail draft whose Send card must be discarded with this turn. */
   retireDraftId?: string;
-  retireDraftAccount?: GoogleAccountId;
+  retireDraftAccount?: PendingEmailState["account"];
   /** Replace only the subject of the open Gmail draft. With reviseEmail, the subject that rewrite uses. */
   subjectUpdate?: string;
   /** Change the open draft's To line without rewriting the message. */

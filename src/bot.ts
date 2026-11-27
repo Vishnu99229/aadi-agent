@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard, Keyboard, type Api, type Context } from "grammy";
 import { isDraftCardOnly } from "./draft_confirm.js";
-import { runAgent } from "./agent.js";
+import { defaultToolNames, runAgent } from "./agent.js";
 import { issueGrant, revokeGrant } from "./agents/auth.js";
 import { listWorkflows } from "./agents/store.js";
 import type { CardButton } from "./agents/helpers.js";
@@ -40,7 +40,7 @@ import { stageExternalContext } from "./context_lookup.js";
 import { bookPendingMeetingAt, handleCommandSendCallback, tryPendingRecipientEdit, sendEmailFromTool } from "./command_email.js";
 import { looksLikeCommandTurn, parseOwnerEmailSendAt, splitOwnerEmailCommand } from "./command_logic.js";
 import { handleScheduledSendCallback, handleScheduledSendsCommand } from "./scheduled_sends.js";
-import { defaultToolNames, FORWARDED_TOOLS } from "./tools/index.js";
+import { FORWARDED_TOOLS } from "./tools/index.js";
 import { handleSequenceCallback, handleSequenceCommand } from "./sequences.js";
 import {
   handleSequencesCommand,
