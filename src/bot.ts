@@ -86,6 +86,7 @@ import {
   deleteMemory,
   getMeetingBrief,
   getSetting,
+  ownerMessageIdsBefore,
   pruneProcessedMessages,
   saveMessage,
   setSetting,
@@ -1643,7 +1644,8 @@ async function handleUserText(
   if (!recovery && owned && ctx.chat && emailReference.kind === "none" &&
     !getPendingAction(ctx.chat.id)?.email && wantsClosedEmail) {
     const last = lastEmailReference(ctx.chat.id);
-    if (last) await handleResult(closedDraftMiss(last));
+    const previous = ownerMessageIdsBefore(ctx.chat.id, ctx.message!.message_id, 1)[0] ?? 0;
+    if (last?.focusMessageId === previous) await handleResult(closedDraftMiss(last));
   }
 
   if (

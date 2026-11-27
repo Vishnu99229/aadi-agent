@@ -2075,7 +2075,7 @@ export function settleDraftDelivery(input: {
     const action = input.actionId === undefined
       ? input.draftId ? getPendingActionForDraft(input.draftId, input.account) : undefined
       : getPendingAction(input.actionId);
-    const delivery = { messageId: input.sentMessageId };
+    const delivery = { messageId: input.sentMessageId, background: input.commandKey?.startsWith("sched:") === true };
     const delivered = action && (transitionPendingAction(action.id, "pending", "sent", delivery) ||
       // A new card may have replaced this one while Gmail was already delivering it.
       transitionPendingAction(action.id, "superseded", "sent", delivery));
@@ -2220,7 +2220,7 @@ export function transitionPendingAction(
   id: number,
   from: PendingActionStatus,
   to: PendingActionStatus,
-  delivery?: { messageId?: string },
+  delivery?: { messageId?: string; background?: boolean },
 ): boolean {
   return db.transaction(() => {
     const changed = db.prepare(
@@ -2231,7 +2231,7 @@ export function transitionPendingAction(
         "UPDATE pending_actions SET sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP), sent_message_id = COALESCE(?, sent_message_id) WHERE id = ?",
       ).run(delivery.messageId ?? null, id);
       const action = getPendingAction(id);
-      if (action?.draft_id) closeEmailContext(emailReferenceForAction(action, to));
+      if (action?.draft_id) closeEmailContext(emailReferenceForAction(action, to), undefined, delivery?.background);
     }
     return changed;
   }).immediate();
@@ -6076,6 +6076,7 @@ export interface ClosedEmailContext {
   status: ClosedEmailStatus;
   sentAt?: string;
   sentMessageId?: string;
+  focusMessageId?: number;
 }
 
 function isClosedEmailStatus(status: PendingActionStatus): status is ClosedEmailStatus & PendingActionStatus {
@@ -6135,6 +6136,19 @@ export function getClosedEmailContext(chatId: number): (ClosedEmailContext & { c
   return row ? { ...JSON.parse(row.detail) as ClosedEmailContext, closedAt: row.closed_at } : undefined;
 }
 
+/** A Gmail read can restore focus on precisely the closed email's thread. */
+export function focusClosedEmailFromRead(input: {
+  chatId: number; messageId: number; account: GoogleAccountId; threadId: string;
+}): void {
+  db.prepare(`UPDATE closed_email_contexts
+    SET detail = json_set(detail, '$.focusMessageId', ?)
+    WHERE chat_id = ?
+      AND json_extract(detail, '$.account') = ?
+      AND json_extract(detail, '$.threadId') = ?
+      AND COALESCE(json_extract(detail, '$.focusMessageId'), 0) < ?`)
+    .run(input.messageId, input.chatId, input.account, input.threadId, input.messageId);
+}
+
 function sameEmailLink(email: EmailLink, ref: ClosedEmailContext): boolean {
   return email.account === ref.account && (ref.status === "cancelled" && ref.scheduleId
     ? email.scheduledSendId === ref.scheduleId
@@ -6143,7 +6157,11 @@ function sameEmailLink(email: EmailLink, ref: ClosedEmailContext): boolean {
 }
 
 /** Called in the transition transaction. Only the email itself and its authority are closed. */
-function closeEmailContext(ref: ClosedEmailContext, origin?: { chatId: number; messageId: number }): void {
+function closeEmailContext(
+  ref: ClosedEmailContext,
+  origin?: { chatId: number; messageId: number },
+  useLinkedMessage = false,
+): void {
   const rows = db.prepare("SELECT * FROM pending_action_contexts").all() as PendingActionRow[];
   const store = db.prepare(`INSERT INTO closed_email_contexts (chat_id, detail)
     VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET detail = excluded.detail, closed_at = CURRENT_TIMESTAMP`);
@@ -6160,7 +6178,11 @@ function closeEmailContext(ref: ClosedEmailContext, origin?: { chatId: number; m
     const matchesCommand = !ref.draftId && !ref.scheduleId && !email.draftId && !email.scheduledSendId &&
       row.chat_id === origin?.chatId && row.confirm_message === origin?.messageId && row.action === "send_email";
     if (!sameEmailLink(email, ref) && !matchesCommand) continue;
-    store.run(row.chat_id, JSON.stringify({ ...ref, to: ref.to ?? linkedRecipient(email) }));
+    const focusMessageId = origin?.messageId ??
+      (ref.scheduleId || useLinkedMessage || ref.status === "expired"
+        ? row.confirm_message
+        : ownerMessageIdsBefore(row.chat_id, Number.MAX_SAFE_INTEGER, 1)[0] ?? 0);
+    store.run(row.chat_id, JSON.stringify({ ...ref, focusMessageId, to: ref.to ?? linkedRecipient(email) }));
     delete state.email;
     if (row.action === "draft_email" || row.action === "send_email") {
       delete state.authorizedAt;
@@ -6183,7 +6205,9 @@ function closeEmailContext(ref: ClosedEmailContext, origin?: { chatId: number; m
       Array<{ chat_id: number; detail: string }>;
     for (const row of previous) {
       const old = JSON.parse(row.detail) as ClosedEmailContext;
-      store.run(row.chat_id, JSON.stringify({ ...ref, to: ref.to ?? old.to, threadId: ref.threadId ?? old.threadId }));
+      store.run(row.chat_id, JSON.stringify({
+        ...ref, to: ref.to ?? old.to, threadId: ref.threadId ?? old.threadId, focusMessageId: old.focusMessageId,
+      }));
     }
   }
 }
@@ -6240,7 +6264,7 @@ export function reconcileClosedEmail(chatId: number, email: EmailLink, gmailMiss
       account: email.account, draftId: email.draftId, scheduleId: email.scheduledSendId,
       threadId: action?.thread_id ?? undefined, to: linkedRecipient(email), status: "unknown",
     };
-    closeEmailContext(ref);
+    closeEmailContext(ref, undefined, true);
     const last = getClosedEmailContext(chatId);
     return last && sameEmailLink(email, last) ? last : ref;
   }).immediate();

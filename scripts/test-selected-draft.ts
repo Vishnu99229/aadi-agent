@@ -264,6 +264,31 @@ assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email"
   savePendingAction(1, stale);
   assert(!getChatAction(1)?.email, "a stale save can't reopen a delivered draft");
 
+  let shortenedAnswer = false;
+  const topicChange = async (params: CompleteParams): Promise<CompleteResult> => {
+    if (!params.tools.length) return modelReply({ text: '{"facts":[]}' });
+    const current = params.messages.at(-1)?.content;
+    const prior = JSON.stringify(params.messages.slice(0, -1));
+    if (typeof current === "string" && current.startsWith("make it shorter")) {
+      shortenedAnswer = prior.includes("Canberra is the capital of Australia.");
+      assert(!JSON.stringify(params.system).includes(fahimThread), "an unrelated follow-up does not bind to the closed thread");
+      return modelReply({ text: "Canberra." });
+    }
+    if (params.messages.at(-1)?.role === "tool") return modelReply({ text: "Fahim raised four concerns about the partnership." });
+    if (typeof current === "string" && current.includes("Fahim")) {
+      return modelReply({ tools: [{ name: "read_email", input: { id: "fahim-inbound", account: "work" } }] });
+    }
+    return modelReply({ text: "Canberra is the capital of Australia." });
+  };
+  setCompleteForTests(topicChange);
+  setRouteModelCompleteForTests(async (_spec, params) => topicChange(params));
+  await say("What is the capital of Australia?");
+  await say("make it shorter");
+  assert(shortenedAnswer, "a follow-up to an unrelated answer retains normal chat history");
+  const beforeRead = getClosedEmailContext(1)?.focusMessageId;
+  await say("What did Fahim say in his latest email?");
+  assert(getClosedEmailContext(1)?.focusMessageId !== beforeRead, "reading Fahim's thread restores its focus");
+
   const instructions = "Also mention flexible negotiation, a one-off 24/7 availability exception, APIs and webhooks ready now, and about 300 sequential outbound calls per agent each day.";
   let reads = 0;
   let reachedEmail = false;
