@@ -1,5 +1,10 @@
 import type { ToolCall } from "../llm.js";
 import { isSuccessfulToolResult } from "../receipt.js";
+import { emailRecoveryFor, hasEmailRecovery, type EmailRecovery } from "../email_recovery.js";
+import {
+  currentEmailTurn, EmailOperationError, newEmailTurn, observeEmailTool, withEmailTurn,
+  type EmailOutcome, type EmailToolObservation, type EmailTurnOutcomes,
+} from "../email_outcomes.js";
 import { assertTestSeam } from "../test_seam.js";
 import { tools as toolRegistry, type ToolTurn } from "../tools/index.js";
 import { authorize, type AuthGrant } from "./auth.js";
@@ -31,6 +36,8 @@ const PREVIEW_CHARS = 200;
 export interface ToolOutcome {
   content: string;
   isError?: boolean;
+  emailRecovery?: EmailRecovery;
+  emailOutcomes?: readonly EmailOutcome[];
 }
 
 type ToolInterceptor = (call: ToolCall, turn: ToolTurn) => string | undefined;
@@ -48,6 +55,8 @@ export interface WorkflowToolRun {
   tool: string;
   ok: boolean;
   content: string;
+  emailOutcomes?: readonly EmailOutcome[];
+  emailRecovery?: EmailRecovery;
 }
 
 const MAX_TRACKED_WORKFLOWS = 50;
@@ -110,6 +119,8 @@ export interface TurnContext {
   cacheHits: number;
   /** Calls running right now, so an identical write started alongside waits for it. */
   inflight: Map<string, Promise<ToolOutcome>>;
+  emailFailures: Map<string, ToolOutcome>;
+  emailTurn: EmailTurnOutcomes;
 }
 
 /** His own chat turn: an owner_chat grant with his confirmation, at the top level of
@@ -162,6 +173,8 @@ export function newTurnContext(input: {
     refused: 0,
     cacheHits: 0,
     inflight: new Map(),
+    emailFailures: new Map(),
+    emailTurn: currentEmailTurn() ?? newEmailTurn(),
   };
 }
 
@@ -222,11 +235,12 @@ export async function dispatchTool(
   turn: ToolTurn,
   ctx: TurnContext,
 ): Promise<ToolOutcome> {
+  const deny = (content: string, reason: "not_authorized" | "write_unconfirmed"): ToolOutcome => ({
+    content, isError: true,
+    emailRecovery: emailRecoveryFor(call.name, call.input, turn, content, new EmailOperationError(content, reason)),
+  });
   if (ctx.allowed && !ctx.allowed.has(call.name)) {
-    return {
-      content: ctx.notAllowedMessage ?? "Tool is not available for a forwarded message.",
-      isError: true,
-    };
+    return deny(ctx.notAllowedMessage ?? "Tool is not available for a forwarded message.", "not_authorized");
   }
   const tool = toolRegistry[call.name];
   const ownership = toolOwnership(call.name);
@@ -244,7 +258,10 @@ export async function dispatchTool(
     console.log(
       `agent dispatch: refused agent=${ownership.owner} capability=${call.name} source=${ctx.grant?.source ?? "none"}`,
     );
-    return { content: `Not done: ${decision.reason}`, isError: true };
+    return deny(`Not done: ${decision.reason}`, "not_authorized");
+  }
+  if (ctx.emailTurn.uncertain && ownership.effect !== "read") {
+    return deny("An email write is unconfirmed. Use read-only tools to check what happened.", "write_unconfirmed");
   }
 
   // `fresh` is for the cache only; the tool never sees it.
@@ -252,6 +269,8 @@ export async function dispatchTool(
   const input = isRecord(call.input) && "fresh" in call.input ? withoutFresh(call.input) : call.input;
   const repeatable = ownership.effect === "read";
   const key = stableKey(call.name, input);
+  const failed = ctx.emailFailures.get(key);
+  if (failed) return failed;
   // A write is never run twice in a turn. A read is, unless this answer is a
   // fallback for a provider that already ran the same call.
   const prior = ctx.doneCalls.get(key);
@@ -270,7 +289,7 @@ export async function dispatchTool(
     const first = await running;
     ctx.trace.push({ tool: call.name, owner: ownership.owner, ok: !first.isError, reused: true, ms: 0 });
     console.log(`agent dispatch: duplicate joined agent=${ownership.owner} capability=${call.name}`);
-    return first;
+    return { ...first, emailOutcomes: undefined };
   }
   const execution = runCall(call, input, key, repeatable, fresh, ownership, turn, ctx);
   ctx.inflight.set(key, execution);
@@ -343,6 +362,8 @@ async function runCall(
   const slot = await acquire("tools");
   const startedAt = Date.now();
   let outcome: ToolOutcome;
+  const observation: EmailToolObservation = { writes: [] };
+  let stubbed = false;
   // A test stand-in that throws is simulating a crash, not a tool error: it is
   // recorded like any failure and then thrown on, as it always was.
   let crash: { error: unknown } | undefined;
@@ -353,19 +374,43 @@ async function runCall(
     const handlerTurn: ToolTurn = { ...turn, ownTurn: isOwnChatTurn(ctx, turn.confirmation) };
     try {
       intercepted = toolInterceptor?.(call, handlerTurn);
+      stubbed = intercepted !== undefined;
     } catch (error) {
       crash = { error };
       throw error;
     }
-    outcome = { content: intercepted !== undefined ? intercepted : await tool.handler(input, handlerTurn) };
+    const content = intercepted !== undefined ? intercepted : await withEmailTurn(ctx.emailTurn, () =>
+      observeEmailTool(observation, () => {
+        if (!repeatable && ctx.emailTurn.uncertain) {
+          throw new EmailOperationError("An email write is unconfirmed. Use read-only tools to check what happened.", "write_unconfirmed");
+        }
+        return tool.handler(input, handlerTurn);
+      }),
+    );
+    outcome = { content };
     if (!outcome.isError) {
       notePresentedFromTool(call.name, outcome.content, turn.confirmation?.chatId ?? ctx.chatId);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof EmailOperationError && !observation.failure) observation.failure = error;
     outcome = { content: `Tool failed: ${message}`, isError: true };
   } finally {
     slot.release();
+  }
+  if (observation.writes.length) outcome.emailOutcomes = observation.writes;
+  if (hasEmailRecovery(call.name) && !stubbed) {
+    const recovery = emailRecoveryFor(call.name, input, turn, outcome.content, observation.failure, outcome.isError);
+    if (recovery) {
+      outcome.emailRecovery = recovery;
+      if (recovery.read_only) ctx.emailTurn.uncertain = true;
+      if (recovery.terminal || observation.writes.length > 0) {
+        ctx.emailFailures.set(key, { ...outcome, emailOutcomes: undefined });
+      }
+      if (recovery.terminal && (recovery.reason !== "approval_required" || observation.writes.length === 0)) {
+        ctx.emailTurn.notices.add(recovery.userMessage);
+      }
+    }
   }
   const ms = Date.now() - startedAt;
   const ok = isSuccessfulToolResult(outcome.content, outcome.isError);
@@ -388,7 +433,7 @@ async function runCall(
   }
   ctx.trace.push({ tool: call.name, owner: ownership.owner, ok, ms });
   if (ctx.parentTaskId && ctx.workflowId) {
-    noteWorkflowToolRun(ctx.workflowId, { tool: call.name, ok, content: outcome.content });
+    noteWorkflowToolRun(ctx.workflowId, { tool: call.name, ok, ...outcome });
   }
   if (taskId) {
     try {

@@ -16,6 +16,7 @@ import { linkPublishedDraft } from "../action_context.js";
 import { emailReferenceForTurn, refersToEarlierEmail } from "../email_references.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
+import { emailProviderRead, EmailOperationError, noteEmailFailure } from "../email_outcomes.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -64,7 +65,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
 };
 
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
-  const values = input as {
+  const values = (input ?? {}) as {
     to?: unknown;
     cc?: unknown;
     subject?: unknown;
@@ -125,10 +126,13 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     const hold = deliveryTimeHold(turn.userText ?? "");
     if (hold) return hold;
   }
-  const account = await getGoogleAccount(
-    values.account === "personal" ? "personal" : "work",
+  const mailbox = values.account === "personal" ? "personal" : "work";
+  const { account, signatureHtml } = await emailProviderRead(
+    async () => {
+      const account = await getGoogleAccount(mailbox);
+      return { account, signatureHtml: await signatureHtmlFor(account) };
+    }, "I couldn't read the mailbox settings. No draft write was attempted.", { account: mailbox, recipient: toHeader },
   );
-  const signatureHtml = await signatureHtmlFor(account);
   const { draftId } = await createNewEmailDraft({
     account,
     to: [toHeader],
@@ -155,6 +159,9 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     }
     if (sent.ok) {
       return [`Sent to ${toHeader}.`, sent.replacementNotice].filter(Boolean).join("\n");
+    }
+    if (sent.reason === "unconfirmed") {
+      return noteEmailFailure(new EmailOperationError("Gmail didn't confirm the send. Check Sent mail before any further action.", "write_unconfirmed", { draftId, account: account.id, recipient: toHeader }));
     }
   }
 

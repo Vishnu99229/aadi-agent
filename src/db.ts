@@ -47,6 +47,7 @@ export interface PendingAction {
   live_to_header?: string | null;
   sent_at?: string | null;
   sent_message_id?: string | null;
+  sent_thread_id?: string | null;
   cc_header: string | null;
   subject: string | null;
   /** The send command this card stands for, when a command became a card. */
@@ -1484,6 +1485,15 @@ if (!tableHasColumn("pending_actions", "sent_message_id")) {
 for (const table of ["pending_actions", "scheduled_sends"]) {
   if (!tableHasColumn(table, "sent_at")) db.exec(`ALTER TABLE ${table} ADD COLUMN sent_at TEXT`);
 }
+if (!tableHasColumn("pending_actions", "sent_thread_id")) {
+  db.exec("ALTER TABLE pending_actions ADD COLUMN sent_thread_id TEXT");
+}
+db.exec(`CREATE TABLE IF NOT EXISTS unconfirmed_draft_deliveries (
+  account TEXT NOT NULL,
+  draft_id TEXT NOT NULL,
+  attempted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (account, draft_id)
+)`);
 // A "send then follow-ups" request rides on the card of an email that needs his tap.
 if (!tableHasColumn("pending_actions", "followup_words")) {
   db.exec(`ALTER TABLE pending_actions ADD COLUMN followup_words TEXT`);
@@ -1879,7 +1889,7 @@ export function insertMessageEmbedding(row: {
 const PENDING_ACTION_COLUMNS = `id, type, draft_id, thread_id, google_account, status,
               telegram_message_id, event_title, event_start, event_end,
               event_attendees, event_description, created_at, auto_send_at,
-              updated_at, to_header, cc_header, subject, command_key, live_to_header, sent_at, sent_message_id`;
+              updated_at, to_header, cc_header, subject, command_key, live_to_header, sent_at, sent_message_id, sent_thread_id`;
 
 export function createPendingAction(
   draftId: string,
@@ -2069,16 +2079,19 @@ export function registerPendingDraft(input: {
 export function settleDraftDelivery(input: {
   account: GoogleAccountId; to: string; actionId?: number; draftId?: string;
   commandKey?: string | null; sentMessageId?: string;
+  sentThreadId?: string;
   schedule?: { id: number; taskId: number };
 }): PendingAction[] {
   return db.transaction(() => {
     const action = input.actionId === undefined
       ? input.draftId ? getPendingActionForDraft(input.draftId, input.account) : undefined
       : getPendingAction(input.actionId);
-    const delivery = { messageId: input.sentMessageId, background: input.commandKey?.startsWith("sched:") === true };
+    const delivery = { messageId: input.sentMessageId, threadId: input.sentThreadId, background: input.commandKey?.startsWith("sched:") === true };
     const delivered = action && (transitionPendingAction(action.id, "pending", "sent", delivery) ||
       // A new card may have replaced this one while Gmail was already delivering it.
       transitionPendingAction(action.id, "superseded", "sent", delivery));
+    const deliveredDraft = input.draftId ?? action?.draft_id;
+    if (deliveredDraft) clearUnconfirmedDraftDelivery(deliveredDraft, input.account);
     if (input.commandKey) recordCommandSendSent(input.commandKey, input.sentMessageId ?? "unknown");
     const command = input.commandKey ? db.prepare(
       "SELECT status, thread_id, sent_at FROM command_sends WHERE idem_key = ? AND account = ?",
@@ -2087,7 +2100,7 @@ export function settleDraftDelivery(input: {
     if (!delivered && (input.draftId || (origin && command?.status === "sent"))) {
       closeEmailContext({
         account: input.account, draftId: input.draftId, status: "sent", to: input.to,
-        threadId: command?.thread_id ?? undefined, sentAt: command?.sent_at ?? recordedNow(),
+        threadId: input.sentThreadId ?? command?.thread_id ?? undefined, sentAt: command?.sent_at ?? recordedNow(),
         sentMessageId: input.sentMessageId,
       }, origin ? { chatId: Number(origin[1]), messageId: Number(origin[2]) } : undefined);
     }
@@ -2220,7 +2233,7 @@ export function transitionPendingAction(
   id: number,
   from: PendingActionStatus,
   to: PendingActionStatus,
-  delivery?: { messageId?: string; background?: boolean },
+  delivery?: { messageId?: string; threadId?: string; background?: boolean },
 ): boolean {
   return db.transaction(() => {
     const changed = db.prepare(
@@ -2228,8 +2241,8 @@ export function transitionPendingAction(
     ).run(to, id, from).changes === 1;
     if (changed && isClosedEmailStatus(to)) {
       if (to === "sent" && delivery) db.prepare(
-        "UPDATE pending_actions SET sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP), sent_message_id = COALESCE(?, sent_message_id) WHERE id = ?",
-      ).run(delivery.messageId ?? null, id);
+        "UPDATE pending_actions SET sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP), sent_message_id = COALESCE(?, sent_message_id), sent_thread_id = COALESCE(?, sent_thread_id) WHERE id = ?",
+      ).run(delivery.messageId ?? null, delivery.threadId ?? null, id);
       const action = getPendingAction(id);
       if (action?.draft_id) closeEmailContext(emailReferenceForAction(action, to), undefined, delivery?.background);
     }
@@ -6105,7 +6118,7 @@ function emailReferenceForAction(action: PendingAction, status: ClosedEmailStatu
     : undefined;
   return {
     account: action.google_account, draftId: action.draft_id ?? undefined, status,
-    threadId: action.thread_id ?? undefined, to: action.live_to_header ?? action.to_header ?? undefined,
+    threadId: action.sent_thread_id ?? action.thread_id ?? undefined, to: action.live_to_header ?? action.to_header ?? undefined,
     sentAt: action.sent_at ?? sentSchedule?.sent_at ?? undefined,
     sentMessageId: action.sent_message_id ?? sentSchedule?.sent_message_id ?? undefined,
   };
@@ -6244,6 +6257,7 @@ export function recordedClosedEmail(email: EmailLink): ClosedEmailContext | unde
 }
 
 export function emailDeliveryUnsettled(email: EmailLink): boolean {
+  if (email.draftId && unconfirmedDraftDelivery(email.draftId, email.account)) return true;
   const schedules = email.draftId ? draftDeliveryRows(email.draftId, email.account) : [];
   const directSchedule = email.scheduledSendId ? getScheduledSend(email.scheduledSendId) : undefined;
   if (directSchedule && scheduleEmailReference(directSchedule, "sent")?.account === email.account) schedules.push(directSchedule);
@@ -6601,6 +6615,19 @@ function draftDeliveryRows(draftId: string, account: string): ScheduledSendRecor
     .all(draftId, account) as ScheduledSendRecord[];
 }
 
+export function recordUnconfirmedDraftDelivery(draftId: string, account: string): boolean {
+  return db.prepare("INSERT OR IGNORE INTO unconfirmed_draft_deliveries (account, draft_id) VALUES (?, ?)").run(account, draftId).changes === 1;
+}
+
+export function clearUnconfirmedDraftDelivery(draftId: string, account: string): void {
+  db.prepare("DELETE FROM unconfirmed_draft_deliveries WHERE account = ? AND draft_id = ?").run(account, draftId);
+}
+
+export function unconfirmedDraftDelivery(draftId: string, account: string): { attempted_at: string } | undefined {
+  return db.prepare("SELECT attempted_at FROM unconfirmed_draft_deliveries WHERE account = ? AND draft_id = ?")
+    .get(account, draftId) as { attempted_at: string } | undefined;
+}
+
 /**
  * One claim for every way this draft can go out. The manual Send button and the
  * scheduled worker both take it before Gmail, so only one of them proceeds.
@@ -6666,6 +6693,9 @@ export function claimDraftDelivery(
     const action = (account === "work" || account === "personal") ? latestDraftAction(draftId, account) : undefined;
     if (action?.status === "superseded" || (action?.status === "pending" && olderDuplicateDrafts().some((row) => row.id === action.id))) {
       return { state: "superseded" };
+    }
+    if (unconfirmedDraftDelivery(draftId, account)) {
+      return { state: "unconfirmed", id: 0, itemText: "Gmail has not confirmed the draft delivery." };
     }
     return classify(0);
   }).immediate();

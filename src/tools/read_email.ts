@@ -167,6 +167,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   return [
     `Account: ${account.label}`,
     `Tag: ${account.tag}`,
+    ...(message.threadId ? [`Thread ID: ${message.threadId}`] : []),
     `From: ${header(headers, "From")}`,
     `To: ${header(headers, "To")}`,
     ...(cc ? [`Cc: ${cc}`] : []),

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Api, InlineKeyboard } from "grammy";
+import { emailProviderWrite, EmailOperationError } from "./email_outcomes.js";
 
 /** A card a tool would post during a turn: its full text, the short text its
  *  buttons need, and its buttons. */
@@ -10,6 +11,8 @@ export interface VoiceCard {
   /** Told the Telegram message the card ended up on, so later taps can edit it. */
   onPosted?: (messageId: number) => void;
   posted?: boolean;
+  emailCard?: EmailOperationError["evidence"];
+  writeUnconfirmed?: boolean;
 }
 
 interface Collector {
@@ -47,11 +50,22 @@ export function holdForVoiceNote(card: VoiceCard): boolean {
 
 /** A card on a message of its own, the way it would have been without a voice turn. */
 export async function postCard(api: Api, chatId: number, card: VoiceCard): Promise<void> {
-  const message = await api.sendMessage(
+  const send = () => api.sendMessage(
     chatId,
     card.text,
     card.keyboard ? { reply_markup: card.keyboard } : {},
   );
+  let message: Awaited<ReturnType<typeof send>>;
+  try {
+    message = card.emailCard ? await emailProviderWrite(send, {
+      rejected: "Telegram rejected the card.",
+      unconfirmed: "Telegram didn't confirm the card. Check Telegram before posting another.",
+      evidence: card.emailCard,
+    }) : await send();
+  } catch (error) {
+    if (error instanceof EmailOperationError && error.reason === "write_unconfirmed") card.writeUnconfirmed = true;
+    throw error;
+  }
   card.posted = true;
   card.onPosted?.(message.message_id);
 }

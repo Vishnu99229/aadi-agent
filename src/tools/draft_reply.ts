@@ -8,9 +8,8 @@ import {
 import { parseGoogleAccountFilter } from "../google/auth.js";
 import type { ToolTurn } from "./index.js";
 import {
-  buildThreadReplyMime,
-  gmailClient,
-  mimeHeaderNames,
+  createThreadReplyDraft,
+  GmailMessageNotFoundError,
   resolveGmailMessage,
   signatureHtmlFor,
 } from "../google/mail.js";
@@ -19,6 +18,7 @@ import { parseAddressList } from "../mail_helpers.js";
 import { isSelfEmail } from "../mom_logic.js";
 import { emailReferenceForTurn } from "../email_references.js";
 import { groundGreeting, recipientGrounding } from "../email_grounding.js";
+import { emailProviderRead, EmailOperationError, noteEmailFailure } from "../email_outcomes.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -116,7 +116,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   if (referencedEmail) {
     return `Not drafted: ${referencedEmail} was selected from the OCR/photo or quoted message, not from a Gmail thread. Use draft_new_email for that address; no old reply was created.`;
   }
-  const values = input as {
+  const values = (input ?? {}) as {
     email_id?: unknown;
     body?: unknown;
     account?: unknown;
@@ -135,13 +135,19 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     const hold = deliveryTimeHold(turn.userText ?? "");
     if (hold) return hold;
   }
-  const { account, message: original } = await resolveGmailMessage(
-    values.email_id.trim(),
-    recovery?.account ?? parseGoogleAccountFilter(values.account),
+  const emailId = values.email_id.trim();
+  const mailbox = recovery?.account ?? parseGoogleAccountFilter(values.account);
+  const { account, message: original } = await emailProviderRead(() => resolveGmailMessage(
+    emailId, mailbox,
     "metadata",
     ["From", "To", "Cc", "Subject", "Message-ID", "References"],
-  );
-  const gmail = gmailClient(account);
+  ).catch(error => {
+    if (error instanceof GmailMessageNotFoundError) throw new EmailOperationError(
+      "That message ID isn't in Gmail. Find the original email before drafting a reply.", "message_missing",
+      { account: mailbox, threadId: recovery?.threadId },
+    );
+    throw error;
+  }), "I couldn't read the original email. No reply draft was created.", { account: mailbox, messageId: emailId, threadId: recovery?.threadId });
   const headers = original.payload?.headers;
   const threadId = original.threadId;
   const from = header(headers, "From");
@@ -150,8 +156,9 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   if (!threadId || !from || !messageId || (recovery && (threadId !== recovery.threadId ||
     senders.length !== 1 || isSelfEmail(senders[0]!.email) || !recovery.recipients.includes(senders[0]!.email)))) {
-    throw new Error(
+    throw new EmailOperationError(
       "The original email is missing threading or sender metadata.",
+      "message_missing", { account: account.id, threadId: recovery?.threadId, recipient: recovery?.recipients[0] },
     );
   }
 
@@ -183,39 +190,30 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   const body = ground ? groundGreeting(values.body, ground.allowedName, ground.line) : values.body;
 
   const subject = replySubject(header(headers, "Subject"));
-  const raw = buildThreadReplyMime({
+  const signatureHtml = await emailProviderRead(() => signatureHtmlFor(account),
+    "I couldn't read the mailbox signature. No reply draft was created.", { account: account.id, messageId: emailId, threadId, recipient: to });
+  if (recovery && !recovery.claimWrite()) {
+    throw new EmailOperationError("A reply draft write was already attempted for this request. Read the thread to check its state.",
+      "write_unconfirmed", { account: account.id, messageId: emailId, threadId, recipient: to });
+  }
+  const { draftId } = await createThreadReplyDraft({
+    account,
+    threadId,
     to,
     cc: cc || undefined,
     subject,
     inReplyTo: messageId,
     references: header(headers, "References"),
     body,
-    signatureHtml: await signatureHtmlFor(account),
+    signatureHtml,
   });
-  if (recovery && !recovery.claimWrite()) {
-    throw new Error("A reply draft write was already attempted for this request.");
-  }
-  console.log(`Draft MIME headers: ${mimeHeaderNames(raw)}`);
-  const result = await gmail.users.drafts.create({
-    userId: "me",
-    requestBody: {
-      message: {
-        threadId,
-        raw: Buffer.from(raw, "utf8").toString("base64url"),
-      },
-    },
-  });
-
-  if (!result.data.id) {
-    throw new Error("Gmail created the draft without returning a draft ID.");
-  }
 
   let cardNote = "";
   const sendImmediately =
     !recovery && values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({
-      draftId: result.data.id,
+      draftId,
       googleAccount: account.id,
       confirmation: turn.confirmation,
       ownTurn: turn.ownTurn === true,
@@ -224,6 +222,9 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     if (sent.ok) {
       return [`Sent to ${to}.`, sent.replacementNotice].filter(Boolean).join("\n");
     }
+    if (sent.reason === "unconfirmed") {
+      return noteEmailFailure(new EmailOperationError("Gmail didn't confirm the send. Check Sent mail before any further action.", "write_unconfirmed", { draftId, account: account.id, recipient: to, threadId, messageId: emailId }));
+    }
     if (sent.reason === "card") {
       cardNote = sent.message;
     }
@@ -231,7 +232,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   let replacementNotice = "";
   await queueDraftApproval({
-    draftId: result.data.id,
+    draftId,
     threadId,
     to,
     cc: cc || undefined,
@@ -243,7 +244,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   if (turn.confirmation) {
     linkPublishedDraft({
       chatId: turn.confirmation.chatId,
-      draftId: result.data.id,
+      draftId,
       to,
       cc,
       subject,
@@ -253,7 +254,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   }
 
   return JSON.stringify({
-    draft_id: result.data.id,
+    draft_id: draftId,
     account: account.id,
     tag: account.tag,
     to,
