@@ -2053,6 +2053,12 @@ export function registerPendingDraft(input: {
       return { replaced: supersedeDraft(existing) ? [existing] : [] };
     }
     const action = existing?.status === "pending" ? existing : createPendingAction(input.draftId, input.threadId, input.account);
+    if (existing?.status === "expired") {
+      db.prepare(`DELETE FROM closed_email_contexts
+        WHERE json_extract(detail, '$.status') = 'expired'
+          AND json_extract(detail, '$.draftId') = ?
+          AND json_extract(detail, '$.account') = ?`).run(input.draftId, input.account);
+    }
     db.prepare("UPDATE pending_actions SET live_to_header = ? WHERE id = ?").run(input.to, action.id);
     if (input.commandKey) setPendingActionCommandKey(action.id, input.commandKey);
     return { action, replaced: supersedeOverlappingDrafts(input.account, input.to, action.id) };

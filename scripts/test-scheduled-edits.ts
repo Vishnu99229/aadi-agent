@@ -544,6 +544,7 @@ async function tapConfirmFor(id: number, data = latestConfirm(id)): Promise<stri
   const sent = sends.at(-1)!;
   assert(sends.length === before + 1, "one email");
   assert(sent.subject === "Roadmap and pricing" && /shared Friday/.test(sent.body), `both revisions go out, got ${sent.subject} / ${sent.body}`);
+  assert(!getPendingAction(chat)?.email && getClosedEmailContext(chat)?.scheduleId === row.id, "schedule-only delivery closes the chat link");
 }
 
 // 4. Changes while the worker prepares a finalized copy: the stale copy is thrown away and
@@ -883,7 +884,7 @@ const newestOpen = () => listOpenScheduledSends().sort((left, right) => right.id
   assert(/already went out/.test(late) && /stays as it was sent/.test(late) && /draft a new email/.test(late), `an edit after sending is refused and offers a new draft, got ${late}`);
   assert(JSON.stringify(drafts.get(draftId)) === draftBefore, "the draft is untouched");
   const shorter = say(chat, "make it shorter");
-  assert(/already went out/.test(shorter.text ?? ""), "a contextual rewrite is refused too");
+  assert(!shorter.reviseEmail && !getPendingAction(chat)?.email && getClosedEmailContext(chat)?.status === "sent", "a contextual rewrite cannot reopen the delivered draft");
   const after = getScheduledSend(row.id)!;
   assert(after.request === sentRow.request && after.sent_message_id === sentRow.sent_message_id && after.status === "sent", "the sent record never changes");
 

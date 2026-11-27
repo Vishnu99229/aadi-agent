@@ -369,5 +369,19 @@ assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email"
   assert(!getChatAction(chatId)?.email && getClosedEmailContext(chatId)?.sentMessageId === "cmd-sent", "command settlement closes the exact originating composition");
 }
 
+// A new approval for the same Gmail draft is allowed after a card expires.
+{
+  const to = "renewed@example.com";
+  const subject = "Renew this draft";
+  const body = "The original wording.";
+  const previous = await draft(to, subject, body);
+  assert(transitionPendingAction(previous.actionId, "pending", "expired"), "the previous approval expires");
+  assert(!getChatAction(1)?.email && getClosedEmailContext(1)?.status === "expired", "the expired card closes the link");
+  const renewed = await queueDraftApproval({ draftId: previous.id, threadId: null, to, subject, body, googleAccount: "work" });
+  assert(renewed !== previous.actionId && getPendingAction(renewed)?.status === "pending", "a fresh card approves the same Gmail draft");
+  focusSelectedDraft(1, { draftId: previous.id, to, subject, body, account: "work" });
+  assert(getChatAction(1)?.email?.draftId === previous.id, "the renewed card can focus the draft again");
+}
+
 console.log = log;
 console.log("selected draft checks passed.");
