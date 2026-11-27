@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { parseAddressList } from "./address_list.js";
+import type { EmailRecovery, EmailRecoveryUpdate } from "./email_recovery.js";
 
 export interface EmailOutcome {
   id: string;
@@ -9,6 +10,8 @@ export interface EmailOutcome {
 export interface EmailTurnOutcomes {
   writes: Map<string, EmailOutcome>;
   notices: Set<string>;
+  recoveries: Map<EmailRecoveryUpdate["operation"], EmailRecovery>;
+  recoveryUpdates: WeakSet<EmailRecoveryUpdate>;
   uncertain: boolean;
   inFlight: number;
   onLateOutcome?: (outcome: EmailOutcome) => void;
@@ -17,6 +20,8 @@ export interface EmailTurnOutcomes {
 export interface EmailToolObservation {
   writes: EmailOutcome[];
   failure?: EmailOperationError;
+  recoveryTool?: string;
+  target?: EmailOperationError["evidence"];
 }
 
 const turns = new AsyncLocalStorage<EmailTurnOutcomes>();
@@ -28,7 +33,7 @@ export function currentEmailTurn(): EmailTurnOutcomes | undefined {
 }
 
 export function newEmailTurn(): EmailTurnOutcomes {
-  return { writes: new Map(), notices: new Set(), uncertain: false, inFlight: 0 };
+  return { writes: new Map(), notices: new Set(), recoveries: new Map(), recoveryUpdates: new WeakSet(), uncertain: false, inFlight: 0 };
 }
 
 export function withEmailTurn<T>(journal: EmailTurnOutcomes, work: () => T): T {
@@ -59,6 +64,11 @@ export function noteEmailNotice(message: string): void {
   if (message.trim()) currentEmailTurn()?.notices.add(message);
 }
 
+export function noteEmailTarget(tool: string, target: EmailOperationError["evidence"]): void {
+  const observation = operations.getStore();
+  if (observation?.recoveryTool === tool) observation.target = target;
+}
+
 /** Voice cards are acknowledged after the model has finished its turn. */
 export function emailCardAcknowledgement(key: string, line: string): (messageId: number) => void {
   const journal = currentEmailTurn();
@@ -74,6 +84,7 @@ export function emailCardAcknowledgement(key: string, line: string): (messageId:
 export function renderEmailOutcomes(journal: EmailTurnOutcomes, reply: string): string {
   const lines = new Set([...journal.writes.values()].map(outcome => outcome.line));
   for (const notice of journal.notices) lines.add(notice);
+  for (const recovery of journal.recoveries.values()) lines.add(recovery.userMessage);
   if (lines.size === 0) return reply;
   const report = [...lines].join("\n");
   return reply === "" ? report : `${report}\n\n${reply}`;
@@ -132,7 +143,7 @@ export function noteEmailFailure(failure: EmailOperationError): string {
   const journal = currentEmailTurn();
   if (journal && failure.reason === "write_unconfirmed") {
     journal.uncertain = true;
-    journal.notices.add(failure.message);
+    if (!observation?.recoveryTool) journal.notices.add(failure.message);
   }
   return failure.message;
 }

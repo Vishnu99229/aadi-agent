@@ -54,7 +54,7 @@ import { assertTestSeam } from "./test_seam.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 import {
-  emailCardAcknowledgement, emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, oneLine,
+  emailCardAcknowledgement, emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, noteEmailTarget, oneLine,
   recordEmailOutcome, requireWritableEmailTurn,
 } from "./email_outcomes.js";
 import {
@@ -780,6 +780,7 @@ export async function requestSequenceCard(
 
   const chosen = eligible[0]!;
   const prospect = chosen.prospect!;
+  noteEmailTarget("start_sequence", { recipient: prospect.email });
   requireWritableEmailTurn();
   const domain = domainOf(prospect.email);
   const existing = getSalesSequenceByThread(chosen.threadId);
@@ -1191,6 +1192,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
       { account: "work", messageId: carry.email?.sentMessageId, recipient: decision.person },
     ));
   }
+  noteEmailTarget("start_sequence", { recipient: chosen.prospect?.email, threadId: chosen.prospect ? undefined : chosen.threadId });
   // The same message already enrolled this thread: report it, enrol nothing more.
   const already = getSalesSequenceByThread(chosen.threadId);
   if (commandKey && already?.status === "active" && already.command_key === commandKey) {

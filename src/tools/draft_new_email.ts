@@ -16,7 +16,7 @@ import { linkPublishedDraft } from "../action_context.js";
 import { emailReferenceForTurn, refersToEarlierEmail } from "../email_references.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
-import { emailProviderRead, EmailOperationError, noteEmailFailure } from "../email_outcomes.js";
+import { emailProviderRead, EmailOperationError, noteEmailFailure, noteEmailTarget } from "../email_outcomes.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -127,6 +127,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     if (hold) return hold;
   }
   const mailbox = values.account === "personal" ? "personal" : "work";
+  noteEmailTarget("draft_new_email", { recipient: toHeader });
   const { account, signatureHtml } = await emailProviderRead(
     async () => {
       const account = await getGoogleAccount(mailbox);

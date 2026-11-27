@@ -29,9 +29,22 @@ export interface EmailRecovery {
   userMessage: string;
 }
 
-export function recordEmailRecovery(journal: EmailTurnOutcomes, recovery: EmailRecovery): void {
-  if (recovery.read_only) journal.uncertain = true;
-  journal.notices.add(recovery.userMessage);
+export type EmailRecoveryUpdate = { operation: string | symbol } & (
+  { recovery: EmailRecovery } | { acknowledged: true }
+);
+
+export function recordEmailRecovery(journal: EmailTurnOutcomes, update: EmailRecoveryUpdate): void {
+  // A delegated result may be credited back to the journal that already saw it.
+  if (journal.recoveryUpdates.has(update)) return;
+  journal.recoveryUpdates.add(update);
+  const previous = journal.recoveries.get(update.operation);
+  if ("recovery" in update) {
+    if (update.recovery.read_only) journal.uncertain = true;
+    // A blocked call cannot replace the original uncertainty with a new notice.
+    if (!previous?.read_only) journal.recoveries.set(update.operation, update.recovery);
+  } else {
+    journal.recoveries.delete(update.operation);
+  }
 }
 
 function textField(input: unknown, key: string): string | undefined {
@@ -44,6 +57,27 @@ function recipientField(input: unknown): string | undefined {
   const to = (input as { to?: unknown } | null)?.to;
   if (!Array.isArray(to)) return textField(input, "to") ?? textField(input, "prospect");
   return to.filter((item): item is string => typeof item === "string").join(", ") || undefined;
+}
+
+function normalizedRecipients(header: string | undefined): string | undefined {
+  return parseAddressList(header ?? "").map(({ email }) => email).sort().join(",") || undefined;
+}
+
+export function emailRecoveryOperation(tool: string, input: unknown, target?: EmailOperationError["evidence"]): string | symbol {
+  const account = textField(input, "account") === "personal" ? "personal" : "work";
+  const identities = [
+    ["draft_id", textField(input, "draft_id")],
+    ["email_id", textField(input, "email_id")],
+    ["thread_id", textField(input, "thread_id")],
+    ["recipient", normalizedRecipients(recipientField(input))],
+    ["draft_id", target?.draftId],
+    ["email_id", target?.messageId],
+    ["thread_id", target?.threadId],
+    ["recipient", normalizedRecipients(target?.recipient)],
+  ];
+  const identity = identities.find(([, value]) => value);
+  // Without an ID or deliverable address we cannot match a later call safely.
+  return identity ? JSON.stringify([tool, account, ...identity]) : Symbol(tool);
 }
 
 function commandRecord(account: GoogleAccountId, turn: ToolTurn) {

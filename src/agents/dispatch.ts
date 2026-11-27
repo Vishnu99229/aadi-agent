@@ -1,6 +1,9 @@
 import type { ToolCall } from "../llm.js";
 import { isSuccessfulToolResult } from "../receipt.js";
-import { emailRecoveryFor, hasEmailRecovery, recordEmailRecovery, type EmailRecovery } from "../email_recovery.js";
+import {
+  emailRecoveryFor, emailRecoveryOperation, hasEmailRecovery, recordEmailRecovery,
+  type EmailRecovery, type EmailRecoveryUpdate,
+} from "../email_recovery.js";
 import {
   currentEmailTurn, EmailOperationError, newEmailTurn, observeEmailTool, withEmailTurn,
   type EmailOutcome, type EmailToolObservation, type EmailTurnOutcomes,
@@ -37,6 +40,7 @@ export interface ToolOutcome {
   content: string;
   isError?: boolean;
   emailRecovery?: EmailRecovery;
+  emailRecoveryUpdate?: EmailRecoveryUpdate;
   emailOutcomes?: readonly EmailOutcome[];
 }
 
@@ -57,6 +61,7 @@ export interface WorkflowToolRun {
   content: string;
   emailOutcomes?: readonly EmailOutcome[];
   emailRecovery?: EmailRecovery;
+  emailRecoveryUpdate?: EmailRecoveryUpdate;
 }
 
 const MAX_TRACKED_WORKFLOWS = 50;
@@ -237,7 +242,7 @@ export async function dispatchTool(
 ): Promise<ToolOutcome> {
   const deny = (content: string, reason: "not_authorized" | "write_unconfirmed"): ToolOutcome => {
     const recovery = emailRecoveryFor(call.name, call.input, turn, content, new EmailOperationError(content, reason));
-    if (recovery) recordEmailRecovery(ctx.emailTurn, recovery);
+    if (recovery) recordEmailRecovery(ctx.emailTurn, { operation: emailRecoveryOperation(call.name, call.input), recovery });
     return { content, isError: true, emailRecovery: recovery };
   };
   if (ctx.allowed && !ctx.allowed.has(call.name)) {
@@ -363,7 +368,8 @@ async function runCall(
   const slot = await acquire("tools");
   const startedAt = Date.now();
   let outcome: ToolOutcome;
-  const observation: EmailToolObservation = { writes: [] };
+  const tracksRecovery = hasEmailRecovery(call.name);
+  const observation: EmailToolObservation = { writes: [], recoveryTool: tracksRecovery ? call.name : undefined };
   let stubbed = false;
   // A test stand-in that throws is simulating a crash, not a tool error: it is
   // recorded like any failure and then thrown on, as it always was.
@@ -400,18 +406,23 @@ async function runCall(
     slot.release();
   }
   if (observation.writes.length) outcome.emailOutcomes = observation.writes;
-  if (hasEmailRecovery(call.name) && !stubbed) {
+  const ok = isSuccessfulToolResult(outcome.content, outcome.isError);
+  if (tracksRecovery && !stubbed) {
     const recovery = emailRecoveryFor(call.name, input, turn, outcome.content, observation.failure, outcome.isError);
+    const operation = emailRecoveryOperation(call.name, input, observation.target ?? observation.failure?.evidence);
     if (recovery) {
       outcome.emailRecovery = recovery;
-      recordEmailRecovery(ctx.emailTurn, recovery);
+      outcome.emailRecoveryUpdate = { operation, recovery };
+      recordEmailRecovery(ctx.emailTurn, outcome.emailRecoveryUpdate);
       if (recovery.terminal || observation.writes.length > 0) {
         ctx.emailFailures.set(key, { ...outcome, emailOutcomes: undefined });
       }
+    } else if (ok && observation.writes.length > 0) {
+      outcome.emailRecoveryUpdate = { operation, acknowledged: true };
+      recordEmailRecovery(ctx.emailTurn, outcome.emailRecoveryUpdate);
     }
   }
   const ms = Date.now() - startedAt;
-  const ok = isSuccessfulToolResult(outcome.content, outcome.isError);
   if (ok) {
     ctx.doneCalls.set(key, outcome.content);
     if (!repeatable) {

@@ -101,7 +101,7 @@ import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
 import {
   emailCardAcknowledgement, emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure,
-  noteEmailNotice, outcomeRecipient, recordEmailOutcome, requireWritableEmailTurn, sentOutcomeLine, trackEmailProviderWrite,
+  noteEmailNotice, noteEmailTarget, outcomeRecipient, recordEmailOutcome, requireWritableEmailTurn, sentOutcomeLine, trackEmailProviderWrite,
 } from "./email_outcomes.js";
 
 const CHOICE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -1131,6 +1131,10 @@ async function resolveAndContinue(
       hint: "Ask Vishnu for the address.",
     };
   }
+  noteEmailTarget("send_email", {
+    draftId: request.draftId, threadId: request.threadId ?? undefined,
+    recipient: request.to.map(slot => slot.mailbox?.email).join(", "),
+  });
   return finishRequest(request, base, confirmation, now);
 }
 
@@ -1309,6 +1313,8 @@ export async function tryPendingRecipientEdit(
   }
   const draftId = action.draft_id;
   const account = action.google_account;
+  noteEmailTarget("send_email", { draftId });
+  noteEmailTarget("confirm_send_pending_draft", { draftId });
   const locked = lockedScheduleForDraft(draftId, account);
   if (locked) return routeMiss(tooLateText(locked), { scope: "read_only" });
   const supplied = matchOwnerSupplied(confirmation.chatId, edit.person, now);
@@ -1409,6 +1415,7 @@ export async function sendEmailFromTool(
     !referencedEmail
   ) {
     if (pendingEmail?.draftId && pendingEmail.scheduledSendId) {
+      noteEmailTarget("send_email", { draftId: pendingEmail.draftId });
       const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId, { ownTurn: turn.ownTurn === true });
       return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok, delivered.failure === "uncertain"));
     }

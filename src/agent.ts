@@ -597,7 +597,7 @@ export async function runAgent(
         const reply = await runAgent(userText, options);
         return options.delegation ? reply : renderEmailOutcomes(journal, reply);
       } catch (error) {
-        if (options.delegation || (journal.writes.size === 0 && journal.notices.size === 0)) throw error;
+        if (options.delegation || (journal.writes.size === 0 && journal.notices.size === 0 && journal.recoveries.size === 0)) throw error;
         const reply = renderEmailOutcomes(journal, "");
         return saveAssistantReply(reply, options.saveAssistantMessage ?? true);
       }
@@ -855,7 +855,7 @@ async function runAgentLoop(
     credit: (runs) => {
       for (const run of runs) {
         if (run.emailOutcomes) addEmailOutcomes(run.emailOutcomes);
-        if (run.emailRecovery) recordEmailRecovery(turnContext.emailTurn, run.emailRecovery);
+        if (run.emailRecoveryUpdate) recordEmailRecovery(turnContext.emailTurn, run.emailRecoveryUpdate);
         toolsUsed.add(run.tool);
         receipts.push({ name: run.tool, success: run.ok, content: run.content });
         if (isFamilyTool(run.tool)) {

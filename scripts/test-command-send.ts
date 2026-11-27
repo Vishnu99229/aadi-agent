@@ -3222,7 +3222,7 @@ await expectCancelled("delete_task", async (row) => {
     const send = (tool: string, args: unknown) => dispatchTool({ id: `call-${nextTurn()}`, name: tool, input: args, execution: "client" },
       { iteration: 1, calledTools: [tool], confirmation, userText, modelCalled }, ctx);
     const result = send(name, input);
-    return { result, send, close: () => { closeTurnContext(ctx); revokeGrant(grant.ref); } };
+    return { result, send, journal: ctx.emailTurn, close: () => { closeTurnContext(ctx); revokeGrant(grant.ref); } };
   };
   const expectRecovery = async (
     name: string, input: unknown, words: string, reason: string, readsOnly: boolean, modelCalled = true,
@@ -3277,7 +3277,18 @@ await expectCancelled("delete_task", async (row) => {
   let uncertainAttempts = 0;
   try {
     users.drafts.send = (async () => { uncertainAttempts += 1; return fail(); }) as typeof draftSend;
-    await expectRecovery("confirm_send_pending_draft", { draft_id: draftId }, "Send it now", "write_unconfirmed", true);
+    const call = dispatch("confirm_send_pending_draft", { draft_id: draftId }, "Send it now");
+    try {
+      const { emailRecovery: uncertain } = await call.result;
+      assert(uncertain?.read_only === true && uncertain.reason === "write_unconfirmed", "an unconfirmed send requires read-only reconciliation");
+      const read = await call.send("read_email", { id: original.id, account });
+      assert(!read.isError && read.content.includes(subject), "the reconciliation read succeeds");
+      const lines = renderEmailOutcomes(call.journal, "Checked the thread.").split("\n");
+      assert(lines.filter(line => line === uncertain?.userMessage).length === 1 && call.journal.uncertain &&
+        call.journal.writes.size === 0, "the successful read leaves the uncertain send notice in place once");
+    } finally {
+      call.close();
+    }
     await expectRecovery("confirm_send_pending_draft", { draft_id: draftId }, "Send it now", "write_unconfirmed", true);
     assert(uncertainAttempts === 1, "a new turn cannot resend a draft with an unresolved delivery");
   } finally {
@@ -3391,6 +3402,29 @@ await expectCancelled("delete_task", async (row) => {
   assert(draftsCreated.length === before + 2 && reply.split("\n").filter(line => line === one).length === 1 &&
     reply.split("\n").filter(line => line === two).length === 1, `two distinct writes and no replayed outcome: ${reply}`);
 
+  const getMessage = gmail.users.messages.get;
+  let reads = 0;
+  gmail.users.messages.get = (async (input: { id: string }, ...args: unknown[]) => {
+    if (input.id === another.id && ++reads === 1) throw new Error("The first Gmail read failed");
+    return Reflect.apply(getMessage, gmail.users.messages, [input, ...args]);
+  }) as typeof getMessage;
+  steps = 0;
+  const replyArgs = { email_id: another.id, account: "work", body: "Thanks for the timeline." };
+  chatScript = () => {
+    if (++steps === 1) return modelReply({ tools: [{ name: "draft_reply", input: replyArgs }] });
+    if (steps === 2) return modelReply({ tools: [{ name: "draft_reply", input: { ...replyArgs, body: "Thanks for sharing the pilot timeline." } }] });
+    return modelReply({ text: "Alina will send the revised budget on Friday." });
+  };
+  try {
+    const retried = await runAgent("Draft a reply to Alina", { skipHistory: true, toolNames: ["draft_reply"] });
+    const lines = retried.split("\n");
+    assert(reads === 2 && !lines.includes("I couldn't read the original email. No reply draft was created.") &&
+      lines.filter(line => line === "Reply draft created for Alina <alina@summary.example> on 'Re: Pilot timeline'.").length === 1,
+      `an acknowledged retry clears its earlier read failure and appears once: ${retried}`);
+  } finally {
+    gmail.users.messages.get = getMessage;
+  }
+
   steps = 0;
   const rejectedCard = { ...first, to: "outcome-card-rejected@reliable.example", subject: "Card rejected" };
   chatScript = () => ++steps === 1
@@ -3419,16 +3453,21 @@ await expectCancelled("delete_task", async (row) => {
     return modelReply({ text: "Alina will send the revised budget on Friday." });
   };
   const create = gmail.users.drafts.create;
-  let attempts = 0;
-  gmail.users.drafts.create = (async (...args: unknown[]) => {
-    if (++attempts === 2) throw Object.assign(new Error("Gmail rejected the second draft"), { code: 403 });
-    return Reflect.apply(create, gmail.users.drafts, args);
-  }) as typeof create;
   try {
-    const partial = await runAgent("Draft both notes", { skipHistory: true, toolNames: ["draft_new_email"] });
-    const lines = partial.split("\n");
-    assert(lines[0] === one && lines.includes("Gmail rejected the new draft. No draft was created.") && !lines.includes(two),
-      `a later rejection is visible without a false acknowledgement: ${partial}`);
+    for (const failedAttempt of [1, 2]) {
+      steps = 0;
+      let attempts = 0;
+      gmail.users.drafts.create = (async (...args: unknown[]) => {
+        if (++attempts === failedAttempt) throw Object.assign(new Error("Gmail rejected one draft"), { code: 403 });
+        return Reflect.apply(create, gmail.users.drafts, args);
+      }) as typeof create;
+      const partial = await runAgent("Draft both notes", { skipHistory: true, toolNames: ["draft_new_email"] });
+      const lines = partial.split("\n");
+      const [created, rejected] = failedAttempt === 1 ? [two, one] : [one, two];
+      assert(lines.filter(line => line === created).length === 1 && !lines.includes(rejected) &&
+        lines.filter(line => line === "Gmail rejected the new draft. No draft was created.").length === 1,
+        `a rejection stays visible regardless of which draft succeeded: ${partial}`);
+    }
   } finally {
     gmail.users.drafts.create = create;
   }
