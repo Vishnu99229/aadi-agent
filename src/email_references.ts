@@ -162,6 +162,11 @@ export function refersToEarlierEmail(text: string, replying = false): boolean {
   return (hasEmailTopic && pointsBack) || repliedAboutAddress;
 }
 
+/** A failed backward lookup is only an OCR problem when the owner names that source. */
+export function mentionsPhotoReference(text: string): boolean {
+  return /\b(?:photo|image|ocr)\b/i.test(text);
+}
+
 /** "send it now" confirms the draft already in hand. A new email, even one that says "now", does not. */
 export function confirmsExistingDraft(text: string): boolean {
   if (isNegativeSendCommand(text) || refersToEarlierEmail(text) || addressIn(text)) {

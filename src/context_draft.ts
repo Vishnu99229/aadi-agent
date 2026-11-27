@@ -4,18 +4,60 @@ import {
   contextScheduleForDraft,
   getPendingAction,
   lockedScheduleFor,
+  lockedScheduleForDraft,
   savePendingAction,
   scheduleSyncNotice,
   tooLateText,
   type ScheduleSync,
 } from "./action_context.js";
-import { readDraftSnapshot } from "./approvals.js";
-import { getScheduledSend } from "./db.js";
+import { draftWriteInProgress, readDraftSnapshot } from "./approvals.js";
+import { emailDeliveryUnsettled, getScheduledSend, reconcileClosedEmail, type ClosedEmailContext } from "./db.js";
 import { groundGreeting, recipientGrounding } from "./email_grounding.js";
 import { complete, type CompleteResult } from "./llm.js";
 import { resolveAgentModel } from "./models/agent_models.js";
 import { handler as draftNewEmail } from "./tools/draft_new_email.js";
 import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.js";
+import { isGoogleNotFound } from "./google/auth.js";
+import { parseAddressList } from "./address_list.js";
+import { routeMiss, type PreRouteResult } from "./pre_route.js";
+
+export function closedDraftMiss(reference: ClosedEmailContext): Extract<PreRouteResult, { kind: "miss" }> {
+  const recipient = parseAddressList(reference.to ?? "")[0];
+  const label = recipient?.name ? ` to ${recipient.name}` : reference.to ? ` to ${reference.to}` : "";
+  let notice: string;
+  if (reference.status === "sent") {
+    const raw = reference.sentAt;
+    const when = raw ? new Date(raw.includes("T") ? raw : raw.replace(" ", "T") + "Z") : undefined;
+    const at = when && !Number.isNaN(when.getTime())
+      ? ` at ${new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false }).format(when)} IST`
+      : " (the send time wasn't recorded)";
+    notice = `That draft${label} went out${at}.`;
+  } else if (reference.status === "unknown") {
+    notice = `That draft${label} is no longer in Gmail. I couldn't verify what happened to it.`;
+  } else {
+    const status = reference.status === "superseded" ? "replaced" : reference.status;
+    notice = `That draft${label} was ${status}.`;
+  }
+  return routeMiss("The linked draft is closed. Do not edit it or use a cached draft body.", {
+    reference,
+    notice,
+    scope: reference.threadId && reference.to && reference.status !== "unknown" &&
+      !linkedDraftWriteInProgress({ account: reference.account, draftId: reference.draftId, scheduledSendId: reference.scheduleId })
+      ? "thread_draft" : "read_only",
+  });
+}
+
+export function draftReadMiss(chatId: number, email: Parameters<typeof reconcileClosedEmail>[1], error: unknown): PreRouteResult {
+  if (linkedDraftWriteInProgress(email)) {
+    return routeMiss("Delivery is underway or unconfirmed. Check its records without writing.", { scope: "read_only" });
+  }
+  const closed = reconcileClosedEmail(chatId, email, error != null && isGoogleNotFound(error));
+  return closed ? closedDraftMiss(closed) : routeMiss("Gmail could not be read. The draft state is unverified.", { scope: "read_only" });
+}
+
+export function linkedDraftWriteInProgress(email: Parameters<typeof reconcileClosedEmail>[1]): boolean {
+  return emailDeliveryUnsettled(email) || Boolean(email.draftId && draftWriteInProgress(email.draftId, email.account));
+}
 
 function subjectFrom(purpose: string): string {
   const line = purpose.replace(/\s+/g, " ").trim();
@@ -157,14 +199,29 @@ export async function reviseLinkedDraft(
   now = new Date(),
   options: { subject?: string } = {},
 ): Promise<string> {
+  const result = await tryReviseLinkedDraft(chatId, instruction, now, options);
+  return result.kind === "miss" ? result.notice ?? result.note : result.text;
+}
+
+export async function tryReviseLinkedDraft(
+  chatId: number,
+  instruction: string,
+  now = new Date(),
+  options: { subject?: string } = {},
+): Promise<PreRouteResult> {
   const pending = getPendingAction(chatId, now);
   const email = pending?.email;
   if (!pending || !email) {
-    return "I don't have an email open to change.";
+    return routeMiss("There is no open email to change.");
   }
-  const locked = lockedScheduleFor(email);
+  const closed = reconcileClosedEmail(chatId, email);
+  if (closed) return closedDraftMiss(closed);
+  const locked = lockedScheduleFor(email) ?? (email.draftId ? lockedScheduleForDraft(email.draftId, email.account) : undefined);
   if (locked) {
-    return tooLateText(locked);
+    return routeMiss(tooLateText(locked), { scope: "read_only" });
+  }
+  if (linkedDraftWriteInProgress(email)) {
+    return routeMiss("Delivery is underway or unconfirmed. Check its records without writing.", { scope: "read_only" });
   }
   // The saved Gmail draft is the email being revised. The chat's copy may be older.
   let live: Awaited<ReturnType<typeof savedDraft>>;
@@ -173,7 +230,7 @@ export async function reviseLinkedDraft(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Contextual revision could not read the draft (${errorType}).`);
-    return "I couldn't read the current draft, so I didn't change it.";
+    return draftReadMiss(chatId, email, error);
   }
   const current = live?.body.trim() ? live.body : savedBody(email);
   const currentSubject = live?.subject.trim() || email.subject;
@@ -206,12 +263,17 @@ export async function reviseLinkedDraft(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Contextual revision failed (${errorType}).`);
-    return "I didn't change the email. The previous wording is still in place.";
+    return routeMiss("The draft revision writer failed before any write. The existing wording is still in place.", { scope: "read_only" });
   }
   const subject = newSubject || currentSubject?.trim() || written.subject;
   const notes = withCurrentDraft(email.notes, written.body);
   const notices: string[] = [];
   if (email.draftId) {
+    const closed = reconcileClosedEmail(chatId, email);
+    if (closed) return closedDraftMiss(closed);
+    if (linkedDraftWriteInProgress(email)) {
+      return routeMiss("Delivery is underway or unconfirmed. Check its records without writing.", { scope: "read_only" });
+    }
     let result: string;
     try {
       // No To or Cc: a body rewrite keeps exactly the people the draft has now.
@@ -223,12 +285,14 @@ export async function reviseLinkedDraft(
     } catch (error) {
       const errorType = error instanceof Error ? error.name : "UnknownError";
       console.error(`Contextual draft update failed (${errorType}).`);
-      return "I couldn't update the Gmail draft, so nothing changed. The previous wording is still in place.";
+      if (error != null && isGoogleNotFound(error)) return draftReadMiss(chatId, email, error);
+      return routeMiss("The Gmail draft update did not return a confirmed result. Verify it by reading; do not retry a write.", { scope: "read_only" });
     }
     const notice = draftUpdateNotice(result);
     if (notice && !result.startsWith("{")) {
       // Refused before Gmail: the email was claimed while this was being written.
-      return notice;
+      const closed = reconcileClosedEmail(chatId, email);
+      return closed ? closedDraftMiss(closed) : routeMiss(notice, { scope: "read_only" });
     }
     if (notice) {
       notices.push(notice);
@@ -241,7 +305,7 @@ export async function reviseLinkedDraft(
     sync = applyToSchedule(scheduleId, { subject, body: written.body });
     if (sync.kind === "too_late" && !email.draftId) {
       // Nothing else was written, so nothing changed at all.
-      return tooLateText(sync);
+      return routeMiss(tooLateText(sync), { scope: "read_only" });
     }
     const notice = scheduleSyncNotice(sync);
     if (notice && !notices.includes(notice)) {
@@ -261,19 +325,22 @@ export async function reviseLinkedDraft(
   );
   const lead = email.draftId ? "Updated the draft." : "Updated the scheduled email.";
   if (notices.length > 0) {
-    return `${lead} ${notices.join(" ")}`;
+    return { kind: "handled", text: `${lead} ${notices.join(" ")}` };
   }
-  return sync.kind === "synced" && email.draftId ? `${lead} The scheduled copy matches it.` : lead;
+  return { kind: "handled", text: sync.kind === "synced" && email.draftId ? `${lead} The scheduled copy matches it.` : lead };
 }
 
 export async function publishReadyDraft(
   chatId: number,
   now = new Date(),
-): Promise<{ posted: boolean; draftId?: string; notice?: string }> {
+): Promise<{ posted: boolean; draftId?: string; notice?: string; recovery?: PreRouteResult }> {
   const pending = getPendingAction(chatId, now);
   const email = pending?.email;
   if (!pending || pending.status !== "open" || !email || email.to.length === 0 || !email.purpose) {
-    return { posted: false };
+    return { posted: false, recovery: routeMiss("The open email does not have enough information to publish a draft.") };
+  }
+  if (linkedDraftWriteInProgress(email)) {
+    return { posted: false, recovery: routeMiss("The open email has an unresolved write. Check its status without writing.", { scope: "read_only" }) };
   }
   const to = email.to.map((item) => item.email).join(", ");
   const name = email.to[0]?.name || "there";
@@ -284,7 +351,7 @@ export async function publishReadyDraft(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Contextual draft could not read the draft (${errorType}).`);
-    return { posted: false };
+    return { posted: false, recovery: draftReadMiss(chatId, email, error) };
   }
   const notes = live?.body.trim() ? withCurrentDraft(email.notes, live.body) : email.notes;
   const facts = [
@@ -353,6 +420,6 @@ export async function publishReadyDraft(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Contextual draft failed (${errorType}).`);
-    return { posted: false };
+    return { posted: false, recovery: routeMiss("Draft publication did not produce a confirmed result. Check Gmail before any new write.", { scope: "read_only" }) };
   }
 }

@@ -26,6 +26,7 @@ import {
   type AccountRecord,
 } from "./account_logic.js";
 import { completeBackground } from "./llm.js";
+import { routeMiss, type PreRouteResult } from "./pre_route.js";
 import {
   addDaysYmd,
   confirmationLine,
@@ -539,18 +540,16 @@ export async function sendMemoryList(ctx: Context): Promise<void> {
 export async function handleForgetQuery(
   ctx: Context,
   query: string,
-): Promise<void> {
+): Promise<PreRouteResult | "completed"> {
   const matches = searchMemories(query, 10);
   if (matches.length === 0) {
-    await ctx.reply("I couldn't find a memory matching that.");
-    return;
+    return routeMiss("The forget command found no matching memory. No memory was deleted.", { scope: "read_only" });
   }
   if (matches.length === 1) {
     const memory = matches[0]!;
     deleteMemory(memory.id);
     clearPendingForgetBatch();
-    await ctx.reply(`Forgotten #${memory.id}.`);
-    return;
+    return { kind: "handled", text: `Forgotten #${memory.id}.` };
   }
   const keyboard = new InlineKeyboard();
   for (const [index, memory] of matches.entries()) {
@@ -564,6 +563,7 @@ export async function handleForgetQuery(
     `Several memories matched:\n${matches.map((item) => `#${item.id} ${item.content}`).join("\n")}`,
     { reply_markup: keyboard },
   );
+  return "completed";
 }
 
 export async function askForgetEverything(ctx: Context): Promise<void> {

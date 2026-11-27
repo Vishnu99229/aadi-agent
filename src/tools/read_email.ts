@@ -2,6 +2,8 @@ import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { parseGoogleAccountFilter } from "../google/auth.js";
 import { resolveGmailMessage } from "../google/mail.js";
+import { focusClosedEmailFromRead } from "../db.js";
+import type { ToolTurn } from "./index.js";
 
 const BODY_LIMIT = 3000;
 
@@ -134,7 +136,7 @@ function truncate(text: string): string {
   return `${characters.slice(0, BODY_LIMIT).join("")}\n[truncated]`;
 }
 
-export async function handler(input: unknown): Promise<string> {
+export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
   const values = input as { id?: unknown; account?: unknown };
   if (typeof values.id !== "string" || !values.id.trim()) {
     throw new Error("id must be a non-empty Gmail message ID.");
@@ -158,6 +160,9 @@ export async function handler(input: unknown): Promise<string> {
   const body = truncate(removeQuotedReplies(rawBody));
   const headers = payload.headers;
   const cc = header(headers, "Cc");
+  if (message.threadId && turn?.ownTurn && turn.confirmation) {
+    focusClosedEmailFromRead({ ...turn.confirmation, account: account.id, threadId: message.threadId });
+  }
 
   return [
     `Account: ${account.label}`,

@@ -4,12 +4,15 @@ import { rememberContactChoice } from "./contacts.js";
 import { retrieveRelevantContext, wantsHistoricalContext } from "./context_lookup.js";
 import {
   deletePendingActionContext,
+  emailDeliveryUnsettled,
   getPendingActionContext,
+  getClosedEmailContext,
   getScheduledSend,
   listCanonicalContacts,
   listScheduledSendsForDraft,
   markTaskDone,
   transitionScheduledSend,
+  reconcileClosedEmail,
   upsertCalendarEventRef,
   upsertPendingActionContext,
   writeScheduledCopy,
@@ -524,6 +527,7 @@ export function syncDraftRecipient(input: {
   let sync: ScheduleSync = { kind: "none" };
   if (email.scheduledSendId) {
     sync = applyToSchedule(email.scheduledSendId, change);
+    if (sync.kind === "stopped" || sync.kind === "too_late") return sync;
     if (sync.kind !== "synced") {
       email = { ...email, scheduledSendId: undefined, sendAt: undefined };
     }
@@ -755,7 +759,7 @@ export function messageAuthorizesExternalSend(text: string): boolean {
   return /\b(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\b(?:don'?t|do not|never)\s+(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\bdraft\b/i.test(command);
 }
 
-function looksLikeEmailContext(text: string): boolean {
+export function looksLikeEmailContext(text: string): boolean {
   if (/^(?:what|who|when|where|why|how|show|list|find|search)\b/i.test(text.trim())) {
     return false;
   }
@@ -766,6 +770,19 @@ function looksLikeEmailContext(text: string): boolean {
     return true;
   }
   return /\b(?:about|regarding|mention|wants?|needs?|requirement|context|subject|shorter|longer|wording|reword|rephrase|formal|tone)\b/i.test(text);
+}
+
+/** A closed email is a referent only. Its earlier instructions never authorize a write. */
+export function lastEmailReference(chatId: number, now = new Date()) {
+  const referral = getClosedEmailContext(chatId);
+  if (!referral) return undefined;
+  const date = referral.closedAt.includes("T") ? referral.closedAt : referral.closedAt.replace(" ", "T") + "Z";
+  return now.getTime() - Date.parse(date) <= TASK_TTL_MS ? referral : undefined;
+}
+
+export function reconcileOpenEmail(chatId: number, now = new Date()) {
+  const email = getPendingAction(chatId, now)?.email;
+  return email ? reconcileClosedEmail(chatId, email) : undefined;
 }
 
 /** "Add bob@example.com to Cc" names an email field. A meeting word keeps it a meeting edit. */
@@ -950,6 +967,7 @@ export interface OwnerTurnResult {
   publishDraft?: boolean;
   /** A published Gmail draft whose Send card must be discarded with this turn. */
   retireDraftId?: string;
+  retireDraftAccount?: PendingEmailState["account"];
   /** Replace only the subject of the open Gmail draft. With reviseEmail, the subject that rewrite uses. */
   subjectUpdate?: string;
   /** Change the open draft's To line without rewriting the message. */
@@ -958,6 +976,8 @@ export interface OwnerTurnResult {
   fieldDraft?: { draftId: string; to?: string; cc?: string };
   /** Rewrite the open draft from this instruction, replacing superseded facts. */
   reviseEmail?: string;
+  /** A failed continuation that can be investigated without making another write. */
+  recoveryNote?: string;
 }
 
 /**
@@ -1030,20 +1050,17 @@ export function applyOwnerContextTurn(
       ...next,
       status: "cancelled",
       action: next.action === "note" ? "draft_email" : next.action,
-      email: {
-        ...next.email,
-        waiting: "purpose",
-        scheduledSendId: undefined,
-        purpose: undefined,
-        subject: undefined,
-        draftId: undefined,
-      },
+      // A standalone draft still has an approval transition to close this link.
+      email: retireDraftId && !next.email.scheduledSendId ? next.email : undefined,
+      authorizedAt: undefined,
+      ownerWords: "",
     };
     savePendingAction(chatId, next, now);
     return {
       handled: true,
       text: "Cancelled that email. It will not be sent. Tell me the context when you're ready.",
       retireDraftId,
+      retireDraftAccount: base.email?.account,
     };
   }
 
@@ -1121,6 +1138,11 @@ export function applyOwnerContextTurn(
   }
 
   const openEmail = next.status === "open" && (next.action === "draft_email" || next.action === "send_email");
+  if (openEmail && next.email && looksLikeEmailContext(clean) && emailDeliveryUnsettled(next.email)) {
+    const locked = lockedScheduleFor(next.email);
+    const text = locked ? tooLateText(locked) : "A delivery for this email is underway or unconfirmed. Check its records without writing.";
+    return { handled: true, text, recoveryNote: text };
+  }
   const fieldEdit = explicitEmailField(clean);
   const openDraftId = next.email?.draftId;
   if (fieldEdit && openEmail && next.email && openDraftId) {
@@ -1142,7 +1164,8 @@ export function applyOwnerContextTurn(
       return { handled: true, text: `Which ${fieldEdit.person}? ${found.contacts.map((item) => item.email).join(", ")}` };
     }
     if (found.kind === "none") {
-      return { handled: true, text: `I don't have a confirmed address for ${fieldEdit.person}. Tell me which address to add.` };
+      const text = `I don't have a confirmed address for ${fieldEdit.person}. Tell me which address to add.`;
+      return { handled: true, text, recoveryNote: text };
     }
     const person = found.contact;
     const email = next.email;
@@ -1185,10 +1208,8 @@ export function applyOwnerContextTurn(
     if (found.kind === "none") {
       next = { ...next, email: { ...next.email, pendingRedirect: asked } };
       savePendingAction(chatId, next, now);
-      return {
-        handled: true,
-        text: `I don't have a confirmed address for ${asked}. Tell me which address to use.`,
-      };
+      const text = `I don't have a confirmed address for ${asked}. Tell me which address to use.`;
+      return { handled: true, text, recoveryNote: text };
     }
     const person = found.contact;
     const locked = lockedScheduleFor(next.email);
@@ -1391,7 +1412,7 @@ export function holdEmailToolTurn(
       {
         ...pending,
         status: "cancelled",
-        email: { ...pending.email, scheduledSendId: undefined, subject: undefined, purpose: undefined },
+        email: undefined,
       },
       now,
     );
@@ -1399,7 +1420,6 @@ export function holdEmailToolTurn(
   }
   if (
     pending?.status === "cancelled" &&
-    pending.email &&
     !messageAuthorizesExternalSend(ownWords)
   ) {
     return "Not sent: that email was cancelled. Nothing from it will go out. Say send when you want a new one.";

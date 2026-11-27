@@ -11,6 +11,7 @@ import {
   allowOwnerChatDeleteEvent,
   allowOwnerChatMoveEvent,
 } from "./security/send_approval.js";
+import { routeMiss, type PreRouteResult } from "./pre_route.js";
 import { assertTestSeam } from "./test_seam.js";
 
 const TIME_ZONE = "Asia/Kolkata";
@@ -694,18 +695,25 @@ export async function noteCalendarReference(input: {
  * A still-pending list, with no named past event, is left for the local editor.
  * Several matches are asked, not patched.
  */
-export async function reviseReferencedMeeting(input: {
+interface ReferencedMeetingEdit {
   chatId: number;
   text: string;
   confirmation: { chatId: number; messageId: number } | undefined;
   now?: Date;
-}): Promise<string | undefined> {
+}
+
+export async function reviseReferencedMeeting(input: ReferencedMeetingEdit): Promise<string | undefined> {
+  const result = await tryReviseReferencedMeeting(input);
+  return result?.kind === "miss" ? result.note : result?.text;
+}
+
+export async function tryReviseReferencedMeeting(input: ReferencedMeetingEdit): Promise<PreRouteResult | undefined> {
   const now = input.now ?? new Date();
   if (explicitEmailField(input.text)) {
     return undefined;
   }
   if (ambiguousSharedReference(input.text, input.chatId, now)) {
-    return "Do you mean the email draft or the meeting?";
+    return { kind: "clarification", text: "Do you mean the email draft or the meeting?" };
   }
   const edit = parseAttendeeEdit(input.text);
   if (!edit || !isMeetingAttendeeEdit(input.text, edit, input.chatId, now)) {
@@ -716,23 +724,25 @@ export async function reviseReferencedMeeting(input: {
   if (pending?.status === "open" && pending.meeting && cues.tokens.length === 0 && !namesADay(cues)) {
     const focused = refsFromStore(input.chatId).find((ref) => ref.focused);
     if (focused) {
-      return `Which meeting? The one still being scheduled, or ${describeMeeting(focused)}?`;
+      return { kind: "clarification", text: `Which meeting? The one still being scheduled, or ${describeMeeting(focused)}?` };
     }
     return undefined;
   }
   const resolved = await resolveMeetingReference({ chatId: input.chatId, text: input.text, edit, now });
   if (resolved.kind === "many") {
-    return resolved.question;
+    return { kind: "clarification", text: resolved.question };
   }
   if (resolved.kind === "none") {
-    return pending?.status === "open" && pending.meeting ? undefined : "I couldn't tell which meeting you mean.";
+    return pending?.status === "open" && pending.meeting
+      ? undefined
+      : routeMiss("I couldn't tell which meeting you mean.", { scope: "read_only" });
   }
   const booked = resolved.ref;
   const current = await currentAttendees(booked);
   if (!current) {
-    return `Not changed: I couldn't read the current guest list for ${booked.title}.`;
+    return routeMiss(`Not changed: I couldn't read the current guest list for ${booked.title}.`, { scope: "read_only" });
   }
-  const resolveNew = (name: string): { email: string; name: string } | string => {
+  const resolveNew = (name: string): { email: string; name: string } | PreRouteResult => {
     const typed = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.exec(name);
     if (typed) {
       const email = typed[0].toLowerCase();
@@ -745,45 +755,45 @@ export async function reviseReferencedMeeting(input: {
       return { email: found.contact.email, name: found.contact.name };
     }
     if (found.kind === "many") {
-      return `Which ${name}? ${found.contacts.map((item) => item.email).join(", ")}`;
+      return { kind: "clarification", text: `Which ${name}? ${found.contacts.map((item) => item.email).join(", ")}` };
     }
-    return `I don't have an address for ${name}.`;
+    return routeMiss(`I don't have an address for ${name}.`, { scope: "read_only" });
   };
   let next = current.map((person) => ({ ...person }));
   if (edit.op === "remove") {
     const matched = peopleMatching(edit.name, next);
     if (matched.length === 0) {
-      return `${edit.name} is not on ${booked.title}.`;
+      return routeMiss(`${edit.name} is not on ${booked.title}.`, { scope: "read_only" });
     }
     if (matched.length > 1) {
-      return `Which ${edit.name}? ${matched.map((person) => person.email ? `${person.name} <${person.email}>` : person.name).join(", ")}`;
+      return { kind: "clarification", text: `Which ${edit.name}? ${matched.map((person) => person.email ? `${person.name} <${person.email}>` : person.name).join(", ")}` };
     }
     next = next.filter((person) => person.resource || person.email !== matched[0]!.email);
   } else if (edit.op === "add") {
     const person = resolveNew(edit.name);
-    if (typeof person === "string") {
+    if ("kind" in person) {
       return person;
     }
     if (next.some((item) => item.email === person.email)) {
-      return `${person.email} is already on ${booked.title}.`;
+      return { kind: "handled", text: `${person.email} is already on ${booked.title}.` };
     }
     next = [...next, { ...person, resource: false }];
   } else {
     const person = resolveNew(edit.to);
-    if (typeof person === "string") {
+    if ("kind" in person) {
       return person;
     }
     const matched = peopleMatching(edit.from, next);
     if (matched.length === 0) {
-      return `${edit.from} is not on ${booked.title}.`;
+      return routeMiss(`${edit.from} is not on ${booked.title}.`, { scope: "read_only" });
     }
     if (matched.length > 1) {
-      return `Which ${edit.from}? ${matched.map((item) => item.email ? `${item.name} <${item.email}>` : item.name).join(", ")}`;
+      return { kind: "clarification", text: `Which ${edit.from}? ${matched.map((item) => item.email ? `${item.name} <${item.email}>` : item.name).join(", ")}` };
     }
     const without = next.filter((item) => item.resource || item.email !== matched[0]!.email);
     next = without.some((item) => item.email === person.email) ? without : [...without, { ...person, resource: false }];
   }
-  const updated = await updateEventAttendees({
+  const updated = await tryUpdateEventAttendees({
     event: {
       accountId: booked.accountId,
       eventId: booked.eventId,
@@ -796,7 +806,7 @@ export async function reviseReferencedMeeting(input: {
     ownerText: input.text,
     confirmation: input.confirmation,
   });
-  if (updated.startsWith("Updated ")) {
+  if (updated.kind === "handled") {
     focusBookedMeeting(input.chatId, {
       eventId: booked.eventId,
       accountId: booked.accountId,
@@ -847,17 +857,24 @@ async function currentAttendees(
  * Patches one event's attendee list and checks Google echoed that list back.
  * sendUpdates follows the attendee-notification policy, not a fixed "all".
  */
-export async function updateEventAttendees(input: {
+interface AttendeeUpdate {
   event: OwnerCalendarEvent;
   attendees: Array<{ email: string; name?: string }>;
   previousEmails?: readonly string[];
   ownerText?: string;
   confirmation: { chatId: number; messageId: number } | undefined;
-}): Promise<string> {
+}
+
+export async function updateEventAttendees(input: AttendeeUpdate): Promise<string> {
+  const result = await tryUpdateEventAttendees(input);
+  return result.kind === "miss" ? result.note : result.text;
+}
+
+async function tryUpdateEventAttendees(input: AttendeeUpdate): Promise<PreRouteResult> {
   try {
     allowOwnerChatAddAttendee(input.confirmation);
   } catch {
-    return "Not changed: only Vishnu's own chat message can change a meeting's attendees.";
+    return { kind: "refusal", text: "Not changed: only Vishnu's own chat message can change a meeting's attendees." };
   }
   const next = input.attendees.map((person) => ({
     email: person.email.toLowerCase(),
@@ -868,11 +885,11 @@ export async function updateEventAttendees(input: {
   const added = expected.filter((email) => !before.includes(email)).length;
   const removed = before.filter((email) => !expected.includes(email)).length;
   if (added === 0 && removed === 0) {
-    return `Updated ${input.event.title}. Attendees: ${expected.join(", ")}. The guest list was already that.`;
+    return { kind: "handled", text: `Updated ${input.event.title}. Attendees: ${expected.join(", ")}. The guest list was already that.` };
   }
   const policy = chooseSendUpdates(input.ownerText ?? "", added, removed);
   if ("ask" in policy) {
-    return policy.ask;
+    return { kind: "clarification", text: policy.ask };
   }
   try {
     if (testHooks.patch) {
@@ -896,19 +913,20 @@ export async function updateEventAttendees(input: {
     const missing = expected.filter((email) => !got.has(email));
     const stillThere = before.filter((email) => !expected.includes(email) && got.has(email));
     if (missing.length > 0 || stillThere.length > 0) {
-      return `Not changed: Google Calendar did not confirm the attendee list for ${input.event.title}.`;
+      return routeMiss(`Not changed: Google Calendar did not confirm the attendee list for ${input.event.title}.`, { scope: "read_only" });
     }
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.log(`calendar attendee update failed (${errorType})`);
-    return `Not changed: Google Calendar refused the update to ${input.event.title}.`;
+    return routeMiss(`Not changed: Google Calendar refused the update to ${input.event.title}.`, { scope: "read_only" });
   }
-  return `Updated ${input.event.title}. Attendees: ${expected.join(", ")}. ${policy.note}`;
+  return { kind: "handled", text: `Updated ${input.event.title}. Attendees: ${expected.join(", ")}. ${policy.note}` };
 }
 
 type ReusedAttendees =
   | { kind: "none" }
   | { kind: "many"; question: string }
+  | { kind: "miss"; note: string }
   | { kind: "one"; title: string; accountId: GoogleAccountId; attendees: Array<{ email: string; name: string }> };
 
 async function reusedAttendees(phrase: string, now: Date): Promise<ReusedAttendees> {
@@ -942,7 +960,7 @@ async function reusedAttendees(phrase: string, now: Date): Promise<ReusedAttende
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.log(`calendar attendee read failed (${errorType})`);
-    return { kind: "many", question: `I found ${event.title} but couldn't read its guests, so I didn't copy them.` };
+    return { kind: "miss", note: `I found ${event.title} but couldn't read its guests, so I didn't copy them.` };
   }
   return { kind: "one", title: event.title, accountId: event.accountId, attendees: peopleFromApi(listed) };
 }

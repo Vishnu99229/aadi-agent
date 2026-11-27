@@ -94,6 +94,12 @@ export function claimRecipientDelivery(account: GoogleAccountId, to: string): ((
   return () => keys.forEach((key) => deliveringTo.delete(key));
 }
 
+export function draftWriteInProgress(draftId: string, account: GoogleAccountId): boolean {
+  const action = latestDraftAction(draftId, account);
+  return Boolean(action && (activeActions.has(action.id) ||
+    parseAddressList(action.live_to_header ?? action.to_header ?? "").some(({ email }) => deliveringTo.has(`${account}:${email}`))));
+}
+
 export const DRAFT_REPLACED = "That draft was replaced by a newer one.";
 
 type AfterDraftSend = (
@@ -1134,6 +1140,7 @@ async function fetchDraftRecipientLabel(
 export interface TextSendDraftResult {
   ok: boolean;
   message: string;
+  failure?: "miss" | "clarification" | "refusal" | "uncertain";
 }
 
 export interface SendConfirmation {
@@ -1152,10 +1159,10 @@ export async function editAndSendPendingDraft(
 ): Promise<TextSendDraftResult> {
   const draftId = action.draft_id;
   if (!draftId || !eligibleDrafts(confirmation).some((draft) => draft.id === action.id)) {
-    return { ok: false, message: getPendingAction(action.id)?.status === "superseded" ? DRAFT_REPLACED
-      : "No draft is waiting for your approval, so nothing was sent." };
+    if (getPendingAction(action.id)?.status === "superseded") return { ok: false, message: DRAFT_REPLACED };
+    return { ok: false, failure: "miss", message: "No draft is waiting for your approval, so nothing was sent." };
   }
-  if (activeActions.has(action.id)) return { ok: false, message: "That draft is already being processed." };
+  if (activeActions.has(action.id)) return { ok: false, failure: "uncertain", message: "That draft is already being processed." };
   activeActions.add(action.id);
   let replacementNotice = "";
   let scheduleNotice: string | undefined;
@@ -1164,10 +1171,10 @@ export async function editAndSendPendingDraft(
     const gmail = await gmailFor(action.google_account);
     const { data } = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "raw" });
     const message = data.message;
-    if (!message?.raw) return { ok: false, message: DRAFT_REREAD_FAILED };
+    if (!message?.raw) return { ok: false, failure: "miss", message: DRAFT_REREAD_FAILED };
     const raw = Buffer.from(message.raw, "base64url").toString("latin1");
     const separator = /\r?\n\r?\n/.exec(raw);
-    if (!separator) return { ok: false, message: DRAFT_REREAD_FAILED };
+    if (!separator) return { ok: false, failure: "miss", message: DRAFT_REREAD_FAILED };
     const headers = raw.slice(0, separator.index);
     const lineBreak = separator[0].startsWith("\r") ? "\r\n" : "\n";
     const field = edit.field === "cc" ? "Cc" : "To";
@@ -1184,7 +1191,7 @@ export async function editAndSendPendingDraft(
     const cc = value(updated, "Cc");
     const previousTo = value(headers, "To");
     const release = claimRecipientDelivery(action.google_account, `${previousTo}, ${to}`);
-    if (!release) return { ok: false, message: "That draft's recipient already has an email going out." };
+    if (!release) return { ok: false, failure: "uncertain", message: "That draft's recipient already has an email going out." };
     try {
       const fresh = getPendingAction(action.id);
       if (fresh?.status !== "pending") return { ok: false, message: fresh?.status === "superseded" ? DRAFT_REPLACED
@@ -1210,7 +1217,7 @@ export async function editAndSendPendingDraft(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Approval action ${action.id}: recipient edit failed (${errorType})`);
-    return { ok: false, message: ["I couldn't update the draft's recipients, so nothing was sent.", replacementNotice].filter(Boolean).join("\n") };
+    return { ok: false, failure: "uncertain", message: ["I couldn't update the draft's recipients, so nothing was sent.", replacementNotice].filter(Boolean).join("\n") };
   } finally {
     activeActions.delete(action.id);
   }
@@ -1360,12 +1367,13 @@ export async function sendPendingDraftByText(
     return { ok: false, message: "Not sent: that draft is different from the card you replied to." };
   }
   if (replyDraft?.status !== undefined && replyDraft.status !== "pending") {
-    return { ok: false, message: "No draft is waiting for your approval, so nothing was sent." };
+    return { ok: false, failure: "miss", message: "No draft is waiting for your approval, so nothing was sent." };
   }
   if (replyDraft) draftId = replyDraft.draft_id ?? undefined;
   if (shown.length === 0) {
     return {
       ok: false,
+      failure: "miss",
       message: "No draft is waiting for your approval, so nothing was sent.",
     };
   }
@@ -1389,12 +1397,13 @@ export async function sendPendingDraftByText(
       console.log(`Send confirmation: ${shown.length} drafts pending; asked which`);
       return {
         ok: false,
+        failure: "clarification",
         message: askedWhichMessage(shown, recipients),
       };
     }
   }
   if (activeActions.has(action.id)) {
-    return { ok: false, message: "That draft is already being sent." };
+    return { ok: false, failure: "uncertain", message: "That draft is already being sent." };
   }
   activeActions.add(action.id);
   try {
@@ -1419,7 +1428,10 @@ export async function sendPendingDraftByText(
     }
     const outcome = await performDraftSend(action, verdict, options[OWNER_TO_EDIT]);
     if (!outcome.ok) {
-      return { ok: false, message: sendFailureText(outcome.reason, outcome.detail) };
+      const failure = outcome.reason === "reread_failed" ? "miss"
+        : outcome.reason === "unconfirmed" || outcome.reason === "send_failed" || outcome.reason === "in_progress"
+          ? "uncertain" : "refusal";
+      return { ok: false, failure, message: sendFailureText(outcome.reason, outcome.detail) };
     }
     if (action.telegram_message_id) {
       try {
@@ -1501,8 +1513,9 @@ async function markCardDiscarded(action: PendingAction): Promise<void> {
 /** Drops a draft the owner cancelled in chat, including its Send card. */
 export async function retireOwnerDraft(
   draftId: string,
+  account?: GoogleAccountId,
 ): Promise<"retired" | "missing" | "delete_failed"> {
-  const action = getPendingActionForDraft(draftId);
+  const action = getPendingActionForDraft(draftId, account);
   if (!action?.draft_id) {
     return "missing";
   }
@@ -1769,7 +1782,8 @@ export function hasPendingDraftEdit(userId: number): boolean {
 
 export async function consumeDraftEdit(
   userId: number,
-): Promise<DraftEditContext | undefined> {
+): Promise<{ kind: "draft"; draft: DraftEditContext } |
+  { kind: "missing"; action?: PendingAction; error?: unknown } | undefined> {
   const actionId = editingActionByUser.get(userId);
   if (!actionId) {
     return undefined;
@@ -1787,16 +1801,15 @@ export async function consumeDraftEdit(
     if (action?.status === "pending") {
       await expireAction(action);
     }
-    return undefined;
+    return { kind: "missing", action };
   }
   const draftId = action.draft_id;
-  const snapshot = await readDraftSnapshot(draftId, action.google_account);
-  return {
-    actionId: action.id,
-    draftId,
-    ...snapshot,
-    account: action.google_account,
-  };
+  try {
+    const snapshot = await readDraftSnapshot(draftId, action.google_account);
+    return { kind: "draft", draft: { actionId: action.id, draftId, ...snapshot, account: action.google_account } };
+  } catch (error) {
+    return { kind: "missing", action, error };
+  }
 }
 
 export async function expirePendingApprovals(): Promise<void> {

@@ -399,7 +399,7 @@ for (const local of [
 
   const said = await say("Cancel that email");
   assert(said.some((text) => /Cancelled that email/.test(text)), `"that email" is the open draft, got ${said.join(" | ")}`);
-  assert(!drafts.has(draftId) && getChatStatus() === "cancelled", "and it is cancelled");
+  assert(!drafts.has(draftId) && getChatStatus() === "cancelled" && !getChatEmail(), "cancellation closes the chat's draft link");
 }
 
 // 10. A finished email is not the open one: "cancel that email" can't delete its draft.

@@ -731,7 +731,9 @@ export async function runOwnerTurn(modelText: string, options: OwnerTurnOptions)
   const { ownerText, quoted, chatId, postCard, route: routeOut, ...agentOptions } = options;
   const picked = pickRoute(ownerText, { quoted, chatId });
   // A direct answer is taken before this point, so here it only means "let the model try".
-  const route: Route = picked.kind === "direct" ? { kind: "aadi", reason: "direct answer fell back" } : picked;
+  const route: Route = agentOptions.replyDraftThread && config.agentRouting !== "off"
+    ? { kind: "specialist", agentId: "email" }
+    : picked.kind === "direct" ? { kind: "aadi", reason: "direct answer fell back" } : picked;
   const report = newRunReport();
   const startedAt = Date.now();
   const meter = newTurnMeter();
@@ -746,12 +748,12 @@ export async function runOwnerTurn(modelText: string, options: OwnerTurnOptions)
         ...agentOptions,
         agentId: route.agentId,
         modelAgent: route.agentId,
-        metaTools: [escalateTool],
+        metaTools: agentOptions.toolNames ? [] : [escalateTool],
         extraContext: [agentOptions.extraContext, pending].filter(Boolean).join("\n\n"),
         report,
       });
     } else {
-      const full = config.agentRouting === "full" && agentOptions.sendConfirmation !== undefined;
+      const full = config.agentRouting === "full" && agentOptions.sendConfirmation !== undefined && !agentOptions.toolNames;
       const waiting = full ? pausedContext(chatId) : "";
       const extra = [waiting, pending, agentOptions.extraContext].filter(Boolean).join("\n\n");
       reply = await runAgent(modelText, {
