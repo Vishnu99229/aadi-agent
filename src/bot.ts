@@ -337,7 +337,8 @@ async function completeChatReply(
       journal.uncertain = true;
       journal.notices.add("An email write was still in progress. Check Gmail or Telegram before any further action.");
     }
-    const reply = renderEmailOutcomes(journal, settled.status === "ok" ? settled.reply : "");
+    const prose = settled.status === "ok" ? settled.reply : "";
+    const reply = renderEmailOutcomes(journal, prose);
     // A tool may finish after the chat deadline, or a voice card may only be
     // acknowledged on delivery. These are new acknowledgements, not retries.
     journal.onLateOutcome = (outcome) => {
@@ -398,7 +399,7 @@ async function completeChatReply(
         const status =
           error instanceof Error ? error.name : "UnknownError";
         console.error(`Voice reply failed: provider=sarvam status=${status}`);
-        await sendPlainText(ctx, renderEmailOutcomes(journal, reply));
+        await sendPlainText(ctx, renderEmailOutcomes(journal, prose));
         await withEmailTurn(journal, () => postUnpostedCards(ctx, cards));
       }
     } else {
@@ -2122,7 +2123,7 @@ async function handleUserText(
       });
       const notice = recovery?.notice;
       if (notice) noteEmailNotice(notice);
-      return notice ? [notice, isDraftCardOnly(reply) || reply.trim() === notice ? "" : reply].filter(Boolean).join("\n\n") : reply;
+      return reply;
     },
     {
       forwarded,

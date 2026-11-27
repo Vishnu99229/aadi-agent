@@ -5,7 +5,7 @@ import {
 } from "./db.js";
 import { parseAddressList } from "./address_list.js";
 import { confirmsExistingDraft } from "./email_references.js";
-import { emailOutcomeTime, EmailOperationError, type EmailFailureReason } from "./email_outcomes.js";
+import { emailOutcomeTime, EmailOperationError, type EmailFailureReason, type EmailTurnOutcomes } from "./email_outcomes.js";
 import type { ToolTurn } from "./tools/index.js";
 
 const EMAIL_WRITE_TOOLS = new Set([
@@ -27,6 +27,11 @@ export interface EmailRecovery {
   read_only: boolean;
   terminal: boolean;
   userMessage: string;
+}
+
+export function recordEmailRecovery(journal: EmailTurnOutcomes, recovery: EmailRecovery): void {
+  if (recovery.read_only) journal.uncertain = true;
+  journal.notices.add(recovery.userMessage);
 }
 
 function textField(input: unknown, key: string): string | undefined {

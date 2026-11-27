@@ -77,7 +77,7 @@ import {
   type ToolReceipt,
 } from "./receipt.js";
 import { contradictsRecordedSend, recordedReceipt } from "./receipt_records.js";
-import { emailRecoveryForModel, hasEmailRecovery, type EmailRecovery } from "./email_recovery.js";
+import { emailRecoveryForModel, hasEmailRecovery, recordEmailRecovery, type EmailRecovery } from "./email_recovery.js";
 import { addEmailOutcomes, currentEmailTurn, newEmailTurn, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
 import type { WorkflowToolRun } from "./agents/dispatch.js";
 import { repliedMessageForTurn } from "./email_references.js";
@@ -654,8 +654,11 @@ async function runAgentLoop(
   const saveUserMessage = options.saveUserMessage ?? true;
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
   const saveReply = (reply: string, save: boolean): string => {
-    const journal = currentEmailTurn();
-    return saveAssistantReply(journal && !options.delegation ? renderEmailOutcomes(journal, reply) : reply, save);
+    if (save) {
+      const journal = currentEmailTurn();
+      saveAssistantReply(journal && !options.delegation ? renderEmailOutcomes(journal, reply) : reply, true);
+    }
+    return reply;
   };
   const promptUrl = new URL("../prompts/system.md", import.meta.url);
   const specialist = options.agentId ? specialistFor(options.agentId) : undefined;
@@ -852,10 +855,7 @@ async function runAgentLoop(
     credit: (runs) => {
       for (const run of runs) {
         if (run.emailOutcomes) addEmailOutcomes(run.emailOutcomes);
-        if (run.emailRecovery?.read_only) turnContext.emailTurn.uncertain = true;
-        if (run.emailRecovery?.terminal && (run.emailRecovery.reason !== "approval_required" || !run.emailOutcomes?.length)) {
-          turnContext.emailTurn.notices.add(run.emailRecovery.userMessage);
-        }
+        if (run.emailRecovery) recordEmailRecovery(turnContext.emailTurn, run.emailRecovery);
         toolsUsed.add(run.tool);
         receipts.push({ name: run.tool, success: run.ok, content: run.content });
         if (isFamilyTool(run.tool)) {
@@ -1427,7 +1427,7 @@ async function runAgentLoop(
       // When the release list itself was read, it is the source. Articles a
       // search also turned up are cited only if the reply used them.
       withSearchCitations(
-        shortenDraftReply(finalReply, draftBodies),
+        turnContext.emailTurn.writes.size > 0 ? finalReply : shortenDraftReply(finalReply, draftBodies),
         releaseSources.length > 0 ? releaseSources : searchSources,
       ),
       saveAssistantMessage,

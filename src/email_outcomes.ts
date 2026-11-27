@@ -70,11 +70,13 @@ export function emailCardAcknowledgement(key: string, line: string): (messageId:
   };
 }
 
-/** Once a write is acknowledged, only code supplies the action portion of the reply.
- *  Retain separate authoritative refusals and questions from the same turn. */
+/** Put recorded outcomes and notices before the reply, leaving its prose intact. */
 export function renderEmailOutcomes(journal: EmailTurnOutcomes, reply: string): string {
-  if (journal.writes.size === 0 && journal.notices.size === 0) return reply;
-  return [...journal.writes.values()].map(outcome => outcome.line).concat([...journal.notices]).join("\n");
+  const lines = new Set([...journal.writes.values()].map(outcome => outcome.line));
+  for (const notice of journal.notices) lines.add(notice);
+  if (lines.size === 0) return reply;
+  const report = [...lines].join("\n");
+  return reply === "" ? report : `${report}\n\n${reply}`;
 }
 
 export function emailOutcomeTime(timestamp?: string | null): string | undefined {

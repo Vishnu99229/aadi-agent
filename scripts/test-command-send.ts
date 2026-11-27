@@ -65,6 +65,7 @@ import {
   recordKnownRecipient,
 } from "../src/db.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
+import { newEmailTurn, renderEmailOutcomes, withEmailTurn } from "../src/email_outcomes.ts";
 import { bindEmailReferenceForTurn } from "../src/email_references.ts";
 import { setSequenceTestHooks, startSequenceFromTool } from "../src/sequences.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
@@ -3335,19 +3336,20 @@ await expectCancelled("delete_task", async (row) => {
 
     chatScript = (params) => {
       if (params.messages.some(m => m.role === "assistant" && m.toolCalls.some(call => call.id.startsWith("code_start_sequence_")))) {
-        return modelReply({ text: "No card was posted." });
+        return modelReply({ text: "You can review the suggested follow-ups." });
       }
       return modelReply({ text: "I will do that." });
     };
     const fallback = await runAgent(`Start 3 follow-ups for ${prospect}`, { backend: "claude", skipHistory: true, sendConfirmation: { chatId: 92, messageId: 250_000 + nextTurn() } });
-    assert(fallback.includes("Start card posted for") && !fallback.includes("No card was posted"), "the command-guarantee fallback contributes a code-rendered card outcome");
-    chatScript = params => params.messages.at(-1)?.role === "tool" ? modelReply({ text: "No follow-ups are active." })
+    assert(fallback.includes("Start card posted for") && fallback.endsWith("You can review the suggested follow-ups."), "the fallback adds the card outcome before the model's prose");
+    chatScript = params => params.messages.at(-1)?.role === "tool" ? modelReply({ text: "The original discussion was about a partnership." })
       : modelReply({ tools: [{ name: "start_sequence", input: { prospect } }] });
     const enrolled = await runAgent(`Start 3 follow-ups for ${prospect}`, {
       backend: "claude", skipHistory: true, sendConfirmation: { chatId: 92, messageId: 250_000 + nextTurn() },
     });
     assert(getSalesSequenceByThread(outreach.threadId)?.status === "active" &&
-      enrolled.split("\n").filter(line => line.startsWith("Started 3 follow-ups to")).length === 1 && !enrolled.includes("No follow-ups"),
+      enrolled.split("\n").filter(line => line.startsWith("Started 3 follow-ups to")).length === 1 &&
+      enrolled.endsWith("The original discussion was about a partnership."),
       `an acknowledged enrollment has one code-rendered outcome: ${enrolled}`);
   } finally {
     users.messages.list = list;
@@ -3356,24 +3358,80 @@ await expectCancelled("delete_task", async (row) => {
   }
 }
 
-// The final reply is driven by the acknowledgements, even on a model failure.
+// Acknowledgements are reported alongside the rest of the reply, even after a model failure.
 {
-  const first = { to: "outcome-one@reliable.example", subject: "First receipt", body: "A short email." };
+  const first = { to: "outcome-one@reliable.example", subject: "First receipt", body: "The kickoff can take place next week. Please let me know which day works." };
   const second = { to: "outcome-two@reliable.example", subject: "Second receipt", body: "A separate email." };
   const one = "Draft created for outcome-one@reliable.example on 'First receipt'.";
   const two = "Draft created for outcome-two@reliable.example on 'Second receipt'.";
+  const another = mail({
+    threadId: "outcome-summary-thread", from: "Alina <alina@summary.example>", to: ME,
+    subject: "Pilot timeline", body: "The pilot will begin in July. Alina will send the revised budget on Friday.",
+  });
+  const prose = `${first.body}\n\n**Pilot timeline**\n\nThe pilot will begin in July.\n\nAlina will send the revised budget on Friday.`;
   let steps = 0;
   chatScript = () => {
     steps += 1;
-    if (steps === 1) return modelReply({ tools: [first, second].map(input => ({ name: "draft_new_email", input })) });
+    if (steps === 1) return modelReply({ tools: [
+      ...[first, second].map(input => ({ name: "draft_new_email", input })),
+      { name: "read_email", input: { id: another.id, account: "work" } },
+    ] });
     if (steps === 2) return modelReply({ tools: [{ name: "draft_new_email", input: first }] });
-    return modelReply({ text: `No drafts were created.\n${one}\n${one}` });
+    return modelReply({ text: prose });
   };
   const before = draftsCreated.length;
-  const reply = await runAgent("Draft the two notes", { skipHistory: true, toolNames: ["draft_new_email"] });
+  // Chat delivery owns this journal. The agent must leave rendering to its caller.
+  const journal = newEmailTurn();
+  const summary = await withEmailTurn(journal, () => runAgent("Draft the two notes and summarize Alina's email", {
+    skipHistory: true, toolNames: ["draft_new_email", "read_email"],
+  }));
+  const reply = renderEmailOutcomes(journal, summary);
+  assert(summary === prose && reply.startsWith(`${one}\n`) && reply.endsWith(`\n\n${prose}`),
+    `outcomes precede the full summary: ${reply}`);
   assert(draftsCreated.length === before + 2 && reply.split("\n").filter(line => line === one).length === 1 &&
-    reply.split("\n").filter(line => line === two).length === 1 && !reply.includes("No drafts were created"),
-    `two distinct writes and no replayed outcome: ${reply}`);
+    reply.split("\n").filter(line => line === two).length === 1, `two distinct writes and no replayed outcome: ${reply}`);
+
+  steps = 0;
+  const rejectedCard = { ...first, to: "outcome-card-rejected@reliable.example", subject: "Card rejected" };
+  chatScript = () => ++steps === 1
+    ? modelReply({ tools: [{ name: "draft_new_email", input: rejectedCard }] })
+    : modelReply({ text: "Alina will send the revised budget on Friday." });
+  setApprovalsTestHooks({
+    telegram: { ...telegram, sendMessage: async () => {
+      throw Object.assign(new Error("Telegram rejected the post"), { error_code: 400 });
+    } } as unknown as Api,
+    gmailFor: () => gmail,
+  });
+  try {
+    const partial = await runAgent("Draft the note", { skipHistory: true, toolNames: ["draft_new_email"] });
+    const lines = partial.split("\n");
+    assert(lines[0] === "Draft created for outcome-card-rejected@reliable.example on 'Card rejected'." &&
+      lines[1] === "Telegram rejected the card. Open the saved draft in Gmail to check it.",
+      `the acknowledged draft and the unresolved card failure both appear: ${partial}`);
+  } finally {
+    setApprovalsTestHooks({ telegram, gmailFor: () => gmail });
+  }
+
+  steps = 0;
+  chatScript = () => {
+    if (++steps === 1) return modelReply({ tools: [{ name: "draft_new_email", input: first }] });
+    if (steps === 2) return modelReply({ tools: [{ name: "draft_new_email", input: second }] });
+    return modelReply({ text: "Alina will send the revised budget on Friday." });
+  };
+  const create = gmail.users.drafts.create;
+  let attempts = 0;
+  gmail.users.drafts.create = (async (...args: unknown[]) => {
+    if (++attempts === 2) throw Object.assign(new Error("Gmail rejected the second draft"), { code: 403 });
+    return Reflect.apply(create, gmail.users.drafts, args);
+  }) as typeof create;
+  try {
+    const partial = await runAgent("Draft both notes", { skipHistory: true, toolNames: ["draft_new_email"] });
+    const lines = partial.split("\n");
+    assert(lines[0] === one && lines.includes("Gmail rejected the new draft. No draft was created.") && !lines.includes(two),
+      `a later rejection is visible without a false acknowledgement: ${partial}`);
+  } finally {
+    gmail.users.drafts.create = create;
+  }
 
   steps = 0;
   chatScript = () => {
@@ -3387,7 +3445,7 @@ await expectCancelled("delete_task", async (row) => {
   const grant = issueGrant({ source: "owner_chat", confirmation, ownerText: "Draft the delegated note" });
   steps = 0;
   chatScript = () => ++steps === 1 ? modelReply({ tools: [{ name: "test_delegate", input: {} }] })
-    : modelReply({ text: "The specialist didn't create anything." });
+    : modelReply({ text: "The draft is ready for review." });
   try {
     const delegated = await runAgent("Draft the delegated note", {
       toolNames: ["draft_new_email"], skipHistory: true, sendConfirmation: confirmation,
@@ -3401,7 +3459,7 @@ await expectCancelled("delete_task", async (row) => {
       }],
     });
     assert(delegated.split("\n").filter(line => line === "Draft created for outcome-one@reliable.example on 'Delegated receipt'.").length === 1 &&
-      !delegated.includes("didn't create"), `delegated acknowledgment arrives exactly once: ${delegated}`);
+      delegated.endsWith("The draft is ready for review."), `delegated acknowledgment arrives exactly once: ${delegated}`);
   } finally {
     revokeGrant(grant.ref);
     chatScript = undefined;

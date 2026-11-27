@@ -1,6 +1,6 @@
 import type { ToolCall } from "../llm.js";
 import { isSuccessfulToolResult } from "../receipt.js";
-import { emailRecoveryFor, hasEmailRecovery, type EmailRecovery } from "../email_recovery.js";
+import { emailRecoveryFor, hasEmailRecovery, recordEmailRecovery, type EmailRecovery } from "../email_recovery.js";
 import {
   currentEmailTurn, EmailOperationError, newEmailTurn, observeEmailTool, withEmailTurn,
   type EmailOutcome, type EmailToolObservation, type EmailTurnOutcomes,
@@ -235,10 +235,11 @@ export async function dispatchTool(
   turn: ToolTurn,
   ctx: TurnContext,
 ): Promise<ToolOutcome> {
-  const deny = (content: string, reason: "not_authorized" | "write_unconfirmed"): ToolOutcome => ({
-    content, isError: true,
-    emailRecovery: emailRecoveryFor(call.name, call.input, turn, content, new EmailOperationError(content, reason)),
-  });
+  const deny = (content: string, reason: "not_authorized" | "write_unconfirmed"): ToolOutcome => {
+    const recovery = emailRecoveryFor(call.name, call.input, turn, content, new EmailOperationError(content, reason));
+    if (recovery) recordEmailRecovery(ctx.emailTurn, recovery);
+    return { content, isError: true, emailRecovery: recovery };
+  };
   if (ctx.allowed && !ctx.allowed.has(call.name)) {
     return deny(ctx.notAllowedMessage ?? "Tool is not available for a forwarded message.", "not_authorized");
   }
@@ -403,12 +404,9 @@ async function runCall(
     const recovery = emailRecoveryFor(call.name, input, turn, outcome.content, observation.failure, outcome.isError);
     if (recovery) {
       outcome.emailRecovery = recovery;
-      if (recovery.read_only) ctx.emailTurn.uncertain = true;
+      recordEmailRecovery(ctx.emailTurn, recovery);
       if (recovery.terminal || observation.writes.length > 0) {
         ctx.emailFailures.set(key, { ...outcome, emailOutcomes: undefined });
-      }
-      if (recovery.terminal && (recovery.reason !== "approval_required" || observation.writes.length === 0)) {
-        ctx.emailTurn.notices.add(recovery.userMessage);
       }
     }
   }
