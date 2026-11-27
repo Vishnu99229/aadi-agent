@@ -13,7 +13,8 @@ import {
   type TaskSummary,
   type WorkflowSummary,
 } from "./engine.js";
-import { takeWorkflowToolRuns } from "./dispatch.js";
+import { takeWorkflowToolRuns, type WorkflowToolRun } from "./dispatch.js";
+import { addEmailOutcomes, currentEmailTurn, newEmailTurn, renderEmailOutcomes, withEmailTurn } from "../email_outcomes.js";
 import type { CardButton } from "./helpers.js";
 import { localSpecialists } from "./index.js";
 import { getAgent, listAgentIds, listAgents, routingHints } from "./registry.js";
@@ -529,12 +530,18 @@ function delegateTool(
         }
         void running
           .then(async (late) => {
-            takeWorkflowToolRuns(late.workflowId);
+            const runs = takeWorkflowToolRuns(late.workflowId);
             rememberOwnerWords(late, grant);
             logGoalTotals(late);
             recordLateWorkflow(turnRef?.id, workflowMeasure(late, workflowStartedAt, true));
             await postCards(late, postCard);
-            await lateNotifier?.(withLocalStepLine(`That job finished.\n${summaryForOwner(late)}`, localStepModel(late.workflowId)));
+            const active = currentEmailTurn();
+            const lateJournal = newEmailTurn();
+            withEmailTurn(lateJournal, () => addEmailOutcomes(runs.flatMap(run =>
+              run.emailOutcomes?.filter(outcome => !active?.writes.has(outcome.id)) ?? [],
+            )));
+            const reply = renderEmailOutcomes(lateJournal, `That job finished.\n${summaryForOwner(late)}`);
+            await lateNotifier?.(withLocalStepLine(reply, localStepModel(late.workflowId)));
           })
           .catch((error: unknown) => {
             const errorType = error instanceof Error ? error.name : "UnknownError";
@@ -569,7 +576,7 @@ function delegateTool(
  * task that was itself a single tool. Aadi's "did the command run" check counts
  * these as its own, so a job handed to the agents isn't reported as not done.
  */
-function toolsRunIn(summary: WorkflowSummary): Array<{ tool: string; ok: boolean; content: string }> {
+function toolsRunIn(summary: WorkflowSummary): WorkflowToolRun[] {
   const inner = takeWorkflowToolRuns(summary.workflowId);
   const direct = summary.tasks
     .filter((task) => getAgent(task.agentId)?.getCapabilities().find((item) => item.name === task.capability)?.kind === "tool")

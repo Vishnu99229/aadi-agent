@@ -5,6 +5,9 @@ import type { gmail_v1 } from "googleapis";
 import { handleApprovalCallback, queueDraftApproval, resendDraftCard, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
 import { clearPendingAction } from "../src/action_context.ts";
 import { defaultToolNames, runAgent } from "../src/agent.ts";
+import { issueGrant, revokeGrant } from "../src/agents/auth.ts";
+import { dispatchTool, newTurnContext, closeTurnContext, takeWorkflowToolRuns } from "../src/agents/dispatch.ts";
+import { startWorkflow } from "../src/agents/engine.ts";
 import { handleCommandSendCallback, handlePendingRecipientEdit, sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import {
   addressesInMemory,
@@ -62,6 +65,7 @@ import {
   recordKnownRecipient,
 } from "../src/db.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
+import { newEmailTurn, renderEmailOutcomes, withEmailTurn } from "../src/email_outcomes.ts";
 import { bindEmailReferenceForTurn } from "../src/email_references.ts";
 import { setSequenceTestHooks, startSequenceFromTool } from "../src/sequences.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
@@ -351,7 +355,7 @@ const telegram = {
   },
   editMessageText: async () => {
     if (telegramFails.edit) {
-      throw new Error("telegram down");
+      throw Object.assign(new Error("Telegram rejected the edit"), { error_code: 400 });
     }
     return true;
   },
@@ -1878,7 +1882,7 @@ await expectCancelled("delete_task", async (row) => {
   let draftFails = false;
   users.drafts.send = async (input) => {
     if (draftFails) {
-      throw new Error("socket hang up");
+      throw Object.assign(new Error("Gmail rejected the draft send"), { code: 403 });
     }
     threadCounter += 1;
     const id = `sent-${input.requestBody.id}`;
@@ -2654,12 +2658,12 @@ await expectCancelled("delete_task", async (row) => {
     unreadableDrafts.add("c-unreadable");
     const failedPosts = posts();
     const unreadable = await resendDraftCard(ownMessage(), "c-unreadable");
-    assert(!unreadable.ok && unreadable.message === "I couldn't re-read the draft from Gmail, so I didn't send it. Try again.", unreadable.message);
+    assert(!unreadable.ok && unreadable.message === "I couldn't re-read the draft from Gmail, so I didn't send it. Check the draft in Gmail.", unreadable.message);
     assert(posts() === failedPosts, "no card is posted");
     const unreadSends = draftsSent.length;
     const unreadTap = await alertingTap("c-unreadable");
     assert(draftsSent.length === unreadSends, "the tap sends nothing");
-    assert(unreadTap.includes("I couldn't re-read the draft from Gmail, so I didn't send it. Try again."), `the tap says why: ${unreadTap.join(" | ")}`);
+    assert(unreadTap.includes("I couldn't re-read the draft from Gmail, so I didn't send it. Check the draft in Gmail."), `the tap says why: ${unreadTap.join(" | ")}`);
     unreadableDrafts.delete("c-unreadable");
   }
 
@@ -3199,6 +3203,306 @@ await expectCancelled("delete_task", async (row) => {
   draftUsers.drafts.send = realSend;
   listUsers.messages.list = cList;
   setDomainLookupForTests(undefined);
+}
+
+// Recovery uses actual Gmail/Telegram boundaries, with a separate owner turn per case.
+{
+  setDomainLookupForTests(async () => "yes");
+  const users = gmail.users;
+  const fail = async () => { throw new Error("socket hang up"); };
+  const subject = "Recovery records";
+  const account = "work";
+  const from = "Recovery <recovery@reliable.example>";
+  const body = "Hi,\n\nHere is the note.";
+  const original = mail({ threadId: "tool-recovery-thread", from, to: ME, subject, body, at: Date.now() });
+  const dispatch = (name: string, input: unknown, userText: string, modelCalled = true) => {
+    const confirmation = { chatId: 91, messageId: 250_000 + nextTurn() };
+    const grant = issueGrant({ source: "owner_chat", confirmation, ownerText: userText });
+    const ctx = newTurnContext({ title: "Email recovery test", grant });
+    const send = (tool: string, args: unknown) => dispatchTool({ id: `call-${nextTurn()}`, name: tool, input: args, execution: "client" },
+      { iteration: 1, calledTools: [tool], confirmation, userText, modelCalled }, ctx);
+    const result = send(name, input);
+    return { result, send, journal: ctx.emailTurn, close: () => { closeTurnContext(ctx); revokeGrant(grant.ref); } };
+  };
+  const expectRecovery = async (
+    name: string, input: unknown, words: string, reason: string, readsOnly: boolean, modelCalled = true,
+  ) => {
+    const call = dispatch(name, input, words, modelCalled);
+    try {
+      const output = await call.result;
+      const info = output.emailRecovery;
+      assert(info?.reason === reason && info?.read_only === readsOnly && Boolean(info.state.status),
+        `${name} reported ${JSON.stringify(info)} instead of ${reason}`);
+      assert(!output.emailOutcomes?.length, "a failed or refused write has no acknowledgement line");
+      if (readsOnly) {
+        assert(info.next.tool === "search_emails" || info.next.tool === "read_draft" || info.next.tool === "read_email", "uncertainty only suggests a concrete read");
+        const blocked = await call.send(name, { ...input as object, subject: "A different retry argument" });
+        assert(blocked.isError === true && blocked.emailRecovery?.read_only === true, "the same turn cannot retry a write with different arguments");
+      }
+      return output;
+    } finally {
+      call.close();
+    }
+  };
+
+  await expectRecovery("draft_new_email", { to: "recovery@reliable.example", subject }, "Draft a note", "input_needed", false);
+  const create = users.drafts.create;
+  try {
+    users.drafts.create = (async () => ({ data: {} })) as typeof create;
+    const unknown = await expectRecovery("draft_new_email", { to: "recovery@reliable.example", subject, body }, "Draft a note", "write_unconfirmed", true);
+    assert(!unknown.emailOutcomes?.length, "create without an ID never claims a draft was acknowledged");
+    await expectRecovery("draft_reply", { email_id: "missing-original", body, account }, "Draft a reply to Recovery", "provider_read_failed", false);
+    users.drafts.create = fail as typeof create;
+    await expectRecovery("draft_reply", { email_id: original.id, body, account }, "Draft a reply to Recovery", "write_unconfirmed", true);
+  } finally {
+    users.drafts.create = create;
+  }
+
+  const to = "Recovery <recovery@reliable.example>";
+  const draftId = "b-recovery-draft";
+  draftHeaders.set(draftId, [{ name: "To", value: to }, { name: "Subject", value: subject }]);
+  const actionId = await queueDraftApproval({ draftId, to, subject, body, googleAccount: account, threadId: original.threadId });
+  unreadableDrafts.add(draftId);
+  await expectRecovery("update_draft", { draft_id: draftId, body }, "Change the draft", "provider_read_failed", false);
+  await expectRecovery("confirm_send_pending_draft", { draft_id: draftId }, "Send it now", "provider_read_failed", false);
+  unreadableDrafts.delete(draftId);
+  const update = users.drafts.update;
+  try {
+    users.drafts.update = fail as typeof update;
+    await expectRecovery("update_draft", { draft_id: draftId, body }, "Change the draft", "write_unconfirmed", true);
+  } finally {
+    users.drafts.update = update;
+  }
+  const draftSend = users.drafts.send;
+  let uncertainAttempts = 0;
+  try {
+    users.drafts.send = (async () => { uncertainAttempts += 1; return fail(); }) as typeof draftSend;
+    const call = dispatch("confirm_send_pending_draft", { draft_id: draftId }, "Send it now");
+    try {
+      const { emailRecovery: uncertain } = await call.result;
+      assert(uncertain?.read_only === true && uncertain.reason === "write_unconfirmed", "an unconfirmed send requires read-only reconciliation");
+      const read = await call.send("read_email", { id: original.id, account });
+      assert(!read.isError && read.content.includes(subject), "the reconciliation read succeeds");
+      const lines = renderEmailOutcomes(call.journal, "Checked the thread.").split("\n");
+      assert(lines.filter(line => line === uncertain?.userMessage).length === 1 && call.journal.uncertain &&
+        call.journal.writes.size === 0, "the successful read leaves the uncertain send notice in place once");
+    } finally {
+      call.close();
+    }
+    await expectRecovery("confirm_send_pending_draft", { draft_id: draftId }, "Send it now", "write_unconfirmed", true);
+    assert(uncertainAttempts === 1, "a new turn cannot resend a draft with an unresolved delivery");
+  } finally {
+    users.drafts.send = draftSend;
+  }
+
+  const deliveredId = "b-delivered-draft";
+  const deliveredTo = "Fahim <recovery-fahim@reliable.example>";
+  draftHeaders.set(deliveredId, [{ name: "To", value: deliveredTo }, { name: "Subject", value: subject }]);
+  const deliveredAction = await queueDraftApproval({ draftId: deliveredId, to: deliveredTo, subject, body, googleAccount: account, threadId: original.threadId });
+  let sentCard = "";
+  let sentButtons = -1;
+  await handleApprovalCallback({
+    callbackQuery: { data: `approval:send:${deliveredAction}`, message: { message_id: approvalAction(deliveredAction)!.telegram_message_id } },
+    answerCallbackQuery: async () => undefined,
+    editMessageText: async (text: string, options: { reply_markup: { inline_keyboard: unknown[] } }) => {
+      sentCard = text;
+      sentButtons = options.reply_markup.inline_keyboard.length;
+    },
+  } as unknown as Context, "send", deliveredAction);
+  assert(/^Sent to Fahim at \d\d:\d\d IST$/.test(sentCard) && sentButtons === 0, "sent card uses recorded time and has no buttons");
+  const sent = await expectRecovery("confirm_send_pending_draft", { draft_id: deliveredId }, "Send it now", "draft_closed", false);
+  assert(sent.emailRecovery?.state.thread_id === original.threadId && sent.emailRecovery.state.recipient === deliveredTo &&
+    sent.emailRecovery.next.tool === "read_email" && !sent.emailOutcomes?.length, "sent drafts recommend the recorded reply context and never confirm again");
+  assert(approvalAction(actionId)?.status === "pending", "the other draft's unresolved claim was not settled by the send");
+
+  const address = "recovery-command@reliable.example";
+  recordKnownRecipient(address, "test");
+  const words = `Send an email to ${address} about the note`;
+  await expectRecovery("send_email", { to: [address] }, words, "input_needed", false);
+  try {
+    sendFails = "network";
+    await expectRecovery("send_email", { to: [address], instruction: "Send a short note." }, words, "write_unconfirmed", true);
+  } finally {
+    sendFails = undefined;
+  }
+
+  const prospect = "outcome-prospect@reliable.example";
+  const outreach = mail({
+    threadId: "outcome-sequence-thread", from: ME, to: prospect, subject: "A partnership discussion",
+    body: "Hi,\n\nWould you be open to a demo of our platform?", sent: true, at: Date.now(),
+  });
+  const list = users.messages.list;
+  users.messages.list = (async (input: { q?: string }) => input.q?.includes("in:sent")
+    ? { data: { messages: [{ id: outreach.id, threadId: outreach.threadId }] } } : list(input as never)) as typeof list;
+  try {
+    await expectRecovery("start_sequence", { prospect: "" }, "Start a sequence for them", "input_needed", false);
+    telegramFails.send = true;
+    try {
+      const unknown = await expectRecovery("start_sequence", { prospect }, `Start 3 follow-ups for ${prospect}`, "write_unconfirmed", true, false);
+      assert(unknown.emailRecovery?.state.sequence_status === "proposed" && getSalesSequenceByThread(outreach.threadId)?.status === "proposed",
+        "an unconfirmed card stays proposed and never enrolls");
+    } finally {
+      telegramFails.send = false;
+    }
+
+    chatScript = (params) => {
+      if (params.messages.some(m => m.role === "assistant" && m.toolCalls.some(call => call.id.startsWith("code_start_sequence_")))) {
+        return modelReply({ text: "You can review the suggested follow-ups." });
+      }
+      return modelReply({ text: "I will do that." });
+    };
+    const fallback = await runAgent(`Start 3 follow-ups for ${prospect}`, { backend: "claude", skipHistory: true, sendConfirmation: { chatId: 92, messageId: 250_000 + nextTurn() } });
+    assert(fallback.includes("Start card posted for") && fallback.endsWith("You can review the suggested follow-ups."), "the fallback adds the card outcome before the model's prose");
+    chatScript = params => params.messages.at(-1)?.role === "tool" ? modelReply({ text: "The original discussion was about a partnership." })
+      : modelReply({ tools: [{ name: "start_sequence", input: { prospect } }] });
+    const enrolled = await runAgent(`Start 3 follow-ups for ${prospect}`, {
+      backend: "claude", skipHistory: true, sendConfirmation: { chatId: 92, messageId: 250_000 + nextTurn() },
+    });
+    assert(getSalesSequenceByThread(outreach.threadId)?.status === "active" &&
+      enrolled.split("\n").filter(line => line.startsWith("Started 3 follow-ups to")).length === 1 &&
+      enrolled.endsWith("The original discussion was about a partnership."),
+      `an acknowledged enrollment has one code-rendered outcome: ${enrolled}`);
+  } finally {
+    users.messages.list = list;
+    chatScript = undefined;
+    setDomainLookupForTests(undefined);
+  }
+}
+
+// Acknowledgements are reported alongside the rest of the reply, even after a model failure.
+{
+  const first = { to: "outcome-one@reliable.example", subject: "First receipt", body: "The kickoff can take place next week. Please let me know which day works." };
+  const second = { to: "outcome-two@reliable.example", subject: "Second receipt", body: "A separate email." };
+  const one = "Draft created for outcome-one@reliable.example on 'First receipt'.";
+  const two = "Draft created for outcome-two@reliable.example on 'Second receipt'.";
+  const another = mail({
+    threadId: "outcome-summary-thread", from: "Alina <alina@summary.example>", to: ME,
+    subject: "Pilot timeline", body: "The pilot will begin in July. Alina will send the revised budget on Friday.",
+  });
+  const prose = `${first.body}\n\n**Pilot timeline**\n\nThe pilot will begin in July.\n\nAlina will send the revised budget on Friday.`;
+  let steps = 0;
+  chatScript = () => {
+    steps += 1;
+    if (steps === 1) return modelReply({ tools: [
+      ...[first, second].map(input => ({ name: "draft_new_email", input })),
+      { name: "read_email", input: { id: another.id, account: "work" } },
+    ] });
+    if (steps === 2) return modelReply({ tools: [{ name: "draft_new_email", input: first }] });
+    return modelReply({ text: prose });
+  };
+  const before = draftsCreated.length;
+  // Chat delivery owns this journal. The agent must leave rendering to its caller.
+  const journal = newEmailTurn();
+  const summary = await withEmailTurn(journal, () => runAgent("Draft the two notes and summarize Alina's email", {
+    skipHistory: true, toolNames: ["draft_new_email", "read_email"],
+  }));
+  const reply = renderEmailOutcomes(journal, summary);
+  assert(summary === prose && reply.startsWith(`${one}\n`) && reply.endsWith(`\n\n${prose}`),
+    `outcomes precede the full summary: ${reply}`);
+  assert(draftsCreated.length === before + 2 && reply.split("\n").filter(line => line === one).length === 1 &&
+    reply.split("\n").filter(line => line === two).length === 1, `two distinct writes and no replayed outcome: ${reply}`);
+
+  const getMessage = gmail.users.messages.get;
+  let reads = 0;
+  gmail.users.messages.get = (async (input: { id: string }, ...args: unknown[]) => {
+    if (input.id === another.id && ++reads === 1) throw new Error("The first Gmail read failed");
+    return Reflect.apply(getMessage, gmail.users.messages, [input, ...args]);
+  }) as typeof getMessage;
+  steps = 0;
+  const replyArgs = { email_id: another.id, account: "work", body: "Thanks for the timeline." };
+  chatScript = () => {
+    if (++steps === 1) return modelReply({ tools: [{ name: "draft_reply", input: replyArgs }] });
+    if (steps === 2) return modelReply({ tools: [{ name: "draft_reply", input: { ...replyArgs, body: "Thanks for sharing the pilot timeline." } }] });
+    return modelReply({ text: "Alina will send the revised budget on Friday." });
+  };
+  try {
+    const retried = await runAgent("Draft a reply to Alina", { skipHistory: true, toolNames: ["draft_reply"] });
+    const lines = retried.split("\n");
+    assert(reads === 2 && !lines.includes("I couldn't read the original email. No reply draft was created.") &&
+      lines.filter(line => line === "Reply draft created for Alina <alina@summary.example> on 'Re: Pilot timeline'.").length === 1,
+      `an acknowledged retry clears its earlier read failure and appears once: ${retried}`);
+  } finally {
+    gmail.users.messages.get = getMessage;
+  }
+
+  steps = 0;
+  const rejectedCard = { ...first, to: "outcome-card-rejected@reliable.example", subject: "Card rejected" };
+  chatScript = () => ++steps === 1
+    ? modelReply({ tools: [{ name: "draft_new_email", input: rejectedCard }] })
+    : modelReply({ text: "Alina will send the revised budget on Friday." });
+  setApprovalsTestHooks({
+    telegram: { ...telegram, sendMessage: async () => {
+      throw Object.assign(new Error("Telegram rejected the post"), { error_code: 400 });
+    } } as unknown as Api,
+    gmailFor: () => gmail,
+  });
+  try {
+    const partial = await runAgent("Draft the note", { skipHistory: true, toolNames: ["draft_new_email"] });
+    const lines = partial.split("\n");
+    assert(lines[0] === "Draft created for outcome-card-rejected@reliable.example on 'Card rejected'." &&
+      lines[1] === "Telegram rejected the card. Open the saved draft in Gmail to check it.",
+      `the acknowledged draft and the unresolved card failure both appear: ${partial}`);
+  } finally {
+    setApprovalsTestHooks({ telegram, gmailFor: () => gmail });
+  }
+
+  steps = 0;
+  chatScript = () => {
+    if (++steps === 1) return modelReply({ tools: [{ name: "draft_new_email", input: first }] });
+    if (steps === 2) return modelReply({ tools: [{ name: "draft_new_email", input: second }] });
+    return modelReply({ text: "Alina will send the revised budget on Friday." });
+  };
+  const create = gmail.users.drafts.create;
+  try {
+    for (const failedAttempt of [1, 2]) {
+      steps = 0;
+      let attempts = 0;
+      gmail.users.drafts.create = (async (...args: unknown[]) => {
+        if (++attempts === failedAttempt) throw Object.assign(new Error("Gmail rejected one draft"), { code: 403 });
+        return Reflect.apply(create, gmail.users.drafts, args);
+      }) as typeof create;
+      const partial = await runAgent("Draft both notes", { skipHistory: true, toolNames: ["draft_new_email"] });
+      const lines = partial.split("\n");
+      const [created, rejected] = failedAttempt === 1 ? [two, one] : [one, two];
+      assert(lines.filter(line => line === created).length === 1 && !lines.includes(rejected) &&
+        lines.filter(line => line === "Gmail rejected the new draft. No draft was created.").length === 1,
+        `a rejection stays visible regardless of which draft succeeded: ${partial}`);
+    }
+  } finally {
+    gmail.users.drafts.create = create;
+  }
+
+  steps = 0;
+  chatScript = () => {
+    if (++steps === 1) return modelReply({ tools: [{ name: "draft_new_email", input: { ...first, subject: "Before model failure" } }] });
+    throw new Error("model failed after Gmail and Telegram acknowledged their writes");
+  };
+  const failed = await runAgent("Draft a note", { skipHistory: true, toolNames: ["draft_new_email"], backend: "claude" });
+  assert(failed.includes("Draft created for outcome-one@reliable.example on 'Before model failure'."), "the outcome survives the model failure");
+
+  const confirmation = { chatId: 94, messageId: 250_000 + nextTurn() };
+  const grant = issueGrant({ source: "owner_chat", confirmation, ownerText: "Draft the delegated note" });
+  steps = 0;
+  chatScript = () => ++steps === 1 ? modelReply({ tools: [{ name: "test_delegate", input: {} }] })
+    : modelReply({ text: "The draft is ready for review." });
+  try {
+    const delegated = await runAgent("Draft the delegated note", {
+      toolNames: ["draft_new_email"], skipHistory: true, sendConfirmation: confirmation,
+      metaTools: [{
+        definition: { type: "function", name: "test_delegate", description: "Delegate a draft", inputSchema: { type: "object" } },
+        handler: async () => {
+          const job = await startWorkflow({ title: "Draft the note", origin: "delegate", chatId: confirmation.chatId, grant,
+            tasks: [{ key: "draft", agentId: "email", capability: "draft_new_email", depth: 1, input: { ...first, subject: "Delegated receipt" } }] });
+          return { content: "Specialist finished.", toolsRun: takeWorkflowToolRuns(job.workflowId) };
+        },
+      }],
+    });
+    assert(delegated.split("\n").filter(line => line === "Draft created for outcome-one@reliable.example on 'Delegated receipt'.").length === 1 &&
+      delegated.endsWith("The draft is ready for review."), `delegated acknowledgment arrives exactly once: ${delegated}`);
+  } finally {
+    revokeGrant(grant.ref);
+    chatScript = undefined;
+  }
 }
 
 // ---- no bodies in the logs ----

@@ -20,6 +20,7 @@ import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.
 import { isGoogleNotFound } from "./google/auth.js";
 import { parseAddressList } from "./address_list.js";
 import { routeMiss, type PreRouteResult } from "./pre_route.js";
+import { EmailOperationError } from "./email_outcomes.js";
 
 export function closedDraftMiss(reference: ClosedEmailContext): Extract<PreRouteResult, { kind: "miss" }> {
   const recipient = parseAddressList(reference.to ?? "")[0];
@@ -51,7 +52,8 @@ export function draftReadMiss(chatId: number, email: Parameters<typeof reconcile
   if (linkedDraftWriteInProgress(email)) {
     return routeMiss("Delivery is underway or unconfirmed. Check its records without writing.", { scope: "read_only" });
   }
-  const closed = reconcileClosedEmail(chatId, email, error != null && isGoogleNotFound(error));
+  const missing = error instanceof EmailOperationError ? error.reason === "draft_missing" : error != null && isGoogleNotFound(error);
+  const closed = reconcileClosedEmail(chatId, email, missing);
   return closed ? closedDraftMiss(closed) : routeMiss("Gmail could not be read. The draft state is unverified.", { scope: "read_only" });
 }
 

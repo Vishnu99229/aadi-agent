@@ -1,4 +1,5 @@
 import type { LlmTool } from "../llm.js";
+import { randomUUID } from "node:crypto";
 import {
   draftChange,
   lockedScheduleForDraft,
@@ -10,11 +11,12 @@ import {
 } from "../action_context.js";
 import { DRAFT_REPLACED, queueDraftApproval } from "../approvals.js";
 import { noteDraftEditedThisTurn } from "./confirm_send_pending_draft.js";
-import { accountBoundToDraft, getPendingActionForDraft, latestDraftAction,
-  setPendingActionThread,
+import { accountBoundToDraft, emailDeliveryUnsettled, getPendingActionForDraft, latestDraftAction,
+  recordedClosedEmail, setPendingActionThread, type GoogleAccountId,
 } from "../db.js";
 import {
   buildMimeMessage,
+  GmailDraftNotFoundError,
   gmailClient,
   messageHeader as header,
   plainTextBody,
@@ -26,6 +28,10 @@ import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 import { sameConversation } from "../subject_logic.js";
 import { emailReferenceForTurn } from "../email_references.js";
+import {
+  emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, noteEmailNotice,
+  oneLine, outcomeRecipient, recordEmailOutcome,
+} from "../email_outcomes.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -73,6 +79,25 @@ function safeHeader(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }
 
+function unavailableDraft(draftId: string, account: GoogleAccountId): string | undefined {
+  const linked = { account, draftId };
+  const locked = lockedScheduleForDraft(draftId, account);
+  const closed = recordedClosedEmail(linked);
+  if (locked) return noteEmailFailure(new EmailOperationError(tooLateText(locked),
+    locked.sent ? "draft_closed" : "write_unconfirmed", linked));
+  if (closed?.status === "superseded") return DRAFT_REPLACED;
+  if (closed?.status === "sent" || closed?.status === "discarded") {
+    return noteEmailFailure(new EmailOperationError(
+      closed.status === "sent" ? "That draft was already sent. Use its thread for a new reply." : "That draft was discarded.",
+      "draft_closed", linked,
+    ));
+  }
+  if (emailDeliveryUnsettled(linked)) return noteEmailFailure(
+    new EmailOperationError("Delivery for this draft is unconfirmed. Check Sent mail before changing it.", "write_unconfirmed", linked),
+  );
+  return undefined;
+}
+
 /** What Vishnu must hear about a scheduled email after an update_draft call: a refusal,
  *  or a scheduled copy that was stopped or was already going out. Undefined when it matches. */
 export function draftUpdateNotice(result: string): string | undefined {
@@ -90,7 +115,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   if (referencedEmail) {
     return `Not updated: the owner selected ${referencedEmail} from OCR/a quoted message. This is a new recipient reference, not permission to rewrite an older Gmail draft.`;
   }
-  const values = input as {
+  const values = (input ?? {}) as {
     draft_id?: unknown;
     body?: unknown;
     cc?: unknown;
@@ -117,21 +142,23 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
 
   const draftId = values.draft_id.trim();
   if (latestDraftAction(draftId)?.status === "superseded") return DRAFT_REPLACED;
-  const pending = getPendingActionForDraft(draftId);
-  const hintedAccount = pending?.google_account ?? accountBoundToDraft(draftId);
+  const hintedAccount = latestDraftAction(draftId)?.google_account ?? accountBoundToDraft(draftId);
   // The email this draft was scheduled as may already be going out, or gone. Its history
   // stays as sent: say so before reading or changing the draft.
   if (hintedAccount) {
-    const locked = lockedScheduleForDraft(draftId, hintedAccount);
-    if (locked) {
-      return tooLateText(locked);
-    }
+    const unavailable = unavailableDraft(draftId, hintedAccount);
+    if (unavailable) return unavailable;
   }
-  const { account, draft: existing } = await resolveGmailDraft(draftId, hintedAccount);
-  const locked = lockedScheduleForDraft(draftId, account.id);
-  if (locked) {
-    return tooLateText(locked);
-  }
+  const { account, draft: existing } = await emailProviderRead(
+    () => resolveGmailDraft(draftId, hintedAccount).catch(error => {
+      if (error instanceof GmailDraftNotFoundError) throw new EmailOperationError(
+        "That draft is missing from Gmail. No edit was attempted.", "draft_missing", { draftId, account: hintedAccount },
+      );
+      throw error;
+    }), "I couldn't read the Gmail draft. No edit was attempted.", { draftId, account: hintedAccount },
+  );
+  const unavailable = unavailableDraft(draftId, account.id);
+  if (unavailable) return unavailable;
   const gmail = gmailClient(account);
   const message = existing.message;
   const headers = message?.payload?.headers;
@@ -183,22 +210,30 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
       ["References", leavesThread ? "" : header(headers, "References")],
     ],
     body,
-    current.signed ? await signatureHtmlFor(account) : "",
+    current.signed ? await emailProviderRead(() => signatureHtmlFor(account),
+      "I couldn't read the mailbox signature. No edit was attempted.", { draftId, account: account.id, recipient: to }) : "",
   );
-  if (latestDraftAction(draftId, account.id)?.status === "superseded") return DRAFT_REPLACED;
-  const result = await gmail.users.drafts.update({
+  const beforeWrite = unavailableDraft(draftId, account.id);
+  if (beforeWrite) return beforeWrite;
+  const result = await emailProviderWrite(() => gmail.users.drafts.update({
     userId: "me",
-    id: values.draft_id,
+    id: draftId,
     requestBody: {
-      id: values.draft_id,
+      id: draftId,
       message: {
         ...(leavesThread ? {} : { threadId: threadId ?? undefined }),
         raw: Buffer.from(raw, "utf8").toString("base64url"),
       },
     },
+  }, { retry: false }), {
+    rejected: "Gmail rejected the draft edit. Read the draft to check its current wording.",
+    unconfirmed: "Gmail didn't confirm the edit. Read the draft to see what was saved before making another change.",
+    evidence: { draftId, account: account.id, recipient: to, threadId },
   });
 
-  const savedDraftId = result.data.id ?? values.draft_id;
+  const savedDraftId = result.data.id ?? draftId;
+  recordEmailOutcome(`draft:update:${account.id}:${savedDraftId}:${randomUUID()}`,
+    `Updated the draft to ${outcomeRecipient(to)} on '${oneLine(subject)}'.`);
   const draftThread = leavesThread ? result.data.message?.threadId ?? threadId : threadId;
   if (leavesThread) {
     // Gmail now has it as a new conversation (no thread, no reply headers): from this
@@ -232,6 +267,8 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   }
   const scheduleNote =
     sync.kind === "synced" ? "The scheduled email was updated to match this draft." : scheduleSyncNotice(sync);
+  noteEmailNotice(scheduleNote);
+  noteEmailNotice(conversationNote);
   let replacementNotice = "";
   await queueDraftApproval({
     draftId: savedDraftId,

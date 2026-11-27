@@ -32,6 +32,7 @@ import { bindEmailReferenceForTurn, bindRepliedMessageForTurn, buildReferencedEm
 import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, tryReviseReferencedMeeting } from "./owner_calendar.js";
 import { closedDraftMiss, composeWithEmailAgent, draftReadMiss, linkedDraftWriteInProgress, publishReadyDraft, tryReviseLinkedDraft } from "./context_draft.js";
 import { routeMiss, type PreRouteResult } from "./pre_route.js";
+import { currentEmailTurn, EmailOperationError, newEmailTurn, noteEmailNotice, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
 import { parseAddressList } from "./address_list.js";
 import { toolOwnership } from "./agents/registry.js";
 import { handler as draftNewEmailTool } from "./tools/draft_new_email.js";
@@ -319,6 +320,7 @@ async function completeChatReply(
   } = {},
 ): Promise<void> {
   const forwarded = options.forwarded === true;
+  const journal = currentEmailTurn() ?? newEmailTurn();
   const gate = beginTurn();
   if (options.retry !== false) attachRetryText(gate, options.retryText ?? userText);
   if (forwarded) {
@@ -329,7 +331,25 @@ async function completeChatReply(
   // A spoken turn keeps the cards its tools make, to put their buttons on the voice note.
   const held = options.voiceReply ? collectVoiceCards() : undefined;
   try {
-    const settled = await settleChatWork(held ? () => held.run(work) : work, turnTimeoutMs());
+    const execute = () => withEmailTurn(journal, () => held ? held.run(work) : work());
+    const settled = await settleChatWork(execute, turnTimeoutMs());
+    if (settled.status === "timeout" && journal.inFlight > 0) {
+      journal.uncertain = true;
+      journal.notices.add("An email write was still in progress. Check Gmail or Telegram before any further action.");
+    }
+    const prose = settled.status === "ok" ? settled.reply : "";
+    const reply = renderEmailOutcomes(journal, prose);
+    // A tool may finish after the chat deadline, or a voice card may only be
+    // acknowledged on delivery. These are new acknowledgements, not retries.
+    journal.onLateOutcome = (outcome) => {
+      void sendPlainText(ctx, outcome.line).catch(() => undefined);
+    };
+    if (settled.status !== "ok" && reply) {
+      gate.open = false;
+      closeTurn(gate, settled.status === "failed" ? "failed" : settled.status === "timeout" ? "timeout" : "empty", startedAt);
+      await sendPlainText(ctx, reply);
+      return;
+    }
     if (settled.status === "timeout") {
       gate.open = false;
       closeTurn(gate, "timeout", startedAt);
@@ -351,41 +371,49 @@ async function completeChatReply(
       return;
     }
     closeTurn(gate, "ok", startedAt);
-    if (isDraftCardOnly(settled.reply)) {
+    if (isDraftCardOnly(reply)) {
       return;
     }
     if (options.voiceReply && ctx.chat) {
       const chatId = ctx.chat.id;
       const cards = held?.close() ?? [];
       try {
-        await deliverVoiceTurn({
+        await withEmailTurn(journal, () => deliverVoiceTurn({
           api: ctx.api,
           chatId,
-          replyText: settled.reply,
+          replyText: reply,
           sourceText: options.voiceSourceText ?? userText,
-          cards,
+          cards: journal.uncertain ? cards.filter(card => !card.emailCard) : cards,
           sendText: (text) => sendPlainText(ctx, text),
-          postCard: (card) => postCard(ctx.api, chatId, card),
-        });
+          postCard: async (card) => {
+            if (card.emailCard && journal.uncertain) return;
+            try {
+              await postCard(ctx.api, chatId, card);
+            } catch (error) {
+              if (!(error instanceof EmailOperationError)) throw error;
+              await sendPlainText(ctx, error.message);
+            }
+          },
+        }));
       } catch (error) {
         const status =
           error instanceof Error ? error.name : "UnknownError";
         console.error(`Voice reply failed: provider=sarvam status=${status}`);
-        await sendPlainText(ctx, settled.reply);
-        await postUnpostedCards(ctx, cards);
+        await sendPlainText(ctx, renderEmailOutcomes(journal, prose));
+        await withEmailTurn(journal, () => postUnpostedCards(ctx, cards));
       }
     } else {
       const rows = options.replyButtons?.() ?? [];
       if (rows.length > 0) {
-        await replyWithButtons(ctx, settled.reply, rows);
+        await replyWithButtons(ctx, reply, rows);
       } else {
-        await sendPlainText(ctx, settled.reply);
+        await sendPlainText(ctx, reply);
       }
     }
   } finally {
     // Failed, timed out or empty: any card the turn made still gets shown. One made
     // after a timeout posts the usual way, because the collector is closed.
-    await postUnpostedCards(ctx, held?.close() ?? []);
+    await withEmailTurn(journal, () => postUnpostedCards(ctx, held?.close() ?? []));
     stopTyping();
   }
 }
@@ -395,7 +423,7 @@ async function postUnpostedCards(ctx: Context, cards: readonly VoiceCard[]): Pro
     return;
   }
   for (const card of cards) {
-    if (card.posted) {
+    if (card.posted || card.writeUnconfirmed || (card.emailCard && currentEmailTurn()?.uncertain)) {
       continue;
     }
     try {
@@ -1362,6 +1390,8 @@ async function handleUserText(
   userText: string,
   options: { forwarded?: boolean; voiceReply?: boolean; contactNote?: string; retried?: boolean } = {},
 ): Promise<void> {
+  if (!currentEmailTurn()) return withEmailTurn(newEmailTurn(), () => handleUserText(ctx, userId, userText, options));
+  const replyFromActions = (message: string): string => renderEmailOutcomes(currentEmailTurn()!, message);
   let recovery: Extract<PreRouteResult, { kind: "miss" }> | undefined;
   const handleResult = async (result: PreRouteResult, save = false): Promise<boolean> => {
     if (result.kind === "miss") {
@@ -1372,7 +1402,7 @@ async function handleUserText(
       saveMessage("user", userText);
       saveMessage("assistant", result.text);
     }
-    await ctx.reply(result.text);
+    await ctx.reply(replyFromActions(result.text));
     return true;
   };
   const changeOpenDraft = async (draftId: string, fields: { to?: string; cc?: string; subject?: string }, lead?: string): Promise<PreRouteResult> => {
@@ -1598,7 +1628,7 @@ async function handleUserText(
               { to: request.to, cc: copies.length ? copies.join(", ") : undefined, subject: written.subject, body: written.body, account },
               { iteration: 1, calledTools: [], userText, confirmation },
             );
-            await ctx.reply(created);
+            await ctx.reply(replyFromActions(created));
             return;
           } catch {
             recovery = routeMiss("Draft creation or card posting failed. Check Gmail without repeating the write.", { scope: "read_only" });
@@ -1631,7 +1661,7 @@ async function handleUserText(
           return "";
         });
         if (!recovery) {
-          await ctx.reply(result);
+          await ctx.reply(replyFromActions(result));
           return;
         }
       }
@@ -1697,7 +1727,11 @@ async function handleUserText(
         },
       });
       const posted = await publishReadyDraft(ctx.chat.id);
-      if (posted.posted) return;
+      if (posted.posted) {
+        const reply = replyFromActions("");
+        if (reply) await ctx.reply(reply);
+        return;
+      }
       if (await handleResult(posted.recovery ?? routeMiss("The meeting guests were found, but draft publication failed.", { scope: "read_only" }))) return;
     }
     if (!recovery) {
@@ -1812,9 +1846,8 @@ async function handleUserText(
           const reply = posted.notice?.startsWith("Too late:")
             ? posted.notice
             : [contextTurn.text, posted.notice].filter(Boolean).join("\n");
-          if (reply) {
-            await ctx.reply(reply);
-          }
+          const observed = replyFromActions(reply ?? "");
+          if (observed) await ctx.reply(observed);
           return;
         }
         if (await handleResult(posted.recovery ?? routeMiss("The draft could not be published.", { scope: "read_only" }))) return;
@@ -1920,7 +1953,7 @@ async function handleUserText(
     if (result.failure === "miss" || result.failure === "uncertain") {
       recovery = routeMiss(result.message, { scope: "read_only", notice: result.message });
     } else {
-      await replyInKind(ctx, result.message, spoken, userText);
+      await replyInKind(ctx, replyFromActions(result.message), spoken, userText);
       return;
     }
   }
@@ -2089,7 +2122,8 @@ async function handleUserText(
         ...(spoken ? { voiceAnswer: "spoken" as const } : inWriting ? { voiceAnswer: "written" as const } : {}),
       });
       const notice = recovery?.notice;
-      return notice ? [notice, isDraftCardOnly(reply) || reply.trim() === notice ? "" : reply].filter(Boolean).join("\n\n") : reply;
+      if (notice) noteEmailNotice(notice);
+      return reply;
     },
     {
       forwarded,

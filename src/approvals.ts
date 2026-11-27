@@ -1,9 +1,11 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
+import { randomUUID } from "node:crypto";
 import { google, type gmail_v1 } from "googleapis";
 import { config } from "./config.js";
 import {
   cancelOpenDraftSchedules,
   claimDraftDelivery,
+  clearUnconfirmedDraftDelivery,
   createPendingEventAction,
   draftCardMessageIds,
   draftDeliveryBlocksDiscard,
@@ -16,6 +18,7 @@ import {
   setPendingActionTelegramMessage,
   pendingDraftActionForMessage,
   reconcilePendingDrafts,
+  recordUnconfirmedDraftDelivery,
   registerPendingDraft,
   settleDraftDelivery,
   supersedeDraftIfReplaced,
@@ -46,6 +49,11 @@ import { plainTextBody, stripSignature } from "./google/mail.js";
 import { collectAttachmentParts } from "./gmail_attachments.js";
 import { evaluateCommandSendGate } from "./security/command_send.js";
 import { assertTestSeam } from "./test_seam.js";
+import {
+  definitelyRejectedWrite, emailOutcomeTime, emailProviderWrite, EmailOperationError,
+  currentEmailTurn, noteEmailFailure, noteEmailNotice, oneLine, outcomeRecipient, recordEmailOutcome,
+  sentOutcomeLine, trackEmailProviderWrite,
+} from "./email_outcomes.js";
 
 const PREVIEW_LIMIT = 3800;
 /** Only a draft that would not fit in one Telegram message is shortened on the card. */
@@ -260,12 +268,24 @@ function callbackMessageText(ctx: Context): string {
 
 async function showStatus(
   ctx: Context,
-  status: "Sent" | "Discarded" | "Expired" | "Cancelled" | "Created",
+  status: "Discarded" | "Expired" | "Cancelled" | "Created",
   trailer?: string,
 ): Promise<void> {
   const base = `${callbackMessageText(ctx)}\n\nStatus: ${status}`;
   const text = trailer ? `${base}\n${trailer}` : base;
   await ctx.editMessageText(text, { reply_markup: new InlineKeyboard() });
+}
+
+function sentCardText(action: PendingAction): string {
+  const recorded = getPendingAction(action.id) ?? action;
+  const people = parseAddressList(recorded.live_to_header ?? recorded.to_header ?? "")
+    .map(({ name, email }) => oneLine(name) || email);
+  const time = emailOutcomeTime(recorded.sent_at);
+  return `Sent to ${people.join(", ") || "the recipient"}${time ? ` at ${time} IST` : ""}`;
+}
+
+async function showSentCard(ctx: Context, action: PendingAction): Promise<void> {
+  await ctx.editMessageText(sentCardText(action), { reply_markup: new InlineKeyboard() });
 }
 
 function eventKeyboard(actionId: number): InlineKeyboard {
@@ -404,6 +424,7 @@ export async function queueDraftApproval(
     onShown?: (actionId: number) => void;
     commandKey?: string;
     onReplaced?: (notice: string) => void;
+    repeated?: boolean;
   } = {},
 ): Promise<number> {
   const previous = getPendingActionForDraft(preview.draftId, preview.googleAccount);
@@ -416,6 +437,7 @@ export async function queueDraftApproval(
     to: preview.to, commandKey: options.commandKey,
   });
   const notice = await showReplacedDrafts(replaced);
+  noteEmailNotice(notice);
   if (notice) options.onReplaced?.(notice);
   if (!action) {
     if (notice && !options.onReplaced) await telegram.sendMessage(config.ownerTelegramId, notice).catch(() => undefined);
@@ -455,7 +477,8 @@ export async function queueDraftApproval(
       await postConfirmCard(spec, { api: telegram, editMessageId: action.telegram_message_id, onShown: () => shown(action.id) });
       console.log(`Approval action ${action.id}: preview updated`);
       return action.id;
-    } catch {
+    } catch (error) {
+      if (error instanceof EmailOperationError && error.reason === "write_unconfirmed") throw error;
       console.log(`Approval action ${action.id}: preview replacement failed`);
     }
   }
@@ -463,6 +486,7 @@ export async function queueDraftApproval(
   const draftActionId = action.id;
   const posted = await postConfirmCard(spec, {
     api: telegram,
+    repeated: options.repeated,
     onShown: (messageId) => {
       setPendingActionTelegramMessage(draftActionId, messageId);
       shown(draftActionId);
@@ -473,7 +497,7 @@ export async function queueDraftApproval(
 }
 
 /** Said whenever a draft can't be re-read from Gmail: nothing is shown stale, nothing sent. */
-export const DRAFT_REREAD_FAILED = "I couldn't re-read the draft from Gmail, so I didn't send it. Try again.";
+export const DRAFT_REREAD_FAILED = "I couldn't re-read the draft from Gmail, so I didn't send it. Check the draft in Gmail.";
 
 /**
  * A replacement card for a pending draft, from the draft as it is in Gmail now: its To
@@ -484,7 +508,8 @@ export const DRAFT_REREAD_FAILED = "I couldn't re-read the draft from Gmail, so 
 async function postRefreshedCard(
   action: PendingAction,
   confirmed: ReadonlySet<string> = new Set<string>(),
-): Promise<{ ok: true; to: string; cc: string; newAddresses: string[] } | { ok: false; reason: "read_failed" | "failed" }> {
+  repeated = false,
+): Promise<{ ok: true; to: string; cc: string; newAddresses: string[] } | { ok: false; reason: "read_failed" | "failed" | "unconfirmed" }> {
   if (!action.draft_id) {
     return { ok: false, reason: "failed" };
   }
@@ -518,6 +543,7 @@ async function postRefreshedCard(
       },
       {
         newCard: true,
+        repeated,
         onShown: (actionId) => {
           posted = actionId;
         },
@@ -526,6 +552,9 @@ async function postRefreshedCard(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Approval action ${action.id}: replacement card failed (${errorType})`);
+    if (error instanceof EmailOperationError && error.reason === "write_unconfirmed") {
+      return { ok: false, reason: "unconfirmed" };
+    }
     return { ok: false, reason: "failed" };
   }
   if (posted !== undefined && oldCard && getPendingAction(posted)?.telegram_message_id !== oldCard) {
@@ -575,7 +604,7 @@ async function currentPendingAction(
       cancelled: "Cancelled",
     } as const;
     const status = statusMap[action.status];
-    await showStatus(ctx, status).catch(() => undefined);
+    await (status === "Sent" ? showSentCard(ctx, action) : showStatus(ctx, status)).catch(() => undefined);
     await ctx.answerCallbackQuery(`Already ${status.toLowerCase()}.`);
     return undefined;
   }
@@ -637,14 +666,14 @@ function deliveryGateText(reason: string): string {
 }
 
 /** The people a draft goes to right now, from Gmail itself: what drafts.send would use. */
-async function readDraftRecipients(account: GoogleAccountId, draftId: string): Promise<{ to: string; recipients: string[] }> {
+async function readDraftRecipients(account: GoogleAccountId, draftId: string): Promise<{ to: string; subject: string; recipients: string[] }> {
   const gmail = await gmailFor(account);
   const draft = await gmail.users.drafts.get({ userId: "me", id: draftId, format: "metadata" });
   const headers = draft.data.message?.payload?.headers ?? [];
   const value = (name: string) =>
     headers.find((item: { name?: string | null; value?: string | null }) => (item.name ?? "").toLowerCase() === name)?.value ?? "";
   const to = value("to");
-  return { to, recipients: [...new Set([...parseAddressList(to), ...parseAddressList(value("cc"))].map((item) => item.email))] };
+  return { to, subject: value("subject"), recipients: [...new Set([...parseAddressList(to), ...parseAddressList(value("cc"))].map((item) => item.email))] };
 }
 
 async function draftRecipients(account: GoogleAccountId, draftId: string): Promise<string[]> {
@@ -668,7 +697,7 @@ function shownOnTappedCard(action: PendingAction, messageId: number | undefined)
 /** His own "send it" for a draft he was shown: only addresses its card showed before
  *  his message, or that he's sent to before, go out with no further tap. */
 async function textSendVerdict(action: PendingAction, messageId: number, ownTurn: boolean): Promise<{ verdict: SendVerdict; to: string }> {
-  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id).catch(() => []) : [];
+  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id) : [];
   const verdict = decideSendAction({
     intent: "send",
     ownTurn,
@@ -700,7 +729,30 @@ function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], d
   if (reason === "unconfirmed") {
     return "Gmail didn't confirm an earlier send, so I won't try again. Check your Sent mail.";
   }
-  return "Sending failed. The draft is still pending; please try again.";
+  return "Gmail rejected the send. The draft is still pending. Check the draft in Gmail.";
+}
+
+async function deliverGmailDraft(gmail: gmail_v1.Gmail, input: {
+  account: GoogleAccountId; draftId: string; recipient: string;
+}): Promise<{ id: string; threadId?: string } | { reason: "send_failed" | "unconfirmed" }> {
+  const unconfirmed = (): { reason: "unconfirmed" } => {
+    noteEmailFailure(new EmailOperationError("Gmail didn't confirm the draft send. Check Sent mail before any further action.", "write_unconfirmed", { ...input, lookup: "sent" }));
+    return { reason: "unconfirmed" };
+  };
+  if (currentEmailTurn()?.uncertain) return { reason: "unconfirmed" };
+  if (!recordUnconfirmedDraftDelivery(input.draftId, input.account)) return unconfirmed();
+  try {
+    const sent = await trackEmailProviderWrite(() => gmail.users.drafts.send(
+      { userId: "me", requestBody: { id: input.draftId } }, { retry: false },
+    ));
+    if (!sent.data.id) return unconfirmed();
+    return { id: sent.data.id, threadId: sent.data.threadId ?? undefined };
+  } catch (error) {
+    if (!definitelyRejectedWrite(error)) return unconfirmed();
+    clearUnconfirmedDraftDelivery(input.draftId, input.account);
+    noteEmailFailure(new EmailOperationError("Gmail rejected the send. The draft is still pending. Check the draft in Gmail.", "provider_rejected", input));
+    return { reason: "send_failed" };
+  }
 }
 
 function recipientKey(header: string): string {
@@ -725,8 +777,9 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict, ow
   // The decision must cover exactly who the draft goes to now.
   let recipients: string[];
   let to: string;
+  let subject: string;
   try {
-    ({ to, recipients } = await readDraftRecipients(action.google_account, draftId));
+    ({ to, subject, recipients } = await readDraftRecipients(action.google_account, draftId));
     assertSendDecision(decision, recipients);
   } catch {
     console.log(`Approval action ${action.id}: send refused reason=not_decided`);
@@ -762,6 +815,7 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict, ow
       return { ok: false, reason: "gate_refused", detail: gate.reason };
     }
     to = current.to;
+    subject = current.subject;
   }
   const gmail = await gmailFor(action.google_account);
   const replaced = supersedeDraftIfReplaced(action, to);
@@ -783,21 +837,14 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict, ow
       console.log(`Approval action ${action.id}: send blocked reason=${claim.state}`);
       return { ok: false, reason: claim.state };
     }
-    try {
-      const sent = await gmail.users.drafts.send({ userId: "me", requestBody: { id: draftId } });
-      sentMessageId = sent.data.id ?? undefined;
-    } catch {
-      if (claim.state === "claimed") {
-        console.log(`Approval action ${action.id}: send unconfirmed; schedule ${claim.id} stays claimed`);
-        return { ok: false, reason: "unconfirmed" };
-      }
-      console.log(`Approval action ${action.id}: send failed; status -> pending`);
-      return { ok: false, reason: "send_failed" };
-    }
+    const delivery = await deliverGmailDraft(gmail, { account: action.google_account, draftId, recipient: to });
+    if ("reason" in delivery) return { ok: false, reason: delivery.reason };
+    sentMessageId = delivery.id;
     replacedOnSend = settleDraftDelivery({
-      account: action.google_account, to, actionId: action.id, sentMessageId,
+      account: action.google_account, to, actionId: action.id, sentMessageId, sentThreadId: delivery.threadId,
       commandKey: action.command_key, schedule: claim.state === "claimed" ? claim : undefined,
     });
+    recordEmailOutcome(`send:${action.google_account}:${sentMessageId}`, sentOutcomeLine(to, getPendingAction(action.id)?.sent_at, subject || action.subject));
     markRecipientsKnown(recipients);
   } finally {
     release();
@@ -821,7 +868,7 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict, ow
  *  It shows the people the card showed, with the draft's body as it is in Gmail. */
 export async function repostPendingCard(
   action: PendingAction,
-): Promise<{ state: "reposted"; to: string; newAddresses: string[] } | { state: "expired" | "failed" | "read_failed" }> {
+): Promise<{ state: "reposted"; to: string; newAddresses: string[] } | { state: "expired" | "failed" | "read_failed" | "unconfirmed" }> {
   if (action.status !== "pending" || !action.draft_id) {
     return { state: "failed" };
   }
@@ -829,7 +876,7 @@ export async function repostPendingCard(
     await expireAction(action);
     return { state: "expired" };
   }
-  const refreshed = await postRefreshedCard(action);
+  const refreshed = await postRefreshedCard(action, undefined, true);
   if (!refreshed.ok) {
     return { state: refreshed.reason };
   }
@@ -849,7 +896,7 @@ export async function sendCreatedDraftNow(params: {
   userText?: string;
 }): Promise<
   | { ok: true; replacementNotice: string }
-  | { ok: false; reason: "not_approved" | "send_failed" }
+  | { ok: false; reason: "not_approved" | "send_failed" | "unconfirmed" }
   | { ok: false; reason: "card"; message: string }
 > {
   // While send_email is on it is the only no-tap path, so its recipient check can't
@@ -865,8 +912,9 @@ export async function sendCreatedDraftNow(params: {
   // Only known people, on his own turn, for a send he asked for: anything else is the card.
   let recipients: string[];
   let to: string;
+  let subject: string;
   try {
-    ({ to, recipients } = await readDraftRecipients(params.googleAccount, params.draftId));
+    ({ to, subject, recipients } = await readDraftRecipients(params.googleAccount, params.draftId));
   } catch {
     return { ok: false, reason: "send_failed" };
   }
@@ -893,19 +941,17 @@ export async function sendCreatedDraftNow(params: {
     const claim = claimDraftDelivery(params.draftId, params.googleAccount, new Date().toISOString());
     if (claim.state === "already_sent" || claim.state === "in_progress" || claim.state === "unconfirmed" || claim.state === "superseded") {
       console.log(`Draft ${params.draftId}: immediate send blocked reason=${claim.state}`);
-      return { ok: false, reason: "send_failed" };
+      return { ok: false, reason: claim.state === "unconfirmed" || claim.state === "in_progress" ? "unconfirmed" : "send_failed" };
     }
-    try {
-      const sent = await gmail.users.drafts.send({ userId: "me", requestBody: { id: params.draftId } });
-      sentMessageId = sent.data.id ?? undefined;
-    } catch {
-      console.log(`Draft ${params.draftId}: immediate send failed`);
-      return { ok: false, reason: "send_failed" };
-    }
+    const delivery = await deliverGmailDraft(gmail, { account: params.googleAccount, draftId: params.draftId, recipient: to });
+    if ("reason" in delivery) return { ok: false, reason: delivery.reason };
+    sentMessageId = delivery.id;
+    const deliveredAt = new Date().toISOString();
     replaced = settleDraftDelivery({
-      account: params.googleAccount, to, draftId: params.draftId, sentMessageId,
+      account: params.googleAccount, to, draftId: params.draftId, sentMessageId, sentThreadId: delivery.threadId,
       schedule: claim.state === "claimed" ? claim : undefined,
     });
+    recordEmailOutcome(`send:${params.googleAccount}:${sentMessageId}`, sentOutcomeLine(to, deliveredAt, subject));
     markRecipientsKnown(recipients);
   } finally {
     release();
@@ -1051,14 +1097,14 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   const outcome = await performDraftSend(action, verdict);
   if (!outcome.ok) {
     if (outcome.reason === "already_sent") {
-      await showStatus(ctx, "Sent").catch(() => undefined);
+      await showSentCard(ctx, action).catch(() => undefined);
     }
     const text = outcome.reason === "superseded" ? DRAFT_REPLACED : sendFailureText(outcome.reason, outcome.detail);
     await ctx.answerCallbackQuery({ text, show_alert: true });
     if (outcome.reason === "superseded" && outcome.detail) await ctx.reply(outcome.detail).catch(() => undefined);
     return;
   }
-  await showStatus(ctx, "Sent").catch(() => {
+  await showSentCard(ctx, action).catch(() => {
     console.log(`Approval action ${action.id}: sent preview update failed`);
   });
   await ctx.answerCallbackQuery("Sent").catch(() => undefined);
@@ -1198,13 +1244,19 @@ export async function editAndSendPendingDraft(
         : "That draft is no longer waiting for approval." };
       if (!draftToMatchesApproval(fresh, previousTo)) return { ok: false, message: sendFailureText("to_changed") };
       if (updated !== headers) {
-        await gmail.users.drafts.update({
+        await emailProviderWrite(() => gmail.users.drafts.update({
           userId: "me", id: draftId,
           requestBody: { id: draftId, message: {
             ...(message.threadId ? { threadId: message.threadId } : {}),
             raw: Buffer.from(updated + raw.slice(separator.index), "latin1").toString("base64url"),
           } },
+        }, { retry: false }), {
+          rejected: "Gmail rejected the recipient edit. The email wasn't sent.",
+          unconfirmed: "Gmail didn't confirm the recipient edit. Read the current draft before any further action.",
+          evidence: { draftId, account: action.google_account, recipient: to },
         });
+        recordEmailOutcome(`draft:update:${action.google_account}:${draftId}:${randomUUID()}`,
+          `Updated the draft to ${outcomeRecipient(to)}${action.subject ? ` on '${oneLine(action.subject)}'` : ""}.`);
         const registered = registerPendingDraft({ draftId, threadId: action.thread_id, account: action.google_account, to });
         replacementNotice = await showReplacedDrafts(registered.replaced);
         if (!registered.action) return { ok: false, message: [DRAFT_REPLACED, replacementNotice].filter(Boolean).join("\n") };
@@ -1217,7 +1269,11 @@ export async function editAndSendPendingDraft(
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Approval action ${action.id}: recipient edit failed (${errorType})`);
-    return { ok: false, failure: "uncertain", message: ["I couldn't update the draft's recipients, so nothing was sent.", replacementNotice].filter(Boolean).join("\n") };
+    return {
+      ok: false,
+      failure: error instanceof EmailOperationError && error.reason === "write_unconfirmed" ? "uncertain" : "miss",
+      message: [error instanceof EmailOperationError ? error.message : "I couldn't update the draft's recipients, so nothing was sent.", replacementNotice].filter(Boolean).join("\n"),
+    };
   } finally {
     activeActions.delete(action.id);
   }
@@ -1415,21 +1471,36 @@ export async function sendPendingDraftByText(
       actionStatus: action.status,
     });
     const recipient = await fetchDraftRecipientLabel(action);
-    const { verdict, to } = await textSendVerdict(action, confirmation.messageId, options.ownTurn === true);
+    let decision: Awaited<ReturnType<typeof textSendVerdict>>;
+    try {
+      decision = await textSendVerdict(action, confirmation.messageId, options.ownTurn === true);
+    } catch {
+      noteEmailFailure(new EmailOperationError(DRAFT_REREAD_FAILED, "provider_read_failed", {
+        draftId: action.draft_id ?? undefined, account: action.google_account,
+      }));
+      return { ok: false, failure: "miss", message: DRAFT_REREAD_FAILED };
+    }
+    const { verdict, to } = decision;
     if (verdict.action !== "send") {
       console.log(`Approval action ${action.id}: card, not sent (${verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
       if (options.refreshOnCard && verdict.action === "card") {
         const confirmed = action.draft_id ? draftRecipientsShownBefore(action.draft_id, confirmation.messageId) : undefined;
         const refreshed = await postRefreshedCard(action, confirmed);
-        if (!refreshed.ok) return { ok: false, message: refreshed.reason === "read_failed"
-          ? DRAFT_REREAD_FAILED : "I updated the draft, but couldn't show its refreshed card. Ask me to show it again." };
+        if (!refreshed.ok) {
+          const message = refreshed.reason === "read_failed" ? DRAFT_REREAD_FAILED
+            : refreshed.reason === "unconfirmed" ? "Telegram didn't confirm the refreshed card. Check Telegram before using it."
+              : "The draft was updated, but Telegram rejected its refreshed card.";
+          return { ok: false, message, failure: refreshed.reason === "unconfirmed" ? "uncertain" : "miss" };
+        }
       }
-      return { ok: false, message: cardReason(verdict, to) };
+      const message = cardReason(verdict, to);
+      noteEmailNotice(message);
+      return { ok: false, message };
     }
     const outcome = await performDraftSend(action, verdict, options[OWNER_TO_EDIT]);
     if (!outcome.ok) {
       const failure = outcome.reason === "reread_failed" ? "miss"
-        : outcome.reason === "unconfirmed" || outcome.reason === "send_failed" || outcome.reason === "in_progress"
+        : outcome.reason === "unconfirmed" || outcome.reason === "in_progress"
           ? "uncertain" : "refusal";
       return { ok: false, failure, message: sendFailureText(outcome.reason, outcome.detail) };
     }
@@ -1438,7 +1509,7 @@ export async function sendPendingDraftByText(
         await telegram.editMessageText(
           config.ownerTelegramId,
           action.telegram_message_id,
-          "Draft approval\n\nStatus: Sent",
+          sentCardText(action),
           { reply_markup: new InlineKeyboard() },
         );
       } catch {
@@ -1590,7 +1661,9 @@ export async function resendDraftCard(
   if (!refreshed.ok) {
     return {
       ok: false,
-      message: refreshed.reason === "read_failed" ? DRAFT_REREAD_FAILED : "Not resent: I couldn't post the card. Try again.",
+      message: refreshed.reason === "read_failed" ? DRAFT_REREAD_FAILED
+        : refreshed.reason === "unconfirmed" ? "Telegram didn't confirm the card. Check Telegram before requesting another."
+          : "Not resent: Telegram rejected the card. Read the draft in Gmail to check it.",
     };
   }
   console.log(`Approval action ${action.id}: card resent`);
@@ -1767,7 +1840,7 @@ export async function retireDraftApproval(draftId: string, account: GoogleAccoun
       await telegram.editMessageText(
         config.ownerTelegramId,
         action.telegram_message_id,
-        "Draft approval\n\nStatus: Sent",
+        sentCardText(action),
         { reply_markup: new InlineKeyboard() },
       );
     } catch {

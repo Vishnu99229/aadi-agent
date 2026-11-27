@@ -13,10 +13,23 @@ import {
   htmlFromSchedulingBody,
 } from "../security/auto_book.js";
 import { assertTestSeam } from "../test_seam.js";
+import { emailProviderWrite, EmailOperationError, noteEmailFailure, oneLine, outcomeRecipient, recordEmailOutcome } from "../email_outcomes.js";
 
 export interface ResolvedGmailMessage {
   account: LoadedGoogleAccount;
   message: gmail_v1.Schema$Message;
+}
+
+export class GmailMessageNotFoundError extends Error {
+  constructor() {
+    super("No Gmail message with that ID was found in the connected accounts.");
+  }
+}
+
+export class GmailDraftNotFoundError extends Error {
+  constructor() {
+    super("No Gmail draft with that ID was found in the connected accounts.");
+  }
 }
 
 let fakeGmailClient:
@@ -206,7 +219,7 @@ export async function resolveGmailMessage(
   }
 
   void lastError;
-  throw new Error("No Gmail message with that ID was found in the connected accounts.");
+  throw new GmailMessageNotFoundError();
 }
 
 export async function resolveGmailDraft(
@@ -234,7 +247,7 @@ export async function resolveGmailDraft(
   }
 
   void lastError;
-  throw new Error("No Gmail draft with that ID was found in the connected accounts.");
+  throw new GmailDraftNotFoundError();
 }
 
 export function messageHeader(
@@ -299,18 +312,27 @@ export async function createNewEmailDraft(params: {
   );
   console.log(`Draft MIME headers: ${mimeHeaderNames(raw)}`);
 
-  const result = await gmail.users.drafts.create({
+  const evidence = { account: params.account.id, recipient: toHeader, lookup: "drafts" as const };
+  const result = await emailProviderWrite(() => gmail.users.drafts.create({
     userId: "me",
     requestBody: {
       message: {
         raw: Buffer.from(raw, "utf8").toString("base64url"),
       },
     },
+  }, { retry: false }), {
+    rejected: "Gmail rejected the new draft. No draft was created.",
+    unconfirmed: "Gmail didn't confirm creation of the draft. Check Gmail before creating another.",
+    evidence,
   });
 
   if (!result.data.id) {
-    throw new Error("Gmail created the draft without returning a draft ID.");
+    const error = new EmailOperationError("Gmail didn't return a draft ID. Check Gmail before creating another draft.", "write_unconfirmed", evidence);
+    noteEmailFailure(error);
+    throw error;
   }
+  recordEmailOutcome(`draft:create:${params.account.id}:${result.data.id}`,
+    `Draft created for ${outcomeRecipient(toHeader)} on '${oneLine(params.subject)}'.`);
   const threadId = result.data.message?.threadId || result.data.id;
   return { draftId: result.data.id, threadId };
 }
@@ -375,7 +397,8 @@ export async function createThreadReplyDraft(params: {
   const raw = buildThreadReplyMime(params);
   console.log(`Draft MIME headers: ${mimeHeaderNames(raw)}`);
 
-  const result = await gmail.users.drafts.create({
+  const evidence = { account: params.account.id, recipient: params.to, threadId: params.threadId, lookup: "drafts" as const };
+  const result = await emailProviderWrite(() => gmail.users.drafts.create({
     userId: "me",
     requestBody: {
       message: {
@@ -383,10 +406,18 @@ export async function createThreadReplyDraft(params: {
         raw: Buffer.from(raw, "utf8").toString("base64url"),
       },
     },
+  }, { retry: false }), {
+    rejected: "Gmail rejected the reply draft. No draft was created.",
+    unconfirmed: "Gmail didn't confirm creation of the reply draft. Read the thread before creating another.",
+    evidence,
   });
 
   if (!result.data.id) {
-    throw new Error("Gmail created the draft without returning a draft ID.");
+    const error = new EmailOperationError("Gmail didn't return a reply draft ID. Read the thread before creating another draft.", "write_unconfirmed", evidence);
+    noteEmailFailure(error);
+    throw error;
   }
+  recordEmailOutcome(`draft:create:${params.account.id}:${result.data.id}`,
+    `Reply draft created for ${outcomeRecipient(params.to)} on '${oneLine(params.subject)}'.`);
   return { draftId: result.data.id };
 }

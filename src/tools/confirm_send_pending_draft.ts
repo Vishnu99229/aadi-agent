@@ -8,6 +8,7 @@ import { followupsAfterDraftSend, handlePendingRecipientEdit, withFollowups } fr
 import { repliedMessageForTurn } from "../email_references.js";
 import { isAmbiguousSendAck } from "../send_triggers.js";
 import type { ToolTurn } from "./index.js";
+import { EmailOperationError, noteEmailFailure } from "../email_outcomes.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -100,6 +101,9 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
       : "Not sent: pass draft_id from the pending-draft list in your context.";
   }
   const result = await sendPendingDraftByText(turn.confirmation, draftId, { ownTurn: turn.ownTurn === true, replyToMessageId });
+  if (result.failure === "uncertain") {
+    noteEmailFailure(new EmailOperationError(result.message, "write_unconfirmed", { draftId }));
+  }
   // "Send it and start 3 follow-ups": only if this exact draft went out.
-  return withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok));
+  return withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok, result.failure === "uncertain"));
 }

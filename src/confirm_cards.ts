@@ -1,10 +1,12 @@
 import { InlineKeyboard, type Api } from "grammy";
+import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { recordCardRecipients } from "./db.js";
 import { formatMailbox } from "./draft_recipients.js";
 import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
 import { recipientFingerprint } from "./security/send_decision.js";
 import { CARD_CAPTION_CHARS, holdForVoiceNote } from "./voice_cards.js";
+import { emailCardAcknowledgement, emailProviderWrite, outcomeRecipient } from "./email_outcomes.js";
 
 /**
  * The one way to post a Telegram card whose button can confirm who an email goes to: a
@@ -176,24 +178,47 @@ export function renderConfirmCard(spec: ConfirmCardSpec): RenderedConfirmCard {
  */
 export async function postConfirmCard(
   spec: ConfirmCardSpec,
-  options: { api: Api; editMessageId?: number; onShown?: (messageId: number) => void },
+  options: { api: Api; editMessageId?: number; onShown?: (messageId: number) => void; repeated?: boolean },
 ): Promise<number | undefined> {
   const card = renderConfirmCard(spec);
+  const editing = options.editMessageId !== undefined;
+  const line = spec.kind === "draft_send"
+    ? `Approval card ${editing ? "updated" : "posted"} for ${outcomeRecipient(spec.to)}. Waiting for your Send tap.`
+    : spec.kind === "schedule_confirm"
+      ? `Confirmation card posted for ${outcomeRecipient(spec.to)}. Waiting for your Confirm tap.`
+      : "Recipient choice card posted. Choose the intended address.";
+  const acknowledged = emailCardAcknowledgement(editing ? `${card.key}:edit:${randomUUID()}` : card.key, line);
+  const evidence = spec.kind === "draft_send" ? { draftId: spec.key, recipient: spec.to } :
+    spec.kind === "schedule_confirm" || spec.kind === "schedule_pick" ? { scheduleId: spec.scheduleId } : {};
   const shown = (messageId: number): void => {
+    if (!options.repeated) acknowledged(messageId);
     recordCardRecipients(messageId, card.key, card.confirms.join(","));
     options.onShown?.(messageId);
   };
   if (options.editMessageId !== undefined) {
-    await options.api.editMessageText(config.ownerTelegramId, options.editMessageId, card.text, {
+    const messageId = options.editMessageId;
+    await emailProviderWrite(() => options.api.editMessageText(config.ownerTelegramId, messageId, card.text, {
       reply_markup: card.keyboard,
+    }), {
+      rejected: "Telegram rejected the card edit.",
+      unconfirmed: "Telegram didn't confirm the card edit. Check the existing card before using it.",
+      evidence,
+      reportRejection: false,
     });
-    shown(options.editMessageId);
-    return options.editMessageId;
+    shown(messageId);
+    return messageId;
   }
-  if (holdForVoiceNote({ text: card.text, caption: card.caption, keyboard: card.keyboard, onPosted: shown })) {
+  if (holdForVoiceNote({ text: card.text, caption: card.caption, keyboard: card.keyboard, onPosted: shown, emailCard: evidence })) {
     return undefined;
   }
-  const message = await options.api.sendMessage(config.ownerTelegramId, card.text, { reply_markup: card.keyboard });
+  const message = await emailProviderWrite(
+    () => options.api.sendMessage(config.ownerTelegramId, card.text, { reply_markup: card.keyboard }),
+    {
+      rejected: "Telegram rejected the card. Open the saved draft in Gmail to check it.",
+      unconfirmed: "Telegram didn't confirm the card. Check Telegram before posting another.",
+      evidence,
+    },
+  );
   shown(message.message_id);
   return message.message_id;
 }

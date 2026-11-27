@@ -54,6 +54,10 @@ import { assertTestSeam } from "./test_seam.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 import {
+  emailCardAcknowledgement, emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, noteEmailTarget, oneLine,
+  recordEmailOutcome, requireWritableEmailTurn,
+} from "./email_outcomes.js";
+import {
   companyFromDomain,
   countManualFollowups,
   domainOf,
@@ -403,10 +407,10 @@ function pitchCardKeyboard(id: number, version?: string): InlineKeyboard {
     .text("Never for this person", `seq:never:${id}`);
 }
 
-async function sendPitchCard(api: Api, row: SalesSequenceRecord, cardText?: string): Promise<boolean> {
+async function sendPitchCard(api: Api, row: SalesSequenceRecord, cardText?: string): Promise<"posted" | "refused" | "unconfirmed"> {
   if (!hasOriginalOutreach(row.original_message_id)) {
     console.log(`Sequence ${row.id}: no original sent message; card not sent`);
-    return false;
+    return "refused";
   }
   try {
     const text = cardText ?? pitchCardText({
@@ -417,23 +421,34 @@ async function sendPitchCard(api: Api, row: SalesSequenceRecord, cardText?: stri
       manualFollowups: row.manual_followups,
     });
     const keyboard = pitchCardKeyboard(row.id, cardVersion(row));
+    const acknowledged = emailCardAcknowledgement(`sequence:${row.id}`,
+      `Start card posted for ${oneLine(prospectLabel(row))}. Waiting for your Start tap.`);
+    const onPosted = (messageId: number): void => {
+      acknowledged(messageId);
+      setSalesSequenceCardMessage(row.id, messageId);
+    };
     if (
       holdForVoiceNote({
         text,
         caption: shortCardText(text),
         keyboard,
-        onPosted: (messageId) => setSalesSequenceCardMessage(row.id, messageId),
+        onPosted,
+        emailCard: { account: "work", sequenceId: row.id, threadId: row.thread_id, recipient: row.prospect_email },
       })
     ) {
-      return true;
+      return "posted";
     }
-    const card = await api.sendMessage(config.ownerTelegramId, text, { reply_markup: keyboard });
-    setSalesSequenceCardMessage(row.id, card.message_id);
-    return true;
+    const card = await emailProviderWrite(() => api.sendMessage(config.ownerTelegramId, text, { reply_markup: keyboard }), {
+      rejected: "Telegram rejected the Start card. No sequence was enrolled.",
+      unconfirmed: "Telegram didn't confirm the Start card. Check Telegram before requesting another card.",
+      evidence: { account: "work", sequenceId: row.id, threadId: row.thread_id, recipient: row.prospect_email },
+    });
+    onPosted(card.message_id);
+    return "posted";
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Sequence card failed (${errorType}); sequence=${row.id}`);
-    return false;
+    return error instanceof EmailOperationError && error.reason === "write_unconfirmed" ? "unconfirmed" : "refused";
   }
 }
 
@@ -484,9 +499,10 @@ export async function runSequenceDetection(api: Api): Promise<number> {
     if (!proposed) {
       continue;
     }
-    if (await sendPitchCard(api, proposed)) {
+    const posted = await sendPitchCard(api, proposed);
+    if (posted === "posted") {
       offered += 1;
-    } else {
+    } else if (posted === "refused") {
       deleteProposedSalesSequence(proposed.id);
     }
   }
@@ -647,6 +663,7 @@ async function enrolProposed(id: number, settings: EnrolSettings = {}): Promise<
   // Never before the email it follows, so his own email never reads as a later send.
   const enrolledAt = new Date(Math.max(now.getTime(), assessed.sentAt.getTime() + 1000));
   const firstAt = firstStepAt(assessed.sentAt, settings.stepDays ?? config.sequenceStepDays, now);
+  requireWritableEmailTurn();
   let activated: boolean;
   try {
     activated = activateSalesSequence(id, {
@@ -668,6 +685,9 @@ async function enrolProposed(id: number, settings: EnrolSettings = {}): Promise<
     return { ok: false, reason: "not_proposed" };
   }
   console.log(`Sequence ${id}: status -> active`);
+  const activatedRow = getSalesSequence(id)!;
+  recordEmailOutcome(`sequence:enrolled:${id}:${activatedRow.enrolled_at ?? enrolledAt.toISOString()}`,
+    `Started ${activatedRow.total_steps - activatedRow.manual_followups} follow-ups to ${oneLine(prospectLabel(activatedRow))}.`);
   let zone: { zone: string; source: string } | undefined;
   try {
     zone = await resolveProspectTimezone(liveGmail, row);
@@ -704,31 +724,34 @@ export async function requestSequenceCard(
   if (!target) {
     return "Who should the sequence be for? Give me a name, company or email.";
   }
-  const { gmail } = await workGmail();
-  const ownAddress = await ownAddressOf(gmail);
-  const selfAddresses = await loadFollowupSelfAddresses();
-  const listed = await gmail.users.messages.list({
-    userId: "me",
-    q: `in:sent newer_than:${EXPLICIT_LOOKBACK_DAYS}d to:"${target}"`,
-    maxResults: 25,
-  });
-  const threadIds = [
-    ...new Set(
-      (listed.data.messages ?? [])
-        .map((message) => message.threadId)
-        .filter((id): id is string => Boolean(id)),
-    ),
-  ].slice(0, EXPLICIT_THREAD_LIMIT);
-
-  const assessedThreads: ThreadAssessment[] = [];
-  for (const threadId of threadIds) {
-    const assessed = await assessLive(gmail, threadId, selfAddresses, ownAddress, {
-      ignoreSequence: (row) => row.thread_id === threadId && revivable(row),
+  const assessedThreads = await emailProviderRead(async () => {
+    const { gmail } = await workGmail();
+    const ownAddress = await ownAddressOf(gmail);
+    const selfAddresses = await loadFollowupSelfAddresses();
+    const listed = await gmail.users.messages.list({
+      userId: "me",
+      q: `in:sent newer_than:${EXPLICIT_LOOKBACK_DAYS}d to:"${target}"`,
+      maxResults: 25,
     });
-    if (assessed) {
-      assessedThreads.push(assessed);
+    const threadIds = [
+      ...new Set(
+        (listed.data.messages ?? [])
+          .map((message) => message.threadId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ].slice(0, EXPLICIT_THREAD_LIMIT);
+
+    const assessedThreads: ThreadAssessment[] = [];
+    for (const threadId of threadIds) {
+      const assessed = await assessLive(gmail, threadId, selfAddresses, ownAddress, {
+        ignoreSequence: (row) => row.thread_id === threadId && revivable(row),
+      });
+      if (assessed) {
+        assessedThreads.push(assessed);
+      }
     }
-  }
+    return assessedThreads;
+  }, "I couldn't read work Sent mail. No sequence was enrolled.", { account: "work", recipient: target });
   assessedThreads.sort((left, right) => right.sentAt.getTime() - left.sentAt.getTime());
   if (assessedThreads.length === 0) {
     return `Not started: I found no email to "${target}" in your work Sent mail from the last ${EXPLICIT_LOOKBACK_DAYS} days.`;
@@ -757,6 +780,8 @@ export async function requestSequenceCard(
 
   const chosen = eligible[0]!;
   const prospect = chosen.prospect!;
+  noteEmailTarget("start_sequence", { recipient: prospect.email });
+  requireWritableEmailTurn();
   const domain = domainOf(prospect.email);
   const existing = getSalesSequenceByThread(chosen.threadId);
   const row = !existing
@@ -785,13 +810,15 @@ export async function requestSequenceCard(
   if (row.command_key) {
     setProposedSalesSequenceSettings(row.id, { totalSteps: SALES_SEQUENCE_STEP_COUNT, stepDays: null, cta: null, commandKey: null });
   }
-  if (!(await sendPitchCard(api, getSalesSequence(row.id) ?? row))) {
+  const posted = await sendPitchCard(api, getSalesSequence(row.id) ?? row);
+  if (posted === "unconfirmed") return "Telegram didn't confirm the Start card. Check Telegram before requesting another card.";
+  if (posted === "refused") {
     if (!existing) {
       deleteProposedSalesSequence(row.id);
     } else if (existing.status === "stopped") {
       stopProposedSalesSequence(row.id, SALES_SEQUENCE_DECLINED);
     }
-    return "Not started: I couldn't send the Start card. Try again.";
+    return "Not started: the Start card wasn't posted. No sequence was enrolled.";
   }
   return `Start card sent for ${prospectLabel(row)} ('${row.subject}'). Nothing is enrolled unless Vishnu taps Start.`;
 }
@@ -1104,7 +1131,7 @@ async function recipientOf(sentMessageId: string): Promise<Mailbox | undefined> 
   }
 }
 
-async function sendCommandCard(api: Api, row: SalesSequenceRecord, settings: CommandSettings): Promise<boolean> {
+async function sendCommandCard(api: Api, row: SalesSequenceRecord, settings: CommandSettings): ReturnType<typeof sendPitchCard> {
   const gap = settings.gapDays ?? config.sequenceStepDays;
   return sendPitchCard(api, row, `Start ${settingsLine(settings.followups, gap, settings.cta).replace(/^(\d+ follow-ups?)/, `$1 to ${prospectLabel(row)}`)}?`);
 }
@@ -1160,16 +1187,25 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Sequence command: thread check failed (${errorType})`);
-    return "Not started: I couldn't check that thread. Try again.";
+    return noteEmailFailure(new EmailOperationError(
+      "Not started: I couldn't check that thread. Read the latest sent email before requesting follow-ups.", "provider_read_failed",
+      { account: "work", messageId: carry.email?.sentMessageId, recipient: decision.person },
+    ));
   }
+  noteEmailTarget("start_sequence", { recipient: chosen.prospect?.email, threadId: chosen.prospect ? undefined : chosen.threadId });
   // The same message already enrolled this thread: report it, enrol nothing more.
   const already = getSalesSequenceByThread(chosen.threadId);
   if (commandKey && already?.status === "active" && already.command_key === commandKey) {
+    noteEmailFailure(new EmailOperationError("That sequence is already active.", "already_handled",
+      { account: "work", sequenceId: already.id }));
     return commandStartedText(already);
   }
   if (chosen.exclusion || !chosen.prospect) {
     const who = chosen.prospect?.email ?? chosen.recipientDomain;
-    return `Not started for ${who} ('${chosen.subject}'): ${EXCLUSION_LABELS[chosen.exclusion ?? "no_external_recipient"]}.`;
+    return noteEmailFailure(new EmailOperationError(
+      `Not started for ${who} ('${chosen.subject}'): ${EXCLUSION_LABELS[chosen.exclusion ?? "no_external_recipient"]}.`,
+      "excluded", { account: "work", threadId: chosen.threadId, recipient: who },
+    ));
   }
   const settings = decision.settings;
   const cap = salesSequenceStepCap();
@@ -1179,6 +1215,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
       : `Not started: that would be more than ${cap} emails after your first one.`;
   }
   const prospect = chosen.prospect;
+  requireWritableEmailTurn();
   const domain = domainOf(prospect.email);
   const existing = getSalesSequenceByThread(chosen.threadId);
   const row = !existing
@@ -1225,7 +1262,10 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
       return "Not started: this database still caps follow-ups at 4.";
     }
     return outcome.reason === "check_failed"
-      ? "Not started: I couldn't check that thread. Try again."
+      ? noteEmailFailure(new EmailOperationError(
+        "Not started: I couldn't check that thread. Read the latest sent email before requesting follow-ups.",
+        "provider_read_failed", { account: "work", threadId: chosen.threadId, recipient: prospect.email },
+      ))
       : "Not started: that sequence was already started or stopped.";
   }
   // A card: it holds exactly what was understood, and Start enrols exactly that.
@@ -1238,11 +1278,13 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     manualFollowups: chosen.facts.manualFollowups,
   });
   const carded = getSalesSequence(row.id)!;
-  if (!(await sendCommandCard(carry.api, carded, settings))) {
+  const posted = await sendCommandCard(carry.api, carded, settings);
+  if (posted === "unconfirmed") return "Telegram didn't confirm the Start card. Check Telegram before requesting another card.";
+  if (posted === "refused") {
     if (!existing) {
       deleteProposedSalesSequence(row.id);
     }
-    return "Not started: I couldn't send the Start card. Try again.";
+    return "Not started: the Start card wasn't posted. No sequence was enrolled.";
   }
   const gap = settings.gapDays ?? config.sequenceStepDays;
   return `Start card sent for ${prospectLabel(carded)}: ${decision.reasons.join("; ")}. Tap Start for ${settingsLine(settings.followups, gap, settings.cta)}. Nothing is enrolled until you tap Start.`;

@@ -77,6 +77,9 @@ import {
   type ToolReceipt,
 } from "./receipt.js";
 import { contradictsRecordedSend, recordedReceipt } from "./receipt_records.js";
+import { emailRecoveryForModel, hasEmailRecovery, recordEmailRecovery, type EmailRecovery } from "./email_recovery.js";
+import { addEmailOutcomes, currentEmailTurn, newEmailTurn, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
+import type { WorkflowToolRun } from "./agents/dispatch.js";
 import { repliedMessageForTurn } from "./email_references.js";
 import {
   parseSearchSources,
@@ -148,7 +151,7 @@ export interface MetaToolResult {
    * Tools that other agents ran while carrying this out. They count toward the
    * turn's "was the command actually run" check exactly as if called here.
    */
-  toolsRun?: ReadonlyArray<{ tool: string; ok: boolean; content: string }>;
+  toolsRun?: readonly WorkflowToolRun[];
   /**
    * The work is paused for Vishnu's answer or still running elsewhere. The turn's
    * "was the command run" check stands down, so the model isn't pushed into
@@ -249,9 +252,20 @@ interface ToolScope {
   widen: () => void;
   stop: (reply: string) => void;
   /** Records tools that ran on this loop's behalf inside a delegated job. */
-  credit: (runs: ReadonlyArray<{ tool: string; ok: boolean; content: string }>) => void;
+  credit: (runs: readonly WorkflowToolRun[]) => void;
   /** The command is in hand elsewhere (paused or still running). */
   defer: () => void;
+}
+
+type AgentToolResult = Extract<LlmMessage, { role: "tool" }> & { emailRecovery?: EmailRecovery };
+
+function toolResultForModel(result: AgentToolResult): LlmMessage {
+  const { emailRecovery, ...raw } = result;
+  if (!emailRecovery) return raw;
+  return {
+    ...raw,
+    content: raw.content.replace(/\bTry again\./gi, "").trim() + emailRecoveryForModel(emailRecovery),
+  };
 }
 
 /** Every tool call goes to the agent that owns the tool, through the dispatcher. */
@@ -259,12 +273,15 @@ async function runTool(
   call: ToolCall,
   turn: ToolTurn,
   state: ToolScope,
-): Promise<Extract<LlmMessage, { role: "tool" }>> {
+): Promise<AgentToolResult> {
   if (state.receiptToolAllowed && (state.meta.has(call.name) || !state.receiptToolAllowed(call.name))) {
     return { role: "tool", toolCallId: call.id, content: "Not done: this tool is unavailable on the receipt retry.", isError: true };
   }
   const meta = state.meta.get(call.name);
   if (meta) {
+    if (state.turnContext.emailTurn.uncertain) {
+      return { role: "tool", toolCallId: call.id, content: "An email write is unconfirmed. Use read-only tools to check its status.", isError: true };
+    }
     try {
       const result = await meta.handler(call.input, turn);
       if (result.widen) {
@@ -282,7 +299,7 @@ async function runTool(
       return {
         role: "tool",
         toolCallId: call.id,
-        content: result.content,
+        content: result.content + (result.toolsRun ?? []).flatMap(run => run.emailRecovery ? [emailRecoveryForModel(run.emailRecovery)] : []).join(""),
         ...(result.isError ? { isError: true } : {}),
       };
     } catch (error) {
@@ -295,6 +312,7 @@ async function runTool(
     role: "tool",
     toolCallId: call.id,
     content: outcome.content,
+    ...(outcome.emailRecovery ? { emailRecovery: outcome.emailRecovery } : {}),
     ...(outcome.isError ? { isError: true } : {}),
   };
 }
@@ -572,6 +590,19 @@ export async function runAgent(
   userText: string,
   options: RunAgentOptions = {},
 ): Promise<string> {
+  if (!currentEmailTurn()) {
+    const journal = newEmailTurn();
+    return withEmailTurn(journal, async () => {
+      try {
+        const reply = await runAgent(userText, options);
+        return options.delegation ? reply : renderEmailOutcomes(journal, reply);
+      } catch (error) {
+        if (options.delegation || (journal.writes.size === 0 && journal.notices.size === 0 && journal.recoveries.size === 0)) throw error;
+        const reply = renderEmailOutcomes(journal, "");
+        return saveAssistantReply(reply, options.saveAssistantMessage ?? true);
+      }
+    });
+  }
   const plan = localPlan(userText, options);
   if (!plan) {
     return runAgentLoop(userText, options);
@@ -622,6 +653,13 @@ async function runAgentLoop(
   const turnStartedAt = Date.now();
   const saveUserMessage = options.saveUserMessage ?? true;
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
+  const saveReply = (reply: string, save: boolean): string => {
+    if (save) {
+      const journal = currentEmailTurn();
+      saveAssistantReply(journal && !options.delegation ? renderEmailOutcomes(journal, reply) : reply, true);
+    }
+    return reply;
+  };
   const promptUrl = new URL("../prompts/system.md", import.meta.url);
   const specialist = options.agentId ? specialistFor(options.agentId) : undefined;
   if (options.agentId && !specialist) {
@@ -816,6 +854,8 @@ async function runAgentLoop(
     },
     credit: (runs) => {
       for (const run of runs) {
+        if (run.emailOutcomes) addEmailOutcomes(run.emailOutcomes);
+        if (run.emailRecoveryUpdate) recordEmailRecovery(turnContext.emailTurn, run.emailRecoveryUpdate);
         toolsUsed.add(run.tool);
         receipts.push({ name: run.tool, success: run.ok, content: run.content });
         if (isFamilyTool(run.tool)) {
@@ -936,9 +976,12 @@ async function runAgentLoop(
       });
     }
     const canUseReceiptTool = allowedTools.receiptToolAllowed;
-    const iterationTools = canUseReceiptTool
+    const scopedTools = canUseReceiptTool
       ? activeTools.filter(tool => tool.type === "function" && !metaTools.has(tool.name) && canUseReceiptTool(tool.name))
       : activeTools;
+    const iterationTools = turnContext.emailTurn.uncertain
+      ? scopedTools.filter(tool => tool.type === "function" && toolOwnership(tool.name)?.effect === "read")
+      : scopedTools;
     const response = local
       ? await completeOnLocalModel({
           system,
@@ -955,7 +998,7 @@ async function runAgentLoop(
           ...(route ? { route } : { backend }),
           task: options.usageTask ?? usageTaskForAgent(options.task),
           effort,
-          ...(toolChoice && !receiptRetryUsed ? { toolChoice } : {}),
+          ...(toolChoice && !receiptRetryUsed && !turnContext.emailTurn.uncertain ? { toolChoice } : {}),
         });
     if (localAllowed) {
       // Checked before anything runs: a write the laptop model reaches for is never made by it.
@@ -1043,9 +1086,16 @@ async function runAgentLoop(
         // These calls came from the model's own response, not from code.
         modelCalled: true,
       };
-      const toolResults = await Promise.all(
-        clientToolCalls.map((call) => runTool(call, turn, allowedTools)),
-      );
+      const toolResults: AgentToolResult[] = [];
+      if (clientToolCalls.some(call => hasEmailRecovery(call.name))) {
+        // An uncertain result must be observed before starting a second
+        // write from this same batch. The normal dispatcher still dedupes it.
+        for (const call of clientToolCalls) {
+          toolResults.push(await runTool(call, turn, allowedTools));
+        }
+      } else {
+        toolResults.push(...await Promise.all(clientToolCalls.map(call => runTool(call, turn, allowedTools))));
+      }
       if (widened) {
         widened = false;
         await widenToAadi();
@@ -1110,7 +1160,7 @@ async function runAgentLoop(
         toolCalls: response.toolCalls,
         ...(response.providerItems ? { providerItems: response.providerItems } : {}),
       });
-      messages.push(...toolResults);
+      messages.push(...toolResults.map(toolResultForModel));
       const whichPerson = stoppedReply === undefined ? contactQuestionAsked(askChatId, contactMark) : undefined;
       if (whichPerson) {
         console.log(`contact question: asked iteration=${iteration}`);
@@ -1124,7 +1174,7 @@ async function runAgentLoop(
           report.stopped = stoppedReply;
         }
         succeeded = !toolFailed;
-        return saveAssistantReply(stoppedReply, saveAssistantMessage);
+        return saveReply(stoppedReply, saveAssistantMessage);
       }
       continue;
     }
@@ -1153,7 +1203,7 @@ async function runAgentLoop(
           userText: guardText,
           ctx: options.ctx,
         };
-        const results: Array<Extract<LlmMessage, { role: "tool" }>> = [];
+        const results: AgentToolResult[] = [];
         for (const call of calls) {
           const result = await runTool(call, turn, allowedTools);
           results.push(result);
@@ -1169,7 +1219,7 @@ async function runAgentLoop(
           }
         }
         messages.push({ role: "assistant", textParts: [], toolCalls: calls });
-        messages.push(...results);
+        messages.push(...results.map(toolResultForModel));
         continue;
       }
       if (!commandRetryUsed) {
@@ -1186,7 +1236,7 @@ async function runAgentLoop(
       }
       console.log(`Command check: not run kinds=${missingKinds.join(",")}`);
       succeeded = false;
-      return saveAssistantReply(commandNotRunMessage(missingKinds), saveAssistantMessage);
+      return saveReply(commandNotRunMessage(missingKinds), saveAssistantMessage);
     }
 
     if (
@@ -1292,7 +1342,7 @@ async function runAgentLoop(
     if (!receiptRetryUsed && response.stopReason === "pause_turn") {
       const partialReply =
         collectedText.join("\n\n") || "I couldn't finish the request.";
-      return saveAssistantReply(
+      return saveReply(
         `${partialReply}\n\nNote: the server-side tool continuation limit was reached.`,
         saveAssistantMessage,
       );
@@ -1319,7 +1369,7 @@ async function runAgentLoop(
       const completed = record ?? (receiptRetryUsed && !/[@#]|\b(?:draft_id|thread_id|sent_message_id)\b/i.test(finalReply) ? previousReceipt : undefined);
       if (completed?.actions.includes("sent")) {
         succeeded = true;
-        return saveAssistantReply(completed.summary, saveAssistantMessage);
+        return saveReply(completed.summary, saveAssistantMessage);
       }
     }
     if (
@@ -1330,7 +1380,7 @@ async function runAgentLoop(
       // now, or, when only a lookup ran, that nothing was done.
       console.log("Command check: reply repeated an earlier answer; using this turn's result");
       succeeded = !toolFailed && actionResults.length > 0;
-      return saveAssistantReply(
+      return saveReply(
         actionResults.length > 0 ? actionResults.join("\n\n") : commandNotRunMessage(intents),
         saveAssistantMessage,
       );
@@ -1365,7 +1415,7 @@ async function runAgentLoop(
       }
       console.log(`receipt check: blocked actions=${missing.join(",")}`);
       succeeded = !toolFailed;
-      return saveAssistantReply(
+      return saveReply(
         receiptRetryReadOnly && options.sendConfirmation && !missing.includes("searched")
           ? "I am not sure what happened. I couldn't verify it from the records."
           : receiptFailureMessage(missing),
@@ -1373,11 +1423,11 @@ async function runAgentLoop(
       );
     }
     succeeded = !toolFailed;
-    return saveAssistantReply(
+    return saveReply(
       // When the release list itself was read, it is the source. Articles a
       // search also turned up are cited only if the reply used them.
       withSearchCitations(
-        shortenDraftReply(finalReply, draftBodies),
+        turnContext.emailTurn.writes.size > 0 ? finalReply : shortenDraftReply(finalReply, draftBodies),
         releaseSources.length > 0 ? releaseSources : searchSources,
       ),
       saveAssistantMessage,
@@ -1385,11 +1435,11 @@ async function runAgentLoop(
   }
 
   if (receiptRetryUsed) {
-    return saveAssistantReply("I am not sure what happened. I couldn't verify it from the records.", saveAssistantMessage);
+    return saveReply("I am not sure what happened. I couldn't verify it from the records.", saveAssistantMessage);
   }
   const partialReply =
     collectedText.join("\n\n") || "I couldn't finish the request.";
-  return saveAssistantReply(
+  return saveReply(
     `${partialReply}\n\nNote: I hit the ${maxIterations}-iteration safety limit.`,
     saveAssistantMessage,
   );

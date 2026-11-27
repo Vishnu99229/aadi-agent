@@ -1,4 +1,5 @@
 import { GrammyError, HttpError, type Api } from "grammy";
+import { emailProviderWriteInProgress } from "./email_outcomes.js";
 
 export const TELEGRAM_MESSAGE_LIMIT = 4000;
 
@@ -62,6 +63,7 @@ export function installNetworkRetry(
         if (
           !(error instanceof HttpError) ||
           !RETRY_METHODS.has(method) ||
+          emailProviderWriteInProgress() ||
           delay === undefined ||
           signal?.aborted
         ) {

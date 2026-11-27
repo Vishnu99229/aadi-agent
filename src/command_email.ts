@@ -55,6 +55,7 @@ import {
   setPendingActionFollowups,
   draftRecipientsShownBefore,
   claimCommandSend,
+  markCommandSendUnconfirmed,
   releaseCommandSend,
   pendingActionForCommandKey,
   latestDraftAction,
@@ -98,6 +99,10 @@ import {
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
 import type { ToolTurn } from "./tools/index.js";
+import {
+  emailCardAcknowledgement, emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure,
+  noteEmailNotice, noteEmailTarget, outcomeRecipient, recordEmailOutcome, requireWritableEmailTurn, sentOutcomeLine, trackEmailProviderWrite,
+} from "./email_outcomes.js";
 
 const CHOICE_TTL_MS = 6 * 60 * 60 * 1000;
 const TELEGRAM_BODY_CHARS = 3400;
@@ -259,11 +264,17 @@ function shown(body: string): string {
  * (he is asked before anything new is made). Undefined: this command is new.
  */
 async function repeatedCommand(key: string): Promise<Outcome | undefined> {
-  if (!getCommandSendByKey(key)) {
-    return undefined;
-  }
+  const command = getCommandSendByKey(key);
+  if (!command) return undefined;
   const card = pendingActionForCommandKey(key);
-  if (!card || card.status === "sent") {
+  if (card?.status === "sent") {
+    return { text: "Not sent again: this command was already handled.", result: "not_sent", repeat: true };
+  }
+  if (command.status === "unconfirmed") {
+    noteEmailFailure(new EmailOperationError("Gmail didn't confirm the earlier attempt. Check Gmail before any further action.", "write_unconfirmed"));
+    return { text: "Not sent again: this command was already handled.", result: "unknown", repeat: true };
+  }
+  if (!card) {
     return { text: "Not sent again: this command was already handled.", result: "not_sent", repeat: true };
   }
   if (card.status === "superseded") return { text: DRAFT_REPLACED, result: "not_sent", repeat: true };
@@ -282,6 +293,10 @@ async function repeatedCommand(key: string): Promise<Outcome | undefined> {
     }
     if (reposted.state === "read_failed") {
       return { text: DRAFT_REREAD_FAILED, result: "not_sent", repeat: true };
+    }
+    if (reposted.state === "unconfirmed") {
+      markCommandSendUnconfirmed(key);
+      return { text: "Telegram didn't confirm the refreshed card. Check Telegram before using it.", result: "unknown", repeat: true };
     }
     if (reposted.state === "failed") {
       return {
@@ -339,9 +354,11 @@ async function showSendCard(input: {
   if (!claimCommandSend({ key: input.key, account: input.account.id, threadId: input.request.threadId })) {
     return (await repeatedCommand(input.key)) ?? { text: "Not sent again: this command was already handled.", result: "not_sent" };
   }
-  const signatureHtml = await signatureHtmlFor(input.account);
+  let signatureHtml: string;
   let draftId: string;
   try {
+    signatureHtml = await emailProviderRead(() => signatureHtmlFor(input.account),
+      "I couldn't read the mailbox signature. No draft write was attempted.", { account: input.account.id, recipient: input.toHeader });
     draftId = input.reply
       ? (
           await createThreadReplyDraft({
@@ -369,9 +386,14 @@ async function showSendCard(input: {
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Command send: card draft failed (${errorType})`);
-    // No draft was made, so the same command may try again.
-    releaseCommandSend(input.key);
-    return { text: "Not sent: I couldn't save it as a draft for you to check, so nothing went out. Try again.", result: "not_sent", recoverable: true };
+    const uncertain = error instanceof EmailOperationError && error.reason === "write_unconfirmed";
+    if (uncertain) markCommandSendUnconfirmed(input.key);
+    else releaseCommandSend(input.key);
+    if (error instanceof EmailOperationError) noteEmailFailure(error);
+    return {
+      text: error instanceof EmailOperationError ? error.message : "I couldn't prepare the draft. Check Gmail before asking for a new one.",
+      result: uncertain ? "unknown" : "not_sent", recoverable: true,
+    };
   }
   const signature = signaturePlainText(signatureHtml);
   let actionId: number;
@@ -391,13 +413,14 @@ async function showSendCard(input: {
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Command send: card post failed (${errorType})`);
     const saved = latestDraftAction(draftId, input.account.id);
-    if (!saved) {
-      releaseCommandSend(input.key);
-      return { text: ["Not sent: I saved a draft but couldn't show its card, so nothing went out. Try again.", replacementNotice].filter(Boolean).join("\n"), result: "not_sent", recoverable: true };
-    }
-    const text = saved.status === "superseded" ? DRAFT_REPLACED
-      : "Not sent: I couldn't show its card. Ask me again and I'll show the same draft.";
-    return { text: [text, replacementNotice].filter(Boolean).join("\n"), result: "not_sent", recoverable: saved.status !== "superseded" };
+    const uncertain = error instanceof EmailOperationError && error.reason === "write_unconfirmed";
+    if (uncertain || !saved) markCommandSendUnconfirmed(input.key);
+    const text = saved?.status === "superseded" ? DRAFT_REPLACED
+      : uncertain ? "The draft is saved. Telegram didn't confirm its card. Check Telegram and Gmail." :
+        "The draft is saved, but its card wasn't shown. Read the saved draft before requesting its card.";
+    if (!uncertain && saved?.status !== "superseded") noteEmailFailure(new EmailOperationError(text, "card_not_shown",
+      { draftId, account: input.account.id, recipient: input.toHeader }));
+    return { text: [text, replacementNotice].filter(Boolean).join("\n"), result: uncertain ? "unknown" : "not_sent", recoverable: saved?.status !== "superseded" };
   }
   if (latestDraftAction(draftId, input.account.id)?.status === "superseded") {
     return { text: [DRAFT_REPLACED, replacementNotice].filter(Boolean).join("\n"), result: "not_sent" };
@@ -422,8 +445,12 @@ async function showSendCard(input: {
   }
   console.log(`Command send: card instead of a send new=${input.verdict.action === "card" ? input.verdict.newAddresses.length : 0}`);
   const followups = input.request.followupWords ? " The follow-ups come as a Start card once it goes out." : "";
+  const approval = `${cardReason(input.verdict, input.toHeader)}${followups}`;
+  noteEmailNotice(approval);
+  noteEmailFailure(new EmailOperationError(approval, "approval_required",
+    { draftId, account: input.account.id, recipient: input.toHeader }));
   return {
-    text: [`${cardReason(input.verdict, input.toHeader)}${followups}`, replacementNotice].filter(Boolean).join("\n"),
+    text: [approval, replacementNotice].filter(Boolean).join("\n"),
     hint: "Nothing has been sent. He has the card; answer in one short line.",
     shown: true,
   };
@@ -482,7 +509,8 @@ export async function writeAndSend(
   if (repeat) {
     return repeat;
   }
-  const account = await getGoogleAccount(request.account);
+  const account = await emailProviderRead(() => getGoogleAccount(request.account),
+    "I couldn't open the mailbox. No send was attempted.", { account: request.account, threadId: request.threadId ?? undefined });
   const gmail = gmailClient(account);
   let thread: LiveThread | undefined;
   if (request.threadId) {
@@ -527,7 +555,7 @@ export async function writeAndSend(
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Command send: writer failed (${errorType})`);
     return {
-      text: "Not sent: I couldn't write the email (Claude didn't answer), so nothing went out. Try again.",
+      text: "Not sent: I couldn't write the email because the writer didn't answer. No email went out.",
       result: "write_failed",
     };
   }
@@ -595,7 +623,7 @@ export async function writeAndSend(
     if (options.beforeSend && !options.beforeSend()) {
       return { text: "Not sent: it was cancelled.", result: "cancelled" };
     }
-    ({ messageId, replacedDrafts } = await sendCommandEmail({
+    ({ messageId, replacedDrafts } = await trackEmailProviderWrite(() => sendCommandEmail({
       decision: options.verdict,
       key,
       confirmation,
@@ -610,12 +638,14 @@ export async function writeAndSend(
       inReplyTo: newConversation ? "" : thread?.inReplyTo ?? "",
       references: newConversation ? "" : thread?.references ?? "",
       sourceDraftId: request.draftId,
-    }));
+    })));
   } catch (error) {
     if (error instanceof CommandSendRefusedError) {
       return gateRefusal(error.reason);
     }
     if (error instanceof CommandSendRejectedError) {
+      noteEmailFailure(new EmailOperationError("Gmail refused the send. Check the thread or recipient before issuing a new command.", "provider_rejected",
+        { account: account.id, recipient: toHeader, threadId: request.threadId ?? undefined }));
       return {
         text: `Not sent: Gmail refused the email (${error.status}), so nothing went out.`,
         result: "not_sent",
@@ -623,8 +653,10 @@ export async function writeAndSend(
       };
     }
     if (error instanceof CommandSendUnconfirmedError) {
+      const text = "Not confirmed: Gmail didn't answer, so the email may or may not have gone out. I won't resend it. Check your Sent mail.";
+      noteEmailFailure(new EmailOperationError(text, "write_unconfirmed", { account: account.id, recipient: toHeader, threadId: request.threadId ?? undefined, lookup: "sent" }));
       return {
-        text: "Not confirmed: Gmail didn't answer, so the email may or may not have gone out. I won't resend it. Check your Sent mail.",
+        text,
         result: "unknown",
       };
     }
@@ -639,8 +671,10 @@ export async function writeAndSend(
     release();
   }
 
+  recordEmailOutcome(`send:${account.id}:${messageId}`, sentOutcomeLine(toHeader, new Date().toISOString(), subject));
   markRecipientsKnown([...to, ...cc].map((item) => item.email));
   const replacementNotice = await showReplacedDrafts(replacedDrafts);
+  noteEmailNotice(replacementNotice);
   const lines = [
     `Sent to ${toHeader}.`,
     ...(ccHeader ? [`Cc: ${ccHeader}`] : []),
@@ -778,7 +812,8 @@ async function scheduleRequest(
   }
   let subject = request.subject?.trim() ?? "";
   if (request.threadId) {
-    const gmail = gmailClient(await getGoogleAccount(request.account));
+    const gmail = gmailClient(await emailProviderRead(() => getGoogleAccount(request.account),
+      "I couldn't open the mailbox to verify the draft. Nothing was scheduled.", { account: request.account, draftId: request.draftId }));
     const thread = await readThread(gmail, request.threadId).catch(() => undefined);
     if (!thread) {
       return {
@@ -817,6 +852,7 @@ async function scheduleRequest(
     return { text: DRAFT_REPLACED };
   }
   const scheduleKey = `${sendKey(base, to)}:${request.sendAt}`;
+  requireWritableEmailTurn();
   const row = createScheduledSend({
     held,
     key: scheduleKey,
@@ -853,7 +889,7 @@ async function scheduleRequest(
           cc: formatMailboxList(current.cc.flatMap((slot) => (slot.mailbox ? [slot.mailbox] : []))),
           headline: text,
         },
-        { api: api() },
+        { api: api(), repeated: true },
       );
       console.log(`Scheduled send ${existing.id}: repeat of a held command; Confirm card posted again`);
       return { text, hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.", shown: true, repeat: true };
@@ -861,6 +897,8 @@ async function scheduleRequest(
     return { text: "Not scheduled again: this command was already handled.", repeat: true };
   }
   console.log(`Scheduled send ${row.id}: status -> ${held ? "held for confirm" : "scheduled"}`);
+  if (!held) recordEmailOutcome(`schedule:${row.id}`,
+    `Scheduled email to ${outcomeRecipient(formatMailboxList(to))} for ${scheduledWhen(row.send_at)} on '${shownSubject.replace(/[\r\n]+/g, " ")}'.`);
   rememberScheduledSend({
     chatId: confirmation.chatId,
     scheduledSendId: row.id,
@@ -887,6 +925,9 @@ async function scheduleRequest(
       },
       { api: api() },
     );
+    noteEmailFailure(new EmailOperationError(heldText, "approval_required",
+      { account: request.account, scheduleId: row.id, recipient: formatMailboxList(to) }));
+    noteEmailNotice(heldText);
     return {
       text: heldText,
       hint: "Nothing is scheduled until he taps Confirm. Answer in one short line.",
@@ -897,11 +938,18 @@ async function scheduleRequest(
     text: `Scheduled: ${itemText}`,
     caption: `Scheduled: ${itemText}`,
     keyboard: new InlineKeyboard().text("Cancel", `cmdsend:cancelsched:${row.id}`),
+    onPosted: emailCardAcknowledgement(`schedule:${row.id}`, `Schedule card posted for ${outcomeRecipient(formatMailboxList(to))}.`),
+    emailCard: { scheduleId: row.id, account: request.account },
   };
   if (!holdForVoiceNote(scheduledCard)) {
-    await api().sendMessage(config.ownerTelegramId, scheduledCard.text, {
+    const posted = await emailProviderWrite(() => api().sendMessage(config.ownerTelegramId, scheduledCard.text, {
       reply_markup: scheduledCard.keyboard,
+    }), {
+      rejected: "The email is scheduled. Telegram rejected the schedule card.",
+      unconfirmed: "The email is scheduled. Telegram didn't confirm the card. Check your outbox and Telegram before any further action.",
+      evidence: { scheduleId: row.id, account: request.account },
     });
+    scheduledCard.onPosted(posted.message_id);
   }
   return {
     text: `Scheduled: ${itemText}`,
@@ -998,7 +1046,8 @@ async function resolveAndContinue(
   confirmation: { chatId: number; messageId: number } | undefined,
   now: Date,
 ): Promise<Outcome> {
-  const account = await getGoogleAccount(request.account);
+  const account = await emailProviderRead(() => getGoogleAccount(request.account),
+    "I couldn't open the mailbox to resolve the recipient. No email write was attempted.", { account: request.account });
   const gmail = gmailClient(account);
   const selfAddresses = await loadFollowupSelfAddresses();
   let threadMailboxes: ParsedMailbox[] | undefined;
@@ -1066,6 +1115,10 @@ async function resolveAndContinue(
       },
       { api: api() },
     );
+    noteEmailFailure(new EmailOperationError(
+      `Which ${first.slot.query}? Choose the intended address on the posted card.`, "choice_required",
+      { account: request.account, choiceId },
+    ));
     return {
       text: `${notDone(request)} yet: ${found}"${first.slot.query}" matches ${first.options.length} people and I've asked with buttons.${extra}`,
       hint: "Tell him to tap one, and don't pick one yourself.",
@@ -1078,6 +1131,10 @@ async function resolveAndContinue(
       hint: "Ask Vishnu for the address.",
     };
   }
+  noteEmailTarget("send_email", {
+    draftId: request.draftId, threadId: request.threadId ?? undefined,
+    recipient: request.to.map(slot => slot.mailbox?.email).join(", "),
+  });
   return finishRequest(request, base, confirmation, now);
 }
 
@@ -1256,6 +1313,8 @@ export async function tryPendingRecipientEdit(
   }
   const draftId = action.draft_id;
   const account = action.google_account;
+  noteEmailTarget("send_email", { draftId });
+  noteEmailTarget("confirm_send_pending_draft", { draftId });
   const locked = lockedScheduleForDraft(draftId, account);
   if (locked) return routeMiss(tooLateText(locked), { scope: "read_only" });
   const supplied = matchOwnerSupplied(confirmation.chatId, edit.person, now);
@@ -1278,7 +1337,7 @@ export async function tryPendingRecipientEdit(
   const result = await editAndSendPendingDraft(confirmation, action, { ...edit, field: edit.field, email }, (headers) =>
     scheduleSyncNotice(syncDraftRecipient({ chatId: confirmation.chatId, draftId, account, ...headers })),
   );
-  const text = withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok));
+  const text = withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok, result.failure === "uncertain"));
   if (result.failure === "miss" || result.failure === "uncertain") return routeMiss(text, { scope: "read_only" });
   return { kind: result.ok ? "handled" : result.failure === "clarification" ? "clarification" : "refusal", text };
 }
@@ -1356,8 +1415,9 @@ export async function sendEmailFromTool(
     !referencedEmail
   ) {
     if (pendingEmail?.draftId && pendingEmail.scheduledSendId) {
+      noteEmailTarget("send_email", { draftId: pendingEmail.draftId });
       const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId, { ownTurn: turn.ownTurn === true });
-      return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok));
+      return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok, delivered.failure === "uncertain"));
     }
     if (!pendingEmail && lastEmailReference(confirmation.chatId, now)) {
       return "No draft is waiting for your approval, so nothing was sent.";
@@ -1473,6 +1533,7 @@ export async function sendEmailFromTool(
   if (!followups.text && !followups.hint) {
     return asToolResult(outcome);
   }
+  if (followups.text?.startsWith("No follow-ups started")) noteEmailNotice(followups.text);
   const hint = [outcome.hint, followups.hint].filter(Boolean).join(" ");
   return `${outcome.text}${followups.text ? `\n${followups.text}` : ""}${hint ? ` ${hint}` : ""}`;
 }
@@ -1490,12 +1551,13 @@ export async function followupsAfterDraftSend(
   turn: FollowupTurn,
   draftId: string,
   sent: boolean,
+  uncertain = false,
 ): Promise<{ text?: string; hint?: string }> {
   const delivered = sent ? sentMessageForDraft(draftId) : undefined;
   const to = parseAddressList(delivered?.to_header ?? "")[0];
   return followupsAfterSend({
     turn,
-    result: delivered?.sent_message_id ? "sent" : "not_sent",
+    result: delivered?.sent_message_id ? "sent" : uncertain ? "unknown" : "not_sent",
     sentMessageId: delivered?.sent_message_id ?? undefined,
     account: delivered?.google_account ?? "work",
     recipient: to?.name.trim().split(/\s+/)[0] || to?.email || "them",

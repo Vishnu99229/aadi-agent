@@ -14,6 +14,7 @@ import { getSetting, setSetting } from "./db.js";
 import { assertTestSeam } from "./test_seam.js";
 import { logLlmUsage } from "./usage.js";
 import type { VoiceCard } from "./voice_cards.js";
+import { emailProviderWrite, EmailOperationError, noteEmailFailure } from "./email_outcomes.js";
 
 export const VOICE_REPLIES_SETTING = "voice_replies";
 /** Telegram Bot API caption limit for sendVoice / sendPhoto / etc. */
@@ -240,6 +241,7 @@ export async function sendSpokenReply(input: {
   caption: string;
   keyboard?: InlineKeyboard;
   sourceText: string;
+  emailCard?: VoiceCard["emailCard"];
 }): Promise<number | undefined> {
   if (!input.spoken.trim()) {
     return undefined;
@@ -254,13 +256,24 @@ export async function sendSpokenReply(input: {
   try {
     const { audio, model } = await synthesizeSpeech(input.spoken, lang);
     await writeFile(audioPath, audio);
-    const messageId = await sendVoiceFn(
+    const post = () => sendVoiceFn(
       input.api,
       input.chatId,
       audioPath,
       input.caption || undefined,
       input.keyboard,
     );
+    const messageId = input.emailCard ? await emailProviderWrite(post, {
+      rejected: "Telegram rejected the voice card.",
+      unconfirmed: "Telegram didn't confirm the voice card. Check Telegram before posting another.",
+      evidence: input.emailCard,
+      reportRejection: false,
+    }) : await post();
+    if (input.emailCard && messageId === undefined) {
+      const error = new EmailOperationError("Telegram didn't return a message ID for the voice card. Check Telegram before posting another.", "write_unconfirmed", input.emailCard);
+      noteEmailFailure(error);
+      throw error;
+    }
     logLlmUsage({
       task: "tts",
       model,
@@ -275,6 +288,7 @@ export async function sendSpokenReply(input: {
     );
     return messageId ?? 0;
   } catch (error) {
+    if (error instanceof EmailOperationError && error.reason === "write_unconfirmed") throw error;
     const status =
       error instanceof Error
         ? error.message.replace(/\s+/g, " ").slice(0, 120)
@@ -306,6 +320,7 @@ export async function deliverVoiceTurn(input: {
   // The card whose buttons ride on the voice note comes first, so its caption (which
   // names everyone those buttons confirm) is never the part a long caption loses.
   const onVoice = [...withButtons.slice(0, 1), ...cards.filter((card) => !card.keyboard)];
+  const emailCard = onVoice.find(card => card.emailCard)?.emailCard;
   const spoken = speechText(input.replyText);
   const messageId = spoken
     ? await sendSpokenReply({
@@ -315,6 +330,7 @@ export async function deliverVoiceTurn(input: {
         caption: voiceCaption(spoken, onVoice.map((card) => card.caption)),
         keyboard: withButtons[0]?.keyboard,
         sourceText: input.sourceText,
+        emailCard,
       })
     : undefined;
   if (messageId !== undefined) {
