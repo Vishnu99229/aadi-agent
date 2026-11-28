@@ -12,7 +12,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "grammy";
 import {
-  asksForMemoryWrite,
   newRunReport,
   runAgent,
   setToolInterceptorForTests,
@@ -178,13 +177,7 @@ setGoalLimitsForTests({ enabled: true, maxConcurrent: 2, goalBudgetUsd: 1, workf
 // ---------------------------------------------------------------- the rules
 assert(LOCAL_AGENT_CONNECT_TIMEOUT_MS === 3_000 && LOCAL_AGENT_TOTAL_TIMEOUT_MS === 120_000, "3 s to connect, 120 s for the whole local run");
 assert(READ_TOOLS.length === 15 && READ_TOOLS.includes("search_everywhere"), `Knowledge has 15 read tools, search_everywhere included (${READ_TOOLS.length})`);
-for (const text of ["Remember that Jeff prefers morning calls.", "Forget Jeff's old number", "Update the memory about Northwind", "Add this to the Q&A bank"]) {
-  assert(asksForMemoryWrite(text), `"${text}" asks for a memory write`);
-}
-for (const text of ["What do you remember about Jeff?", "Find the pricing deck in my Drive", "Do you remember the Northwind call?"]) {
-  assert(!asksForMemoryWrite(text), `"${text}" only reads`);
-}
-passed.push("rules: 3 s connect, 120 s total, 15 read tools, memory-write requests recognised");
+passed.push("rules: 3 s connect, 120 s total, 15 read tools");
 
 // ---------------------------------------------------------------- the picker
 const edits: string[] = [];
@@ -341,17 +334,9 @@ await withOllama([{ tools: [{ name: "remember", arguments: { fact: "Jeff prefers
   assert(reply === `Cloud answer.\n\n${NOTE.memory}`, `the turn reran on cloud with the note (${JSON.stringify(reply)})`);
   assert(cloudCalls.length > 0 && cloudCalls.every((call) => call.agent === "knowledge" && call.tools.includes("remember")), "with Knowledge's normal tools");
 });
-await withOllama([{ content: "the laptop should never be asked" }], async (url, bodies) => {
-  setLocalAgentModelConfigForTests({ model: MODEL, url });
-  cloudCalls = [];
-  const own = await knowledgeTurn("Remember that Jeff prefers morning calls.");
-  assert(bodies.length === 0 && own === `Cloud answer.\n\n${NOTE.memory}`, `his own "remember" goes straight to cloud (${JSON.stringify(own)})`);
-  const goal = "Remember that Jeff prefers morning calls.";
-  const delegated = await delegate({ agentId: "knowledge", capability: "goal", input: { goal }, grant: ownerGrant(goal) });
-  assert(bodies.length === 0, "a delegated request to remember never reaches the laptop");
-  assert(delegated.state === "completed" && delegated.text === `Cloud answer.\n\n${NOTE.memory}`, `and is answered on cloud with the note (${delegated.state} ${JSON.stringify(delegated.text)})`);
-});
-passed.push("memory writes: a local call to remember is stopped before it runs and the turn reruns on cloud; a request to remember never goes local");
+// No word rule sends "remember" to cloud: the laptop model only has read tools, and
+// its call to a write stops the run before the call runs (above).
+passed.push("memory writes: a local call to remember is stopped before it runs and the turn reruns on cloud");
 
 // ---------------------------------------------------------------- a delegated read runs local
 await withOllama([{ content: "Jeff prefers mornings." }], async (url, bodies) => {

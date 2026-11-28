@@ -1,21 +1,13 @@
 import { config } from "./config.js";
-import type { LlmBackend, LlmMessage, LlmTool, ModelRoute, ToolCall, ToolChoice } from "./llm.js";
+import type { LlmBackend, LlmMessage, LlmTool, ModelRoute, ToolCall } from "./llm.js";
 import { resolveAgentModel, type ReasoningTier, type ResolvedAgentModel } from "./models/agent_models.js";
 import type { LocalAgentModel } from "./models/local_agent_models.js";
 import { completeOnLocalModel, LocalModelUnavailable } from "./local_agent_backend.js";
 import { historyForSpecialist, type ContextMeasure } from "./agents/context.js";
 import { readFile } from "node:fs/promises";
 import { getTaskBackend, getTaskEffort, type ModelTask } from "./chat_backend.js";
-import { shouldForceCalendarTool } from "./calendar_guard.js";
 import { contactQuestionAsked, contactQuestionMark } from "./contact_questions.js";
 import { draftBodyFromCall, shortenDraftReply } from "./draft_confirm.js";
-import { looksLikeDeferredAction } from "./deferred_action.js";
-import {
-  documentMultiReadRetryPrompt,
-  documentRewriteRetryPrompt,
-  looksLikeDocumentRewrite,
-  resolveReferencedDocumentIds,
-} from "./document_rewrite.js";
 import {
   CONVERSATION_SUMMARY_KEY,
   CONVERSATION_SUMMARY_UNTIL_KEY,
@@ -25,24 +17,10 @@ import {
   setSetting,
   type StoredMessage,
 } from "./db.js";
-import { backendForcesTools, complete } from "./llm.js";
-import {
-  COMMAND_TOOLS,
-  commandFamilyTools,
-  commandIntents,
-  forcedCommandTool,
-  commandNotRunMessage,
-  commandRetryPrompt,
-  echoesEarlierReply,
-  type CommandKind,
-} from "./command_intent.js";
+import { complete } from "./llm.js";
 import type { UsageTask } from "./usage.js";
 import { memoryContextLine } from "./memory.js";
-import {
-  getRecentUpload,
-  getRecentUploads,
-  recentUploadLine,
-} from "./recent_upload.js";
+import { recentUploadLine } from "./recent_upload.js";
 import {
   SPECIALIST_ONLY_TOOLS,
   TOOL_ORDER,
@@ -64,21 +42,24 @@ import { specialistFor } from "./agents/index.js";
 import { toolOwnership } from "./agents/registry.js";
 import { AgentTaskError } from "./agents/types.js";
 import type { ReactionSession } from "./contextual_react.js";
-import {
-  isSuccessfulToolResult,
-  isDeliveryTool,
-  receiptFailureMessage,
-  isLookupQuestion,
-  receiptActionTools,
-  receiptRetryIsReadOnly,
-  receiptRetryPrompt,
-  unreceiptedClaims,
-  type ReceiptRetryMetadata,
-  type ToolReceipt,
-} from "./receipt.js";
-import { deliveryReadsFromTool, recordedReceipt } from "./receipt_records.js";
+import { isSuccessfulToolResult, isDeliveryTool, type ToolReceipt } from "./receipt.js";
+import { confirmedSentReads, deliveryReadsFromTool, recordedReceipt } from "./receipt_records.js";
 import { emailRecoveryForModel, hasEmailRecovery, recordEmailRecovery, type EmailRecovery } from "./email_recovery.js";
-import { addEmailOutcomes, currentEmailTurn, newEmailTurn, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
+import { addEmailOutcomes, currentEmailTurn, hasEmailOutcomeLines, newEmailTurn, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
+import {
+  changeLines,
+  checkReply,
+  checkRetryPrompt,
+  NOT_CHECKED_LABEL,
+  NOTHING_CHANGED_TEXT,
+  UNCONFIRMED_TEXT,
+  type CheckedTool,
+  type CheckedToolStatus,
+  type CheckInput,
+  type CheckResult,
+  type ReplyCheckRecord,
+} from "./reply_checker.js";
+import { FORMAT_PROBLEM_TEXT, isRawPayload } from "./raw_text_guard.js";
 import type { WorkflowToolRun } from "./agents/dispatch.js";
 import {
   parseSearchSources,
@@ -147,15 +128,11 @@ export interface MetaToolResult {
   /** End the loop now with this as the reply. */
   stop?: string;
   /**
-   * Tools that other agents ran while carrying this out. They count toward the
-   * turn's "was the command actually run" check exactly as if called here.
+   * Tools that other agents ran while carrying this out. They are this turn's
+   * records exactly as if called here, for the outcome lines and the reply check.
    */
   toolsRun?: readonly WorkflowToolRun[];
-  /**
-   * The work is paused for Vishnu's answer or still running elsewhere. The turn's
-   * "was the command run" check stands down, so the model isn't pushed into
-   * doing the action itself with a guessed value, or doing it twice.
-   */
+  /** The work is paused for Vishnu's answer or still running elsewhere. */
   deferred?: boolean;
 }
 
@@ -171,7 +148,8 @@ export interface MetaTool {
 
 /** Filled in by runAgent so the caller can see what the turn did and cost. */
 export interface RunReport {
-  receiptRetries?: ReceiptRetryMetadata[];
+  /** Each reply check this run, and what the loop did after it. */
+  replyChecks?: ReplyCheckRecord[];
   agentId: string;
   llmCalls: number;
   costUsd: number;
@@ -199,7 +177,7 @@ export interface RunReport {
   cacheHits?: number;
   /** Context this run was given, against what it would have been given uncompressed. */
   context?: ContextMeasure;
-  /** The run ended with an answer and no failed tool or unrun command. */
+  /** The run ended with a checked answer and no failed tool. */
   succeeded?: boolean;
   widened: boolean;
   stopped?: string;
@@ -245,21 +223,24 @@ function sendIntentContext(confirmation: SendConfirmation | undefined): string {
 
 /** What this loop may call and how each call is carried out. */
 interface ToolScope {
-  receiptToolAllowed?: (name: string) => boolean;
+  /** Set by a failed reply check: only these tools on the retry. */
+  retryToolAllowed?: (name: string) => boolean;
   turnContext: TurnContext;
   meta: Map<string, MetaTool>;
   widen: () => void;
   stop: (reply: string) => void;
   /** Records tools that ran on this loop's behalf inside a delegated job. */
   credit: (runs: readonly WorkflowToolRun[]) => void;
-  /** The command is in hand elsewhere (paused or still running). */
-  defer: () => void;
 }
 
-type AgentToolResult = Extract<LlmMessage, { role: "tool" }> & { emailRecovery?: EmailRecovery };
+type AgentToolResult = Extract<LlmMessage, { role: "tool" }> & {
+  emailRecovery?: EmailRecovery;
+  /** Ids of the outcomes the tool's write recorded (deliveries, cards). */
+  recordIds?: string[];
+};
 
 function toolResultForModel(result: AgentToolResult): LlmMessage {
-  const { emailRecovery, ...raw } = result;
+  const { emailRecovery, recordIds: _recordIds, ...raw } = result;
   if (!emailRecovery) return raw;
   return {
     ...raw,
@@ -273,8 +254,8 @@ async function runTool(
   turn: ToolTurn,
   state: ToolScope,
 ): Promise<AgentToolResult> {
-  if (state.receiptToolAllowed && (state.meta.has(call.name) || !state.receiptToolAllowed(call.name))) {
-    return { role: "tool", toolCallId: call.id, content: "Not done: this tool is unavailable on the receipt retry.", isError: true };
+  if (state.retryToolAllowed && (state.meta.has(call.name) || !state.retryToolAllowed(call.name))) {
+    return { role: "tool", toolCallId: call.id, content: "Not done: only read tools are available while the reply is being corrected.", isError: true };
   }
   const meta = state.meta.get(call.name);
   if (meta) {
@@ -291,9 +272,6 @@ async function runTool(
       }
       if (result.toolsRun && result.toolsRun.length > 0) {
         state.credit(result.toolsRun);
-      }
-      if (result.deferred) {
-        state.defer();
       }
       return {
         role: "tool",
@@ -312,9 +290,38 @@ async function runTool(
     toolCallId: call.id,
     content: outcome.content,
     ...(outcome.emailRecovery ? { emailRecovery: outcome.emailRecovery } : {}),
+    ...(outcome.emailOutcomes?.length ? { recordIds: outcome.emailOutcomes.map((item) => item.id) } : {}),
     ...(outcome.isError ? { isError: true } : {}),
   };
 }
+
+/** A tool's status for the reply check, from the call's own records. */
+function toolStatus(success: boolean, recovery: EmailRecovery | undefined, isError: boolean | undefined): CheckedToolStatus {
+  const reason = recovery?.reason;
+  if (reason === "write_unconfirmed") {
+    return "uncertain";
+  }
+  if (success && !recovery) {
+    return "ok";
+  }
+  if (
+    reason === "provider_read_failed" || reason === "provider_rejected" || reason === "card_not_shown" ||
+    reason === "draft_missing" || reason === "message_missing" || reason === "draft_closed"
+  ) {
+    return "failed";
+  }
+  if (reason) {
+    return "refused";
+  }
+  return isError ? "failed" : "refused";
+}
+
+function statusLine(content: string): string {
+  return (content.trim().split("\n", 1)[0] ?? "").slice(0, 160);
+}
+
+const FORMAT_RETRY_PROMPT =
+  "Your last reply was raw data (JSON, or a tool call written out as text), so it was not sent and nothing in it was run. To use a tool, make a real tool call. Otherwise answer Vishnu in plain words.";
 
 function saveAssistantReply(reply: string, saveAssistantMessage: boolean): string {
   if (saveAssistantMessage) {
@@ -531,30 +538,20 @@ class LocalRunAbort extends Error {
   }
 }
 
-const MEMORY_WRITE_WORDS =
-  /\b(?:remember|forget|memori[sz]e|keep\s+in\s+mind|note\s+(?:that|this|it|down)|(?:save|store)\s+(?:this|that|it))\b|\bupdate\b[^.?!\n]{0,20}\bmemor(?:y|ies)\b|\b(?:learn|add|save|import)\b[^.?!\n]{0,40}?\b(?:q\s*&\s*a|q\s+and\s+a|qa\s+bank)\b/i;
-/** "What do you remember about Jeff?" reads a memory; it doesn't write one. */
-const RECALL_QUESTION = /\b(?:what|who|when|where|how|which|why)\b[^.?!\n]{0,30}\bremember\b|\b(?:do|did)\s+(?:you|i)\s+remember\b/i;
-
-/** The request asks to save, change or drop a memory or a Q&A bank entry. Errs towards yes. */
-export function asksForMemoryWrite(text: string): boolean {
-  const kinds = commandIntents(text);
-  return (
-    kinds.includes("memory") ||
-    kinds.includes("qa_bank") ||
-    (MEMORY_WRITE_WORDS.test(text) && !RECALL_QUESTION.test(text))
-  );
-}
-
 function withLine(reply: string, line: string): string {
   return reply.trim() ? `${reply}\n\n${line}` : reply;
 }
 
-/** A run that starts on the laptop model, one that must go to cloud with a note, or an ordinary run. */
+/**
+ * A run that starts on the laptop model, or an ordinary run. The rule is
+ * structural, never a reading of his words: the laptop model is only ever given
+ * its agent's read tools, and a call to anything else (a write, a tool it wasn't
+ * given, or handing the turn back to Aadi) stops the run before the call runs
+ * and the turn reruns on cloud (LocalRunAbort).
+ */
 function localPlan(
-  userText: string,
   options: RunAgentOptions,
-): { model: LocalAgentModel; readTools: Set<string> } | { note: LocalNote } | undefined {
+): { model: LocalAgentModel; readTools: Set<string> } | undefined {
   if (options.backend || options.toolNames || !options.modelAgent || options.agentId !== options.modelAgent) {
     return undefined;
   }
@@ -562,15 +559,6 @@ function localPlan(
   const specialist = model ? specialistFor(options.modelAgent) : undefined;
   if (!model || !specialist) {
     return undefined;
-  }
-  // A delegated task's request is its goal line; a chat turn's is his own words.
-  const request = options.delegation ? (userText.split("\n")[0] ?? "") : (options.guardText ?? userText);
-  if (asksForMemoryWrite(request)) {
-    return { note: "memory" };
-  }
-  // An explicit command makes the loop force a tool, which the laptop model can't take.
-  if (!options.delegation && options.sendConfirmation && commandIntents(request).length > 0) {
-    return { note: "tool" };
   }
   return {
     model,
@@ -601,13 +589,9 @@ export async function runAgent(
       }
     });
   }
-  const plan = localPlan(userText, options);
+  const plan = localPlan(options);
   if (!plan) {
     return runAgentLoop(userText, options);
-  }
-  if ("note" in plan) {
-    console.log(`local model: agent=${options.modelAgent} cloud reason=${plan.note}`);
-    return withLine(await runAgentLoop(userText, options), LOCAL_NOTES[plan.note]);
   }
   const startedAt = Date.now();
   const localReport = options.report ? newRunReport() : undefined;
@@ -762,16 +746,8 @@ async function runAgentLoop(
       : backend === "claude" || backend === "haiku"
         ? getTaskEffort(task)
         : undefined;
-  const routeForcesTools = (): boolean => route?.models[0]?.forcesTools ?? false;
-  let deferredRetryUsed = false;
-  let calendarRetryUsed = false;
-  let documentRewriteRetryUsed = false;
-  let documentMultiReadRetryUsed = false;
   const toolsUsed = new Set<string>();
-  const documentsRead = new Set<number>();
   const guardText = options.guardText ?? userText;
-  // The nudges below read Vishnu's message. A delegated task isn't his message.
-  const nudgeText = options.delegation ? "" : guardText;
   const defaults = defaultToolNames(config.sendOnCommandEnabled);
   const ownScope: readonly string[] | undefined =
     options.toolNames ??
@@ -835,7 +811,6 @@ async function runAgentLoop(
   // ends on it, so the model can't go on and pick someone itself.
   const askChatId = (options.delegation?.grant?.confirmation ?? options.sendConfirmation)?.chatId;
   const contactMark = contactQuestionMark(askChatId);
-  let commandDeferred = false;
   let widened = false;
   let aadiPrompt: string | undefined;
   const allowedTools: ToolScope = {
@@ -847,9 +822,6 @@ async function runAgentLoop(
     stop: (reply) => {
       stoppedReply = reply;
     },
-    defer: () => {
-      commandDeferred = true;
-    },
     credit: (runs) => {
       for (const run of runs) {
         if (run.emailOutcomes) {
@@ -857,13 +829,11 @@ async function runAgentLoop(
         }
         if (run.emailRecoveryUpdate) recordEmailRecovery(turnContext.emailTurn, run.emailRecoveryUpdate);
         toolsUsed.add(run.tool);
-        noteToolReceipt({ name: run.tool, success: run.ok, content: run.content }, run.emailRecovery);
-        if (isFamilyTool(run.tool)) {
-          freshResults.push(run.content);
-        }
-        if (isActionTool(run.tool)) {
-          actionResults.push(run.content);
-        }
+        noteToolReceipt({ name: run.tool, success: run.ok, content: run.content }, {
+          recovery: run.emailRecovery,
+          isError: !run.ok,
+          recordIds: run.emailOutcomes?.map((item) => item.id),
+        });
       }
     },
   };
@@ -895,71 +865,121 @@ async function runAgentLoop(
     }
     console.log(`agent routing: ${specialist.definition.id} handed the turn back to Aadi`);
   };
-  const outsideScope = (name: string): boolean =>
-    turnContext.allowed !== undefined && !turnContext.allowed.has(name);
   let succeeded = false;
   let toolFailed = false;
-  let receiptRetryUsed = false;
-  let receiptRetryReadOnly = false;
+  /**
+   * One retry per turn after a failed reply check: read tools only after a claim
+   * the records don't support, the normal tools when the reply was incomplete.
+   */
+  let checkRetry: "none" | "read_only" | "tools" = "none";
+  let formatRetryUsed = false;
   const receipts: ToolReceipt[] = [];
+  /** This turn's tools as the reply checker sees them: records only, no bodies. */
+  const checkedTools: CheckedTool[] = [];
   const receiptReads: ReturnType<typeof deliveryReadsFromTool> = [];
   let writeFailed = false;
-  function noteToolReceipt(receipt: ToolReceipt, recovery?: EmailRecovery): void {
+  function noteToolReceipt(
+    receipt: ToolReceipt,
+    extra: { recovery?: EmailRecovery; isError?: boolean; recordIds?: readonly string[] } = {},
+  ): void {
     receipts.push(receipt);
     const effect = toolOwnership(receipt.name)?.effect;
     if (effect === "read" && receipt.success && receipt.content !== undefined) {
       receiptReads.push(...deliveryReadsFromTool(receipt.name, receipt.content));
     }
-    if (effect && effect !== "read" && (!receipt.success || recovery)) {
+    if (effect && effect !== "read" && (!receipt.success || extra.recovery)) {
       writeFailed = true;
-      const reason = recovery?.userMessage ?? receipt.content;
+      const reason = extra.recovery?.userMessage ?? receipt.content;
       if (reason?.trim()) turnContext.emailTurn.notices.add(reason);
     }
+    if (effect && effect !== "read" && receipt.success && !extra.recovery) {
+      turnContext.emailTurn.changed.add(receipt.name);
+    }
+    const writes = effect === "draft" || effect === "write" || effect === "external";
+    checkedTools.push({
+      name: receipt.name,
+      effect: effect ?? (metaTools.has(receipt.name) ? "task" : "unknown"),
+      status: toolStatus(receipt.success, extra.recovery, extra.isError),
+      records: [...(extra.recordIds ?? [])],
+      ...(writes && receipt.content ? { note: statusLine(receipt.content) } : {}),
+    });
   }
   const draftBodies: string[] = [];
   let searchSources: SearchHit[] = [];
   /** The official release pages a release check read. They are cited ahead of search hits. */
   let releaseSources: SearchHit[] = [];
 
-  // An explicit command in his own message has to be answered by a tool that runs
-  // this turn. Models, DeepSeek especially, can otherwise repeat an old answer
-  // from the chat history without checking anything. Forwarded messages have no
-  // confirmation and a fixed tool list, so this never applies to them.
-  const ownTurnIntents: CommandKind[] =
-    options.sendConfirmation && !options.toolNames ? commandIntents(guardText) : [];
-  const commandsAfterQuestion = isLookupQuestion(guardText)
-    ? commandIntents(guardText.split("?").slice(1).join(" "))
-    : undefined;
-  // A delegated task is one step of his request, so the whole-turn check stays with Aadi.
-  const intents: CommandKind[] = options.delegation ? [] : commandsAfterQuestion
-    ? ownTurnIntents.filter(kind => commandsAfterQuestion.includes(kind))
-    : ownTurnIntents;
-  const earlierReplies = history.messages
-    .filter((message) => message.role !== "user")
-    .map((message) => message.content);
-  const earlierToolResults = history.messages
-    .filter((message) => message.role === "tool")
-    .map((message) => message.content);
-  // Results from this turn's command tools: lookups included (anything said this
-  // turn is fresh), and the actions alone (what an echo is replaced with).
-  const freshResults: string[] = [];
-  const actionResults: string[] = [];
-  const isFamilyTool = (name: string): boolean =>
-    intents.some((kind) => commandFamilyTools(kind).includes(name));
-  const isActionTool = (name: string): boolean =>
-    intents.some((kind) => COMMAND_TOOLS[kind].includes(name));
-  const forcing = (kinds: readonly CommandKind[]): { name: string } | undefined => {
-    // Ollama takes no forced tool choice.
-    const forces = local ? false : route ? routeForcesTools() : backendForcesTools(backend);
-    const name = forces ? forcedCommandTool(kinds) : undefined;
-    return name ? { name } : undefined;
+  const journal = turnContext.emailTurn;
+  // Every model-written reply that goes to Vishnu is checked. A delegated step goes
+  // back to Aadi's own loop (whose reply is checked), and the morning brief is a
+  // scheduled report started by code or /brief, not a reply.
+  const checksReplies = !options.delegation && options.task !== "brief";
+  /** Code-written lines for writes the email journal has no line for. */
+  const fallbackLead = (nothingLine: boolean): string[] => {
+    const lines = changeLines(checkedTools, (tool) => tool.records.length > 0 || hasEmailRecovery(tool.name));
+    return lines.length > 0 || hasEmailOutcomeLines(journal) || !nothingLine ? lines : [NOTHING_CHANGED_TEXT];
   };
-  const firstForced = forcing(intents);
-  let toolChoice: ToolChoice | undefined = firstForced;
-  let commandRetryUsed = false;
-  if (intents.length > 0) {
-    console.log(`Command turn: kinds=${intents.join(",")} forced=${firstForced?.name ?? "none"}`);
-  }
+  /** The reply as the checker sees it: his words, the draft, and this turn's records. */
+  const checkInputFor = (reply: string): CheckInput => ({
+    ownerMessage: guardText,
+    reply,
+    tools: checkedTools,
+    recordedOutcomes: [...journal.writes.values()].map(({ id, line }) => ({ id, line })),
+    deliveryGrounded: recordedReceipt({
+      outcomeIds: journal.writes.keys(),
+      reads: receiptReads,
+      deliveryAttempted: receipts.some((receipt) => isDeliveryTool(receipt.name)),
+      writeFailed,
+    }),
+    sendsFoundByLookup: confirmedSentReads(receiptReads),
+    availableLookups: activeTools.flatMap((tool) =>
+      tool.type === "function" && toolOwnership(tool.name)?.effect === "read" ? [tool.name] : [],
+    ),
+  });
+  const recordCheck = (result: CheckResult | "raw_payload" | "step_limit", action: ReplyCheckRecord["action"]): void => {
+    const entry: ReplyCheckRecord =
+      result === "raw_payload"
+        ? { verdict: "raw_payload", issues: [], ms: 0, action }
+        : result === "step_limit"
+          ? { verdict: "unavailable", issues: [], reason: "step limit before a corrected reply", ms: 0, action }
+          : result.status === "checked"
+          ? { verdict: result.verdict, issues: result.issues, model: result.model, ms: result.ms, action }
+          : { verdict: "unavailable", issues: [], reason: result.reason, ms: result.ms, action };
+    if (report) {
+      (report.replyChecks ??= []).push(entry);
+    }
+    console.log(
+      `reply check: verdict=${entry.verdict} action=${action}${entry.model ? ` model=${entry.model}` : ""}${entry.reason ? ` reason=${entry.reason}` : ""} ms=${entry.ms}`,
+    );
+  };
+  /** Outcome lines first, then the reply under a label: never blocked silently. */
+  const unchecked = (reply: string): string => [...fallbackLead(true), `${NOT_CHECKED_LABEL}\n${reply}`].join("\n\n");
+  const withheld = (): string => [...fallbackLead(true), UNCONFIRMED_TEXT].join("\n\n");
+  const formatProblem = (): string => [...fallbackLead(false), FORMAT_PROBLEM_TEXT].join("\n\n");
+  /** A model-written reply the loop can't retry any more: one check, then send, label or withhold. */
+  const finishOnce = async (reply: string): Promise<string> => {
+    if (options.delegation) {
+      return reply;
+    }
+    if (isRawPayload(reply)) {
+      recordCheck("raw_payload", "format_withheld");
+      return formatProblem();
+    }
+    if (!checksReplies) {
+      return reply;
+    }
+    const result = await checkReply(checkInputFor(reply));
+    if (result.status === "unavailable") {
+      recordCheck(result, "sent_unchecked");
+      return unchecked(reply);
+    }
+    if (result.verdict !== "ok") {
+      recordCheck(result, "withheld");
+      return withheld();
+    }
+    recordCheck(result, "sent");
+    return reply;
+  };
 
   const maxIterations = Math.max(1, Math.min(MAX_ITERATIONS, options.maxIterations ?? MAX_ITERATIONS));
   let spentUsd = 0;
@@ -986,9 +1006,9 @@ async function runAgentLoop(
         uncertain: turnContext.trace.some((entry) => entry.ok),
       });
     }
-    const canUseReceiptTool = allowedTools.receiptToolAllowed;
-    const scopedTools = canUseReceiptTool
-      ? activeTools.filter(tool => tool.type === "function" && !metaTools.has(tool.name) && canUseReceiptTool(tool.name))
+    const canUseRetryTool = allowedTools.retryToolAllowed;
+    const scopedTools = canUseRetryTool
+      ? activeTools.filter(tool => tool.type === "function" && !metaTools.has(tool.name) && canUseRetryTool(tool.name))
       : activeTools;
     const iterationTools = turnContext.emailTurn.uncertain
       ? scopedTools.filter(tool => tool.type === "function" && toolOwnership(tool.name)?.effect === "read")
@@ -1009,7 +1029,6 @@ async function runAgentLoop(
           ...(route ? { route } : { backend }),
           task: options.usageTask ?? usageTaskForAgent(options.task),
           effort,
-          ...(toolChoice && !receiptRetryUsed && !turnContext.emailTurn.uncertain ? { toolChoice } : {}),
         });
     if (localAllowed) {
       // Checked before anything runs: a write the laptop model reaches for is never made by it.
@@ -1019,7 +1038,6 @@ async function runAgentLoop(
         throw new LocalRunAbort(ownWrite ? "memory" : "tool", outside.name);
       }
     }
-    toolChoice = undefined;
     // A fallback sees the tool results of the provider that failed. Repeating
     // those calls would run the side effect twice, so identical calls are replayed.
     // This holds whichever provider or agent model the fallback lands on.
@@ -1117,16 +1135,14 @@ async function runAgentLoop(
         const call = clientToolCalls[i]!;
         const result = toolResults[i]!;
         const success = isSuccessfulToolResult(result.content, result.isError);
-        noteToolReceipt({ name: call.name, success, content: result.content }, result.emailRecovery);
+        noteToolReceipt({ name: call.name, success, content: result.content }, {
+          recovery: result.emailRecovery,
+          isError: result.isError,
+          recordIds: result.recordIds,
+        });
         const draftBody = draftBodyFromCall(call.name, call.input, success);
         if (draftBody) {
           draftBodies.push(draftBody);
-        }
-        if (call.name === "read_document") {
-          const id = (call.input as { id?: unknown }).id;
-          if (typeof id === "number" && Number.isSafeInteger(id) && id > 0) {
-            documentsRead.add(id);
-          }
         }
         if (call.name === "web_search" && success) {
           const hits = parseSearchSources(result.content);
@@ -1139,12 +1155,6 @@ async function runAgentLoop(
           if (pages.length > 0) {
             releaseSources = pages;
           }
-        }
-        if (isFamilyTool(call.name)) {
-          freshResults.push(result.content);
-        }
-        if (isActionTool(call.name)) {
-          actionResults.push(result.content);
         }
         if (saveAssistantMessage) {
           saveMessage("tool", result.content, call.name);
@@ -1175,132 +1185,12 @@ async function runAgentLoop(
       continue;
     }
 
-    const missingKinds = commandDeferred || receiptRetryUsed
-      ? []
-      : intents.filter((kind) => !commandFamilyTools(kind).some((name) => toolsUsed.has(name)));
-    if (response.toolCalls.length === 0 && missingKinds.length > 0) {
-      if (!commandRetryUsed) {
-        commandRetryUsed = true;
-        console.log(`Command check: retry kinds=${missingKinds.join(",")} iteration=${iteration}`);
-        toolChoice = forcing(missingKinds);
-        messages.push({
-          role: "assistant",
-          textParts: response.textParts,
-          toolCalls: [],
-        });
-        messages.push({ role: "user", content: commandRetryPrompt(missingKinds) });
-        continue;
-      }
-      console.log(`Command check: not run kinds=${missingKinds.join(",")}`);
-      succeeded = false;
-      return saveReply(commandNotRunMessage(missingKinds), saveAssistantMessage);
-    }
-
-    if (
-      !receiptRetryUsed && !calendarRetryUsed &&
-      response.toolCalls.length === 0 &&
-      shouldForceCalendarTool(nudgeText, [...toolsUsed])
-    ) {
-      calendarRetryUsed = true;
-      console.log(`Calendar-tool retry: iteration=${iteration}`);
-      if (outsideScope("list_events")) {
-        await widenToAadi();
-      }
-      messages.push({
-        role: "assistant",
-        textParts: response.textParts,
-        toolCalls: [],
-      });
-      messages.push({
-        role: "user",
-        content:
-          "This question is about meetings, the schedule, or the calendar. Call list_events now. Use Asia/Kolkata dates (call get_current_time first if you do not yet know today's date). Omit account so both the personal and work calendars are read, unless Vishnu named only one. Answer from the tool result. Do not say there are no meetings unless list_events returned none.",
-      });
-      continue;
-    }
-
-    if (
-      !receiptRetryUsed && !deferredRetryUsed &&
-      response.toolCalls.length === 0 &&
-      looksLikeDeferredAction(responseText)
-    ) {
-      deferredRetryUsed = true;
-      console.log(`Deferred-action retry: iteration=${iteration}`);
-      messages.push({
-        role: "assistant",
-        textParts: response.textParts,
-        toolCalls: [],
-      });
-      messages.push({
-        role: "user",
-        content:
-          "Do that now. Call the necessary tool in this turn and reply with the result. Do not say you will do it later.",
-      });
-      continue;
-    }
-
-    const neededDocIds = resolveReferencedDocumentIds(
-      nudgeText,
-      getRecentUploads(),
-    );
-    const missingDocIds = neededDocIds.filter((id) => !documentsRead.has(id));
-    if (
-      !receiptRetryUsed && !documentMultiReadRetryUsed &&
-      response.toolCalls.length === 0 &&
-      neededDocIds.length > 0 &&
-      missingDocIds.length > 0
-    ) {
-      documentMultiReadRetryUsed = true;
-      if (outsideScope("read_document")) {
-        await widenToAadi();
-      }
-      console.log(
-        `Document-multi-read retry: iteration=${iteration} ids=${missingDocIds.join(",")}`,
-      );
-      messages.push({
-        role: "assistant",
-        textParts: response.textParts,
-        toolCalls: [],
-      });
-      messages.push({
-        role: "user",
-        content: documentMultiReadRetryPrompt(missingDocIds),
-      });
-      continue;
-    }
-
-    const recentUpload = getRecentUpload();
-    if (
-      !receiptRetryUsed && !documentRewriteRetryUsed &&
-      response.toolCalls.length === 0 &&
-      !toolsUsed.has("read_document") &&
-      looksLikeDocumentRewrite(nudgeText) &&
-      recentUpload
-    ) {
-      documentRewriteRetryUsed = true;
-      if (outsideScope("read_document")) {
-        await widenToAadi();
-      }
-      console.log(
-        `Document-rewrite retry: iteration=${iteration} document_id=${recentUpload.documentId}`,
-      );
-      messages.push({
-        role: "assistant",
-        textParts: response.textParts,
-        toolCalls: [],
-      });
-      messages.push({
-        role: "user",
-        content: documentRewriteRetryPrompt(recentUpload.documentId),
-      });
-      continue;
-    }
-
-    if (!receiptRetryUsed && response.stopReason === "pause_turn") {
+    if (response.stopReason === "pause_turn") {
       const partialReply =
         collectedText.join("\n\n") || "I couldn't finish the request.";
+      succeeded = !toolFailed;
       return saveReply(
-        `${partialReply}\n\nNote: the server-side tool continuation limit was reached.`,
+        await finishOnce(`${partialReply}\n\nNote: the server-side tool continuation limit was reached.`),
         saveAssistantMessage,
       );
     }
@@ -1314,64 +1204,51 @@ async function runAgentLoop(
       succeeded = !toolFailed;
       return "";
     }
-    if (
-      !receiptRetryUsed && intents.length > 0 &&
-      echoesEarlierReply(finalReply, earlierReplies, freshResults, earlierToolResults)
-    ) {
-      // A tool ran, but the words are an earlier turn's. Show what the action said
-      // now, or, when only a lookup ran, that nothing was done.
-      console.log("Command check: reply repeated an earlier answer; using this turn's result");
-      succeeded = !toolFailed && actionResults.length > 0;
-      return saveReply(
-        actionResults.length > 0 ? actionResults.join("\n\n") : commandNotRunMessage(intents),
-        saveAssistantMessage,
-      );
-    }
-    const missing = unreceiptedClaims(finalReply, receipts, {
-      ownerText: guardText,
-      isReadTool: (name) => toolOwnership(name)?.effect === "read",
-      deliveryGrounded: recordedReceipt({
-        outcomeIds: turnContext.emailTurn.writes.keys(),
-        reads: receiptReads,
-        deliveryAttempted: receipts.some(receipt => isDeliveryTool(receipt.name)),
-        writeFailed,
-      }),
-    });
-    if (missing.length > 0) {
-      if (!receiptRetryUsed) {
-        receiptRetryUsed = true;
-        const retryText = options.delegation || options.toolNames ? "" : guardText;
-        receiptRetryReadOnly = receiptRetryIsReadOnly(missing, retryText);
-        allowedTools.receiptToolAllowed = (name) => toolOwnership(name)?.effect === "read" ||
-          (!receiptRetryReadOnly && missing.some(action => receiptActionTools(action, retryText).includes(name)));
-        if (report) {
-          (report.receiptRetries ??= []).push({ actions: missing, lookup: isLookupQuestion(guardText), toolsRestricted: receiptRetryReadOnly });
+    if (!options.delegation) {
+      // Raw data is never a reply, and a tool call written as text is never run.
+      if (isRawPayload(finalReply)) {
+        if (!formatRetryUsed) {
+          formatRetryUsed = true;
+          recordCheck("raw_payload", "format_retry");
+          messages.push({ role: "assistant", textParts: response.textParts, toolCalls: [] });
+          messages.push({ role: "user", content: FORMAT_RETRY_PROMPT });
+          continue;
         }
-        console.log(`receipt check: retry actions=${missing.join(",")}`);
-        messages.push({
-          role: "assistant",
-          textParts: response.textParts,
-          toolCalls: [],
-        });
-        messages.push({
-          role: "user",
-          content: receiptRetryPrompt(missing, retryText),
-        });
-        continue;
+        recordCheck("raw_payload", "format_withheld");
+        succeeded = false;
+        return saveReply(formatProblem(), saveAssistantMessage);
       }
-      console.log(`receipt check: blocked actions=${missing.join(",")}`);
-      succeeded = !toolFailed;
-      return saveReply(
-        receiptRetryReadOnly && options.sendConfirmation && !missing.includes("searched")
-          ? "I am not sure what happened. I couldn't verify it from the records."
-          : receiptFailureMessage(missing),
-        saveAssistantMessage,
-      );
+    }
+    if (checksReplies) {
+      // Whether the reply is true to this turn's records is the checker's call.
+      const input = checkInputFor(finalReply);
+      const result = await checkReply(input);
+      if (result.status === "unavailable") {
+        recordCheck(result, "sent_unchecked");
+        succeeded = !toolFailed;
+        return saveReply(unchecked(finalReply), saveAssistantMessage);
+      }
+      if (result.verdict !== "ok") {
+        if (checkRetry === "none") {
+          checkRetry = result.verdict === "incomplete" ? "tools" : "read_only";
+          recordCheck(result, checkRetry === "tools" ? "retry_tools" : "retry_read_only");
+          if (checkRetry === "read_only") {
+            allowedTools.retryToolAllowed = (name) => toolOwnership(name)?.effect === "read";
+          }
+          messages.push({ role: "assistant", textParts: response.textParts, toolCalls: [] });
+          messages.push({ role: "user", content: checkRetryPrompt(result, input) });
+          continue;
+        }
+        recordCheck(result, "withheld");
+        succeeded = false;
+        return saveReply(withheld(), saveAssistantMessage);
+      }
+      recordCheck(result, "sent");
     }
     succeeded = !toolFailed;
     return saveReply(
-      // When the release list itself was read, it is the source. Articles a
-      // search also turned up are cited only if the reply used them.
+      // Sources come from the search tool's own results, never from the reply's words.
+      // When the release list itself was read, it is the source.
       withSearchCitations(
         turnContext.emailTurn.writes.size > 0 ? finalReply : shortenDraftReply(finalReply, draftBodies),
         releaseSources.length > 0 ? releaseSources : searchSources,
@@ -1380,13 +1257,15 @@ async function runAgentLoop(
     );
   }
 
-  if (receiptRetryUsed) {
-    return saveReply("I am not sure what happened. I couldn't verify it from the records.", saveAssistantMessage);
+  if (checkRetry !== "none") {
+    // The corrected reply never arrived within the step limit.
+    recordCheck("step_limit", "withheld");
+    return saveReply(withheld(), saveAssistantMessage);
   }
   const partialReply =
     collectedText.join("\n\n") || "I couldn't finish the request.";
   return saveReply(
-    `${partialReply}\n\nNote: I hit the ${maxIterations}-iteration safety limit.`,
+    await finishOnce(`${partialReply}\n\nNote: I hit the ${maxIterations}-iteration safety limit.`),
     saveAssistantMessage,
   );
   } finally {

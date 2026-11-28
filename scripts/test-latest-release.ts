@@ -13,7 +13,8 @@ import { localSpecialists, specialistFor } from "../src/agents/index.ts";
 import { pickRoute, runOwnerTurn, type Route } from "../src/agents/orchestrator.ts";
 import { allToolOwnership } from "../src/agents/registry.ts";
 import { setCompleteForTests, type CompleteParams } from "../src/llm.ts";
-import { isSuccessfulToolResult, receiptFailureMessage, unreceiptedClaims } from "../src/receipt.ts";
+import { isSuccessfulToolResult } from "../src/receipt.ts";
+import { setReplyCheckerForTests, UNCONFIRMED_TEXT } from "../src/reply_checker.ts";
 import {
   changelogTop,
   compareVersions,
@@ -439,7 +440,6 @@ script = [
 ];
 const direct = await ask("What's the latest version of the Lumen protocol?");
 assert(direct.reply.startsWith("As of today the latest stable release is v1.0.1"), `a release check counts as a live lookup (${direct.reply.slice(0, 80)})`);
-assert(unreceiptedClaims("As of today the latest stable release is v1.0.1.", [{ name: "latest_release", success: true }]).length === 0, "for the reply check too");
 
 github({ "/search/repositories": { items: [apiRepo("TheTutorials/Lumen"), apiRepo("lumenproto/lumen")] } });
 script = [
@@ -447,9 +447,20 @@ script = [
   { text: "As of today the latest release of Lumen is v3.2." },
   { text: "As of today the latest release of Lumen is v3.2." },
 ];
+// The checker decides from the records: the release check did not succeed, so the version is unsupported.
+const releaseStatuses: string[] = [];
+setReplyCheckerForTests((input) => {
+  const release = input.tools.find((tool) => tool.name === "latest_release");
+  releaseStatuses.push(release?.status ?? "none");
+  return release?.status === "ok"
+    ? { status: "checked", verdict: "ok", issues: [], model: "test", ms: 0 }
+    : { status: "checked", verdict: "unsupported_claim", issues: ["No release check succeeded."], model: "test", ms: 0 };
+});
 const guessed = await ask("What's the latest version of Lumen?");
-assert(guessed.reply === receiptFailureMessage(["searched"]), `a version named after nothing was checked is not delivered (${guessed.reply})`);
-ok("the reply check: a release check counts as a live lookup; naming a latest version when nothing was checked is blocked");
+setReplyCheckerForTests(undefined);
+assert(releaseStatuses.length === 2 && releaseStatuses.every((status) => status !== "ok"), `checked twice against a release check that did not succeed (${releaseStatuses.join(",")})`);
+assert(guessed.reply.endsWith(UNCONFIRMED_TEXT) && !guessed.reply.includes("v3.2"), `a version named after nothing was checked is not delivered (${guessed.reply})`);
+ok("the reply check: a release check counts as a live lookup; naming a latest version when nothing was checked is withheld");
 
 // No project or version is baked into the lookup code. The invented histories
 // above already move past v1.0.1; this check keeps A2A (or any other project)

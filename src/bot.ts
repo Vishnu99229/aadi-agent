@@ -29,7 +29,7 @@ import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, 
 import { noteRepliedPeople } from "./recipient_facts.js";
 import { closedDraftMiss, closedEmailFacts, draftReadMiss, linkedDraftWriteInProgress, publishReadyDraft, tryReviseLinkedDraft } from "./context_draft.js";
 import { routeMiss, type PreRouteResult } from "./pre_route.js";
-import { currentEmailTurn, EmailOperationError, newEmailTurn, noteEmailNotice, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
+import { currentEmailTurn, EmailOperationError, newEmailTurn, noteEmailNotice, renderEmailOutcomes, turnMayHaveChanged, withEmailTurn } from "./email_outcomes.js";
 import { parseAddressList } from "./address_list.js";
 import { toolOwnership } from "./agents/registry.js";
 import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.js";
@@ -190,14 +190,17 @@ import { quotedMessageText, withQuotedContext } from "./reply_context.js";
 import {
   installCaptionEditFallback,
   installNetworkRetry,
+  installOutgoingTextGuard,
   redactBotToken,
   safeErrorText,
   splitForTelegram,
 } from "./telegram_io.js";
+import { FORMAT_PROBLEM_TEXT, isRawPayload } from "./raw_text_guard.js";
 import {
   attachRetryText,
   beginTurn,
   closeTurn,
+  failureCause,
   formatTurnFailure,
   markTurnForwarded,
   retryKeyboard,
@@ -205,6 +208,7 @@ import {
   turnWasForwarded,
   settleChatWork,
   turnTimeoutMs,
+  type TurnFailureCause,
   type TurnGate,
 } from "./turns.js";
 
@@ -213,6 +217,7 @@ const TYPING_REFRESH_MS = 4_000;
 export const bot = new Bot(config.telegramBotToken);
 installNetworkRetry(bot.api);
 installCaptionEditFallback(bot.api);
+installOutgoingTextGuard(bot.api);
 
 bot.use(ownerOnly(config.ownerTelegramId));
 
@@ -255,6 +260,12 @@ bot.use(async (ctx, next) => {
 });
 
 async function sendPlainText(ctx: Context, text: string): Promise<void> {
+  // Checked whole, before splitting: a long payload split in chunks is still raw data.
+  if (isRawPayload(text)) {
+    console.error(`Outgoing text guard: a ${text.trim().length}-char reply was raw data; sent the formatting notice instead.`);
+    await ctx.reply(FORMAT_PROBLEM_TEXT);
+    return;
+  }
   for (const chunk of splitForTelegram(text)) {
     await ctx.reply(chunk);
   }
@@ -287,9 +298,10 @@ async function whileTyping<T>(
 async function sendTurnFailure(
   ctx: Context,
   gate: TurnGate,
-  reason: string,
+  cause: TurnFailureCause,
+  changed: boolean,
 ): Promise<void> {
-  const text = formatTurnFailure(reason);
+  const text = formatTurnFailure(cause, changed);
   try {
     await ctx.reply(text, { reply_markup: retryKeyboard(gate.id) });
   } catch (error) {
@@ -347,17 +359,17 @@ async function completeChatReply(
     if (settled.status === "timeout") {
       gate.open = false;
       closeTurn(gate, "timeout", startedAt);
-      await sendTurnFailure(ctx, gate, "timed out after 60s");
+      await sendTurnFailure(ctx, gate, { kind: "timeout" }, turnMayHaveChanged(journal));
       return;
     }
     if (settled.status === "empty") {
       closeTurn(gate, "empty", startedAt);
-      await sendTurnFailure(ctx, gate, "empty reply");
+      await sendTurnFailure(ctx, gate, { kind: "empty" }, turnMayHaveChanged(journal));
       return;
     }
     if (settled.status === "failed") {
       closeTurn(gate, "failed", startedAt, settled.reason);
-      await sendTurnFailure(ctx, gate, settled.reason);
+      await sendTurnFailure(ctx, gate, settled.cause, turnMayHaveChanged(journal));
       return;
     }
     if (!gate.open) {
@@ -2094,7 +2106,8 @@ bot.on("message:text", async (ctx) => {
       markTurnForwarded(gate, true);
     }
     closeTurn(gate, "failed", Date.now(), shortError(error));
-    await sendTurnFailure(ctx, gate, shortError(error));
+    // Pre-routing may have written before it failed, so nothing is promised here.
+    await sendTurnFailure(ctx, gate, failureCause(error), true);
   }
 });
 

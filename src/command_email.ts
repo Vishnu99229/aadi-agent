@@ -79,7 +79,7 @@ import {
   sendCommandEmail,
 } from "./security/command_send.js";
 import { SendNotApprovedError } from "./security/send_approval.js";
-import { installCaptionEditFallback } from "./telegram_io.js";
+import { installCaptionEditFallback, installOutgoingTextGuard } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
 import {
   awaitRecipientDelivery, DRAFT_REPLACED, DRAFT_REREAD_FAILED,
@@ -168,6 +168,7 @@ export function commandApi(): Api {
   if (!telegram) {
     telegram = new Api(config.telegramBotToken);
     installCaptionEditFallback(telegram);
+    installOutgoingTextGuard(telegram);
   }
   return telegram;
 }

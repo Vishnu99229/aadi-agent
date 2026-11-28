@@ -190,6 +190,28 @@ export interface CompleteParams {
 
 export type ToolChoice = "required" | { name: string };
 
+/** One provider that failed in a chain, as structured data (never its response body). */
+export interface ProviderFailure {
+  provider: string;
+  model: string;
+  outcome: CallOutcome;
+}
+
+/** Every model a call could use failed. The message is for logs only. */
+export class LlmChainError extends Error {
+  constructor(
+    message: string,
+    readonly failures: readonly ProviderFailure[],
+  ) {
+    super(message);
+    this.name = "LlmChainError";
+  }
+}
+
+function unusableOutcome(reason: string): CallOutcome {
+  return reason === "circuit open" ? "server" : "auth";
+}
+
 /** Backends that take a forced tool call. */
 export function backendForcesTools(backend: LlmBackend): boolean {
   return backend !== "claude" && backend !== "haiku" && backend !== "deepseek-reasoner";
@@ -361,6 +383,7 @@ function cacheTtlForTask(task?: UsageTask): CacheTtl {
     task === "document" ||
     task === "contract_review" ||
     task === "memory_extraction" ||
+    task === "reply_check" ||
     task === "other"
   ) {
     return "5m";
@@ -1303,6 +1326,7 @@ async function completeOnRoute(params: CompleteParams): Promise<CompleteResult> 
     return complete({ ...params, route: undefined, backend: undefined });
   }
   const failures: string[] = [];
+  const structured: ProviderFailure[] = [];
   const usable = fitting.filter((spec) => modelUnavailableReason(spec) === undefined || modelUnavailableReason(spec) === "circuit open");
   const healthy = usable.filter((spec) => !circuitOpenFor(spec));
   // Every usable model's circuit is open: try the first anyway rather than fail the turn.
@@ -1311,6 +1335,7 @@ async function completeOnRoute(params: CompleteParams): Promise<CompleteResult> 
     if (!order.includes(spec)) {
       const reason = modelUnavailableReason(spec) ?? "circuit open";
       failures.push(`${spec.key}:${reason}`);
+      structured.push({ provider: spec.provider, model: spec.key, outcome: unusableOutcome(reason) });
       continue;
     }
     try {
@@ -1335,9 +1360,10 @@ async function completeOnRoute(params: CompleteParams): Promise<CompleteResult> 
         flagProvider(spec.provider, reason);
       }
       failures.push(`${spec.key}:${reason}`);
+      structured.push({ provider: spec.provider, model: spec.key, outcome: classifyFailure(error) });
     }
   }
-  throw new Error(`All models for ${route.agentId} failed: [${failures.join("; ")}]`);
+  throw new LlmChainError(`All models for ${route.agentId} failed: [${failures.join("; ")}]`, structured);
 }
 
 export function setNamedBackendCompleteForTests(
@@ -1370,9 +1396,10 @@ export async function complete(
         hasPdf: messagesHavePdf(params),
       });
   if (chain.length === 0) {
-    throw new Error("All LLM backends failed: none usable");
+    throw new LlmChainError("All LLM backends failed: none usable", []);
   }
   const failures: string[] = [];
+  const structured: ProviderFailure[] = [];
   const openSkipped: LlmBackend[] = [];
   for (const backend of chain) {
     if (!isBackendUsable(backend)) {
@@ -1383,6 +1410,7 @@ export async function complete(
     if (provider !== "local" && !circuitAllows(provider) && !(last && openSkipped.length === chain.length - 1)) {
       openSkipped.push(backend);
       failures.push(`${backend}:circuit open`);
+      structured.push({ provider, model: backend, outcome: "server" });
       continue;
     }
     try {
@@ -1409,9 +1437,10 @@ export async function complete(
         flagLlmBackend(backend, reason);
       }
       failures.push(`${backend}:${reason}`);
+      structured.push({ provider, model: backend, outcome: classifyFailure(error) });
     }
   }
-  throw new Error(`All LLM backends failed: [${failures.join("; ")}]`);
+  throw new LlmChainError(`All LLM backends failed: [${failures.join("; ")}]`, structured);
 }
 
 /** Same cascade as complete(); kept so job/document callers stay stable. */

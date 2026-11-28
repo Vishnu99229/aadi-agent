@@ -19,7 +19,6 @@ import { taskMessage } from "./protocol.js";
 import { parseRef } from "./refs.js";
 import { findCapability } from "./registry.js";
 import { acquire } from "../governor.js";
-import { commandIntents } from "../command_intent.js";
 import {
   AgentTaskError,
   AuthRequiredSignal,
@@ -165,11 +164,12 @@ async function runGoal(
   // compact results of earlier steps), never the chat. Built in code.
   const compressStarted = Date.now();
   const base = ctx.message ?? taskMessage(ctx.request, ctx.dependencies);
-  const sendAsked = commandIntents(ctx.grant?.ownerText ?? "").includes("send");
+  // A goal never sends on its own. Since PR #44 no word rule names a send, so this
+  // was already true for every goal; it is now stated, not derived from his words.
   const message = {
     ...base,
     goal,
-    constraints: { ...(base.constraints ?? {}), ...(sendAsked ? {} : { do_not_send: true }) },
+    constraints: { ...(base.constraints ?? {}), do_not_send: true },
   };
   const text = formatTaskForAgent(message, new Set(agent.toolNames()), { asked });
   const contextMeasure = measureTask(message, ctx.dependencies, text, compressStarted);

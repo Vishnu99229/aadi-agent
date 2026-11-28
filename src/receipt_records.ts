@@ -46,6 +46,19 @@ function hasSentRecord(account: GoogleAccountId, id: string): boolean {
   `).get({ account, id }));
 }
 
+/** The sent messages among this turn's reads that the records (or Gmail's own sent flag) confirm. */
+export function confirmedSentReads(reads: readonly DeliveryRead[]): Array<{ account: GoogleAccountId; id: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ account: GoogleAccountId; id: string }> = [];
+  for (const read of reads) {
+    const key = `${read.account}:${read.id}`;
+    if (seen.has(key) || !(read.sent || hasSentRecord(read.account, read.id))) continue;
+    seen.add(key);
+    out.push({ account: read.account, id: read.id });
+  }
+  return out;
+}
+
 /** Use a delivery acknowledged by this turn's write, or the exact message a read returned. */
 export function recordedReceipt(input: {
   outcomeIds: Iterable<string>;

@@ -514,32 +514,10 @@ export function formatReplyCitations(hits: SearchHit[]): string {
   return `Sources:\n${lines.join("\n")}`;
 }
 
-function urlKey(url: string): string {
-  try {
-    const parsed = new URL(url);
-    return `${parsed.origin}${parsed.pathname}`;
-  } catch {
-    return url;
-  }
-}
-
+/** Code always lists the sources the search tool returned. The reply's own words are not read. */
 export function withSearchCitations(reply: string, hits: SearchHit[]): string {
-  if (hits.length === 0) {
-    return reply;
-  }
-  const missing = hits.filter((hit) => !reply.includes(urlKey(hit.url)));
-  if (missing.length === 0) {
-    return reply;
-  }
-  const block = formatReplyCitations(missing);
-  if (!block) {
-    return reply;
-  }
-  if (/\bSources:/i.test(reply)) {
-    const extra = missing.map((hit) => `- ${hit.title} — ${hit.url}`).join("\n");
-    return `${reply.trim()}\n${extra}`;
-  }
-  return `${reply.trim()}\n\n${block}`;
+  const block = formatReplyCitations(hits);
+  return block ? `${reply.trim()}\n\n${block}` : reply;
 }
 
 export function formatSearchToolResult(outcome: SearchOutcome): string {

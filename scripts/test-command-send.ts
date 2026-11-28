@@ -1772,6 +1772,22 @@ await expectCancelled("delete_task", async (row) => {
   const waiting = await startSequenceFromTool("", model(ocrTurn), undefined, { source: "current_send", total_steps: 3, step_days: 4 });
   assert(waiting.startsWith("The follow-ups will be offered on a Start card"), waiting);
   assert(getPendingActionForDraft(draftsCreated.at(-1)!)?.to_header?.includes(address), "the Send card holds the OCR recipient");
+
+  // The other side of the same rule: an address he has emailed before is not new just
+  // because it is also on a linked photo. It sends directly, with no card.
+  const knownOnPhoto = "kit@kit-co.com";
+  mail({ threadId: `earlier-${knownOnPhoto}`, from: `Vishnu <${ME}>`, to: knownOnPhoto, subject: "Earlier", body: "Hi", sent: true });
+  written = { subject: "Hello again", body: "Hello,\n\nGood to see your card again." };
+  const knownTurn = own("Email the person on this card and say hello.");
+  const knownPhoto = createDocument("known-card.jpg", "personal", knownOnPhoto, null);
+  const knownPhotoMessage = knownTurn.confirmation.messageId - 1;
+  rememberTelegramDocumentRef(knownTurn.confirmation.chatId, knownPhotoMessage, knownPhoto.id);
+  bindPhotoForTurn({ ...knownTurn.confirmation, replyTo: { message_id: knownPhotoMessage, photo: [{}] } });
+  const beforeKnown = sends.length;
+  const cardsBeforeKnown = draftsCreated.length;
+  const knownSend = await sendEmailFromTool({ to: [knownOnPhoto], photo_address: knownOnPhoto, instruction: "Say hello" }, knownTurn);
+  assert(sends.length === beforeKnown + 1 && knownSend.startsWith("Sent to") && knownSend.includes(knownOnPhoto), `a known address on a linked photo is sent directly: ${knownSend}`);
+  assert(!knownSend.includes("Tap Send") && draftsCreated.length === cardsBeforeKnown, "and no Send card or draft was made for it");
   users.messages.send = realSend;
   users.messages.list = realList;
   users.drafts.send = realDraftSend;

@@ -59,7 +59,6 @@ import {
   runSequenceDetection,
   startSequenceFromTool,
 } from "../src/sequences.ts";
-import { unreceiptedClaims } from "../src/receipt.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -641,22 +640,6 @@ assert(!hasOriginalOutreach("") && !hasOriginalOutreach(null) && hasOriginalOutr
   });
   assert(shown.includes("(qa-prospect@example.com)"), "the card shows the stored address");
   assert(!shown.includes("<qa-prospect@example.com>"), "the address is not wrapped in angle brackets");
-}
-{
-  const claim =
-    "Offer posted for Aadi QA Demo (qa-prospect@example.com). The follow-up sequence card is shown above. Nothing is enrolled until you tap Start.";
-  assert(
-    unreceiptedClaims(claim, []).includes("offered"),
-    "a Start card claimed with no tool is not accepted",
-  );
-  assert(
-    unreceiptedClaims(claim, [{ name: "start_sequence", success: true }]).length === 0,
-    "a real Start card satisfies the claim",
-  );
-  assert(
-    unreceiptedClaims(claim, [{ name: "start_sequence", success: false }]).includes("offered"),
-    "a refused sequence tool does not count as a card",
-  );
 }
 {
   const before = telegram.sent.length;

@@ -1,13 +1,9 @@
 import { recordImmediateDraftSend } from "../src/db.ts";
 import { recordEmailOutcome } from "../src/email_outcomes.ts";
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
-import {
-  detectClaimedActions,
-  isSuccessfulToolResult,
-  receiptFailureMessage,
-  unreceiptedClaims,
-} from "../src/receipt.ts";
-import { setCompleteForTests } from "../src/llm.ts";
+import { isSuccessfulToolResult } from "../src/receipt.ts";
+import { setReplyCheckerForTests } from "../src/reply_checker.ts";
+import { LlmChainError, setCompleteForTests } from "../src/llm.ts";
 import { formatHealthReport } from "../src/scheduler.ts";
 import {
   beginTurn,
@@ -25,30 +21,7 @@ function assert(condition: boolean, message: string): void {
   }
 }
 
-function testReceiptDetection(): void {
-  assert(
-    detectClaimedActions("I sent the email to Priya.").includes("sent"),
-    "detects a sent claim",
-  );
-  assert(
-    detectClaimedActions("I couldn't send that.").length === 0,
-    "negated sent is not a claim",
-  );
-  assert(
-    unreceiptedClaims("I sent it.", []).includes("sent"),
-    "sent with no tool is unreceipted",
-  );
-  assert(
-    unreceiptedClaims("I sent it.", [{ name: "draft_reply", success: true }]).length ===
-      0,
-    "sent with a successful draft_reply is receipted",
-  );
-  assert(
-    unreceiptedClaims("I sent it.", [{ name: "draft_reply", success: false }]).includes(
-      "sent",
-    ),
-    "failed send tool is not a receipt",
-  );
+function testToolResults(): void {
   assert(
     !isSuccessfulToolResult("Not sent: missing draft_id."),
     "Not sent is not success",
@@ -61,11 +34,13 @@ async function testFakeModelSentClaimBlocked(): Promise<void> {
     if (params.tools.length === 0) {
       return modelReply({ text: '{"facts":[]}' });
     }
-    const last = params.messages.at(-1);
-    if (last?.role === "user" && /no tool did it/i.test(String(last.content))) {
-      return modelReply({ text: "I sent the email to Priya." });
-    }
     return modelReply({ text: "I sent the email to Priya." });
+  });
+  // The checker reads the records: nothing ran, so the claim is unsupported both times.
+  const seen: string[] = [];
+  setReplyCheckerForTests((input) => {
+    seen.push(input.tools.map((tool) => `${tool.name}:${tool.status}`).join(","));
+    return { status: "checked", verdict: "unsupported_claim", issues: ["No send is on record."], model: "test", ms: 0 };
   });
   setToolInterceptorForTests(() => "should not run");
   const reply = await runAgent("send the Eternal email", {
@@ -73,10 +48,12 @@ async function testFakeModelSentClaimBlocked(): Promise<void> {
     saveAssistantMessage: false,
     skipHistory: true,
   });
+  assert(seen.length === 2 && seen.every((tools) => tools === ""), `checked twice with no tool on record (${seen.join(" | ")})`);
   assert(
-    reply === receiptFailureMessage(["sent"]),
-    `unreceipted sent claim is blocked, got: ${reply}`,
+    reply === "Nothing was sent or changed this turn.\n\nI've left out the rest of my reply because I couldn't confirm it.",
+    `an unsupported sent claim is withheld, got: ${reply}`,
   );
+  setReplyCheckerForTests(undefined);
   setCompleteForTests(undefined);
   setToolInterceptorForTests(undefined);
 }
@@ -127,17 +104,42 @@ async function testThrownEmptyTimeout(): Promise<void> {
   }, 1_000);
   assert(thrown.status === "failed", "thrown work is failed");
   if (thrown.status === "failed") {
-    assert(thrown.reason === "boom from model", "failed reason is the error");
+    assert(thrown.reason === "boom from model", "the logged reason is the error");
     assert(
-      formatTurnFailure(thrown.reason) === "I couldn't finish that: boom from model.",
-      "failure message includes the reason",
+      formatTurnFailure(thrown.cause) === "I couldn't finish that (internal error). Nothing was sent or changed.",
+      `an internal error gets the fixed message, got: ${formatTurnFailure(thrown.cause)}`,
     );
+  }
+
+  // A provider 400 with a JSON body: the message names the provider and class, never the body.
+  const body = '400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.1: bad"}}';
+  const provider = await settleChatWork(async () => {
+    throw new LlmChainError(`All models for aadi failed: [anthropic:sonnet:${body}]`, [
+      { provider: "anthropic", model: "anthropic:sonnet", outcome: "other" },
+      { provider: "gemini", model: "gemini:flash", outcome: "rate_limit" },
+    ]);
+  }, 1_000);
+  assert(provider.status === "failed", "a provider failure is failed");
+  if (provider.status === "failed") {
+    const text = formatTurnFailure(provider.cause);
+    assert(text === "I couldn't finish that (Claude: request rejected). Nothing was sent or changed.", `fixed provider message, got: ${text}`);
+    assert(!text.includes("{") && !text.includes("invalid_request_error"), "no JSON from the provider body");
+    assert(
+      formatTurnFailure(provider.cause, true) === "I couldn't finish that (Claude: request rejected). Something may already have changed; check before trying again.",
+      "a turn that wrote something does not promise that nothing changed",
+    );
+  }
+  const limited = await settleChatWork(async () => {
+    throw new LlmChainError("All LLM backends failed: [gemini:429]", [{ provider: "gemini", model: "gemini", outcome: "rate_limit" }]);
+  }, 1_000);
+  if (limited.status === "failed") {
+    assert(formatTurnFailure(limited.cause) === "I couldn't finish that (Gemini: rate limit). Nothing was sent or changed.", "rate limit class");
   }
 
   const empty = await settleChatWork(async () => "", 1_000);
   assert(empty.status === "empty", "empty string is empty");
   assert(
-    formatTurnFailure("empty reply") === "I couldn't finish that: empty reply.",
+    formatTurnFailure({ kind: "empty" }) === "I couldn't finish that (the model returned an empty reply). Nothing was sent or changed.",
     "empty failure message",
   );
 
@@ -149,8 +151,8 @@ async function testThrownEmptyTimeout(): Promise<void> {
   }, 30);
   assert(timed.status === "timeout", "slow work times out");
   assert(
-    formatTurnFailure("timed out after 60s") ===
-      "I couldn't finish that: timed out after 60s.",
+    formatTurnFailure({ kind: "timeout" }) ===
+      "I couldn't finish that (the reply timed out). Nothing was sent or changed.",
     "timeout failure message",
   );
 }
@@ -168,7 +170,7 @@ function testHealthCounts(): void {
 }
 
 async function main(): Promise<void> {
-  testReceiptDetection();
+  testToolResults();
   await testFakeModelSentClaimBlocked();
   await testRealToolSuccessAllowed();
   testRetryButton();

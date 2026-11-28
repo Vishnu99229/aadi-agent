@@ -1,13 +1,16 @@
 import { notAnEventCommand, splitOwnerEmailCommand, withoutActionConstraints } from "./command_logic.js";
-/** Commands where a reply must come from a tool that ran this turn, never from
- *  what Aadi said before. */
+
+/**
+ * The kinds of explicit command his own English words name. Only agent routing
+ * reads this now (agents/orchestrator.ts pickRoute, until routing moves to
+ * records in PR D). The agent loop no longer reads his words: whether a reply
+ * is truthful is the reply checker's call (reply_checker.ts).
+ */
 export type CommandKind =
-  | "sequence"
   | "sequence_stop"
   | "sequence_timezone"
   | "sales_fact_add"
   | "sales_fact_remove"
-  | "send"
   | "draft"
   | "draft_discard"
   | "calendar"
@@ -23,187 +26,6 @@ export type CommandKind =
   | "ignore"
   | "resume"
   | "ignore_list";
-
-interface CommandFamily {
-  /** Tools that carry the command out. */
-  action: readonly string[];
-  /** Read tools the model may need first, such as list_tasks before complete_task.
-   *  A fresh lookup that ends in "which one?" is a real answer too. */
-  lookup: readonly string[];
-  /** Forced on the first step where the backend allows it. Only tools that need
-   *  no lookup first and can't do harm from a wrong guess. */
-  force?: string;
-  retry: string;
-  notRun: string;
-}
-
-const FAMILIES: Record<CommandKind, CommandFamily> = {
-  sequence: {
-    action: ["start_sequence"],
-    lookup: [],
-    force: "start_sequence",
-    retry: "For a sequence, call start_sequence now with the person as Vishnu named them.",
-    notRun: "no sequence was started or checked",
-  },
-  sequence_stop: {
-    action: ["stop_sequence"],
-    lookup: [],
-    // Never forced: "pause all follow-ups" stops every sequence.
-    retry: "To stop follow-ups, call stop_sequence now with who he named, or \"all\" only if he said all.",
-    notRun: "no follow-ups were stopped",
-  },
-  sequence_timezone: {
-    action: ["set_sequence_timezone"],
-    lookup: [],
-    force: "set_sequence_timezone",
-    retry: "For a prospect's time zone, call set_sequence_timezone now.",
-    notRun: "no time zone was changed",
-  },
-  sales_fact_add: {
-    action: ["add_sales_fact"],
-    lookup: [],
-    force: "add_sales_fact",
-    retry: "To add a sales fact, call add_sales_fact now with his point.",
-    notRun: "nothing was added to your sales facts",
-  },
-  sales_fact_remove: {
-    action: ["remove_sales_fact"],
-    lookup: ["list_sales_facts"],
-    force: "remove_sales_fact",
-    retry: "To remove a sales fact, call remove_sales_fact now.",
-    notRun: "no sales fact was removed",
-  },
-  send: {
-    action: [
-      "send_email",
-      "draft_new_email",
-      "draft_reply",
-      "confirm_send_pending_draft",
-      "resend_draft_card",
-      "cancel_scheduled_send",
-    ],
-    lookup: ["search_emails", "read_email", "read_draft"],
-    retry: "For an email, call send_email now (find the thread with search_emails first if it's a reply), or the draft tool if he asked for a draft.",
-    notRun: "no email was sent",
-  },
-  draft: {
-    action: ["draft_new_email", "draft_reply", "draft_mom", "update_draft", "resend_draft_card"],
-    lookup: ["search_emails", "read_email", "read_draft", "search_notes"],
-    retry: "For a draft, call draft_new_email, draft_reply, draft_mom or update_draft now (search_emails first if it's a reply).",
-    notRun: "no draft was written or changed",
-  },
-  draft_discard: {
-    action: ["discard_pending_draft"],
-    lookup: ["read_draft"],
-    retry: "To discard the draft, call discard_pending_draft now.",
-    notRun: "no draft was discarded",
-  },
-  calendar: {
-    action: [
-      "create_event",
-      "book_meeting",
-      "move_event",
-      "delete_calendar_event",
-      "add_calendar_attendee",
-      "create_meeting",
-      "propose_calendar_event",
-    ],
-    lookup: ["list_events"],
-    retry: "For his calendar, call the tool for it now: create_event, book_meeting, move_event, delete_calendar_event or add_calendar_attendee.",
-    notRun: "your calendar wasn't changed",
-  },
-  reminder: {
-    action: ["set_reminder", "cancel_reminder", "add_task"],
-    lookup: ["get_current_time", "list_reminders"],
-    retry: "For a reminder, call set_reminder now (get_current_time first), or cancel_reminder to cancel one.",
-    notRun: "no reminder was set or cancelled",
-  },
-  task_add: {
-    action: ["add_task"],
-    lookup: [],
-    force: "add_task",
-    retry: "To add a task, call add_task now.",
-    notRun: "no task was added",
-  },
-  task: {
-    action: ["complete_task", "delete_task"],
-    lookup: ["list_tasks"],
-    retry: "For a task, call list_tasks and then complete_task or delete_task now.",
-    notRun: "your task list wasn't changed",
-  },
-  bill: {
-    action: ["mark_bill_paid", "ignore_bill", "ignore_item"],
-    lookup: ["list_bills"],
-    retry: "For a bill, call list_bills and then mark_bill_paid, ignore_bill, or ignore_item now.",
-    notRun: "no bill was marked paid or skipped",
-  },
-  ignore: {
-    action: ["ignore_item", "ignore_bill"],
-    lookup: ["list_ignored", "list_tasks", "list_bills", "list_reminders"],
-    retry: "To ignore something, call ignore_item now with what he named.",
-    notRun: "nothing was ignored",
-  },
-  resume: {
-    action: ["resume_item"],
-    lookup: ["list_ignored"],
-    retry: "To resume tracking, call resume_item now with what he named.",
-    notRun: "nothing was resumed",
-  },
-  ignore_list: {
-    action: ["list_ignored"],
-    lookup: [],
-    force: "list_ignored",
-    retry: "To show ignored items, call list_ignored now.",
-    notRun: "ignored items were not listed",
-  },
-  date_add: {
-    action: ["add_date"],
-    lookup: [],
-    force: "add_date",
-    retry: "To save the date, call add_date now.",
-    notRun: "no date was saved",
-  },
-  date: {
-    action: ["remove_date"],
-    lookup: ["list_dates", "list_upcoming_dates"],
-    retry: "To remove the date, call list_dates and then remove_date now.",
-    notRun: "no date was removed",
-  },
-  account: {
-    action: ["add_account", "update_account", "remove_account"],
-    lookup: ["list_accounts", "account_status"],
-    retry: "For an account, call add_account, update_account or remove_account now (list_accounts first if you need its id).",
-    notRun: "no account was changed",
-  },
-  memory: {
-    action: ["remember", "update_memory", "forget_memory"],
-    lookup: ["list_memories", "search_memories"],
-    retry: "For a memory, call remember, update_memory or forget_memory now.",
-    notRun: "nothing was remembered or forgotten",
-  },
-  qa_bank: {
-    action: ["learn_qa_bank"],
-    lookup: ["list_documents", "read_document"],
-    retry: "For the Q&A bank, call learn_qa_bank now with the document's id (list_documents first if you need it).",
-    notRun: "nothing was added to the Q&A bank",
-  },
-};
-
-/** The tools that carry each command out. */
-export const COMMAND_TOOLS: Record<CommandKind, readonly string[]> = Object.fromEntries(
-  Object.entries(FAMILIES).map(([kind, family]) => [kind, family.action]),
-) as Record<CommandKind, readonly string[]>;
-
-/** Any of these running this turn means the command was carried out or checked
- *  against current data. */
-export function commandFamilyTools(kind: CommandKind): readonly string[] {
-  return [...FAMILIES[kind].action, ...FAMILIES[kind].lookup];
-}
-
-/** The one tool to force for these commands, if forcing is safe. */
-export function forcedCommandTool(kinds: readonly CommandKind[]): string | undefined {
-  return kinds.length === 1 ? FAMILIES[kinds[0]!].force : undefined;
-}
 
 /** "Call" also means a recording or a phone call, so those uses don't count. */
 const NOT_THE_EVENT = "(?!\\s*(?:recordings?|notes?|summary|summaries|transcripts?|logs?|links?|deck|minutes|mom)\\b)";
@@ -326,7 +148,6 @@ const QA_BANK = /\b(?:learn|add|save|import)\b[^.?!\n]{0,40}?\b(?:q\s*&\s*a|q\s+
 /** These name what the command is about, so a "call" or an "email" inside them
  *  doesn't also make it a calendar or send command. */
 const SPECIFIC: readonly CommandKind[] = [
-  "sequence",
   "sequence_stop",
   "sequence_timezone",
   "sales_fact_add",
@@ -347,8 +168,8 @@ const SPECIFIC: readonly CommandKind[] = [
   "ignore_list",
 ];
 
-/** The explicit commands in his own words, in English. Other languages stay the
- *  model's call, and no rule here grants anything: it only makes sure a tool runs. */
+/** The explicit commands in his own words, in English, for routing only. Other
+ *  languages stay the model's call, and no rule here grants anything. */
 export function commandIntents(ownWords: string): CommandKind[] {
   const text = ownWords.trim();
   if (!text) {
@@ -431,60 +252,4 @@ export function commandIntents(ownWords: string): CommandKind[] {
     found.delete("calendar");
   }
   return [...found];
-}
-
-function normalized(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[‘’]/g, "'")
-    .replace(/[^\p{L}\p{N}@.'-]+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function firstLine(text: string): string {
-  return normalized(text.trim().split(/\n/)[0] ?? "");
-}
-
-/** The reply opens with what Aadi said, or a tool returned, on an earlier turn,
- *  nothing that ran this turn said it, and the outcome has changed since. That is
- *  a repeated answer, not a fresh result. When every tool this turn returned
- *  exactly what it returned before, saying the same again is right. */
-export function echoesEarlierReply(
-  reply: string,
-  earlierReplies: readonly string[],
-  freshResults: readonly string[],
-  earlierToolResults: readonly string[] = [],
-): boolean {
-  const opening = firstLine(reply);
-  if (opening.length < 20) {
-    return false;
-  }
-  const before = new Set(earlierToolResults.map(normalized));
-  if (freshResults.length > 0 && freshResults.every((result) => before.has(normalized(result)))) {
-    return false;
-  }
-  if (freshResults.some((result) => normalized(result).includes(opening))) {
-    return false;
-  }
-  return earlierReplies.some((earlier) => normalized(earlier).includes(opening));
-}
-
-/** Asks again without pushing an action he didn't ask for: if the words only
- *  looked like a command, the model can say so, and he's told nothing ran. */
-export function commandRetryPrompt(kinds: readonly CommandKind[]): string {
-  return [
-    "Vishnu's message looks like a command, and no tool has run for it this turn. An earlier answer in this chat is not a result: what happened before may have changed, so never repeat it.",
-    ...kinds.map((kind) => FAMILIES[kind].retry),
-    "Answer only from what the tool returns this turn. If his message isn't asking for that, don't call anything and say so in one line.",
-  ].join(" ");
-}
-
-/** What he's told when the tool still didn't run: the truth, never an old answer. */
-export function commandNotRunMessage(kinds: readonly CommandKind[]): string {
-  const what = kinds.map((kind) => FAMILIES[kind].notRun).join(", and ");
-  const hint = kinds.includes("sequence")
-    ? " Say it again, or use /outbox with their name or email."
-    : " Please say it again.";
-  return `I didn't carry that out this time, so ${what}.${hint}`;
 }

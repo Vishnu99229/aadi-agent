@@ -93,6 +93,8 @@ for (const table of ["metric_turns", "metric_agent_runs"]) {
   addColumn(table, "tools_json", "TEXT NOT NULL DEFAULT '[]'");
 }
 addColumn("metric_turns", "receipt_retries_json", "TEXT NOT NULL DEFAULT '[]'");
+// Each reply check this turn: verdict, issues, checker model and what the loop did next.
+addColumn("metric_turns", "reply_checks_json", "TEXT NOT NULL DEFAULT '[]'");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS metric_workflows (
@@ -408,7 +410,7 @@ export function recordTurn(input: TurnRecordInput): number | undefined {
            input_tokens, output_tokens, cost_usd, tool_calls, duplicate_skipped, first_model_ms,
            total_ms, workflow_ms, workflows, workflows_failed, success, auth_required, uncertain, error,
            queue_ms, ctx_original_tokens, ctx_compressed_tokens, compress_ms, cache_hits, tools_json,
-           receipt_retries_json
+           reply_checks_json
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
@@ -440,7 +442,7 @@ export function recordTurn(input: TurnRecordInput): number | undefined {
         Math.round(report?.context?.ms ?? 0) + goals.compressMs,
         (report?.cacheHits ?? 0) + goals.cacheHits,
         JSON.stringify([...tools.map((entry) => entry.tool), ...goals.toolNames].slice(0, 40)),
-        JSON.stringify(report?.receiptRetries ?? []),
+        JSON.stringify(report?.replyChecks ?? []),
       );
     turnId = Number(result.lastInsertRowid);
     if (input.path !== "fast" || input.report) {

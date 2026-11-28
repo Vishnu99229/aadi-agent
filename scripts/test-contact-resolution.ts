@@ -32,7 +32,6 @@ import { createAccount, createMemory, db } from "../src/db.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, type CompleteParams } from "../src/llm.ts";
-import { askedOnlyToLook, receiptFailureMessage, unreceiptedClaims } from "../src/receipt.ts";
 import { FORWARDED_TOOLS, TOOL_ORDER, tools } from "../src/tools/index.ts";
 import { modelReply, nextMessageId } from "./fakes.ts";
 
@@ -516,7 +515,7 @@ assert(searches().join("|") === "from:(priya@acme.com)", `the search ran on her 
 assert(!hasOpenContactQuestion(CHAT) && unique[0]!.buttons.length === 0, "nothing was asked");
 assert(modelCalls.length === 3, `no retry was forced (${modelCalls.length} model calls)`);
 passed.push('unique: "Find the latest email from Priya and summarise it" searched from:(priya@acme.com) and answered in one go');
-passed.push(`read-only summary: a reply saying her email "was sent on Tuesday" is delivered as written, not replaced by "${receiptFailureMessage(["sent"])}"`);
+passed.push('read-only summary: a reply saying her email "was sent on Tuesday" is delivered as written');
 
 // =====================================================================
 // 5. Two matches: asked, with the request kept
@@ -728,29 +727,6 @@ assert(searches().length === 0 && hasOpenContactQuestion(CHAT), "a forwarded \"P
 passed.push('authorization: a forwarded message saying "Pinnacle" does not answer the question');
 forget();
 
-// =====================================================================
-// 10. The receipt check on read-only turns
-// =====================================================================
-const isReadTool = (name: string) => toolOwnership(name)?.effect === "read";
-const readOk = [{ name: "search_emails", success: true }, { name: "read_email", success: true }];
-const lookup = { ownerText: ASK, isReadTool };
-const claims = (reply: string, receipts = readOk, context = lookup) => unreceiptedClaims(reply, receipts, context).join(",");
-assert(claims("Hardik's email was sent on Monday.") === "", "a passive 'was sent' in a summary is a description");
-assert(claims("He sent the email at 9am and the meeting is scheduled for Friday.") === "", "so is what the sender did");
-assert(claims('He wrote: "I sent the contract yesterday."') === "", "and words quoted from the email");
-assert(claims("I sent the email to Hardik.") === "sent", "Aadi saying it sent something is still checked");
-assert(claims("Hardik's email was sent on Monday.", []) === "sent", "with nothing read, the claim is checked");
-assert(claims("Hardik's email was sent on Monday.", [{ name: "search_emails", success: false }]) === "sent", "a failed read doesn't count");
-assert(claims("The email was sent.", [...readOk, { name: "send_email", success: false }]) === "sent", "a send that was tried and failed is still checked");
-assert(claims("The email was sent.", readOk, { ownerText: "send Hardik the deck", isReadTool }) === "sent", "when he asked to send, it is checked");
-assert(claims("The email was sent.", readOk, { ownerText: "yes, do it", isReadTool }) === "sent", "a go-ahead is not a lookup");
-assert(claims("The email was sent.", readOk, { ownerText: "Find Hardik's email and reply to it", isReadTool }) === "sent", "look-up-and-act is checked");
-assert(claims("His reply was sent this morning.", readOk, { ownerText: "Did Hardik reply?", isReadTool }) === "", "a question about the past is a lookup");
-assert(claims("The email was sent.", readOk, { ownerText: "Did Hardik reply? If not, send him a nudge", isReadTool }) === "sent", "unless it also asks for the action");
-assert(unreceiptedClaims("As of today Nifty closed higher.", readOk, lookup).join() === "searched", "live-lookup claims are never relaxed");
-assert(unreceiptedClaims("The email was sent.", readOk).join() === "sent", "without context the check is exactly as before");
-assert(askedOnlyToLook(ASK, "sent") && !askedOnlyToLook("email him back", "sent") && !askedOnlyToLook("", "sent"), "what counts as a lookup");
-passed.push('receipt check: "was sent" in a read-only summary passes; "I sent…", a go-ahead, a requested or attempted send, and live-lookup claims are all still checked');
 
 setCompleteForTests(undefined);
 setToolInterceptorForTests(undefined);

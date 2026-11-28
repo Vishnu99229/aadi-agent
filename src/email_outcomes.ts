@@ -16,6 +16,8 @@ export interface EmailTurnOutcomes {
   recoveryUpdates: WeakSet<EmailRecoveryUpdate>;
   uncertain: boolean;
   inFlight: number;
+  /** Tools that changed something this turn (any write that went through). */
+  changed: Set<string>;
   onLateOutcome?: (outcome: EmailOutcome) => void;
 }
 
@@ -35,7 +37,7 @@ export function currentEmailTurn(): EmailTurnOutcomes | undefined {
 }
 
 export function newEmailTurn(): EmailTurnOutcomes {
-  return { startedAt: Date.now(), writes: new Map(), notices: new Set(), recoveries: new Map(), recoveryUpdates: new WeakSet(), uncertain: false, inFlight: 0 };
+  return { startedAt: Date.now(), writes: new Map(), notices: new Set(), recoveries: new Map(), recoveryUpdates: new WeakSet(), uncertain: false, inFlight: 0, changed: new Set() };
 }
 
 export function withEmailTurn<T>(journal: EmailTurnOutcomes, work: () => T): T {
@@ -80,6 +82,16 @@ export function emailCardAcknowledgement(key: string, line: string): (messageId:
     observation?.writes.push(outcome);
     if (journal) withEmailTurn(journal, () => addEmailOutcomes([outcome]));
   };
+}
+
+/** Code-written lines for this turn: deliveries, cards, notices and recoveries. */
+export function hasEmailOutcomeLines(journal: EmailTurnOutcomes): boolean {
+  return journal.writes.size > 0 || journal.notices.size > 0 || journal.recoveries.size > 0;
+}
+
+/** Something this turn may have changed: a recorded write, a write tool that went through, or one still in doubt. */
+export function turnMayHaveChanged(journal: EmailTurnOutcomes): boolean {
+  return journal.writes.size > 0 || journal.changed.size > 0 || journal.uncertain || journal.inFlight > 0;
 }
 
 /** Put recorded outcomes and notices before the reply, leaving its prose intact. */
