@@ -42,7 +42,7 @@ import {
   allowSendDraft,
 } from "./security/send_approval.js";
 import { parseAddressList } from "./address_list.js";
-import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
+import { installCaptionEditFallback, installNetworkRetry, installOutgoingTextGuard } from "./telegram_io.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import { draftSendCallback, postConfirmCard, type ConfirmCardSpec } from "./confirm_cards.js";
 import { repliedDraftForTurn } from "./email_references.js";
@@ -68,6 +68,7 @@ const EXPIRY_SWEEP_MS = 60 * 60 * 1000;
 const realTelegram = new Api(config.telegramBotToken);
 installNetworkRetry(realTelegram);
 installCaptionEditFallback(realTelegram);
+installOutgoingTextGuard(realTelegram);
 let telegram: Api = realTelegram;
 let fakeGmailFor: ((account: GoogleAccountId) => gmail_v1.Gmail) | undefined;
 

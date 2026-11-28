@@ -11,11 +11,8 @@ process.env.BRIEF_TIME ??= "08:00";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import { createDocument, getDocument } from "../src/db.ts";
-import {
-  looksLikeDocumentRewrite,
-  documentRewriteRetryPrompt,
-} from "../src/document_rewrite.ts";
 import { ingestDocumentBytes } from "../src/documents.ts";
+import { setReplyCheckerForTests } from "../src/reply_checker.ts";
 import { setCompleteForTests, type CompleteResult } from "../src/llm.ts";
 import {
   RECENT_UPLOAD_WINDOW_MS,
@@ -68,17 +65,7 @@ async function buildTextPdf(marker: string): Promise<Uint8Array> {
 
 {
   assert(RECENT_UPLOAD_WINDOW_MS === 4 * 60 * 60 * 1_000, "recent-upload window is 4 hours");
-  assert(looksLikeDocumentRewrite("make it concise"), "concise");
-  assert(looksLikeDocumentRewrite("shorter please"), "shorter");
-  assert(looksLikeDocumentRewrite("rewrite that"), "rewrite");
-  assert(looksLikeDocumentRewrite("redo it"), "redo");
-  assert(looksLikeDocumentRewrite("make it tighter"), "tighter");
-  assert(!looksLikeDocumentRewrite("what is the price?"), "plain question is not rewrite");
-  assert(
-    /Rewrite from the document/.test(documentRewriteRetryPrompt(9)),
-    "nudge mentions rewrite from document",
-  );
-  console.log("rewrite detection + window: ok");
+  console.log("recent-upload window: ok");
 }
 
 {
@@ -144,7 +131,7 @@ async function buildTextPdf(marker: string): Promise<Uint8Array> {
   recordRecentUpload(doc.id, "figures.pdf", "PDF");
 
   let readCalled = false;
-  let sawRewriteNudge = false;
+  let sawCheckRetry = false;
   setToolInterceptorForTests((call) => {
     if (call.name === "read_document") {
       readCalled = true;
@@ -162,9 +149,9 @@ async function buildTextPdf(marker: string): Promise<Uint8Array> {
     if (
       last?.role === "user" &&
       typeof last.content === "string" &&
-      /Rewrite from the document/i.test(last.content)
+      last.content.startsWith("A check of your reply")
     ) {
-      sawRewriteNudge = true;
+      sawCheckRetry = true;
       return modelReply({
         text: "",
         tools: [{ name: "read_document", input: { id: doc.id, question: "make it concise" } }],
@@ -177,12 +164,20 @@ async function buildTextPdf(marker: string): Promise<Uint8Array> {
     return modelReply({ text: prior });
   });
 
+  // The checker, not a word rule, finds the copied reply incomplete: read_document was there and unused.
+  setReplyCheckerForTests((input) => {
+    const read = input.tools.some((tool) => tool.name === "read_document" && tool.status === "ok");
+    return read || !input.availableLookups.includes("read_document")
+      ? { status: "checked", verdict: "ok", issues: [], model: "test", ms: 0 }
+      : { status: "checked", verdict: "incomplete", issues: ["It copies the old summary without reading the document."], model: "test", ms: 0 };
+  });
   const reply = await runAgent("make it concise", {
     saveUserMessage: false,
     saveAssistantMessage: false,
     skipHistory: true,
   });
-  assert(sawRewriteNudge, "agent sent the rewrite-from-document nudge");
+  setReplyCheckerForTests(undefined);
+  assert(sawCheckRetry, "the checker's incomplete verdict sent one retry");
   assert(readCalled, "make it concise forces read_document");
   assert(reply === rewritten, `got rewritten text, not prior: ${reply.slice(0, 80)}`);
   assert(reply !== prior, "reply is not identical to the previous assistant message");

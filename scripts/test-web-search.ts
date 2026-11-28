@@ -23,11 +23,7 @@ const {
   clearLlmBackendFlagsForTests,
   flagLlmBackend,
 } = await import("../src/llm_fallback.ts");
-const {
-  detectClaimedActions,
-  receiptFailureMessage,
-  unreceiptedClaims,
-} = await import("../src/receipt.ts");
+const { setReplyCheckerForTests, UNCONFIRMED_TEXT } = await import("../src/reply_checker.ts");
 const {
   formatSearchToolResult,
   getSearchOrder,
@@ -192,14 +188,15 @@ async function testDailyCap(): Promise<void> {
 
 async function testCitationsAppended(): Promise<void> {
   const hits = [bbc, hindu];
-  const withUrls = withSearchCitations(
-    `Spain won.\n\nSources:\n- ${bbc.title} — ${bbc.url}\n- ${hindu.title} — ${hindu.url}`,
-    hits,
-  );
-  assert(withUrls.includes(bbc.url) && withUrls.includes(hindu.url), "keeps existing cites");
+  // Code always renders the search tool's sources; the reply's own words are not read.
   const appended = withSearchCitations("Spain won Euro 2024.", hits);
-  assert(appended.includes("Sources:"), "appends Sources block");
-  assert(appended.includes(bbc.url) && appended.includes(hindu.url), "appends both URLs");
+  assert(
+    appended === `Spain won Euro 2024.\n\nSources:\n- ${bbc.title} — ${bbc.url}\n- ${hindu.title} — ${hindu.url}`,
+    `appends the Sources block from the results: ${appended}`,
+  );
+  const mentioned = withSearchCitations(`Spain won (${bbc.url}).`, hits);
+  assert(mentioned.endsWith(`Sources:\n- ${bbc.title} — ${bbc.url}\n- ${hindu.title} — ${hindu.url}`), "rendered even when the reply names a URL");
+  assert(withSearchCitations("No results.", []) === "No results.", "nothing to cite, nothing added");
   const parsed = parseSearchSources(
     formatSearchToolResult({
       ok: true,
@@ -209,37 +206,6 @@ async function testCitationsAppended(): Promise<void> {
     }),
   );
   assert(parsed.length === 2 && parsed[0]?.url === bbc.url, "parses source marker");
-}
-
-function testReceiptSearchClaims(): void {
-  assert(
-    detectClaimedActions("As of today Nifty is at 24100.").includes("searched"),
-    "as of today is a search claim",
-  );
-  assert(
-    detectClaimedActions("Latest news: Spain won Euro 2024.").includes("searched"),
-    "latest news is a search claim",
-  );
-  assert(
-    detectClaimedActions("Your meeting is today at 3pm.").includes("searched") === false,
-    "ordinary today is not a search claim",
-  );
-  assert(
-    unreceiptedClaims("As of today Nifty closed higher.", []).includes("searched"),
-    "live claim without tool is unreceipted",
-  );
-  assert(
-    unreceiptedClaims("As of today Nifty closed higher.", [
-      { name: "web_search", success: true },
-    ]).length === 0,
-    "successful web_search receipts the claim",
-  );
-  assert(
-    unreceiptedClaims("As of today Nifty closed higher.", [
-      { name: "web_search", success: false },
-    ]).includes("searched"),
-    "failed web_search is not a receipt",
-  );
 }
 
 async function testAgentBlocksInventedSearch(): Promise<void> {
@@ -252,15 +218,18 @@ async function testAgentBlocksInventedSearch(): Promise<void> {
     if (params.tools.length === 0) {
       return modelReply({ text: '{"facts":[]}' });
     }
-    const last = params.messages.at(-1);
-    if (last?.role === "user" && /could not search/i.test(String(last.content))) {
-      return modelReply({
-        text: "As of today Nifty closed at 99,999 on invented data.",
-      });
-    }
     return modelReply({
       text: "As of today Nifty closed at 99,999.",
     });
+  });
+  // No web_search ran, so the checker finds the live figure unsupported, twice.
+  let checks = 0;
+  setReplyCheckerForTests((input) => {
+    checks += 1;
+    const searched = input.tools.some((tool) => tool.name === "web_search" && tool.status === "ok");
+    return searched
+      ? { status: "checked", verdict: "ok", issues: [], model: "test", ms: 0 }
+      : { status: "checked", verdict: "unsupported_claim", issues: ["No search ran this turn."], model: "test", ms: 0 };
   });
   setToolInterceptorForTests(undefined);
   const reply = await runAgent("What's Nifty at as of today?", {
@@ -268,10 +237,12 @@ async function testAgentBlocksInventedSearch(): Promise<void> {
     saveAssistantMessage: false,
     skipHistory: true,
   });
+  assert(checks === 2, `checked, retried, checked again (${checks})`);
   assert(
-    reply === receiptFailureMessage(["searched"]),
-    `invented live claim is blocked, got: ${reply}`,
+    reply.endsWith(UNCONFIRMED_TEXT) && !reply.includes("99,999"),
+    `invented live claim is withheld, got: ${reply}`,
   );
+  setReplyCheckerForTests(undefined);
   setCompleteForTests(undefined);
 }
 
@@ -324,7 +295,6 @@ async function main(): Promise<void> {
   await testAllFailClearMessage();
   await testDailyCap();
   await testCitationsAppended();
-  testReceiptSearchClaims();
   await testAgentBlocksInventedSearch();
   await testAgentUsesPrimaryAndCites();
   setSearchProvidersForTests(undefined);

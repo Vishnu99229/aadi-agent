@@ -1,5 +1,29 @@
 import { GrammyError, HttpError, type Api } from "grammy";
 import { emailProviderWriteInProgress } from "./email_outcomes.js";
+import { assertSendableText } from "./raw_text_guard.js";
+
+const GUARDED = new WeakSet<Api>();
+
+/**
+ * The one check every outgoing Telegram text passes: a message text or caption
+ * that is raw data (JSON or a tool call written as text) is never sent. Installed
+ * on every Api client the bot uses.
+ */
+export function installOutgoingTextGuard(api: Api): void {
+  if (GUARDED.has(api)) {
+    return;
+  }
+  GUARDED.add(api);
+  api.config.use(async (prev, method, payload, signal) => {
+    const fields = payload as { text?: unknown; caption?: unknown } | undefined;
+    for (const value of [fields?.text, fields?.caption]) {
+      if (typeof value === "string") {
+        assertSendableText(value, method);
+      }
+    }
+    return prev(method, payload, signal);
+  });
+}
 
 export const TELEGRAM_MESSAGE_LIMIT = 4000;
 

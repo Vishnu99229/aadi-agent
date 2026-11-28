@@ -52,7 +52,7 @@ import {
 } from "./security/send_approval.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
-import { installCaptionEditFallback, installNetworkRetry } from "./telegram_io.js";
+import { installCaptionEditFallback, installNetworkRetry, installOutgoingTextGuard } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import type { ToolTurn } from "./tools/index.js";
@@ -95,6 +95,7 @@ const EXPLICIT_THREAD_LIMIT = 10;
 const telegram = new Api(config.telegramBotToken);
 installNetworkRetry(telegram);
 installCaptionEditFallback(telegram);
+installOutgoingTextGuard(telegram);
 let telegramForTests: Api | undefined;
 
 /** Tests post Start cards to a fake Telegram. Only against the in-memory database. */

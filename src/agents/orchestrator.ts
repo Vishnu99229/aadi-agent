@@ -35,6 +35,7 @@ import { localModelOn } from "../models/local_agent_models.js";
 import { toAgentResult } from "./protocol.js";
 import { parseRef } from "./refs.js";
 import { formatPendingAction, getPendingAction } from "../action_context.js";
+import { isRawPayload } from "../raw_text_guard.js";
 
 /**
  * Aadi as orchestrator. It decides who handles a turn, hands work to the
@@ -290,16 +291,29 @@ function summaryForModel(summary: WorkflowSummary): string {
   });
 }
 
+/**
+ * What a job that finished after its turn tells Vishnu. A tool capability's text
+ * is the tool's raw output, so it is never shown: what it did reaches him as the
+ * code-written outcome lines. Text that is raw data is never shown either.
+ */
 export function summaryForOwner(summary: WorkflowSummary): string {
   return summary.tasks
     .map((task) => {
-      const label = getAgent(task.agentId)?.manifest.name ?? task.agentId;
-      const body =
-        task.state === "completed"
-          ? task.text ?? "Done."
-          : task.state === "input-required" || task.state === "auth-required"
-            ? task.inputRequired?.question ?? task.text ?? "Waiting on you."
-            : `${task.state}: ${task.error?.message ?? ""}`;
+      const agent = getAgent(task.agentId);
+      const label = agent?.manifest.name ?? task.agentId;
+      const kind = agent?.manifest.capabilities.find((item) => item.name === task.capability)?.kind;
+      const shown = (text: string | undefined): string | undefined => {
+        const clean = text?.trim();
+        return clean && !isRawPayload(clean) ? clean : undefined;
+      };
+      let body: string;
+      if (task.state === "completed") {
+        body = (kind === "tool" ? undefined : shown(task.text)) ?? "Done.";
+      } else if (task.state === "input-required" || task.state === "auth-required") {
+        body = shown(task.inputRequired?.question) ?? "Waiting on you.";
+      } else {
+        body = `Didn't finish (${task.error?.code ?? task.state}).${task.error?.uncertain ? " It may have partly run; check before trying again." : ""}`;
+      }
       return `${label}: ${body}`;
     })
     .join("\n");

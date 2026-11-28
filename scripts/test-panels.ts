@@ -11,7 +11,6 @@ function ensureTestEnv(): void {
 
 ensureTestEnv();
 
-const { looksLikeDeferredAction } = await import("../src/deferred_action.ts");
 const { isSelfSentRecipient, parseAddressList } = await import("../src/mail_helpers.ts");
 
 function assert(condition: boolean, message: string): void {
@@ -19,12 +18,6 @@ function assert(condition: boolean, message: string): void {
     throw new Error(message);
   }
 }
-
-assert(looksLikeDeferredAction("Let me check the email for you."), "let me check");
-assert(looksLikeDeferredAction("I'll look that up."), "I'll look");
-assert(looksLikeDeferredAction("I will check the inbox."), "I will check");
-assert(looksLikeDeferredAction("Let me find that thread."), "let me find");
-assert(!looksLikeDeferredAction("The email is from Priya."), "plain answer is not deferred");
 
 const named = parseAddressList('"Priya Sharma" <priya@pinnacle.in>');
 assert(named[0]?.name === "Priya Sharma", "quoted display name");
@@ -45,4 +38,4 @@ assert(
   "external recipient is not self-sent",
 );
 
-console.log("Deferred-action and address checks passed.");
+console.log("Address checks passed.");

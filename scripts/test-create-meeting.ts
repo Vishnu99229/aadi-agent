@@ -1,4 +1,3 @@
-import { shouldForceCalendarTool } from "../src/calendar_guard.ts";
 import { mailboxMatchesName } from "../src/owner_meeting.ts";
 import {
   createOwnerMeeting,
@@ -30,11 +29,6 @@ assert(
     email: "nitin@conversely.in",
   }),
   "Nitin is not Nitish",
-);
-
-assert(
-  !shouldForceCalendarTool("create a meeting with Nitish tomorrow at 4pm", []),
-  "create intent is not a calendar read",
 );
 
 {

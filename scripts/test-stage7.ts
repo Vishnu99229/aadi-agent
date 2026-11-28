@@ -37,7 +37,6 @@ const {
   textLinkedToMeeting,
   toMeetingAttendees,
 } = await import("../src/meeting_logic.ts");
-const { shouldForceCalendarTool } = await import("../src/calendar_guard.ts");
 const {
   addOwnerCalendarAttendee,
   resetOwnerCalendarTestHooks,
@@ -674,53 +673,6 @@ function testHistoryQuoteAndCalendar(): void {
   assert(
     range.timeMax === "2026-10-19T18:30:00.000Z",
     "today ends at the next Asia/Kolkata midnight",
-  );
-  assert(
-    shouldForceCalendarTool("any meetings with Vatsal today?", []),
-    "calendar questions require list_events",
-  );
-  assert(
-    !shouldForceCalendarTool("any meetings with Vatsal today?", ["list_events"]),
-    "list_events satisfies the calendar guard",
-  );
-  assert(
-    !shouldForceCalendarTool("remember to buy milk", []),
-    "unrelated chat does not force the calendar",
-  );
-  assert(
-    !shouldForceCalendarTool("create a meeting with Nitish tomorrow at 4pm", []),
-    "create-meeting requests do not force list_events",
-  );
-  assert(
-    !shouldForceCalendarTool("share the meeting link here", ["create_meeting"]),
-    "create_meeting satisfies the calendar guard",
-  );
-  assert(
-    shouldForceCalendarTool("what's on my calendar", []),
-    "explicit calendar questions still force list_events",
-  );
-  assert(
-    shouldForceCalendarTool("when is my next meeting", []),
-    "next-meeting questions still force list_events",
-  );
-  assert(
-    !shouldForceCalendarTool(
-      "Call notes: the meeting with Sujal went well, we stretched the 3pm Catch up",
-      [],
-    ),
-    "wrap-up notes do not force list_events",
-  );
-  assert(
-    !shouldForceCalendarTool("wrap up the Aspirare call, they want a follow-up meeting", []),
-    "wrap up prefix does not force list_events",
-  );
-  assert(
-    !shouldForceCalendarTool("The meeting with Sujal went well", []),
-    "mentioning a meeting in recap does not force list_events",
-  );
-  assert(
-    !shouldForceCalendarTool("add ashwini@epicode.in to the Catch up meeting", []),
-    "add-attendee requests do not force list_events",
   );
 }
 

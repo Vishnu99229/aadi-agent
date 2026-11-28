@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { InlineKeyboard, type Api, type Context } from "grammy";
+import { installOutgoingTextGuard } from "./telegram_io.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
 import { google, type gmail_v1 } from "googleapis";
 import { decodedAccounts } from "./accounts.js";
@@ -2094,6 +2095,7 @@ export async function processDuePendingBookings(
 async function sendOwnerTelegram(text: string, markup?: InlineKeyboard): Promise<void> {
   const { Api } = await import("grammy");
   const api = new Api(config.telegramBotToken);
+  installOutgoingTextGuard(api);
   await api.sendMessage(
     config.ownerTelegramId,
     text,

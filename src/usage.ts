@@ -22,6 +22,7 @@ export const USAGE_TASKS = [
   "embedding",
   "sequence",
   "sequence_check",
+  "reply_check",
   "command_send",
   "tts",
   "other",

@@ -1,5 +1,4 @@
 import { readFile } from "node:fs/promises";
-import { shouldForceCalendarTool } from "../src/calendar_guard.ts";
 import {
   deleteOwnerCalendarEvent,
   resetOwnerCalendarTestHooks,
@@ -23,11 +22,6 @@ const catchup: OwnerCalendarEvent = {
 };
 
 resetOwnerCalendarTestHooks();
-
-assert(
-  !shouldForceCalendarTool("delete the Catch up event", []),
-  "delete intent is not a calendar read",
-);
 
 {
   const reply = await deleteOwnerCalendarEvent({

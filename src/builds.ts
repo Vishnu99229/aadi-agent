@@ -2,6 +2,7 @@ import { assertTestSeam } from "./test_seam.js";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { Api, InlineKeyboard, type Context } from "grammy";
+import { installOutgoingTextGuard } from "./telegram_io.js";
 import { everyMs, type IntervalJob } from "./scheduler.js";
 import {
   confirmBuildText,
@@ -121,8 +122,17 @@ export function setBuildsTestApi(api: Api | undefined): void {
   testApi = api;
 }
 
+let realApi: Api | undefined;
+
 function ownerApi(): Api {
-  return testApi ?? new Api(config.telegramBotToken);
+  if (testApi) {
+    return testApi;
+  }
+  if (!realApi) {
+    realApi = new Api(config.telegramBotToken);
+    installOutgoingTextGuard(realApi);
+  }
+  return realApi;
 }
 
 async function notifyBuild(

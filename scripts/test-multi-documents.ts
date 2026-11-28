@@ -10,10 +10,6 @@ process.env.BRIEF_TIME ??= "08:00";
 
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import { createDocument, getDocument } from "../src/db.ts";
-import {
-  documentMultiReadRetryPrompt,
-  resolveReferencedDocumentIds,
-} from "../src/document_rewrite.ts";
 import { setCompleteForTests } from "../src/llm.ts";
 import {
   getRecentUpload,
@@ -53,24 +49,6 @@ function assert(condition: boolean, message: string): void {
     /use id 11 \("pricing\.xlsx"\)/.test(block!),
     '"the document" points at newest',
   );
-  const ids = resolveReferencedDocumentIds("compare the two docs", [
-    {
-      documentId: 11,
-      fileName: "pricing.xlsx",
-      kind: "XLSX",
-      uploadedAt: Date.now(),
-    },
-    {
-      documentId: 10,
-      fileName: "msa.pdf",
-      kind: "PDF",
-      uploadedAt: Date.now() - 1,
-    },
-  ]);
-  assert(
-    ids.includes(10) && ids.includes(11) && ids.length === 2,
-    `compare the two docs resolves both ids, got ${ids.join(",")}`,
-  );
   console.log("two uploads → both ids in context: ok");
 }
 
@@ -92,104 +70,6 @@ function assert(condition: boolean, message: string): void {
   console.log("list_documents returns both newest-first: ok");
 }
 
-{
-  setRecentUploadsForTests([
-    {
-      documentId: 21,
-      fileName: "msa.pdf",
-      kind: "PDF",
-      uploadedAt: Date.now() - 120_000,
-    },
-    {
-      documentId: 22,
-      fileName: "pricing.xlsx",
-      kind: "XLSX",
-      uploadedAt: Date.now() - 30_000,
-    },
-  ]);
-  createDocument("msa.pdf", "work", "Alpha clause", null);
-  // force known ids by recording against createDocument results:
-  const docA = createDocument("msa-compare.pdf", "work", "Alpha clause", null);
-  const docB = createDocument(
-    "pricing-compare.xlsx",
-    "work",
-    "Beta numbers",
-    null,
-  );
-  setRecentUploadsForTests([
-    {
-      documentId: docA.id,
-      fileName: "msa-compare.pdf",
-      kind: "PDF",
-      uploadedAt: Date.now() - 120_000,
-    },
-    {
-      documentId: docB.id,
-      fileName: "pricing-compare.xlsx",
-      kind: "XLSX",
-      uploadedAt: Date.now() - 30_000,
-    },
-  ]);
-
-  const readIds: number[] = [];
-  let sawMultiNudge = false;
-  setToolInterceptorForTests((call) => {
-    if (call.name === "read_document") {
-      const id = (call.input as { id?: number }).id!;
-      readIds.push(id);
-      return getDocument(id)!.extracted_text;
-    }
-    throw new Error(`unexpected tool ${call.name}`);
-  });
-  setCompleteForTests(async (params) => {
-    if (params.tools.length === 0) {
-      return modelReply({ text: '{"facts":[]}' });
-    }
-    const last = params.messages.at(-1);
-    if (
-      last?.role === "user" &&
-      typeof last.content === "string" &&
-      /Call read_document for each of these ids/i.test(last.content)
-    ) {
-      sawMultiNudge = true;
-      assert(
-        last.content.includes(String(docA.id)) &&
-          last.content.includes(String(docB.id)),
-        "nudge lists both ids",
-      );
-      return modelReply({
-        text: "",
-        tools: [
-          { name: "read_document", input: { id: docA.id, question: "compare" } },
-          { name: "read_document", input: { id: docB.id, question: "compare" } },
-        ],
-      });
-    }
-    if (last?.role === "tool") {
-      return modelReply({ text: "Both docs: Alpha vs Beta." });
-    }
-    return modelReply({ text: "I only have one document." });
-  });
-
-  const reply = await runAgent("compare the two docs", {
-    saveUserMessage: false,
-    saveAssistantMessage: false,
-    skipHistory: true,
-  });
-  assert(sawMultiNudge, "agent sent multi-read nudge");
-  assert(
-    readIds.includes(docA.id) && readIds.includes(docB.id),
-    `read both ids, got ${readIds.join(",")}`,
-  );
-  assert(/Alpha vs Beta/.test(reply), `final reply from both docs: ${reply}`);
-  assert(
-    /each of these ids now:/.test(documentMultiReadRetryPrompt([1, 2])),
-    "multi prompt shape",
-  );
-  setCompleteForTests(undefined);
-  setToolInterceptorForTests(undefined);
-  console.log("compare the two docs triggers read_document on both: ok");
-}
 
 {
   setRecentUploadsForTests([
