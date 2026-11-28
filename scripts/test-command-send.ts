@@ -3297,8 +3297,9 @@ await expectCancelled("delete_task", async (row) => {
     users.drafts.send = (async () => { uncertainAttempts += 1; return fail(); }) as typeof draftSend;
     const call = dispatch("confirm_send_pending_draft", { draft_id: draftId }, "Send it now");
     try {
-      const { emailRecovery: uncertain } = await call.result;
-      assert(uncertain?.read_only === true && uncertain.reason === "write_unconfirmed", "an unconfirmed send requires read-only reconciliation");
+      const { emailRecovery: uncertain, content: uncertainContent } = await call.result;
+      assert(uncertain?.read_only === true && uncertain.reason === "write_unconfirmed",
+        `an unconfirmed send requires read-only reconciliation: ${JSON.stringify(uncertain)} after ${uncertainAttempts} attempt(s): ${uncertainContent}`);
       const read = await call.send("read_email", { id: original.id, account });
       assert(!read.isError && read.content.includes(subject), "the reconciliation read succeeds");
       const lines = renderEmailOutcomes(call.journal, "Checked the thread.").split("\n");
