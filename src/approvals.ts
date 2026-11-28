@@ -744,9 +744,18 @@ function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], d
   return "Gmail rejected the send. The draft is still pending. Check the draft in Gmail.";
 }
 
-async function deliverGmailDraft(gmail: gmail_v1.Gmail, input: {
+async function deliverGmailDraft(gmail: gmail_v1.Gmail, delivery: {
   account: GoogleAccountId; draftId: string; recipient: string;
+  /** decideSendAction's "send" for exactly these people. Without it nothing goes out. */
+  decision: SendVerdict; recipients: readonly string[];
 }): Promise<{ id: string; threadId?: string } | { reason: "send_failed" | "unconfirmed" }> {
+  const { decision, recipients, ...input } = delivery;
+  // The one Gmail draft send checks the decision itself, right before Gmail.
+  try {
+    assertSendDecision(decision, recipients);
+  } catch {
+    return { reason: "send_failed" };
+  }
   const unconfirmed = (): { reason: "unconfirmed" } => {
     noteEmailFailure(new EmailOperationError("Gmail didn't confirm the draft send. Check Sent mail before any further action.", "write_unconfirmed", { ...input, lookup: "sent" }));
     return { reason: "unconfirmed" };
@@ -849,7 +858,7 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict, ow
       console.log(`Approval action ${action.id}: send blocked reason=${claim.state}`);
       return { ok: false, reason: claim.state };
     }
-    const delivery = await deliverGmailDraft(gmail, { account: action.google_account, draftId, recipient: to });
+    const delivery = await deliverGmailDraft(gmail, { account: action.google_account, draftId, recipient: to, decision, recipients });
     if ("reason" in delivery) return { ok: false, reason: delivery.reason };
     sentMessageId = delivery.id;
     replacedOnSend = settleDraftDelivery({
@@ -957,7 +966,7 @@ export async function sendCreatedDraftNow(params: {
       console.log(`Draft ${params.draftId}: immediate send blocked reason=${claim.state}`);
       return { ok: false, reason: claim.state === "unconfirmed" || claim.state === "in_progress" ? "unconfirmed" : "send_failed" };
     }
-    const delivery = await deliverGmailDraft(gmail, { account: params.googleAccount, draftId: params.draftId, recipient: to });
+    const delivery = await deliverGmailDraft(gmail, { account: params.googleAccount, draftId: params.draftId, recipient: to, decision: verdict, recipients });
     if ("reason" in delivery) return { ok: false, reason: delivery.reason };
     sentMessageId = delivery.id;
     const deliveredAt = new Date().toISOString();

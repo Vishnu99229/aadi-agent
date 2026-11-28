@@ -809,7 +809,7 @@ assert(
       );
     }
   }
-  assert(sendSites === 3, `the three checked send sites: command_send.ts and two in approvals.ts, got ${sendSites}`);
+  assert(sendSites === 2, `the two checked send sites: command_send.ts and deliverGmailDraft in approvals.ts, got ${sendSites}`);
   // One card builder: only src/confirm_cards.ts makes a button that can confirm who an
   // email goes to (a draft's Send, a held schedule's Confirm, an address choice), and only
   // it records who a posted card showed. Every other file can only parse those buttons.
