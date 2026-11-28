@@ -1,7 +1,6 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
 import { accountMatchesEmail } from "./account_logic.js";
-import { namesMatch, parseSequenceCommand, type FollowupSettings as CommandSettings } from "./command_intent.js";
 import { decodedAccounts } from "./accounts.js";
 import { config } from "./config.js";
 import {
@@ -19,6 +18,8 @@ import {
   getSalesSequenceByThread,
   isSalesDoNotContact,
   latestRecordedSendTo,
+  getPendingAction,
+  setPendingActionFollowups,
   recordSalesPitchScan,
   reproposeDeclinedSalesSequence,
   SALES_SEQUENCE_DECLINED,
@@ -56,7 +57,7 @@ import { assertTestSeam } from "./test_seam.js";
 import { holdForVoiceNote, shortCardText } from "./voice_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 import {
-  emailCardAcknowledgement, emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, noteEmailTarget, oneLine,
+  emailCardAcknowledgement, emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, noteEmailNotice, noteEmailTarget, oneLine,
   recordEmailOutcome, requireWritableEmailTurn,
 } from "./email_outcomes.js";
 import {
@@ -67,7 +68,6 @@ import {
   evaluatePitchExclusion,
   firstStepAt,
   hasOriginalOutreach,
-  isExplicitSequenceRequest,
   ownTeamCc,
   prospectDisplay,
   parsePitchClassification,
@@ -618,6 +618,7 @@ interface EnrolSettings {
   followups?: number;
   stepDays?: number | null;
   cta?: string | null;
+  ccFirstOnly?: boolean;
   commandKey?: string | null;
 }
 
@@ -673,6 +674,7 @@ async function enrolProposed(id: number, settings: EnrolSettings = {}): Promise<
       enrolledAt: enrolledAt.toISOString(),
       manualFollowups: assessed.facts.manualFollowups,
       stepOneCc: ownTeamCc(assessed.facts.cc, selfAddresses, ownAddress),
+      ccFirstOnly: settings.ccFirstOnly,
       followups: settings.followups,
       stepDays: settings.stepDays ?? null,
       cta: settings.cta ?? null,
@@ -826,168 +828,89 @@ export async function requestSequenceCard(
 }
 
 type CommandTurn = Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled">;
+type Mailbox = Pick<ParsedMailbox, "name" | "email">;
+type SendState = "pending" | "failed" | "unconfirmed" | "scheduled" | "sent";
 
-const NOT_SENT_DRAFT = "That draft isn't sent yet. Say 'send it and start follow-ups' or send it first.";
-const UNKNOWN_EMAIL =
-  "Not started: I can't tell which email that message is about. Say who the follow-ups are for, e.g. 'start follow-ups for Mayur'.";
-const WAITING_FOR_SEND = "Not started yet: follow-ups start only once the email has gone out.";
-const NO_SEQUENCE_ASKED =
-  "No card sent. A sequence is only offered when Vishnu says \"start a sequence for X\", \"follow up with X\", \"follow up X N times\", \"add X to sequence\", \"auto follow up with X\", \"follow up on my email to X\" or \"remind me to follow up with X\". For a reminder about something else, use set_reminder.";
-const SEVERAL_PEOPLE = "Send one person per message and I'll start each one.";
-const SAID_NOT_TO = "Not started: you said not to start follow-ups.";
-const WHO = "Who should the follow-ups be for? Give me a name, company or email.";
-const VAGUE_TARGET = /^(?:this|that|it|the|him|her|them)\b/i;
-
-type SendState = "sent" | "pending" | "failed" | "unconfirmed" | "scheduled";
-type Mailbox = { name: string; email: string };
-
+const WHO = "Who is the prospect?";
+const UNKNOWN_EMAIL = "Not started: reply to a message about a sent email, or name the prospect.";
 const SEND_STATE_TEXT: Record<Exclude<SendState, "sent">, string> = {
-  pending: WAITING_FOR_SEND,
+  pending: "Not started yet: the email has not gone out.",
   failed: "No follow-ups started: the email didn't go out.",
   unconfirmed: "No follow-ups started: Gmail didn't confirm the email went out.",
-  scheduled: "No follow-ups started: the email is scheduled, not sent. Start them once it goes out.",
+  scheduled: "No follow-ups started: the email is scheduled. Start them once it goes out.",
 };
 
-/** Everything the decision needs, gathered by whichever path he used. */
-export interface SequenceFacts {
-  /** tool: start_sequence (the model's call or the command-guarantee fallback).
-   *  after_send: a send path with no model after it (the referenced-email send in
-   *  bot.ts). slash: /outbox <name>. */
-  source: "tool" | "after_send" | "slash";
-  /** His own words for this turn. */
-  words: string;
-  /** Straight from his own chat turn, set by dispatch from the turn context. */
-  ownTurn: boolean;
-  /** The model itself called start_sequence. The fallback and code paths never are. */
-  modelCalled: boolean;
-  /** The model's argument, or the /outbox name. It never picks the person on its own. */
-  toolTarget?: string;
-  /** Send then follow-ups: what happened to that email, and who it went to. */
-  email?: { state: SendState; recipient?: Mailbox };
-  /** A reply to an Aadi message about an email: what that email is. */
-  replied?: { state: "sent" | "unsent_draft" | "never_sent" | "unknown"; recipient?: Mailbox };
+const FOLLOWUP_LIMIT = 6;
+const GAP_LIMIT = 14;
+const CTA_LIMIT = 100;
+
+export interface SequenceArguments {
+  prospect?: unknown;
+  source?: unknown;
+  preview?: unknown;
+  total_steps?: unknown;
+  step_days?: unknown;
+  cta?: unknown;
+  cc_first_only?: unknown;
 }
 
-export type SequenceDecision =
-  | { action: "reply"; text: string }
+interface CommandSettings {
+  followups: number;
+  gapDays: number | null;
+  cta: string | null;
+  ccFirstOnly: boolean;
+}
+
+interface SequenceRequest {
+  prospect: string;
+  source: "prospect" | "current_send" | "replied_email";
+  preview: boolean;
+  settings: CommandSettings;
+  adjustments: string[];
+}
+
+function sequenceRequest(values: SequenceArguments): SequenceRequest | string {
+  const { total_steps, step_days, cta, cc_first_only, source = "prospect", preview = false } = values;
+  if (source !== "prospect" && source !== "current_send" && source !== "replied_email") {
+    return "Not started: choose a prospect, this turn's send, or the replied-to email.";
+  }
+  if (typeof preview !== "boolean" || (cc_first_only !== undefined && typeof cc_first_only !== "boolean")) {
+    return "Not started: preview and cc_first_only must be true or false.";
+  }
+  if (total_steps !== undefined && (typeof total_steps !== "number" || !Number.isSafeInteger(total_steps))) {
+    return "Not started: total_steps must be a whole number.";
+  }
+  if (step_days !== undefined && (typeof step_days !== "number" || !Number.isSafeInteger(step_days))) {
+    return "Not started: step_days must be a whole number.";
+  }
+  if (cta !== undefined && typeof cta !== "string") {
+    return "Not started: provide the call to action as text.";
+  }
+  const prospect = typeof values.prospect === "string" ? values.prospect.trim() : "";
+  if (source === "prospect" && !prospect) return WHO;
+  const requestedSteps = total_steps ?? 3;
+  const followups = Math.max(1, Math.min(FOLLOWUP_LIMIT, requestedSteps));
+  const gapDays = step_days === undefined ? null : Math.max(1, Math.min(GAP_LIMIT, step_days));
+  const ask = cta?.trim() || null;
+  const adjustments: string[] = [];
+  if (followups !== requestedSteps) adjustments.push(`Adjusted ${requestedSteps} requested follow-ups to ${followups} (allowed: 1–${FOLLOWUP_LIMIT}).`);
+  if (step_days !== undefined && gapDays !== step_days) adjustments.push(`Adjusted the interval from ${step_days} to ${gapDays} days (allowed: 1–${GAP_LIMIT}).`);
+  if (ask && ask.length > CTA_LIMIT) adjustments.push(`Shortened the call to action to ${CTA_LIMIT} characters.`);
+  return {
+    prospect, source, preview, adjustments,
+    settings: { followups, gapDays, cta: ask?.slice(0, CTA_LIMIT) ?? null, ccFirstOnly: cc_first_only ?? true },
+  };
+}
+
+type SequenceDecision =
   | { action: "standard_card"; person: string }
   | {
       action: "enroll" | "card";
-      via: "named" | "sent_email" | "replied_email";
-      /** Who, from his own words (named), or null when the email decides. */
+      via: SequenceRequest["source"];
       person: string | null;
       settings: CommandSettings;
-      /** Why it's a card, in words for him. Empty for enroll. */
       reasons: string[];
     };
-
-function recipientMatches(said: string, recipient: Mailbox): boolean {
-  const known = `${recipient.name} ${recipient.email.split("@")[0]} ${domainOf(recipient.email).split(".")[0]}`;
-  if (namesMatch(said, known)) {
-    return true;
-  }
-  const words = new Set(known.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean));
-  const named = said.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
-  return named.length > 0 && named.every((word) => words.has(word));
-}
-
-/**
- * THE decision for every follow-up start from his command: the model's start_sequence,
- * the command-guarantee fallback, send then follow-ups, a reply to an Aadi message, the
- * referenced-email send path and /outbox. Pure: it reads only the facts given.
- *
- * Enrol with no card only when every one holds: his own turn; the model itself called
- * start_sequence; the person is named in his own words (the model's argument never
- * picks anyone); the command is a plain allowlisted imperative; every setting he gave
- * was read for certain; no stop word. The live exclusion check runs after, in the
- * executor. Anything else is a pre-filled Start card, or a plain reply.
- */
-export function decideSequenceAction(facts: SequenceFacts): SequenceDecision {
-  const asked = (facts.toolTarget ?? "").replace(/["\\]/g, " ").replace(/\s+/g, " ").trim();
-  if (facts.source === "slash") {
-    return asked ? { action: "standard_card", person: asked } : { action: "reply", text: WHO };
-  }
-  const command = parseSequenceCommand(facts.words);
-  if (command.kind === "none") {
-    return { action: "reply", text: NO_SEQUENCE_ASKED };
-  }
-  if (command.kind === "negated") {
-    return { action: "reply", text: SAID_NOT_TO };
-  }
-  if (command.kind === "several") {
-    return { action: "reply", text: SEVERAL_PEOPLE };
-  }
-  if (command.kind === "soft") {
-    return asked && !VAGUE_TARGET.test(asked)
-      ? { action: "standard_card", person: asked }
-      : { action: "reply", text: WHO };
-  }
-  const reasons: string[] = [];
-  let via: "named" | "sent_email" | "replied_email";
-  let person: string | null = null;
-  // A person is a name or an address, not a phrase: more than 4 words isn't clear.
-  const named =
-    command.target && !VAGUE_TARGET.test(command.target) && command.target.split(/\s+/).length <= 4
-      ? command.target
-      : null;
-  if (command.combined) {
-    via = "sent_email";
-    const state = facts.email?.state ?? "pending";
-    if (state !== "sent") {
-      return { action: "reply", text: SEND_STATE_TEXT[state] };
-    }
-    const recipient = facts.email?.recipient;
-    if (named && recipient && !recipientMatches(named, recipient)) {
-      reasons.push(`you named ${named}, but the email went to ${prospectDisplay(recipient.name, recipient.email)}`);
-    }
-  } else if (command.thisEmail && facts.replied) {
-    via = "replied_email";
-    if (facts.replied.state === "unsent_draft") {
-      return { action: "reply", text: NOT_SENT_DRAFT };
-    }
-    if (facts.replied.state === "never_sent") {
-      return { action: "reply", text: "Not started: that draft was never sent." };
-    }
-    if (facts.replied.state === "unknown") {
-      return { action: "reply", text: UNKNOWN_EMAIL };
-    }
-    const recipient = facts.replied.recipient;
-    if (named && recipient && !recipientMatches(named, recipient)) {
-      reasons.push(`you named ${named}, but that email went to ${prospectDisplay(recipient.name, recipient.email)}`);
-    }
-  } else {
-    via = "named";
-    if (command.thisEmail && !named && (!asked || VAGUE_TARGET.test(asked))) {
-      return { action: "reply", text: "Not started: reply to the message about that email, or say who the follow-ups are for." };
-    }
-    if (!named) {
-      reasons.push("your message didn't name one person clearly");
-      person = asked && !VAGUE_TARGET.test(asked) ? asked : null;
-    } else if (asked && !VAGUE_TARGET.test(asked) && !namesMatch(asked, named)) {
-      // The model's argument never authorizes anyone: the card is for who he named.
-      reasons.push(`you named ${named}, not ${asked}`);
-      person = named;
-    } else {
-      person = named;
-    }
-    if (!person) {
-      return { action: "reply", text: WHO };
-    }
-  }
-  if (!facts.ownTurn) {
-    reasons.push("it didn't come straight from your own message");
-  }
-  if (facts.source === "after_send") {
-    reasons.push("the email went out from a referenced message, so I'm checking with you first");
-  } else if (!facts.modelCalled) {
-    reasons.push("a backup check started this, not my own reading of your message");
-  }
-  if (!command.allowlisted) {
-    reasons.push("I only start follow-ups on my own from a plain command like 'start 3 follow-ups for Mayur'");
-  }
-  reasons.push(...command.unsure);
-  return { action: reasons.length === 0 ? "enroll" : "card", via, person, settings: command.settings, reasons };
-}
 
 function commandKeyOf(turn: CommandTurn): string | undefined {
   return turn.confirmation ? `msg:${turn.confirmation.chatId}:${turn.confirmation.messageId}` : undefined;
@@ -1029,25 +952,29 @@ function settingsOfRow(row: SalesSequenceRecord): EnrolSettings {
         followups: Math.max(1, row.total_steps - row.manual_followups),
         stepDays: row.step_days,
         cta: row.cta,
+        ccFirstOnly: row.cc_first_only !== 0,
         commandKey: row.command_key,
       }
     : {};
 }
 
-/** What one message's send came to, and whether the model asked for follow-ups first. */
-const turnState = new Map<string, { send?: { state: SendState; sentMessageId?: string; account?: string; recipient?: Mailbox }; modelAsked?: string; at: number }>();
+interface SequenceSend {
+  state: SendState;
+  sentMessageId?: string;
+  cardActionId?: number;
+  account: string;
+  recipient?: Mailbox;
+}
+
+const turnSends = new Map<string, { send: SequenceSend; at: number }>();
 const TURN_STATE_TTL_MS = 30 * 60_000;
 
-function stateFor(key: string): { send?: { state: SendState; sentMessageId?: string; account?: string; recipient?: Mailbox }; modelAsked?: string; at: number } {
+export function recordSequenceSend(confirmation: NonNullable<CommandTurn["confirmation"]>, send: SequenceSend): void {
   const now = Date.now();
-  for (const [id, entry] of turnState) {
-    if (now - entry.at > TURN_STATE_TTL_MS) {
-      turnState.delete(id);
-    }
+  for (const [key, entry] of turnSends) {
+    if (now - entry.at > TURN_STATE_TTL_MS) turnSends.delete(key);
   }
-  const entry = turnState.get(key) ?? { at: now };
-  turnState.set(key, entry);
-  return entry;
+  turnSends.set(commandKeyOf({ confirmation })!, { send, at: now });
 }
 
 /** His newest email to the person he named. More than one person: ask which. */
@@ -1057,9 +984,11 @@ async function newestThreadFor(
   selfAddresses: ReadonlySet<string>,
   ownAddress: string,
 ): Promise<ThreadAssessment | string> {
+  const safeTarget = target.replaceAll('"', "").replaceAll("\\", "").replaceAll("\n", " ").replaceAll("\r", " ").trim();
+  if (!safeTarget) return WHO;
   const listed = await gmail.users.messages.list({
     userId: "me",
-    q: `in:sent newer_than:${EXPLICIT_LOOKBACK_DAYS}d to:"${target}"`,
+    q: `in:sent newer_than:${EXPLICIT_LOOKBACK_DAYS}d to:"${safeTarget}"`,
     maxResults: 25,
   });
   const threadIds = [
@@ -1135,7 +1064,7 @@ async function recipientOf(sentMessageId: string): Promise<Mailbox | undefined> 
 
 async function sendCommandCard(api: Api, row: SalesSequenceRecord, settings: CommandSettings): ReturnType<typeof sendPitchCard> {
   const gap = settings.gapDays ?? config.sequenceStepDays;
-  return sendPitchCard(api, row, `Start ${settingsLine(settings.followups, gap, settings.cta).replace(/^(\d+ follow-ups?)/, `$1 to ${prospectLabel(row)}`)}?`);
+  return sendPitchCard(api, row, `Start follow-ups to ${prospectLabel(row)}? ${settingsLine(settings.followups, gap, settings.cta)}. Cc: ${settings.ccFirstOnly ? "first follow-up only" : "eligible teammates on each follow-up"}.`);
 }
 
 interface CarryContext {
@@ -1143,34 +1072,21 @@ interface CarryContext {
   api: Api;
   /** The email the follow-ups are for, when the email (not a name) decides. */
   email?: { sentMessageId: string; account: string };
-  /** The model's start_sequence argument: who the follow-ups are for, by name or address. */
-  asked?: string;
+  commandKey?: string;
 }
 
-/**
- * Who named follow-ups are for, from facts (recipient_facts.ts), on his own turn: the
- * name in his words, then the model's argument. One address, or a reply that asks.
- * Off his own turn, or with no match, the name goes to the Sent-mail search.
- */
-async function namedProspect(person: string, carry: CarryContext): Promise<string | { reply: string }> {
-  const confirmation = carry.turn.confirmation;
-  if (!confirmation || carry.turn.ownTurn !== true) return person;
-  // His words' name first. Only when that is nobody does the model's argument decide
-  // who: either the same person by name, or decideSequenceAction already made it a
-  // Start card that names the difference.
-  const queries = [...new Set([person.trim(), carry.asked?.trim()].filter((query): query is string => Boolean(query)))];
-  for (const query of queries) {
-    const match = await resolvePersonFromFacts(query, {
-      chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: carry.turn.userText ?? "",
-    });
-    if (match.kind === "one") return match.mailbox.email;
-    if (match.kind === "many") {
-      const options = match.options.map((option) => `- ${prospectDisplay(option.name, option.email)}`);
-      return { reply: `Not started: more than one person matches "${query}". Which one?\n${options.join("\n")}` };
-    }
+/** Resolve a named prospect with chat records, then fall back to the Sent mailbox. */
+async function namedProspect(person: string, turn: CommandTurn): Promise<string | { reply: string }> {
+  const confirmation = turn.confirmation;
+  if (!confirmation || turn.ownTurn !== true) return person;
+  const match = await resolvePersonFromFacts(person, {
+    chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: turn.userText ?? "",
+  });
+  if (match.kind === "one") return match.mailbox.email;
+  if (match.kind === "many") {
+    const options = match.options.map(option => `- ${prospectDisplay(option.name, option.email)}`);
+    return { reply: `Not started: more than one person matches "${person}". Which one?\n${options.join("\n")}` };
   }
-  // Nobody in the facts: his Sent mail's To headers by name, as before (people he has
-  // emailed), which is the same kind of record.
   return person;
 }
 
@@ -1192,18 +1108,15 @@ async function recordedThreadFor(
   })) ?? undefined;
 }
 
-/** The one executor: after decideSequenceAction, enrol or post a pre-filled card.
+/** Enrol or post a pre-filled card.
  *  The live exclusion check runs here, for both. */
 async function carryOutSequenceDecision(decision: SequenceDecision, carry: CarryContext): Promise<string> {
-  if (decision.action === "reply") {
-    return decision.text;
-  }
   if (decision.action === "standard_card") {
     return requestSequenceCard(decision.person, carry.api);
   }
   const turn = carry.turn;
-  const commandKey = commandKeyOf(turn);
-  if (decision.via !== "named" && !carry.email) {
+  const commandKey = carry.commandKey ?? commandKeyOf(turn);
+  if (decision.via !== "prospect" && !carry.email) {
     return UNKNOWN_EMAIL;
   }
   if (carry.email && carry.email.account !== "work") {
@@ -1214,8 +1127,8 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     const { gmail } = await workGmail();
     const ownAddress = await ownAddressOf(gmail);
     const selfAddresses = await loadFollowupSelfAddresses();
-    if (decision.via === "named") {
-      const target = await namedProspect(decision.person!, carry);
+    if (decision.via === "prospect") {
+      const target = await namedProspect(decision.person!, turn);
       if (typeof target !== "string") {
         return target.reply;
       }
@@ -1265,13 +1178,13 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
       "excluded", { account: "work", threadId: chosen.threadId, recipient: who },
     ));
   }
-  const settings = decision.settings;
-  const cap = salesSequenceStepCap();
-  if (chosen.facts.manualFollowups + settings.followups > cap) {
-    return cap < 9
-      ? "Not started: this database still caps follow-ups at 4."
-      : `Not started: that would be more than ${cap} emails after your first one.`;
-  }
+  const remaining = salesSequenceStepCap() - chosen.facts.manualFollowups;
+  if (remaining < 1) return "Not started: this thread has already reached its follow-up limit.";
+  const settings = { ...decision.settings, followups: Math.min(decision.settings.followups, remaining) };
+  const threadLimit = settings.followups < decision.settings.followups
+    ? `Capped at ${settings.followups} additional follow-ups for this thread.`
+    : "";
+  if (threadLimit) noteEmailNotice(threadLimit);
   const prospect = chosen.prospect;
   requireWritableEmailTurn();
   const domain = domainOf(prospect.email);
@@ -1301,6 +1214,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     followups: settings.followups,
     stepDays: settings.gapDays,
     cta: settings.cta,
+    ccFirstOnly: settings.ccFirstOnly,
     commandKey,
   };
   if (decision.action === "enroll") {
@@ -1308,7 +1222,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     const outcome = await enrolProposed(row.id, enrolSettings);
     if (outcome.ok) {
       console.log(`Sequence ${row.id}: enrolled by command steps=${outcome.row.total_steps}`);
-      return commandStartedText(outcome.row);
+      return [commandStartedText(outcome.row), threadLimit].filter(Boolean).join(" ");
     }
     if (!existing && getSalesSequence(row.id)?.status === "proposed") {
       deleteProposedSalesSequence(row.id);
@@ -1317,7 +1231,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
       return `Not started for ${prospect.email} ('${chosen.subject}'): ${EXCLUSION_LABELS[outcome.exclusion]}.`;
     }
     if (outcome.reason === "too_many") {
-      return "Not started: this database still caps follow-ups at 4.";
+      return "Not started: the thread reached its follow-up limit while I was checking it.";
     }
     return outcome.reason === "check_failed"
       ? noteEmailFailure(new EmailOperationError(
@@ -1331,6 +1245,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     totalSteps: chosen.facts.manualFollowups + settings.followups,
     stepDays: settings.gapDays,
     cta: settings.cta,
+    ccFirstOnly: settings.ccFirstOnly,
     commandKey: commandKey ?? null,
     // Today's count of his own follow-ups, so the card's number is what Start enrols.
     manualFollowups: chosen.facts.manualFollowups,
@@ -1345,116 +1260,105 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     return "Not started: the Start card wasn't posted. No sequence was enrolled.";
   }
   const gap = settings.gapDays ?? config.sequenceStepDays;
-  return `Start card sent for ${prospectLabel(carded)}: ${decision.reasons.join("; ")}. Tap Start for ${settingsLine(settings.followups, gap, settings.cta)}. Nothing is enrolled until you tap Start.`;
+  return `Start card sent for ${prospectLabel(carded)}: ${decision.reasons.join("; ")}. Tap Start for ${settingsLine(settings.followups, gap, settings.cta)}. Nothing is enrolled until you tap Start.${threadLimit ? ` ${threadLimit}` : ""}`;
 }
 
-/** After an email he asked for in the same message went out (or didn't). It records
- *  the send for this message; it starts follow-ups only through decideSequenceAction:
- *  when the model already asked this turn, or (on the referenced-email path, which has
- *  no model after it) as a card. Returns a line for him and/or a hint for the model. */
-export async function followupsAfterSend(input: {
-  turn: CommandTurn & { directSend?: boolean };
-  result: "sent" | "scheduled" | "unknown" | "not_sent" | "pending";
-  sentMessageId?: string;
-  account: string;
-  /** Who the email went to, as he'd say it, for the "say ..." hint. */
-  recipient: string;
-  recipientMailbox?: Mailbox;
-}): Promise<{ text?: string; hint?: string }> {
-  const words = input.turn.userText ?? "";
-  const command = parseSequenceCommand(words);
-  if (command.kind === "none") {
-    return command.mentionsFollowups && input.result === "sent"
-      ? { text: `No follow-ups started; say 'start follow-ups for ${input.recipient}' if you want them.` }
-      : {};
+async function runSequenceRequest(request: SequenceRequest, carry: CarryContext, recipient?: Mailbox): Promise<string> {
+  const reasons: string[] = [];
+  if (request.preview) reasons.push("confirmation required");
+  if (carry.turn.ownTurn !== true || carry.turn.modelCalled !== true) {
+    reasons.push("this did not come directly from your chat turn");
   }
-  if (command.kind === "negated") {
-    return input.result === "sent" ? { text: "No follow-ups started, as you said." } : {};
+  if (request.source !== "prospect" && request.prospect) {
+    const named = await namedProspect(request.prospect, carry.turn);
+    const recipientNames = recipient ? [recipient.email, recipient.name].map(name => name.trim().toLowerCase()) : [];
+    if (typeof named !== "string" || !recipientNames.includes(named.toLowerCase())) {
+      reasons.push(recipient ? `the email went to ${prospectDisplay(recipient.name, recipient.email)}` : "the recipient could not be verified");
+    }
   }
-  if (command.kind !== "direct" || !command.combined) {
-    return {};
-  }
-  const state: SendState =
-    input.result === "sent" && input.sentMessageId
-      ? "sent"
-      : input.result === "scheduled"
-        ? "scheduled"
-        : input.result === "unknown"
-          ? "unconfirmed"
-          : input.result === "pending"
-            ? "pending"
-            : "failed";
-  const key = commandKeyOf(input.turn);
-  const entry = key ? stateFor(key) : undefined;
-  if (entry) {
-    entry.send = { state, sentMessageId: input.sentMessageId, account: input.account, recipient: input.recipientMailbox };
-  }
-  const direct = input.turn.directSend === true;
-  if (state === "sent" && !direct && entry?.modelAsked === undefined) {
-    return { hint: "He also asked for follow-ups on this email: call start_sequence now with the person as he named them." };
-  }
-  const decision = decideSequenceAction({
-    source: direct ? "after_send" : "tool",
-    words,
-    ownTurn: input.turn.ownTurn === true,
-    modelCalled: !direct && entry?.modelAsked !== undefined,
-    toolTarget: entry?.modelAsked ?? input.recipient,
-    email: { state, recipient: input.recipientMailbox },
-  });
-  const text = await carryOutSequenceDecision(decision, {
-    turn: input.turn,
-    api: cardApi(),
-    email: input.sentMessageId ? { sentMessageId: input.sentMessageId, account: input.account } : undefined,
-    asked: entry?.modelAsked ?? input.recipient,
-  });
-  return { text };
+  const result = await carryOutSequenceDecision({
+    action: reasons.length ? "card" : "enroll",
+    via: request.source,
+    person: request.prospect || null,
+    settings: request.settings,
+    reasons,
+  }, carry);
+  for (const adjustment of request.adjustments) noteEmailNotice(adjustment);
+  return [result, ...request.adjustments].join(" ");
 }
 
 export async function startSequenceFromTool(
   target: string,
   turn: CommandTurn,
   explicitApi?: Api,
+  values: SequenceArguments = {},
 ): Promise<string> {
   const api = cardApi(explicitApi);
   allowOwnerChatStartSequence(turn.confirmation);
-  const words = turn.userText ?? "";
-  const facts: SequenceFacts = {
-    source: "tool",
-    words,
-    ownTurn: turn.ownTurn === true,
-    modelCalled: turn.modelCalled === true,
-    toolTarget: target,
-  };
-  const carry: CarryContext = { turn, api, asked: target };
-  const command = parseSequenceCommand(words);
-  const key = commandKeyOf(turn);
-  if (command.kind === "direct" && command.combined) {
-    const entry = key ? stateFor(key) : undefined;
-    if (entry?.send) {
-      facts.email = { state: entry.send.state, recipient: entry.send.recipient };
-      if (entry.send.sentMessageId && entry.send.account) {
-        carry.email = { sentMessageId: entry.send.sentMessageId, account: entry.send.account };
-      }
-    } else {
-      facts.email = { state: "pending" };
-      // The model asked before the send: the send completes it, through the decision.
-      if (entry && facts.modelCalled) {
-        entry.modelAsked = target;
-      }
-    }
-  } else if (command.kind === "direct" && command.thisEmail) {
+  const request = sequenceRequest({ ...values, prospect: target });
+  if (typeof request === "string") return request;
+  const carry: CarryContext = { turn, api };
+  if (request.source === "prospect") return runSequenceRequest(request, carry);
+
+  if (request.source === "replied_email") {
+    if (turn.confirmation?.chatId !== config.ownerTelegramId) return UNKNOWN_EMAIL;
     const repliedTo = repliedMessageForTurn(turn.confirmation?.chatId, turn.confirmation?.messageId);
-    if (repliedTo !== undefined) {
-      const found = emailForTelegramMessage(repliedTo);
-      if (found.state === "sent") {
-        facts.replied = { state: "sent", recipient: await recipientOf(found.sentMessageId) };
-        carry.email = { sentMessageId: found.sentMessageId, account: found.account };
-      } else {
-        facts.replied = { state: found.state };
-      }
+    if (repliedTo === undefined) return UNKNOWN_EMAIL;
+    const found = emailForTelegramMessage(repliedTo);
+    if (found.state !== "sent") {
+      if (found.state === "unsent_draft") return "Not started: that draft has not been sent.";
+      if (found.state === "never_sent") return "Not started: that draft was never sent.";
+      return UNKNOWN_EMAIL;
+    }
+    carry.email = found;
+    return runSequenceRequest(request, carry, await recipientOf(found.sentMessageId));
+  }
+
+  const key = commandKeyOf(turn);
+  const entry = key ? turnSends.get(key) : undefined;
+  const sent = entry && Date.now() - entry.at <= TURN_STATE_TTL_MS ? entry.send : undefined;
+  if (sent?.state === "sent" && sent.sentMessageId) {
+    carry.email = { sentMessageId: sent.sentMessageId, account: sent.account };
+    return runSequenceRequest(request, carry, sent.recipient);
+  }
+  if (sent?.state === "pending" && key && sent.cardActionId !== undefined) {
+    const card = getPendingAction(sent.cardActionId);
+    if (card?.status === "sent" && card.sent_message_id) {
+      carry.email = { sentMessageId: card.sent_message_id, account: card.google_account };
+      return runSequenceRequest({ ...request, preview: true }, carry, sent.recipient);
+    }
+    // Store the validated settings so the Send tap can offer the same sequence.
+    const deferred: SequenceArguments = {
+      prospect: request.prospect, source: request.source,
+      total_steps: request.settings.followups, step_days: request.settings.gapDays ?? undefined,
+      cta: request.settings.cta ?? undefined, cc_first_only: request.settings.ccFirstOnly,
+    };
+    if (card?.status === "pending" && setPendingActionFollowups(card.id, JSON.stringify(deferred), key)) {
+      const message = "The follow-ups will be offered on a Start card after this email goes out.";
+      for (const adjustment of request.adjustments) noteEmailNotice(adjustment);
+      return [message, ...request.adjustments].join(" ");
     }
   }
-  return carryOutSequenceDecision(decideSequenceAction(facts), carry);
+  return sent && sent.state !== "sent" ? SEND_STATE_TEXT[sent.state] : SEND_STATE_TEXT.pending;
+}
+
+export async function offerFollowupsAfterCardSend(
+  stored: { settings: string; key: string },
+  send: { sentMessageId: string; account: string; recipient?: Mailbox },
+): Promise<string> {
+  let values: SequenceArguments;
+  try {
+    const parsed: unknown = JSON.parse(stored.settings);
+    if (typeof parsed !== "object" || parsed === null || !("source" in parsed) || parsed.source !== "current_send") {
+      return "Ask for follow-ups again to choose the settings for the email you just sent.";
+    }
+    values = parsed;
+  } catch {
+    return "Ask for follow-ups again to choose the settings for the email you just sent.";
+  }
+  const request = sequenceRequest(values);
+  if (typeof request === "string") return request;
+  return runSequenceRequest({ ...request, preview: true }, { turn: {}, api: cardApi(), email: send, commandKey: stored.key }, send.recipient);
 }
 
 export async function handleSequenceCommand(ctx: Context): Promise<void> {
@@ -1467,15 +1371,7 @@ export async function handleSequenceCommand(ctx: Context): Promise<void> {
     await ctx.reply("Usage: /outbox <name, company or email>");
     return;
   }
-  // /outbox <name> is the standard Start card, decided like every other start.
-  const decision = decideSequenceAction({
-    source: "slash",
-    words: `/outbox ${target}`,
-    ownTurn: false,
-    modelCalled: false,
-    toolTarget: target,
-  });
-  await ctx.reply(await carryOutSequenceDecision(decision, { turn: {}, api: ctx.api }));
+  await ctx.reply(await carryOutSequenceDecision({ action: "standard_card", person: target }, { turn: {}, api: ctx.api }));
 }
 
 export function registerSequenceDetection(api: Api): IntervalJob | undefined {

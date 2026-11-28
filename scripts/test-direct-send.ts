@@ -189,7 +189,7 @@ function clearLogs(): void {
   assert(!newSrc.includes("buildAutonomyFacts"), "draft_new_email has no autonomy facts");
   assert(!replySrc.includes("buildAutonomyFacts"), "draft_reply has no autonomy facts");
   assert(
-    systemMd.includes("Set `send_immediately: true` in the tool call"),
+    systemMd.includes("use send_email with the recipient and instruction"),
     "system prompt tells the LLM how to distinguish send vs draft",
   );
   assert(!systemMd.includes("5-minute"), "system prompt has no 5-minute auto-send window");
@@ -209,15 +209,6 @@ function clearLogs(): void {
   assert(reply.includes("New address: newbie@new-co.com. Tap Send to confirm."), `he's told why: ${reply}`);
   const cardFor = /draft_id: (\S+)/.exec(reply)?.[1] ?? "";
   assert(getPendingActionForDraft(cardFor)?.status === "pending", `the card is shown and waits: ${reply}`);
-}
-{
-  // PR #27: "draft ... please send me the proposal" is a draft, never a send.
-  clearLogs();
-  const reply = await draftNewEmail(
-    { to: "priya@acme.com", subject: "Proposal", body: "Please send me the proposal.", send_immediately: true },
-    ownerTurn("draft an email to priya@acme.com saying please send me the proposal"),
-  );
-  assert(gmailLog.sent.length === 0 && getPendingActionForDraft(/draft_id: (\S+)/.exec(reply)?.[1] ?? "")?.status === "pending", `"draft" never sends: ${reply}`);
 }
 {
   // A delegated goal (not his own turn): a card, even for a known address.

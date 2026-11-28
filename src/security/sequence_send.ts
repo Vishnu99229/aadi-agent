@@ -73,6 +73,7 @@ export interface SequenceSendGateInput {
         prospect_timezone: string | null;
         /** Every step row, his own included. Missing means the original 4. */
         total_steps?: number;
+        cc_first_only?: number;
       }
     | undefined;
   /** The open sequence for this person, which must be this one. */
@@ -117,8 +118,8 @@ function sameAddresses(left: string[], right: string[]): boolean {
 }
 
 /** Follow-up 1 may Cc exactly the own-team addresses stored at Start: epicode.in
- *  colleagues and his own addresses, never the prospect or a partner. Every later
- *  step, and any step with nothing stored, has no Cc at all. */
+ *  colleagues and his own addresses. Later steps require an explicit persisted
+ *  setting and the same per-step stored addresses. */
 function ccAllowed(input: SequenceSendGateInput, enrolled: string): boolean {
   const given = input.cc?.trim() ?? "";
   const stored = input.step?.cc?.trim() ?? "";
@@ -127,7 +128,7 @@ function ccAllowed(input: SequenceSendGateInput, enrolled: string): boolean {
   }
   const addresses = addressesIn(given);
   if (
-    input.stepNo !== 1 ||
+    (input.stepNo !== 1 && input.sequence?.cc_first_only !== 0) ||
     addresses.length === 0 ||
     !sameAddresses(addresses, addressesIn(stored))
   ) {

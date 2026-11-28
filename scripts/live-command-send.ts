@@ -7,10 +7,7 @@ import type { gmail_v1 } from "googleapis";
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import type { ChatBackend } from "../src/chat_backend.ts";
 import {
-  looksLikeCommandTurn,
-  mentionsSendDate,
   notAnEventCommand,
-  notASendCommand,
   referencesAttachment,
 } from "../src/command_logic.ts";
 import { writeCommandEmail } from "../src/command_writer.ts";
@@ -64,7 +61,6 @@ const CASES: Array<[string, string]> = [
   ["what's on my calendar on Friday?", "none"],
 ];
 
-// As in production: command turns on Sonnet, everything else on the normal model.
 const backends = (process.argv[2] ?? "deepseek").split(",") as ChatBackend[];
 let wrong = 0;
 for (const backend of backends) {
@@ -78,14 +74,7 @@ for (const backend of backends) {
       const input = call.input as { send_immediately?: unknown };
       immediate ||= input?.send_immediately === true;
       if (call.name === "send_email") {
-        const refused = notASendCommand(text);
-        if (refused) {
-          return `Not sent: ${refused}. Use the right tool, or ask him if he wants it sent now.`;
-        }
         const later = (call.input as { send_on?: unknown }).send_on;
-        if (!later && mentionsSendDate(text)) {
-          return "Not sent: he gave a date or time, so nothing went out. Call send_email again with send_on, and send_time if he gave one.";
-        }
         acted.add(later ? "send_later" : call.name);
         return later ? "Scheduled: Send email to Selvaraj K. It's on his task list. Answer in one short line." : "Sent to Selvaraj K <s@example.test>.\nSubject: Hi\nVishnu has already been shown the full email. Answer in one short line and don't repeat it.";
       }
@@ -120,7 +109,7 @@ for (const backend of backends) {
       guardText: text,
       sendConfirmation: { chatId: 1, messageId: 1 },
       skipHistory: true,
-      backend: looksLikeCommandTurn(text) ? "claude" : backend,
+      backend,
     } as Parameters<typeof runAgent>[1]);
     const ok = (want === "none" ? acted.size === 0 : acted.has(want) && acted.size === 1) && !immediate;
     wrong += ok ? 0 : 1;

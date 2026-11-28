@@ -1,46 +1,31 @@
 import { Api, InlineKeyboard, type Context } from "grammy";
-import { routeMiss, type PreRouteResult } from "./pre_route.js";
 import type { gmail_v1 } from "googleapis";
 import {
-  asksForAttachment,
-  deliveryTimeHold,
   isAutomatedAddress,
   mailboxMatches,
-  mentionsSendDate,
   nameTokens,
   namedInOwnWords,
   notAnEventCommand,
-  notASendCommand,
-  splitOwnerEmailCommand,
 } from "./command_logic.js";
 import {
   authorizationWords,
   clearPendingAction,
-  explicitEmailField,
   getPendingAction,
-  holdEmailToolTurn,
-  lastEmailReference,
   linkPublishedDraft,
-  lockedScheduleForDraft,
   matchOwnerSupplied,
   pendingResolvedEmails,
   rememberBookedMeeting,
   rememberScheduledSend,
   savePendingAction,
-  scheduleSyncNotice,
-  syncDraftRecipient,
-  tooLateText,
   type ResolvedAttendee,
 } from "./action_context.js";
-import { rememberContactChoice, resolveContact } from "./contacts.js";
-import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
-import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail, repliedMessageForTurn } from "./email_references.js";
+import { rememberContactChoice } from "./contacts.js";
+import { addressesFromReference, photoForTurn, selectedPhotoAddress } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
 import { cardReason, decideSendAction, recentSendLine, type RecentSend, type SendVerdict } from "./security/send_decision.js";
 import { choiceCardKey, postConfirmCard } from "./confirm_cards.js";
-import { withoutFollowupClause } from "./command_intent.js";
-import { followupsAfterSend } from "./sequences.js";
+import { recordSequenceSend } from "./sequences.js";
 import { mailDomainRefusal } from "./email_grounding.js";
 import { looksLikeTimeFill } from "./time_parse.js";
 import { config } from "./config.js";
@@ -53,7 +38,6 @@ import {
   sentMessageForDraft,
   setCommandSendTelegramMessage,
   listOpenCommandChoices,
-  setPendingActionFollowups,
   draftRecipientsShownBefore,
   externalAddresses,
   recentSendWarningsForMessage,
@@ -63,7 +47,6 @@ import {
   releaseCommandSend,
   pendingActionForCommandKey,
   latestDraftAction,
-  pendingDraftActionForMessage,
   scheduledSendByKey,
   cardRecipientsForMessage,
   type PendingAction,
@@ -99,8 +82,8 @@ import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
 import {
-  awaitRecipientDelivery, DRAFT_REPLACED, DRAFT_REREAD_FAILED, editAndSendPendingDraft,
-  eligibleDrafts, pickLatestDraft, queueDraftApproval, repostPendingCard, sendPendingDraftByText, showReplacedDrafts,
+  awaitRecipientDelivery, DRAFT_REPLACED, DRAFT_REREAD_FAILED,
+  queueDraftApproval, repostPendingCard, showReplacedDrafts,
 } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
 import { sameConversation } from "./subject_logic.js";
@@ -124,8 +107,8 @@ export interface Outcome {
   messageId?: string;
   /** For recent_send: who was emailed in the window, from records, when it was held. */
   recentSends?: RecentSend[];
-  /** The same command again: its follow-ups were handled the first time. */
   repeat?: boolean;
+  cardActionId?: number;
   recoverable?: boolean;
 }
 
@@ -167,8 +150,6 @@ export interface CommandRequest {
   /** Addresses he confirmed by a tap (an offered address button, or Confirm on a held
    *  schedule), or that were known when he scheduled it. */
   confirmedRecipients?: string[];
-  /** His whole message, when it also asked for follow-ups: they ride on the card. */
-  followupWords?: string;
   /** He tapped Confirm on a card that said "You emailed X at T": address to the newest
    *  send that card named. Later sends to them still wait for him. */
   recentSendsConfirmed?: Record<string, string>;
@@ -193,26 +174,6 @@ export function commandApi(): Api {
 }
 
 const api = commandApi;
-
-function mailboxFromContact(contact: {
-  name: string;
-  emails: string[];
-}): ParsedMailbox {
-  return { email: contact.emails[0]!.toLowerCase(), name: contact.name };
-}
-
-function matchFromContact(resolution: Awaited<ReturnType<typeof resolveContact>>): RecipientMatch {
-  if (resolution.kind === "one") {
-    return { kind: "one", mailbox: mailboxFromContact(resolution.contact) };
-  }
-  if (resolution.kind === "many") {
-    return {
-      kind: "many",
-      options: resolution.options.map(mailboxFromContact),
-    };
-  }
-  return { kind: "none" };
-}
 
 function stringList(value: unknown): string[] {
   const items = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
@@ -439,13 +400,6 @@ async function showSendCard(input: {
   if (latestDraftAction(draftId, input.account.id)?.status === "superseded") {
     return { text: [DRAFT_REPLACED, replacementNotice].filter(Boolean).join("\n"), result: "not_sent" };
   }
-  if (input.request.followupWords && input.confirmation) {
-    setPendingActionFollowups(
-      actionId,
-      input.request.followupWords,
-      `msg:${input.confirmation.chatId}:${input.confirmation.messageId}`,
-    );
-  }
   if (input.confirmation) {
     linkPublishedDraft({
       chatId: input.confirmation.chatId,
@@ -458,14 +412,14 @@ async function showSendCard(input: {
     });
   }
   console.log(`Command send: card instead of a send new=${input.verdict.action === "card" ? input.verdict.newAddresses.length : 0}`);
-  const followups = input.request.followupWords ? " The follow-ups come as a Start card once it goes out." : "";
-  const approval = `${cardReason(input.verdict, input.toHeader)}${followups}`;
+  const approval = cardReason(input.verdict, input.toHeader);
   noteEmailNotice(approval);
   noteEmailFailure(new EmailOperationError(approval, "approval_required",
     { draftId, account: input.account.id, recipient: input.toHeader }));
   return {
     text: [approval, replacementNotice].filter(Boolean).join("\n"),
     hint: "Nothing has been sent. He has the card; answer in one short line.",
+    cardActionId: actionId,
     shown: true,
   };
 }
@@ -1094,35 +1048,6 @@ async function finishRequest(
   return { text: result.text };
 }
 
-async function resolveNamedRecipient(input: {
-  gmail: gmail_v1.Gmail;
-  query: string;
-  selfAddresses: ReadonlySet<string>;
-  threadMailboxes?: readonly ParsedMailbox[];
-}): Promise<RecipientMatch> {
-  const threadMatch = await resolveRecipient(input);
-  if (threadMatch.kind === "one") {
-    return threadMatch;
-  }
-  // A typed address is already decided (including "that's me, don't send").
-  if (parseAddressList(input.query).length > 0) {
-    return threadMatch;
-  }
-  const fromIndex = matchFromContact(await resolveContact(input.query));
-  // Gmail already found several different addresses: don't collapse them to one
-  // canonical person.
-  if (threadMatch.kind === "many") {
-    return fromIndex.kind === "many" ? fromIndex : threadMatch;
-  }
-  if (fromIndex.kind === "one") {
-    return fromIndex;
-  }
-  if (fromIndex.kind === "many") {
-    return fromIndex;
-  }
-  return threadMatch;
-}
-
 /** Fills in each recipient it can. Collects genuine ambiguities and asks once. */
 async function resolveAndContinue(
   request: CommandRequest,
@@ -1269,8 +1194,9 @@ function parseSendAt(
   sendTime: unknown,
   now: Date,
 ): string | undefined | { refused: string } {
-  if (typeof sendOn !== "string" || !sendOn.trim()) {
-    return undefined;
+  if (sendOn === undefined && sendTime === undefined) return undefined;
+  if (typeof sendOn !== "string" || !sendOn.trim() || sendTime !== undefined && typeof sendTime !== "string") {
+    return { refused: "Not scheduled: provide send_on as YYYY-MM-DD and send_time, if given, as HH:MM in IST." };
   }
   const date = sendOn.trim();
   const time = typeof sendTime === "string" && sendTime.trim() ? sendTime.trim() : DEFAULT_SEND_TIME;
@@ -1290,102 +1216,10 @@ function parseSendAt(
   return at.toISOString();
 }
 
-/** The owner's command, typed or spoken. */
-function recipientEditAndSend(words: string): { field: "to" | "cc" | "bcc"; person: string; replace: boolean } | undefined {
-  const clean = withoutFollowupClause(words).trim();
-  if (/\bnew\s+(?:e-?mail|draft|message)\b/i.test(clean)) return undefined;
-  const request = /^(.*?)\s*(?:,\s*|\s+)(?:and\s+then\s+|and\s+|then\s+)?send(?:\s+(?:it|(?:(?:this|that|the)\s+)?(?:e-?mail|draft|message|reply)))?(?:\s+now)?[.!]*$/i.exec(clean)?.[1]?.trim();
-  if (!request) return undefined;
-  const edit = request.replace(/^(?:please\s+)?(?:also\s+)?/i, "")
-    .replace(/\s+(?:in|on|to)\s+(?:this|that|the)\s+(?:e-?mail|draft|message|reply)$/i, "");
-  const explicit = explicitEmailField(edit);
-  if (explicit) return { ...explicit, replace: false };
-  const replacement = /^(?:change|switch|update)\s+(?:the\s+)?(?:to|recipient)\s+to\s+(.+)$/i.exec(edit)?.[1];
-  if (replacement) return { field: "to", person: replacement, replace: true };
-  const add = /^(cc|bcc|add)\s+(.+)$/i.exec(edit);
-  if (!add?.[2] || /\b(?:meeting|calendar|attendee|task|reminder|point|paragraph|line|sentence|wording|phrase|bullet|section)\b|\b(?:saying|mention(?:ing)?|write|include)\b/i.test(add[2])) return undefined;
-  return { field: add[1]?.toLowerCase() === "bcc" ? "bcc" : "cc", person: add[2], replace: false };
-}
-
-/** One interception point for both the chat entry and a model's send_email call. */
-export async function handlePendingRecipientEdit(
-  turn: FollowupTurn,
-  replyToMessageId?: number,
-  now = new Date(),
-): Promise<string | undefined> {
-  const result = await tryPendingRecipientEdit(turn, replyToMessageId, now);
-  return result?.kind === "miss" ? result.notice ?? result.note : result?.text;
-}
-
-export async function tryPendingRecipientEdit(
-  turn: FollowupTurn,
-  replyToMessageId?: number,
-  now = new Date(),
-): Promise<PreRouteResult | undefined> {
-  const clarify = (text: string): PreRouteResult => ({ kind: "clarification", text });
-  const refuse = (text: string): PreRouteResult => ({ kind: "refusal", text });
-  const words = turn.userText ?? "";
-  const edit = recipientEditAndSend(words);
-  if (!edit) return undefined;
-  const confirmation = turn.confirmation;
-  if (!confirmation || turn.ownTurn !== true) return refuse("Only your own message can change and send a pending draft.");
-  const stop = notASendCommand(words);
-  if (stop) return refuse(`Not sent: ${stop}.`);
-  const hold = deliveryTimeHold(words);
-  if (hold) return refuse(hold);
-  if (edit.field === "bcc") return refuse("I can add them on Cc. Tell me if you'd like that.");
-  if (asksForAttachment(words)) return refuse("I haven't sent the draft. Add the attachment in Gmail first.");
-
-  const shown = eligibleDrafts(confirmation);
-  const replied = replyToMessageId === undefined ? undefined : pendingDraftActionForMessage(replyToMessageId);
-  const focused = replyToMessageId === undefined ? getPendingAction(confirmation.chatId, now)?.email : undefined;
-  const target = replied ?? (focused?.draftId ? latestDraftAction(focused.draftId, focused.account) : undefined);
-  const action = target ? shown.find((draft) => draft.id === target.id)
-    : replyToMessageId === undefined ? pickLatestDraft(shown) : undefined;
-  if (!action?.draft_id) {
-    if (target?.status === "superseded") return refuse(DRAFT_REPLACED);
-    if (!target && replyToMessageId === undefined && shown.length > 1) return clarify("Which draft should I update? Reply to its card.");
-    return routeMiss("No draft is waiting for your approval, so nothing was sent.", { scope: "read_only" });
-  }
-  if (parseAddressList(edit.person).length > 1) {
-    return clarify("I found more than one address in that recipient edit. Tell me which single address to add.");
-  }
-  const draftId = action.draft_id;
-  const account = action.google_account;
-  noteEmailTarget("send_email", { draftId });
-  noteEmailTarget("confirm_send_pending_draft", { draftId });
-  const locked = lockedScheduleForDraft(draftId, account);
-  if (locked) return routeMiss(tooLateText(locked), { scope: "read_only" });
-  const supplied = matchOwnerSupplied(confirmation.chatId, edit.person, now);
-  if (supplied.kind === "many") return clarify(`Which ${edit.person}? ${supplied.contacts.map((contact) => contact.email).join(", ")}`);
-  const explicitMailbox = parseAddressList(edit.person)[0];
-  const match: RecipientMatch = supplied.kind === "one"
-    ? { kind: "one", mailbox: { email: supplied.contact.email, name: supplied.contact.name } }
-    : explicitMailbox
-      ? { kind: "one", mailbox: explicitMailbox }
-      : await resolveNamedRecipient({
-        gmail: gmailClient(await getGoogleAccount(account)),
-        query: edit.person, selfAddresses: await loadFollowupSelfAddresses(),
-      });
-  if (match.kind === "many") return clarify(`Which ${edit.person}? ${match.options.map(formatMailbox).join(", ")}`);
-  if (match.kind === "none") return routeMiss(`I couldn't find an address for ${edit.person}. Which address should I add?`, { scope: "read_only" });
-  const email = match.mailbox.email.trim().toLowerCase();
-  if (parseAddressList(email)[0]?.email !== email || isSelfEmail(email)) return refuse("I couldn't use that address. Which address should I add?");
-  const refusal = await mailDomainRefusal([email]);
-  if (refusal) return refuse(refusal);
-  const result = await editAndSendPendingDraft(confirmation, action, { ...edit, field: edit.field, email }, (headers) =>
-    scheduleSyncNotice(syncDraftRecipient({ chatId: confirmation.chatId, draftId, account, ...headers })),
-  );
-  const text = withFollowups(result.message, await followupsAfterDraftSend(turn, draftId, result.ok, result.failure === "uncertain"));
-  if (result.failure === "miss" || result.failure === "uncertain") return routeMiss(text, { scope: "read_only" });
-  return { kind: result.ok ? "handled" : result.failure === "clarification" ? "clarification" : "refusal", text };
-}
-
 export async function sendEmailFromTool(
   input: unknown,
   /** directSend: a path with no model after it (the referenced-email send in bot.ts). */
   turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & {
-    directSend?: boolean;
     onRecovery?: (note: string) => void;
   },
   now = new Date(),
@@ -1397,18 +1231,7 @@ export async function sendEmailFromTool(
   if (!confirmation) {
     return "Not sent: only Vishnu's own message can send an email.";
   }
-  const ownWords = turn.userText?.trim() ?? "";
-  const edited = await handlePendingRecipientEdit(turn, repliedMessageForTurn(confirmation.chatId, confirmation.messageId), now);
-  if (edited !== undefined) return edited;
-  const command = splitOwnerEmailCommand(ownWords).command;
-  const held = holdEmailToolTurn(confirmation.chatId, ownWords, now);
-  if (held) {
-    return held;
-  }
-  const notCommand = notASendCommand(ownWords);
-  if (notCommand) {
-    return `Not sent: ${notCommand}. Use the right tool, or ask him if he wants it sent now.`;
-  }
+  const ownWords = turn.userText ?? "";
   const values = (input ?? {}) as {
     to?: unknown;
     cc?: unknown;
@@ -1420,62 +1243,31 @@ export async function sendEmailFromTool(
     send_time?: unknown;
     subject?: unknown;
     draft_id?: unknown;
+    photo_address?: unknown;
   };
-  if (values.attachment_requested === true || asksForAttachment(ownWords)) {
-    return "Not sent: he asked for a file and I can't attach one here, so nothing went out. Ask him whether to send it without the file or draft it so he can add it.";
+  if (values.attachment_requested === true) {
+    return "Not sent: I can't attach a file here. Ask whether to send without it or draft the email so Vishnu can add it.";
   }
   const pendingEmail = getPendingAction(confirmation.chatId, now)?.email;
-  let when = parseSendAt(values.send_on, values.send_time, now);
-  const deliveryHold = deliveryTimeHold(ownWords);
-  if (deliveryHold && typeof when !== "string") {
-    return deliveryHold;
+  const parsedWhen = parseSendAt(values.send_on, values.send_time, now);
+  if (typeof parsedWhen === "object") return parsedWhen.refused;
+  const when = parsedWhen ?? (typeof values.draft_id === "string" && pendingEmail?.draftId === values.draft_id ? pendingEmail?.sendAt : undefined);
+  const photo = photoForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
+  const referencedEmail = selectedPhotoAddress(values.photo_address, photo);
+  if (values.photo_address !== undefined && !referencedEmail) {
+    return "Not sent: that address is unavailable. Reply directly to the photo or attach it to this message.";
   }
-  if (typeof when === "object") {
-    return when.refused;
+  if (referencedEmail && (when || values.thread_id || values.draft_id)) {
+    return "Not sent: a photo address requires a new email with a Send card. Use draft_new_email to prepare it.";
   }
-  if (
-    pendingEmail?.needsFreshAuthorization &&
-    pendingEmail.sendAt &&
-    !(/\bsend\b/i.test(command) && /\bnow\b/i.test(command))
-  ) {
-    when = when ?? pendingEmail.sendAt;
+  if (!when && values.draft_id !== undefined) {
+    return "Use confirm_send_pending_draft to send an existing draft from its card.";
   }
-  // A follow-up clause ("... and start 3 follow-ups every Monday") is not a send date.
-  if (when === undefined && mentionsSendDate(withoutFollowupClause(ownWords))) {
-    return "Not sent: he gave a date or time, so nothing went out. Call send_email again with send_on, and send_time if he gave one.";
-  }
-  if (when === undefined && /\bschedule\b/i.test(command) && !/\bsend\s+(?:it\s+)?now\b/i.test(command)) {
-    return "Not sent: he asked to schedule it, so nothing went out immediately. Ask him for the day and time.";
-  }
-  const referencedEmail = emailReferenceForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
-  if (
-    when === undefined &&
-    confirmsExistingDraft(ownWords) &&
-    !referencedEmail
-  ) {
-    if (pendingEmail?.draftId && pendingEmail.scheduledSendId) {
-      noteEmailTarget("send_email", { draftId: pendingEmail.draftId });
-      const delivered = await sendPendingDraftByText(confirmation, pendingEmail.draftId, { ownTurn: turn.ownTurn === true });
-      return withFollowups(delivered.message, await followupsAfterDraftSend(turn, pendingEmail.draftId, delivered.ok, delivered.failure === "uncertain"));
-    }
-    if (!pendingEmail && lastEmailReference(confirmation.chatId, now)) {
-      return "No draft is waiting for your approval, so nothing was sent.";
-    }
-  }
-  let toQueries = stringList(values.to);
+  const toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
   const instruction = typeof values.instruction === "string" ? values.instruction.trim() : "";
-  if (referencedEmail) {
-    // The owner's reference picked this one address. A model cannot substitute
-    // a stale Gmail recipient or tack on people from an unrelated thread.
-    const refersToSelected = toQueries.length === 1 &&
-      (toQueries[0]!.toLowerCase() === referencedEmail ||
-       refersToEarlierEmail(toQueries[0]!) ||
-       /^(?:it|him|her|them|this|that|the contact)$/i.test(toQueries[0]!.trim()));
-    if (!refersToSelected || ccQueries.length > 0 && !/\bcc\b/i.test(ownWords)) {
-      return `Not ${when ? "scheduled" : "sent"}: the referenced photo/message identifies ${referencedEmail}, not the recipient the agent selected. Nothing went out.`;
-    }
-    toQueries = [referencedEmail];
+  if (referencedEmail && (toQueries.length !== 1 || toQueries[0]?.trim().toLowerCase() !== referencedEmail)) {
+    return "Not sent: To must match the selected address from the photo.";
   }
   if (toQueries.length === 0) {
     return "Not sent: he didn't name anyone. Ask him who it's for.";
@@ -1483,7 +1275,7 @@ export async function sendEmailFromTool(
   if (!instruction) {
     return "Not sent: I don't know what it should say. Ask him.";
   }
-  // The address he pointed at this turn (a photo or quoted message he replied to): used
+  // The address from the photo linked to this turn is used
   // as it is for this email only, never as a fact about people, and always new on its
   // card even if he has emailed it before. Everyone else comes from the facts.
   const referencedSlot: RecipientSlot | undefined = referencedEmail
@@ -1501,7 +1293,7 @@ export async function sendEmailFromTool(
     // instruction and time. A follow-up can identify the person without
     // having to repeat all the wording. This stores no permission beyond the
     // existing short send-authorization window, and does not schedule yet.
-    if (when && /\b(?:send|schedule)\b/i.test(command)) {
+    if (when && turn.ownTurn === true) {
       const unresolved = (query: string): ResolvedAttendee => ({
         query, name: query, email: "", resolved: false,
       });
@@ -1521,6 +1313,10 @@ export async function sendEmailFromTool(
     }
     return slots;
   }
+  const typed = new Set(addressesFromReference(ownWords));
+  if (!referencedEmail && slots.some(slot => slot.mailbox && photo?.emails.includes(slot.mailbox.email) && !typed.has(slot.mailbox.email))) {
+    return "Not sent: use photo_address for an address from the linked photo and prepare it with a Send card.";
+  }
   const request: CommandRequest = {
     kind: "email",
     to: slots.slice(0, toQueries.length),
@@ -1528,10 +1324,8 @@ export async function sendEmailFromTool(
     threadId:
       typeof values.thread_id === "string" && values.thread_id.trim() ? values.thread_id.trim() : null,
     instruction,
-    // The email writer never sees a follow-up clause: only what the email should say.
-    ownWords: withoutFollowupClause(ownWords),
+    ownWords,
     ownTurn: turn.ownTurn === true,
-    ...(withoutFollowupClause(ownWords) !== ownWords ? { followupWords: ownWords } : {}),
     account: values.account === "personal" ? "personal" : "work",
     ...(when ? { sendAt: when } : {}),
     ...(typeof values.subject === "string" && values.subject.trim()
@@ -1552,61 +1346,33 @@ export async function sendEmailFromTool(
   if (outcome.recoverable || outcome.result === "write_failed" || outcome.result === "unknown") {
     turn.onRecovery?.(outcome.text);
   }
-  if (outcome.repeat) {
-    // The same command again: nothing new went out, and its follow-ups were handled then.
-    return asToolResult(outcome);
-  }
-  // Follow-ups he asked for in the same message start only after this send went out.
-  const first = request.to[0];
-  const followups = await followupsAfterSend({
-    turn,
-    result:
-      outcome.result === "sent"
-        ? "sent"
-        : outcome.result === "unknown"
-          ? "unknown"
-          : request.sendAt && outcome.result === undefined
-            ? "scheduled"
-            : outcome.result === undefined
-              ? "pending"
-              : "not_sent",
-    sentMessageId: outcome.result === "sent" ? outcome.messageId : undefined,
+  if (outcome.repeat || turn.ownTurn !== true) return asToolResult(outcome);
+  const first = request.to[0]?.mailbox;
+  recordSequenceSend(confirmation, {
+    state: outcome.result === "sent" && outcome.messageId ? "sent"
+      : outcome.result === "unknown" ? "unconfirmed"
+      : outcome.result === undefined && request.sendAt ? "scheduled"
+      : outcome.result === undefined ? "pending"
+      : "failed",
+    sentMessageId: outcome.messageId,
+    cardActionId: outcome.cardActionId,
     account: request.account,
-    recipient: first?.mailbox?.name.trim().split(/\s+/)[0] || first?.query || "them",
-    recipientMailbox: first?.mailbox ? { name: first.mailbox.name, email: first.mailbox.email } : undefined,
+    recipient: first,
   });
-  if (!followups.text && !followups.hint) {
-    return asToolResult(outcome);
-  }
-  if (followups.text?.startsWith("No follow-ups started")) noteEmailNotice(followups.text);
-  const hint = [outcome.hint, followups.hint].filter(Boolean).join(" ");
-  return `${outcome.text}${followups.text ? `\n${followups.text}` : ""}${hint ? ` ${hint}` : ""}`;
+  return asToolResult(outcome);
 }
 
-type FollowupTurn = Pick<ToolTurn, "confirmation" | "userText" | "ownTurn" | "modelCalled"> & { directSend?: boolean };
-
-/** A send result with what the same message's follow-ups came to. */
-export function withFollowups(message: string, followups: { text?: string; hint?: string }): string {
-  return [message, followups.text, followups.hint].filter(Boolean).join("\n");
-}
-
-/** After a draft he confirmed by message: the follow-ups from the same message, only
- *  if this exact send went out. */
-export async function followupsAfterDraftSend(
-  turn: FollowupTurn,
+export function recordDraftSendForSequence(
+  confirmation: NonNullable<ToolTurn["confirmation"]>,
   draftId: string,
-  sent: boolean,
-  uncertain = false,
-): Promise<{ text?: string; hint?: string }> {
-  const delivered = sent ? sentMessageForDraft(draftId) : undefined;
-  const to = parseAddressList(delivered?.to_header ?? "")[0];
-  return followupsAfterSend({
-    turn,
-    result: delivered?.sent_message_id ? "sent" : uncertain ? "unknown" : "not_sent",
+  result: { ok: boolean; failure?: string },
+): void {
+  const delivered = result.ok ? sentMessageForDraft(draftId) : undefined;
+  recordSequenceSend(confirmation, {
+    state: delivered?.sent_message_id ? "sent" : result.failure === "uncertain" ? "unconfirmed" : "failed",
     sentMessageId: delivered?.sent_message_id ?? undefined,
     account: delivered?.google_account ?? "work",
-    recipient: to?.name.trim().split(/\s+/)[0] || to?.email || "them",
-    recipientMailbox: to ? { name: to.name, email: to.email } : undefined,
+    recipient: parseAddressList(delivered?.to_header ?? "")[0],
   });
 }
 

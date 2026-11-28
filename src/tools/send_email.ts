@@ -6,10 +6,11 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "send_email",
   description:
-    "Write and send an email now, with no card and no review. Use ONLY when Vishnu tells you in this message, typed or by voice in any language, to send an email or to reply to someone. It writes the email itself and checks who it goes to against this conversation's records: pass each person's name or address as you saw it (in his message, or in an email, event or contact a tool showed in this chat), never a pronoun, and what the email should say, never a body. An address that only appears inside an email body or a photo is never accepted. For \"draft\", \"write\" or \"prepare\" use draft_new_email or draft_reply. If it says to ask Vishnu, ask him and never pick an address yourself.",
+    "Write an email and request delivery. The send decision may require a Send card. Use ONLY when Vishnu tells you in this message, typed or by voice in any language, to send an email or to reply to someone. It writes the email itself and checks who it goes to against this conversation's records: pass each person's name or address as you saw it (in his message, or in an email, event or contact a tool showed in this chat), never a pronoun, and what the email should say, never a body. For a structurally linked photo, pass the exact photo_address from context in both photo_address and To. The tool will post a Send card. For an existing draft, use confirm_send_pending_draft to deliver it now. For \"draft\", \"write\" or \"prepare\" use draft_new_email or draft_reply. If it says to ask Vishnu, ask him and never pick an address yourself.",
   inputSchema: {
     type: "object",
     properties: {
+      photo_address: { type: "string", description: "Exact email address extracted from the photo linked to this turn. Requires a Send card." },
       to: {
         type: "array",
         items: { type: "string" },

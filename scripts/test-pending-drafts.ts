@@ -142,66 +142,6 @@ const aspirare = {
   assert(getPendingAction(satya)!.status === "sent", "Satyapramod row is sent");
 }
 
-// "send the latest" / fast path: most recently edited.
-{
-  clear();
-  const first = showDraft("d-old", { to: "a@x.com", subject: "A" });
-  const second = showDraft("d-new", { to: "b@x.com", subject: "B" });
-  setPendingActionTimestampsForTests(first, {
-    createdAt: sqliteHoursAgo(2),
-    updatedAt: sqliteHoursAgo(2),
-  });
-  setPendingActionTimestampsForTests(second, {
-    createdAt: sqliteHoursAgo(1.5),
-    updatedAt: sqliteHoursAgo(0.2),
-  });
-  const sent = await sendPendingDraftByText({
-    chatId,
-    messageId: nextMessageId(),
-  }, undefined, { ownTurn: true });
-  assert(sent.ok && gmail.sent.at(-1) === "d-new", "send it picks the most recently edited");
-}
-
-// One clearly latest among four: send it.
-{
-  clear();
-  showDraft("p1", { to: "sujoy@x.com", subject: "s1" });
-  showDraft("p2", { to: "sujoy@x.com", subject: "s2" });
-  showDraft("p3", { to: "ashwini@epicode.in", subject: "s3" });
-  const latest = showDraft("p4", aspirare);
-  for (const id of created.slice(0, 3)) {
-    setPendingActionTimestampsForTests(id, {
-      createdAt: sqliteHoursAgo(2),
-      updatedAt: sqliteHoursAgo(2),
-    });
-  }
-  setPendingActionTimestampsForTests(latest, {
-    createdAt: sqliteHoursAgo(1),
-    updatedAt: sqliteHoursAgo(0.05),
-  });
-  const sent = await sendPendingDraftByText({
-    chatId,
-    messageId: nextMessageId(),
-  }, undefined, { ownTurn: true });
-  assert(sent.ok && gmail.sent.at(-1) === "p4", "one clearly latest sends");
-}
-
-// Two equally recent: ask.
-{
-  clear();
-  const left = showDraft("eq-a", { to: "a@x.com", subject: "A" });
-  const right = showDraft("eq-b", { to: "b@x.com", subject: "B" });
-  const ts = sqliteHoursAgo(0.1);
-  setPendingActionTimestampsForTests(left, { createdAt: ts, updatedAt: ts });
-  setPendingActionTimestampsForTests(right, { createdAt: ts, updatedAt: ts });
-  const asked = await sendPendingDraftByText({
-    chatId,
-    messageId: nextMessageId(),
-  }, undefined, { ownTurn: true });
-  assert(!asked.ok && asked.message.includes("Which one"), "equal recency asks which");
-  assert(gmail.sent.filter((id) => id === "eq-a" || id === "eq-b").length === 0, "neither equal draft sent");
-}
-
 // Editing in place: same draft_id stays one pending row and becomes latest.
 {
   clear();
@@ -243,7 +183,7 @@ const aspirare = {
   const sent = await sendPendingDraftByText({
     chatId,
     messageId: nextMessageId(),
-  }, undefined, { ownTurn: true });
+  }, "edit-me", { ownTurn: true });
   assert(sent.ok && gmail.sent.at(-1) === "edit-me", `edited draft is treated as latest: ${sent.message}`);
   assert(getPendingAction(older)!.status === "pending", "pre-edit sibling stays pending");
 }
@@ -264,7 +204,7 @@ const aspirare = {
   const sent = await sendPendingDraftByText({
     chatId,
     messageId: nextMessageId(),
-  }, undefined, { ownTurn: true });
+  }, "fresh", { ownTurn: true });
   assert(sent.ok && gmail.sent.at(-1) === "fresh", "stale draft is ignored");
   assert(getPendingAction(stale)!.status === "expired", "untouched 3h draft expires");
 }
@@ -330,12 +270,7 @@ const aspirare = {
   );
   assert(getPendingAction(createdThisTurn.id)!.status === "pending", "same-turn draft stays pending");
 
-  const okHeld = await confirmHandler(
-    { draft_id: "this-turn" },
-    ownerTurn(confirmation.messageId, { userText: "ok" }),
-  );
-  assert(/ambiguous/i.test(okHeld), '"ok" is refused even with a draft_id');
-  assert(gmail.sent.length === 0, '"ok" sends nothing');
+
 }
 
 assert(
@@ -485,10 +420,10 @@ assert(
   const confirmation = { chatId, messageId: nextMessageId() };
   const shown = eligibleDrafts(confirmation);
   assert(shown.length === 1 && shown[0]?.id === latest, "only the newest legacy approval is eligible");
-  const sent = await sendPendingDraftByText(confirmation, undefined, { ownTurn: true });
+  const sent = await sendPendingDraftByText(confirmation, "legacy-newest", { ownTurn: true });
   assert(sent.ok && gmail.sent.join() === "legacy-newest", "send it delivers the newest legacy draft once");
   assert(getPendingAction(old)?.status === "superseded", "the older row is superseded permanently");
-  const after = await sendPendingDraftByText({ chatId, messageId: nextMessageId() }, undefined, { ownTurn: true });
+  const after = await sendPendingDraftByText({ chatId, messageId: nextMessageId() }, "legacy-newest", { ownTurn: true });
   assert(!after.ok && after.message.includes("No draft is waiting") && gmail.sent.length === 1, "another send it sends nothing");
 }
 

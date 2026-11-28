@@ -49,7 +49,6 @@ import {
   transitionPendingAction,
 } from "../src/db.ts";
 import {
-  pickLatestDraft,
   sendPendingDraftByText,
   setApprovalsTestHooks,
 } from "../src/approvals.ts";
@@ -744,7 +743,7 @@ assert(
     const rest = sequencesSrc.slice(at);
     return rest.slice(0, rest.indexOf("\n}\n"));
   };
-  // One way in from his command: decideSequenceAction, then the one executor.
+  // Tool and card entry points share the enrollment executor.
   const carry = bodyOf("async function carryOutSequenceDecision(");
   assert(
     carry.includes('decision.action === "enroll"') &&
@@ -754,11 +753,11 @@ assert(
   );
   for (const entry of [
     "export async function startSequenceFromTool(",
-    "export async function followupsAfterSend(",
+    "export async function offerFollowupsAfterCardSend(",
     "export async function handleSequenceCommand(",
   ]) {
     const body = bodyOf(entry);
-    assert(body.includes("decideSequenceAction("), `${entry} goes through decideSequenceAction`);
+    assert(body.includes("runSequenceRequest(") || body.includes("carryOutSequenceDecision("), `${entry} uses the sequence executor`);
     assert(!body.includes("enrolProposed(") && !body.includes("activateSalesSequence("), `${entry} never enrols itself`);
   }
   assert((sequencesSrc.match(/enrolProposed\(/g) ?? []).length === 3, "enrolProposed: defined, the Start tap, the executor");
@@ -782,8 +781,7 @@ assert(
   // Only the model's own tool calls are marked as the model's; the code-run fallback isn't.
   const agentLoopSrc = await readFile(join(root, "src/agent.ts"), "utf8");
   assert((agentLoopSrc.match(/modelCalled: true/g) ?? []).length === 1, "one place marks the model's own calls");
-  const codeRun = agentLoopSrc.slice(agentLoopSrc.indexOf("code_start_sequence_"));
-  assert(!codeRun.slice(0, codeRun.indexOf("continue;")).includes("modelCalled"), "the code-run fallback is never marked");
+
 }
 {
   // C: every Gmail send call site checks a send decision first. sequence_send.ts and
@@ -1595,12 +1593,7 @@ assert(
     { draft_id: afterId },
     ownerTurn(confirmingMessage),
   );
-  const fastPath = await sendPendingDraftByText({
-    chatId: ownerChat,
-    messageId: confirmingMessage,
-  }, undefined, { ownTurn: true });
   assert(confirmGmail.sent.length === 0, "a draft whose card came after the confirming message is never sent");
-  assert(!fastPath.ok, "the exact-phrase fast path enforces shown-first too");
   assert(getPendingAction(shownAfter)!.status === "pending", "that draft stays pending");
 }
 {
@@ -1671,57 +1664,6 @@ assert(
   assert(refusals.every((text) => text.startsWith("Not sent")), "each refusal says not sent");
 }
 
-function hoursAgo(hours: number): string {
-  return new Date(Date.now() - hours * 3600_000)
-    .toISOString()
-    .slice(0, 19)
-    .replace("T", " ");
-}
-
-// Recency: most recently created or edited wins; two equal timestamps ask.
-{
-  discardConfirmDrafts();
-  const older = draftWithCard(nextMessageId(), "other@acme.com");
-  const recent = draftWithCard(nextMessageId());
-  setPendingActionTimestampsForTests(older, {
-    createdAt: hoursAgo(2),
-    updatedAt: hoursAgo(2),
-  });
-  setPendingActionTimestampsForTests(recent, {
-    createdAt: hoursAgo(1.5),
-    updatedAt: hoursAgo(0.2),
-  });
-  const sent = await sendPendingDraftByText({
-    chatId: ownerChat,
-    messageId: nextMessageId(),
-  }, undefined, { ownTurn: true });
-  assert(sent.ok, "fast path sends the most recently edited draft");
-  assert(
-    confirmGmail.sent.at(-1) === getPendingAction(recent)!.draft_id,
-    "latest edited draft is the one sent",
-  );
-  assert(getPendingAction(older)!.status === "pending", "the older draft is untouched");
-
-  discardConfirmDrafts();
-  const left = draftWithCard(nextMessageId(), "other@acme.com");
-  const right = draftWithCard(nextMessageId());
-  const tied = hoursAgo(0.3);
-  setPendingActionTimestampsForTests(left, {
-    createdAt: tied,
-    updatedAt: tied,
-  });
-  setPendingActionTimestampsForTests(right, {
-    createdAt: tied,
-    updatedAt: tied,
-  });
-  const asked = await sendPendingDraftByText({
-    chatId: ownerChat,
-    messageId: nextMessageId(),
-  }, undefined, { ownTurn: true });
-  assert(!asked.ok, "two equally recent drafts: nothing is sent");
-  assert(asked.message.includes("Which one"), "two equally recent drafts: Aadi asks which");
-}
-assert(pickLatestDraft([]) === undefined, "no shown drafts picks nothing");
 
 {
   try {

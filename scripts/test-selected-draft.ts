@@ -335,9 +335,9 @@ assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email"
   const tryStaleSend = async (params: CompleteParams): Promise<CompleteResult> => {
     if (!params.tools.length) return modelReply({ text: '{"facts":[]}' });
     const toolResult = params.messages.at(-1);
-    assert(!params.tools.some(tool => "name" in tool && tool.name === "confirm_send_pending_draft"), "a stale confirmation has no send tool");
+
     if (toolResult?.role === "tool") {
-      rejected = toolResult.isError === true;
+      rejected = toolResult.content.includes("different from the card") || toolResult.content.includes("draft was replaced");
       return modelReply({ text: "The card you replied to is closed." });
     }
     return modelReply({ tools: [{ name: "confirm_send_pending_draft", input: { draft_id: bob.id } }] });

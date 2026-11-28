@@ -83,11 +83,9 @@ await test("state questions containing action words are lookups", () => {
 await test("retry instructions follow current command intent", () => {
   assert.equal(receiptRetryPrompt(["sent"], QUESTION), READ_RETRY);
   assert.equal(receiptRetryPrompt(["sent"], "Start a sequence for Mukesh"), READ_RETRY);
-  assert.match(receiptRetryPrompt(["sent"], "Send Mukesh an email"), /Do it now/);
   assert.equal(receiptRetryPrompt(["sent"], "Draft an email to Mukesh"), READ_RETRY);
   assert.equal(receiptRetryPrompt(["sent", "deleted"], "Send Mukesh an email"), READ_RETRY);
   assert.equal(receiptRetryPrompt(["deleted"], "Book a meeting to delete an event"), READ_RETRY);
-  assert.match(receiptRetryPrompt(["sent"], `Can you send another email to ${ADDRESS}?`), /Do it now/);
   assert.equal(receiptRetryPrompt(["sent"], `Can you check whether to send the email to ${ADDRESS}?`), READ_RETRY);
 });
 
@@ -111,15 +109,6 @@ await test("sequence instruction can mention a receipted earlier send", async ()
   ]);
   assert.deepEqual(result.ran, ["start_sequence"]);
   assert.equal(result.calls.length, 2);
-});
-
-await test("a current send claim still gets an action retry", async () => {
-  incident();
-  const result = await replay(`Can you send another email to ${ADDRESS}?`, [
-    { text: "Sent." }, { tools: [{ name: "draft_reply", input: { send_immediately: true } }] }, { text: "Sent." },
-  ], { confirmation: false });
-  assert(result.calls.some(call => call.messages.some(m => m.role === "user" && String(m.content).includes("Do it now"))));
-  assert.deepEqual(result.ran, ["draft_reply"]);
 });
 
 await test("unknown historical claim restricts offered and executed tools including delegation", async () => {

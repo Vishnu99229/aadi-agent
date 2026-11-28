@@ -34,7 +34,6 @@ import {
   commandNotRunMessage,
   commandRetryPrompt,
   echoesEarlierReply,
-  sequenceTargets,
   type CommandKind,
 } from "./command_intent.js";
 import type { UsageTask } from "./usage.js";
@@ -127,7 +126,7 @@ const WRITTEN_ANSWER_NOTE =
   "Vishnu sent this as a voice note but wants the answer in writing. Give the full, detailed text answer. If he's saying yes to your offer to send something in writing, write out in full what you summarised before.";
 
 const SEND_ON_COMMAND_NOTE =
-  "Sending email: when Vishnu tells you in this message, in any language, to send an email or to reply to someone, call send_email straight away with the names as he said them. It finds the address and writes the email, so never ask him for an address or for wording first, and don't look the address up yourself. For a reply, find the thread with search_emails and pass thread_id. Ask him only when send_email tells you to. Never set send_immediately: it only makes a Send card. draft_new_email and draft_reply are for when he says draft, write or prepare. \"Remind me to email X\" stays set_reminder, and \"follow up on my email to X\" or \"remind me to follow up with X\" is start_sequence. Calendar: when he tells you to create an event, block his calendar or add something to it, call create_event right away, on the work calendar and 30 minutes unless he said otherwise, and don't ask which calendar or how long; to meet with someone, call book_meeting with the names as he said them; to delete, cancel or move an event, call delete_calendar_event or move_event. None of these needs a card or a tap, and create_meeting is unavailable. Use propose_calendar_event only when he says propose or park. For add_calendar_attendee, pass the name as he said it in attendee_email. Sending later: when he says send on Monday or a date or time, call send_email with send_on (and send_time if he gave one), and a short subject for a new email; these timers do exist. To schedule a Gmail draft he means, also pass its draft_id; never pass a draft_id for a different email, even one to the same person. A date inside what the email should say isn't a send date. To cancel one, call cancel_scheduled_send.";
+  "Sending email: when Vishnu tells you in this message, in any language, to send an email or to reply to someone, call send_email straight away with the names as he said them. It finds the address and writes the email, so never ask him for an address or for wording first, and don't look the address up yourself. For a reply, find the thread with search_emails and pass thread_id. Ask him only when send_email tells you to. Use confirm_send_pending_draft for delivery of an existing draft. A bare affirmation can confirm only the live card the current message replies to. When the owner asks for follow-ups on this turn’s delivery, call start_sequence with source current_send after the send tool returns. Pass follow-up count, interval, CTA and Cc policy as structured arguments. draft_new_email and draft_reply are for when he says draft, write or prepare. \"Remind me to email X\" stays set_reminder, and \"follow up on my email to X\" or \"remind me to follow up with X\" is start_sequence. Calendar: when he tells you to create an event, block his calendar or add something to it, call create_event right away, on the work calendar and 30 minutes unless he said otherwise, and don't ask which calendar or how long; to meet with someone, call book_meeting with the names as he said them; to delete, cancel or move an event, call delete_calendar_event or move_event. None of these needs a card or a tap, and create_meeting is unavailable. Use propose_calendar_event only when he says propose or park. For add_calendar_attendee, pass the name as he said it in attendee_email. Sending later: when he says send on Monday or a date or time, call send_email with send_on (and send_time if he gave one), and a short subject for a new email; these timers do exist. To schedule a Gmail draft he means, also pass its draft_id; never pass a draft_id for a different email, even one to the same person. A date inside what the email should say isn't a send date. To cancel one, call cancel_scheduled_send.";
 
 function formatCurrentTime(): string {
   return new Intl.DateTimeFormat("en-IN", {
@@ -944,7 +943,6 @@ async function runAgentLoop(
   const firstForced = forcing(intents);
   let toolChoice: ToolChoice | undefined = firstForced;
   let commandRetryUsed = false;
-  let sequenceRunInCode = false;
   if (intents.length > 0) {
     console.log(`Command turn: kinds=${intents.join(",")} forced=${firstForced?.name ?? "none"}`);
   }
@@ -1181,45 +1179,6 @@ async function runAgentLoop(
       ? []
       : intents.filter((kind) => !commandFamilyTools(kind).some((name) => toolsUsed.has(name)));
     if (response.toolCalls.length === 0 && missingKinds.length > 0) {
-      // A sequence request names the person in his words, so code runs the check
-      // itself rather than trusting the model's answer.
-      const targets =
-        missingKinds.includes("sequence") && !sequenceRunInCode ? sequenceTargets(guardText) : undefined;
-      if (targets) {
-        sequenceRunInCode = true;
-        console.log(`Command check: start_sequence run in code, targets=${targets.length} iteration=${iteration}`);
-        const calls: ToolCall[] = targets.map((target, index) => ({
-          id: `code_start_sequence_${iteration}_${index}`,
-          name: "start_sequence",
-          input: { prospect: target },
-          execution: "client",
-        }));
-        const turn: ToolTurn = {
-          iteration,
-          calledTools: calls.map((call) => call.name),
-          confirmation: options.sendConfirmation,
-          userText: guardText,
-          ctx: options.ctx,
-        };
-        const results: AgentToolResult[] = [];
-        for (const call of calls) {
-          const result = await runTool(call, turn, allowedTools);
-          results.push(result);
-          toolsUsed.add(call.name);
-          receipts.push({ name: call.name, success: isSuccessfulToolResult(result.content, result.isError), content: result.content });
-          freshResults.push(result.content);
-          actionResults.push(result.content);
-          if (result.isError) {
-            toolFailed = true;
-          }
-          if (saveAssistantMessage) {
-            saveMessage("tool", result.content, call.name);
-          }
-        }
-        messages.push({ role: "assistant", textParts: [], toolCalls: calls });
-        messages.push(...results.map(toolResultForModel));
-        continue;
-      }
       if (!commandRetryUsed) {
         commandRetryUsed = true;
         console.log(`Command check: retry kinds=${missingKinds.join(",")} iteration=${iteration}`);

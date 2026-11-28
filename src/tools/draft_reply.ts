@@ -1,4 +1,3 @@
-import { deliveryTimeHold, notASendCommand } from "../command_logic.js";
 import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import {
@@ -16,7 +15,7 @@ import {
 import { linkPublishedDraft } from "../action_context.js";
 import { parseAddressList } from "../mail_helpers.js";
 import { isSelfEmail } from "../mom_logic.js";
-import { emailReferenceForTurn } from "../email_references.js";
+import { unlinkedPhotoAddress } from "../email_references.js";
 import { groundGreeting, recipientGrounding } from "../email_grounding.js";
 import { emailProviderRead, EmailOperationError, noteEmailFailure } from "../email_outcomes.js";
 
@@ -111,10 +110,6 @@ export function dropSelf(header: string): string {
 }
 
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
-  const referencedEmail = emailReferenceForTurn(turn.confirmation?.chatId, turn.confirmation?.messageId);
-  if (referencedEmail) {
-    return `Not drafted: ${referencedEmail} was selected from the OCR/photo or quoted message, not from a Gmail thread. Use draft_new_email for that address; no old reply was created.`;
-  }
   const values = (input ?? {}) as {
     email_id?: unknown;
     body?: unknown;
@@ -130,10 +125,6 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("body must be a non-empty plain-text reply.");
   }
 
-  if (values.send_immediately === true) {
-    const hold = deliveryTimeHold(turn.userText ?? "");
-    if (hold) return hold;
-  }
   const emailId = values.email_id.trim();
   const mailbox = parseGoogleAccountFilter(values.account);
   const { account, message: original } = await emailProviderRead(() => resolveGmailMessage(
@@ -162,6 +153,9 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   const explicitTo = toAddressList(values.to).join(", ");
   const explicitCc = toAddressList(values.cc).join(", ");
+  if (unlinkedPhotoAddress(turn.confirmation?.chatId, turn.userText ?? "", [explicitTo, explicitCc])) {
+    return "Not drafted: a photo address is available only for a new email with a Send card.";
+  }
   const fromIsSelf = senders.every((item) =>
     isSelfEmail(item.email),
   );
@@ -204,7 +198,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   let cardNote = "";
   const sendImmediately =
-    values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
+    values.send_immediately === true;
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({
       draftId,

@@ -1,29 +1,24 @@
 // End-to-end send confirmation through the real bot handlers, with a fake
 // Telegram client, fake Gmail and a scripted model. Nothing real is sent.
-import { readFile } from "node:fs/promises";
 import { setApprovalsTestHooks } from "../src/approvals.ts";
-import { setToolInterceptorForTests } from "../src/agent.ts";
 import { bot } from "../src/bot.ts";
 import {
-  claimTelegramMessage,
   createPendingAction,
-  getLatestPendingSendAction,
   getPendingAction,
-  listMemories,
   setPendingActionDraftMeta,
   setPendingActionTelegramMessage,
-  transitionPendingAction,
   recordCardRecipients,
+  transitionPendingAction,
 } from "../src/db.ts";
+import { config } from "../src/config.ts";
 import { setCompleteForTests } from "../src/llm.ts";
-import { isSendDraftCommand } from "../src/send_triggers.ts";
 import {
   fakeGmail,
   fakeTelegramApi,
   nextMessageId,
-  scriptedModel,
+  modelReply,
+  type FakeDraftMeta,
   type GmailLog,
-  type ScriptedStep,
   type TelegramLog,
 } from "./fakes.ts";
 
@@ -33,20 +28,12 @@ function assert(condition: boolean, message: string): void {
   }
 }
 
-const SEND_PHRASES = [
-  "send it",
-  "send that",
-  "send the email",
-  "go ahead fire it off",
-  "haan bhej do",
-  "send cheyyu",
-];
-
 const gmail: GmailLog = { sent: [], created: [] };
 const cards: TelegramLog = { sent: [], edited: [] };
+const providerDrafts: Record<string, FakeDraftMeta> = {};
 setApprovalsTestHooks({
   telegram: fakeTelegramApi(cards),
-  gmailFor: () => fakeGmail(gmail),
+  gmailFor: () => fakeGmail(gmail, providerDrafts),
 });
 
 // Chat replies from the bot itself go through bot.api; record them instead.
@@ -63,196 +50,84 @@ bot.api.config.use(async (_prev, method, payload) => {
     chat.push(text);
     return {
       ok: true,
-      result: { message_id: nextMessageId(), date: 0, chat: { id: 1, type: "private" }, text },
+      result: { message_id: nextMessageId(), date: 0, chat: { id: config.ownerTelegramId, type: "private" }, text },
     } as never;
   }
   return { ok: true, result: true } as never;
 });
 await bot.init();
 
-// The scripted model stands in for the real one: CI checks the plumbing and
-// the guards; `npm run eval:send-intent` checks the real model's judgment.
-let background = '{"facts":[]}';
-const model = scriptedModel((text): ScriptedStep => {
-  if (SEND_PHRASES.includes(text)) {
-    const latest = getLatestPendingSendAction();
-    return {
-      tools: [
-        {
-          name: "confirm_send_pending_draft",
-          input: { draft_id: latest?.draft_id ?? "" },
-        },
-      ],
-    };
-  }
-  if (text === "change the time to 3pm") {
-    return { tools: [{ name: "update_draft", input: { draft_id: "x", body: "3pm" } }] };
-  }
-  if (text.startsWith("draft an email")) {
-    return {
-      tools: [
-        {
-          name: "draft_new_email",
-          input: { to: "priya@acme.com", subject: "Demo", body: "Hi Priya,\n\nVishnu" },
-        },
-      ],
-    };
-  }
-  return { text: "Send it, or want to change something?" };
-}, () => background);
-setCompleteForTests(model.fake);
-
-// Only confirm_send_pending_draft runs for real (against fake Gmail); other
-// tools are answered here so no Google account is touched.
-setToolInterceptorForTests((call) => {
-  if (call.name === "confirm_send_pending_draft") {
-    return undefined;
-  }
-  if (call.name === "draft_new_email") {
-    return "Draft created for priya@acme.com (work). Waiting for your Send tap.";
-  }
-  return "Draft updated.";
+let selectedByModel: string | undefined;
+let inspectContext: (context: string) => void = () => undefined;
+let modelCalls = 0;
+setCompleteForTests(async params => {
+  if (!params.tools.length) return modelReply({ text: '{"facts":[]}' });
+  if (params.messages.at(-1)?.role === "tool") return modelReply({ text: "I checked the draft." });
+  modelCalls += 1;
+  inspectContext(JSON.stringify(params.system));
+  return selectedByModel
+    ? modelReply({ tools: [{ name: "confirm_send_pending_draft", input: { draft_id: selectedByModel } }] })
+    : modelReply({ text: "There is no draft waiting." });
 });
 
-const created: number[] = [];
-
-function shownDraft(): number {
-  claimTelegramMessage(1, nextMessageId());
-  const action = createPendingAction(`draft-${nextMessageId()}`, null, "work");
+function shownDraft(to: string) {
+  const draftId = `draft-${nextMessageId()}`;
+  const action = createPendingAction(draftId, null, "work");
   const cardMessage = nextMessageId();
+  providerDrafts[draftId] = { to };
   setPendingActionTelegramMessage(action.id, cardMessage);
-  // A posted card shows the draft's people (the fake draft goes to Priya), recorded for
-  // its message as the card builder records it.
-  setPendingActionDraftMeta(action.id, { toHeader: "Priya <priya@acme.com>", ccHeader: "", subject: "Demo" });
-  recordCardRecipients(cardMessage, action.draft_id!, "Priya <priya@acme.com>");
-  created.push(action.id);
-  return action.id;
+  setPendingActionDraftMeta(action.id, { toHeader: to, ccHeader: "", subject: "Demo" });
+  recordCardRecipients(cardMessage, draftId, to);
+  return { actionId: action.id, draftId, cardMessage };
 }
 
-function clearPending(): void {
-  for (const id of created) {
-    transitionPendingAction(id, "pending", "discarded");
-  }
-}
-
-async function say(text: string): Promise<string[]> {
-  const before = chat.length;
+async function sayYes(replyTo?: number, chatId = config.ownerTelegramId): Promise<void> {
   const messageId = nextMessageId();
+  const date = Math.floor(Date.now() / 1000);
+  const telegramChat = { id: chatId, type: "private", first_name: "Vishnu" };
   await bot.handleUpdate({
     update_id: messageId,
     message: {
-      message_id: messageId,
-      date: Math.floor(Date.now() / 1000),
-      chat: { id: 1, type: "private", first_name: "Vishnu" },
-      from: { id: 1, is_bot: false, first_name: "Vishnu" },
-      text,
+      message_id: messageId, date, chat: telegramChat, text: "yes",
+      from: { id: config.ownerTelegramId, is_bot: false, first_name: "Vishnu" },
+      ...(replyTo === undefined ? {} : {
+        reply_to_message: {
+          message_id: replyTo, date, chat: telegramChat, text: "Email preview",
+          from: { id: 999, is_bot: true, first_name: "Aadi" },
+        },
+      }),
     },
   } as never);
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  return chat.slice(before);
 }
 
-// 1. Every phrase sends the pending draft, through the same dispatch as Send.
-for (const phrase of SEND_PHRASES) {
-  clearPending();
-  const id = shownDraft();
-  const draftId = getPendingAction(id)!.draft_id!;
-  const sentBefore = gmail.sent.length;
-  const modelCallsBefore = model.chatCalls();
-  const replies = await say(phrase);
-  assert(gmail.sent.length === sentBefore + 1, `"${phrase}" sends exactly one draft`);
-  assert(gmail.sent.at(-1) === draftId, `"${phrase}" sends the pending draft`);
-  assert(getPendingAction(id)!.status === "sent", `"${phrase}" marks the draft sent`);
-  assert(replies.some((line) => line.includes("Sent the draft")), `"${phrase}" confirms in chat`);
-  if (phrase === "send it") {
-    assert(model.chatCalls() === modelCallsBefore, '"send it" takes the fast path');
-  }
-}
+const older = shownDraft("Priya <priya@acme.com>");
+const newer = shownDraft("Lee <lee@beta.example>");
+inspectContext = context => {
+  assert(context.includes(`replies to the Send card for draft_id=${older.draftId}`), "the model sees the replied card");
+  assert(context.includes(newer.draftId), "the model sees the other live card");
+};
+selectedByModel = newer.draftId;
+await sayYes(older.cardMessage);
+assert(gmail.sent.length === 0, "the handler rejects the other draft even if the model picks it");
 
-// 2. With no pending draft, nothing sends and Aadi says so.
-clearPending();
-for (const phrase of SEND_PHRASES) {
-  const sentBefore = gmail.sent.length;
-  const replies = await say(phrase);
-  assert(gmail.sent.length === sentBefore, `"${phrase}" with no draft sends nothing`);
-  assert(
-    replies.some((line) => line.includes("No draft is waiting")),
-    `"${phrase}" with no draft says none is waiting`,
-  );
-}
+selectedByModel = older.draftId;
+await sayYes(older.cardMessage);
+assert(gmail.sent.join() === older.draftId, "yes sends only the replied card's draft");
+assert(getPendingAction(older.actionId)?.status === "sent", "delivery is recorded");
+assert(getPendingAction(newer.actionId)?.status === "pending", "the other card stays pending");
 
-// 3. An edit request never sends.
-{
-  clearPending();
-  const id = shownDraft();
-  const sentBefore = gmail.sent.length;
-  await say("change the time to 3pm");
-  assert(gmail.sent.length === sentBefore, "edit request sends nothing");
-  assert(getPendingAction(id)!.status === "pending", "edited draft stays pending");
-}
+inspectContext = context => assert(!context.includes(newer.draftId), "an unrelated chat does not see this chat's draft");
+selectedByModel = newer.draftId;
+await sayYes(newer.cardMessage, config.ownerTelegramId + 1);
+assert(gmail.sent.join() === older.draftId, "the same card message ID in a different chat authorizes nothing");
 
-// 4. Ambiguous replies ask instead of sending, and miss the fast path.
-for (const text of ["ok", "👍"]) {
-  clearPending();
-  const id = shownDraft();
-  const sentBefore = gmail.sent.length;
-  assert(!isSendDraftCommand(text), `"${text}" is not the fast path`);
-  const replies = await say(text);
-  assert(gmail.sent.length === sentBefore, `"${text}" sends nothing`);
-  assert(getPendingAction(id)!.status === "pending", `"${text}" leaves the draft pending`);
-  assert(
-    replies.includes("Send it, or want to change something?"),
-    `"${text}" asks what to do`,
-  );
-}
-
-// 5. Voice notes take the same path: the transcript goes to handleUserText,
-// and the voice handler has no send logic of its own.
-{
-  const botSrc = await readFile(new URL("../src/bot.ts", import.meta.url), "utf8");
-  const voiceStart = botSrc.indexOf('bot.on("message:voice"');
-  const voiceEnd = botSrc.indexOf("async function answerDocumentCaption");
-  const voiceHandler = botSrc.slice(voiceStart, voiceEnd);
-  assert(voiceStart >= 0 && voiceEnd > voiceStart, "voice handler found");
-  assert(
-    /handleUserText\(ctx, ctx\.from\.id, transcript/.test(voiceHandler),
-    "voice transcript goes through handleUserText",
-  );
-  assert(
-    !/sendPendingDraftByText|isSendDraftCommand|confirm_send/.test(voiceHandler),
-    "voice handler has no separate send path",
-  );
-}
-
-// 6. Creating a draft sends exactly one chat confirmation; memory stays silent
-// even when the extractor returns a fact.
-{
-  clearPending();
-  background = JSON.stringify({
-    facts: [
-      {
-        content: "Aadi plans to email Priya about the demo",
-        category: "plan",
-        tag: "work",
-        event_date: null,
-        weight: "important",
-        update_of_id: null,
-      },
-    ],
-  });
-  const memoriesBefore = listMemories().length;
-  const replies = await say("draft an email to priya@acme.com about the demo");
-  background = '{"facts":[]}';
-  assert(replies.length === 1, `draft request sends exactly one chat message (got ${replies.length})`);
-  assert(replies[0]!.startsWith("Draft created"), "that message is the draft confirmation");
-  assert(
-    !chat.some((line) => /^(Updated|Noted):/.test(line)),
-    "no memory confirmation line ever reaches chat",
-  );
-  assert(listMemories().length === memoriesBefore + 1, "the memory was still saved, silently");
-}
+transitionPendingAction(newer.actionId, "pending", "discarded");
+inspectContext = context => assert(context.includes("No email draft is waiting"), "there is no live card in the model context");
+const before = modelCalls;
+await sayYes();
+assert(modelCalls > before, "the affirmation reaches the model");
+assert(gmail.sent.join() === older.draftId, "yes with no live card sends nothing even if the model supplies a closed ID");
 
 setCompleteForTests(undefined);
-setToolInterceptorForTests(undefined);
-console.log("Send intent checks passed.");
+console.log("Send confirmation checks passed.");
 process.exit(0);

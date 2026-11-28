@@ -27,7 +27,7 @@ import {
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 import { sameConversation } from "../subject_logic.js";
-import { emailReferenceForTurn } from "../email_references.js";
+import { unlinkedPhotoAddress } from "../email_references.js";
 import {
   emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, noteEmailNotice,
   oneLine, outcomeRecipient, recordEmailOutcome,
@@ -111,10 +111,6 @@ export function draftUpdateNotice(result: string): string | undefined {
 }
 
 export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
-  const referencedEmail = emailReferenceForTurn(turn?.confirmation?.chatId, turn?.confirmation?.messageId);
-  if (referencedEmail) {
-    return `Not updated: the owner selected ${referencedEmail} from OCR/a quoted message. This is a new recipient reference, not permission to rewrite an older Gmail draft.`;
-  }
   const values = (input ?? {}) as {
     draft_id?: unknown;
     body?: unknown;
@@ -140,6 +136,10 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     throw new Error("Pass body, to, cc, subject, or a combination.");
   }
 
+  const changedRecipients = [...toAddressList(values.to), ...toAddressList(values.cc)];
+  if (unlinkedPhotoAddress(turn?.confirmation?.chatId, turn?.userText ?? "", changedRecipients)) {
+    return "Not updated: a photo address is available only for a new email with a Send card.";
+  }
   const draftId = values.draft_id.trim();
   if (latestDraftAction(draftId)?.status === "superseded") return DRAFT_REPLACED;
   const hintedAccount = latestDraftAction(draftId)?.google_account ?? accountBoundToDraft(draftId);

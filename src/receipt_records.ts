@@ -1,5 +1,5 @@
 import { db } from "./db.js";
-import { detectClaimedActions, hasCurrentSendRequest, requestedClaimAction, type ClaimAction } from "./receipt.js";
+import { detectClaimedActions, type ClaimAction } from "./receipt.js";
 
 interface SendRecord {
   status: string;
@@ -93,8 +93,8 @@ export interface RecordedReceipt {
 export function recordedReceipt(context: ReceiptRecordContext): RecordedReceipt | undefined {
   const denial = contradictsRecordedSend(context.reply);
   const claims = detectClaimedActions(context.reply);
-  const sent = (denial || claims.includes("sent")) && !hasCurrentSendRequest(context.ownerText);
-  const scheduled = claims.includes("scheduled") && !requestedClaimAction(context.ownerText, "scheduled");
+  const sent = denial || claims.includes("sent");
+  const scheduled = claims.includes("scheduled");
   if (!sent && !scheduled) return undefined;
   if (/\b(?:just (?:sent|emailed)|sent (?:it )?(?:just )?now|sent .*\b(?:this turn|just now))\b/i.test(context.reply)) return undefined;
   const records = sendRecords();
