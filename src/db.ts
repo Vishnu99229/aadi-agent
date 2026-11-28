@@ -1570,6 +1570,16 @@ db.exec(`
   -- A card that told him "You emailed X at T. Send another?", written only by the card
   -- builder once Telegram confirmed it. His tap on that card, or his own message after
   -- it, confirms another email to X for sends up to sent_at.
+  -- An address his own turn pointed at in a photo's text or a quoted message: usable as
+  -- that email's recipient (always through the new-address card), never as a fact about
+  -- who a name means, an invite or an attendee, unless he types it himself.
+  CREATE TABLE IF NOT EXISTS external_addresses (
+    chat_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, email)
+  );
   CREATE TABLE IF NOT EXISTS card_recent_send_warnings (
     message_id INTEGER NOT NULL,
     card_key TEXT NOT NULL,
@@ -2417,6 +2427,22 @@ export function conversationParticipants(chatId: number, sinceIso: string): Conv
      WHERE chat_id = ? AND seen_at >= ? ORDER BY seen_at DESC`,
   ).all(chatId, sinceIso) as Array<{ email: string; name: string; source: string; source_ref: string; seen_at: string }>;
   return rows.map((row) => ({ email: row.email, name: row.name, source: row.source, sourceRef: row.source_ref, seenAt: row.seen_at }));
+}
+
+/** His own turn pointed at this address in a photo or a quoted message. */
+export function recordExternalAddress(chatId: number, email: string, source: string, now = new Date()): void {
+  const address = normalizedEmail(email);
+  if (!address.includes("@")) return;
+  db.prepare(
+    `INSERT INTO external_addresses (chat_id, email, source, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(chat_id, email) DO UPDATE SET source = excluded.source, created_at = excluded.created_at`,
+  ).run(chatId, address, source, now.toISOString());
+}
+
+/** Addresses this chat only ever got from a photo or a quoted message. */
+export function externalAddresses(chatId: number): Set<string> {
+  return new Set((db.prepare("SELECT email FROM external_addresses WHERE chat_id = ?").all(chatId) as Array<{ email: string }>)
+    .map((row) => row.email));
 }
 
 /** The people an Aadi message was about, recorded when it was posted. */
@@ -6134,6 +6160,22 @@ export function claimCommandSend(input: {
     )
     .run(input.key, input.account, input.threadId, input.to ?? null);
   return result.changes === 1;
+}
+
+/** A draft Aadi sent at once with no card (sendCreatedDraftNow): no pending_actions row
+ *  exists for it, so it is recorded like a direct command send, where recentSendsTo and
+ *  the receipts read it. */
+export function recordImmediateDraftSend(input: {
+  key: string;
+  account: string;
+  threadId: string | null;
+  to: string;
+  sentMessageId: string;
+}): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO command_sends (idem_key, status, account, thread_id, to_header, sent_message_id, sent_at)
+     VALUES (?, 'sent', ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+  ).run(input.key, input.account, input.threadId, input.to, input.sentMessageId);
 }
 
 export function getCommandSendByKey(

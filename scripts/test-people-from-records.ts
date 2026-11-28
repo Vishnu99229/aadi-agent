@@ -3,9 +3,9 @@
 // replayed against the real handlers with a fake Gmail and Telegram. Nothing real is sent.
 import type { Api, Context } from "grammy";
 import type { gmail_v1 } from "googleapis";
-import { focusSelectedDraft } from "../src/action_context.ts";
-import { handleApprovalCallback, queueDraftApproval, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
-import { scheduledSendVerdict, sendEmailFromTool, setCommandEmailTestHooks, type CommandRequest } from "../src/command_email.ts";
+import { clearPendingAction, focusSelectedDraft, savePendingAction } from "../src/action_context.ts";
+import { handleApprovalCallback, queueDraftApproval, sendCreatedDraftNow, sendPendingDraftByText, setApprovalsTestHooks } from "../src/approvals.ts";
+import { resolveCommandAttendee, scheduledSendVerdict, sendEmailFromTool, setCommandEmailTestHooks, type CommandRequest } from "../src/command_email.ts";
 import { config } from "../src/config.ts";
 import { renderConfirmCard } from "../src/confirm_cards.ts";
 import { closedDraftMiss, closedEmailFacts } from "../src/context_draft.ts";
@@ -16,10 +16,16 @@ import {
   createDocument,
   getClosedEmailContext,
   getPendingAction,
+  getScheduledSend,
   linkTelegramMessageParticipants,
+  listOpenScheduledSends,
   recordCommandSendSent,
   recordConversationParticipants,
+  recordExternalAddress,
+  recordKnownRecipient,
 } from "../src/db.ts";
+import { bindEmailReferenceForTurn } from "../src/email_references.ts";
+import { fireScheduledSend } from "../src/scheduled_sends.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
@@ -89,6 +95,9 @@ interface Draft { to: string; cc: string; subject: string; body: string; threadI
 const drafts = new Map<string, Draft>();
 const draftSends: string[] = [];
 const messageSends: Array<{ to: string; cc: string }> = [];
+/** Holds Gmail's message send open, to put another send in the middle of one. */
+let holdSends: Promise<void> | undefined;
+let onSendStarted: (() => void) | undefined;
 let draftCounter = 0;
 const headerOf = (raw: string, name: string) =>
   new RegExp(`^${name}: (.*)$`, "im").exec(raw.split(/\r?\n\r?\n/)[0] ?? "")?.[1]?.trim() ?? "";
@@ -126,6 +135,8 @@ function gmailFake(): gmail_v1.Gmail {
           return { data: toGmail(found) };
         },
         send: async ({ requestBody }: { requestBody: { raw: string } }) => {
+          onSendStarted?.();
+          if (holdSends) await holdSends;
           const raw = Buffer.from(requestBody.raw, "base64url").toString("utf8");
           messageSends.push({ to: headerOf(raw, "To"), cc: headerOf(raw, "Cc") });
           return { data: { id: `sent-${messageSends.length}` } };
@@ -390,6 +401,120 @@ setRecentSendGuardForTests(true);
   const bot = await readFile(new URL("../src/bot.ts", import.meta.url), "utf8");
   assert(!bot.includes("looksLikeEmailContext(userText)") && !/repl\(\?:y\|ied\|ies\)/.test(bot), "no word trigger names the closed email");
   assert(!bot.includes("focusMessageId === previous") && !bot.includes("replyDraftThread"), "no focus rule and no thread scoping");
+}
+
+// ---- 10. Two commands to the same known person at once: one email and one card ----
+{
+  const chat = 20;
+  const address = "both.at.once@known.example";
+  recordKnownRecipient(address, "test");
+  const before = messageSends.length;
+  const results = await Promise.all([
+    sendEmailFromTool({ to: [address], instruction: "say hello" }, ownTurn(chat, `email ${address} saying hello`)),
+    sendEmailFromTool({ to: [address], instruction: "say hello again" }, ownTurn(chat, `email ${address} saying hello again`)),
+  ]);
+  assert(messageSends.length === before + 1, `two commands at once send one email: ${results.join(" | ")}`);
+  assert(results.filter((result) => result.startsWith("Sent to")).length === 1, `one of them is sent: ${results.join(" | ")}`);
+  assert(results.some((result) => /You emailed .+ at \d\d:\d\d\. Send another\?/.test(result)), `the other is the card: ${results.join(" | ")}`);
+}
+
+// ---- 11. A Retry while that send is still going out: the card, not a second email ----
+{
+  const chat = 21;
+  const address = "retry.during@known.example";
+  recordKnownRecipient(address, "test");
+  let letGmailFinish!: () => void;
+  holdSends = new Promise<void>((resolve) => { letGmailFinish = resolve; });
+  const started = new Promise<void>((resolve) => { onSendStarted = resolve; });
+  const before = messageSends.length;
+  const first = sendEmailFromTool({ to: [address], instruction: "say hello" }, ownTurn(chat, `email ${address} saying hello`));
+  await started;
+  onSendStarted = undefined;
+  // His Retry: the same words as a new turn, decided while Gmail is still sending.
+  const retry = sendEmailFromTool({ to: [address], instruction: "say hello" }, ownTurn(chat, `email ${address} saying hello`));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  letGmailFinish();
+  holdSends = undefined;
+  const [firstResult, retryResult] = await Promise.all([first, retry]);
+  assert(firstResult.startsWith("Sent to") && messageSends.length === before + 1, `the first goes out once: ${firstResult}`);
+  assert(/You emailed .+ at \d\d:\d\d\. Send another\?/.test(retryResult), `the Retry is the card: ${retryResult}`);
+}
+
+// ---- 12. A scheduled email firing right after a manual one waits for his Confirm ----
+{
+  const chat = 22;
+  const address = "scheduled.after@known.example";
+  recordKnownRecipient(address, "test");
+  const tomorrow = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date(Date.now() + 24 * 60 * 60 * 1000));
+  const scheduled = await sendEmailFromTool(
+    { to: [address], instruction: "say hello", send_on: tomorrow, send_time: "10:00", subject: "Hello" },
+    ownTurn(chat, `email ${address} tomorrow at 10 am saying hello`),
+  );
+  const row = listOpenScheduledSends().find((item) => item.request.includes(address));
+  assert(row && row.status === "scheduled", `it is scheduled: ${scheduled}`);
+  const before = messageSends.length;
+  // The manual email (from another chat here, so the schedule's open context can't touch
+  // it: the guard reads the send records, wherever they came from).
+  const manual = await sendEmailFromTool({ to: [address], instruction: "quick note" }, ownTurn(26, `email ${address} saying quick note`));
+  assert(manual.startsWith("Sent to") && messageSends.length === before + 1, `the manual email goes out: ${manual}`);
+  const cardsBefore = told.length;
+  await fireScheduledSend(getScheduledSend(row.id)!, new Date());
+  assert(messageSends.length === before + 1, "the scheduled one doesn't follow it out");
+  assert(getScheduledSend(row.id)?.status === "held", "it is held for his Confirm");
+  assert(told.slice(cardsBefore).some((card) => /You emailed .+ at \d\d:\d\d\. Send another\?/.test(card.text)), "on a card that says why");
+}
+
+// ---- 13. A draft sent at once with no card is a recent send the guard can see ----
+{
+  const address = "immediate.draft@known.example";
+  recordKnownRecipient(address, "test");
+  drafts.set("d-now", { to: `Imm Ediate <${address}>`, cc: "", subject: "Now", body: "Hi,\n\nNow." });
+  settings.sendOnCommandEnabled = false;
+  const result = await sendCreatedDraftNow({
+    draftId: "d-now", googleAccount: "work", confirmation: { chatId: 23, messageId: (messageCounter += 1) },
+    ownTurn: true, userText: `send ${address} the note now`,
+  });
+  settings.sendOnCommandEnabled = true;
+  assert(result.ok, `it goes out: ${JSON.stringify(result)}`);
+  assert(recentSendsFor([address]).length === 1, "and is recorded where the recent-send check reads");
+}
+
+// ---- 14. "Email this address" on a photo: the card, even for an address he knows ----
+{
+  const chat = 24;
+  const address = "photo.known@known.example";
+  recordKnownRecipient(address, "test");
+  const turn = ownTurn(chat, "email this address saying we met at BTS");
+  bindEmailReferenceForTurn(chat, turn.confirmation.messageId, address);
+  recordExternalAddress(chat, address, "document:1");
+  const before = messageSends.length;
+  const result = await sendEmailFromTool({ to: [address], instruction: "say we met at BTS" }, turn);
+  assert(result.includes(`New address: ${address}. Tap Send to confirm.`) && messageSends.length === before, `a photo's address gets the card: ${result}`);
+}
+
+// ---- 15. A photo's address is never an attendee or an invitee unless he types it ----
+{
+  const chat = 25;
+  const address = "ocr.attendee@photo.example";
+  recordExternalAddress(chat, address, "document:2");
+  // An open email made from that photo lists it as a resolved recipient.
+  savePendingAction(chat, {
+    action: "send_email", status: "open", ownerWords: "", confirmChat: chat, confirmMessage: 1, updatedAt: new Date().toISOString(),
+    email: { to: [{ query: address, name: "", email: address, resolved: true }], cc: [], notes: [], purpose: "x", account: "work", waiting: "confirm" },
+  });
+  const context = (text: string) => ({ chatId: chat, messageId: (messageCounter += 1), ownerText: text });
+  const attendee = await resolveCommandAttendee(address, context("add him to the standup"));
+  assert("refused" in attendee, `never added from the photo: ${JSON.stringify(attendee)}`);
+  const invite = await resolvePersonFromFacts(address, context("book a meeting with him"));
+  assert(invite.kind === "none", "nor invited to a meeting");
+  const typedAttendee = await resolveCommandAttendee(address, context(`add ${address} to the standup`));
+  assert("email" in typedAttendee && typedAttendee.email === address, "his typed address is added");
+  const typedInvite = await resolvePersonFromFacts(address, context(`book a meeting with ${address}`));
+  assert(typedInvite.kind === "one", "and invited");
+  // The photo's record stays; only the open email is put away before he types it.
+  clearPendingAction(chat);
+  const typedEmail = await sendEmailFromTool({ to: [address], instruction: "say hi" }, ownTurn(chat, `email ${address} saying hi`));
+  assert(typedEmail.includes(`New address: ${address}`), `and a typed email to it goes through the card as any new address: ${typedEmail}`);
 }
 
 setRecentSendGuardForTests(false);

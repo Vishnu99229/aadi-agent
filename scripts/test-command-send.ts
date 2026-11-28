@@ -22,6 +22,7 @@ import {
   referencesAttachment,
 } from "../src/command_logic.ts";
 import { commandIntents } from "../src/command_intent.ts";
+import { rememberContactChoice } from "../src/contacts.ts";
 import { resetAgentModelSettings, resolveAgentModel, setAgentModelSetting } from "../src/models/agent_models.ts";
 import { commandWriterInput, COMMAND_WRITER_SYSTEM } from "../src/command_writer.ts";
 import { execFileSync } from "node:child_process";
@@ -1167,6 +1168,10 @@ eventsOnCalendar.push(
   const count = inserted.length;
   const blocked = await run("create_meeting", { person: "evil@attacker.example", start_time: FUTURE }, "create a meeting");
   assert(blocked.includes("book_meeting") && inserted.length === count, "create_meeting refuses");
+  // An attendee is an address he typed or one of his confirmed contacts.
+  rememberContactChoice("Sanchit Rao", { name: "Sanchit Rao", emails: ["sanchit@squadstack.ai"], sources: ["gmail"] });
+  rememberContactChoice("Sanchit Mehta", { name: "Sanchit Mehta", emails: ["sanchit@vinfer.ai"], sources: ["gmail"] });
+  rememberContactChoice("Arjun", { name: "Arjun Nair", emails: ["arjun@acme.example"], sources: ["gmail"] });
   const injected = await run("add_calendar_attendee", { event_title: "Standup A", attendee_email: "evil@attacker.example" }, "add Arjun to standup A");
   assert(injected.includes("own message") && patched.length === 0, "an address from read text isn't added");
   const many = await run("add_calendar_attendee", { event_title: "Standup A", attendee_email: "Sanchit" }, "add Sanchit to standup A");

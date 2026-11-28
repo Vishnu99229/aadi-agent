@@ -2,6 +2,7 @@ import { InlineKeyboard, type Context } from "grammy";
 import {
   commandApi,
   readThread,
+  scheduledAcknowledged,
   scheduledSendVerdict,
   scheduledWhen,
   writeAndSend,
@@ -243,8 +244,25 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
       prepared: snapshot,
       explicitSubject: request.subjectEdited ? request.finalSubject || request.subject : undefined,
       verdict,
+      // Rechecked right before Gmail: a send to them since this verdict holds it.
+      acknowledged: scheduledAcknowledged(request),
+      holdOnRecentSend: true,
     },
   );
+  if (outcome.result === "recent_send") {
+    // Someone on To was emailed while this was being prepared: he confirms another.
+    if (holdScheduledSendForConfirm(row.id)) {
+      console.log(`Scheduled send ${row.id}: status -> held for confirm (recent send at delivery)`);
+      await tellCard({
+        kind: "schedule_confirm",
+        scheduleId: row.id,
+        ...peopleOf(request),
+        headline: `Held, not sent: ${row.item_text}\nTap Confirm to send it.`,
+        recentSends: outcome.recentSends ?? [],
+      });
+    }
+    return;
+  }
   if (outcome.result === "sent") {
     recordScheduledSendSent(row.id, outcome.messageId ?? null);
     markTaskDone(row.task_id);

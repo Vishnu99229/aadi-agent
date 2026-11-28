@@ -48,6 +48,9 @@ export interface SendFacts {
   /** Aadi's sends to these To addresses in the last 30 minutes that no card he acted
    *  on has shown him. Any of them makes this a card, never a second silent send. */
   recentSends?: readonly RecentSend[];
+  /** Addresses taken from something he pointed at (a photo's text, a quoted message):
+   *  new on the card even if he has emailed them, until a card he tapped showed them. */
+  external?: ReadonlySet<string>;
 }
 
 function normalize(email: string): string {
@@ -70,7 +73,8 @@ export function decideSendAction(facts: SendFacts): SendVerdict {
     return { action: "card", newAddresses: [], notOwnTurn: !facts.ownTurn };
   }
   const newAddresses = recipients.filter(
-    (email) => !facts.known.has(email) && !(facts.confirmed?.has(email) ?? false),
+    (email) => !(facts.confirmed?.has(email) ?? false) &&
+      (!facts.known.has(email) || (facts.external?.has(email) ?? false)),
   );
   const repeats = (facts.recentSends ?? []).filter((send) => recipients.includes(normalize(send.email)));
   if (!facts.ownTurn || newAddresses.length > 0 || repeats.length > 0) {

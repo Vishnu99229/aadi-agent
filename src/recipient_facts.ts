@@ -12,7 +12,8 @@
  *      address he has sent to, a memory he told Aadi himself, and the To/Cc headers of
  *      his own Sent mail.
  * Headers and attendee lists only: an address that is only in an email body or a photo's
- * text is never one of these. The first tier with any match decides; several there is a
+ * text is never one of these. (An address from a photo he replied to is send_email's
+ * alone, and always goes through the new-address card: see sendEmailFromTool.) The first tier with any match decides; several there is a
  * question, none at all is a question. Downstream checks (the new-address card, the
  * recent-send card, domain blocks) still apply to whatever this returns.
  *
@@ -27,6 +28,7 @@ import {
   cardRecipientsOnMessage,
   conversationParticipants,
   draftCardForTelegramMessage,
+  externalAddresses,
   latestDraftAction,
   listCanonicalContacts,
   listKnownRecipientEmails,
@@ -35,7 +37,7 @@ import {
   telegramMessageParticipants,
 } from "./db.js";
 import { chosenContact } from "./contacts.js";
-import { emailReferenceForTurn, repliedMessageForTurn } from "./email_references.js";
+import { repliedMessageForTurn } from "./email_references.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
@@ -110,9 +112,16 @@ export function conversationPeople(context: PeopleContext): Map<string, string> 
     );
     for (const email of cardRecipientsOnMessage(replied)) add(found, { email, name: named.get(email) ?? "" });
   }
-  const referenced = emailReferenceForTurn(context.chatId, context.messageId, now.getTime());
-  if (referenced) add(found, { email: referenced, name: "" });
   for (const option of context.offered ?? []) add(found, option);
+  // An address that came from a photo or a quoted message he pointed at (an open email
+  // made from one, say) is never a fact about people unless he typed it himself.
+  const typed = new Set([
+    ...fromHeader(context.ownerText).map((item) => lower(item.email)),
+    ...(pending?.ownerSupplied ?? []).map((item) => lower(item.email)),
+  ]);
+  for (const email of externalAddresses(context.chatId)) {
+    if (!typed.has(email)) found.delete(email);
+  }
   return found;
 }
 
@@ -134,6 +143,25 @@ export function noteRepliedPeople(chatId: number, repliedMessageId: number, now 
     const errorType = error instanceof Error ? error.name : "UnknownError";
     console.error(`Recipient facts: replied people not recorded (${errorType})`);
   }
+}
+
+/** His confirmed contacts (email to name), and the addresses he picked for exactly this
+ *  name before. Records only. */
+export function confirmedContacts(query = ""): { people: Map<string, string>; picked: Set<string> } {
+  const people = new Map<string, string>();
+  for (const row of listCanonicalContacts()) {
+    if (!row.confirmed) continue;
+    let emails: string[] = [];
+    try {
+      emails = JSON.parse(row.emails_json) as string[];
+    } catch {
+      continue;
+    }
+    for (const email of emails) add(people, { email, name: row.display_name });
+  }
+  const choice = query ? chosenContact(query) : undefined;
+  for (const email of choice?.emails ?? []) add(people, { email, name: choice?.name || query });
+  return { people, picked: new Set((choice?.emails ?? []).map(lower)) };
 }
 
 /** Tier 2, without Gmail: confirmed contacts, the person he picked for this name before,

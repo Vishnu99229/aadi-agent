@@ -88,6 +88,7 @@ import {
   getMeetingBrief,
   getSetting,
   pruneProcessedMessages,
+  recordExternalAddress,
   saveMessage,
   setSetting,
 } from "./db.js";
@@ -1517,6 +1518,11 @@ async function handleUserText(
     // The people that message was about (a meeting brief's attendees, a card's To/Cc)
     // are who "him" can mean in this chat from now on.
     noteRepliedPeople(ctx.chat.id, ctx.message.reply_to_message.message_id);
+  }
+  // An address his own turn pointed at in a photo or a quoted message: only ever that
+  // email's recipient (through the new-address card), never a fact about people.
+  if (emailReference.kind === "one" && ctx.chat) {
+    recordExternalAddress(ctx.chat.id, emailReference.email, emailReference.documentId ? `document:${emailReference.documentId}` : "quoted");
   }
   if (emailReference.kind === "missing" && (ctx.message?.reply_to_message || mentionsPhotoReference(userText))) {
     await ctx.reply("I couldn't find an email address in that message or the latest OCR photo. Reply directly to the OCR result, or share the address. I haven't drafted or sent anything.");

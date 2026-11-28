@@ -5,6 +5,7 @@ import {
   asksForAttachment,
   deliveryTimeHold,
   isAutomatedAddress,
+  mailboxMatches,
   mentionsSendDate,
   nameTokens,
   namedInOwnWords,
@@ -36,7 +37,7 @@ import { resolveRecipient, type RecipientMatch } from "./command_recipients.js";
 import { confirmsExistingDraft, emailReferenceForTurn, refersToEarlierEmail, repliedMessageForTurn } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
-import { cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
+import { cardReason, decideSendAction, recentSendLine, type RecentSend, type SendVerdict } from "./security/send_decision.js";
 import { choiceCardKey, postConfirmCard } from "./confirm_cards.js";
 import { withoutFollowupClause } from "./command_intent.js";
 import { followupsAfterSend } from "./sequences.js";
@@ -54,6 +55,7 @@ import {
   listOpenCommandChoices,
   setPendingActionFollowups,
   draftRecipientsShownBefore,
+  externalAddresses,
   recentSendWarningsForMessage,
   recentSendWarningsShownBefore,
   claimCommandSend,
@@ -68,7 +70,7 @@ import {
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
 import { recentSendsFor } from "./recent_sends.js";
-import { personRefusal, resolvePersonFromFacts } from "./recipient_facts.js";
+import { confirmedContacts, personRefusal, resolvePersonFromFacts } from "./recipient_facts.js";
 import { parseAddressList, type ParsedMailbox } from "./address_list.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
@@ -97,7 +99,7 @@ import { SendNotApprovedError } from "./security/send_approval.js";
 import { installCaptionEditFallback } from "./telegram_io.js";
 import { assertTestSeam } from "./test_seam.js";
 import {
-  claimRecipientDelivery, DRAFT_REPLACED, DRAFT_REREAD_FAILED, editAndSendPendingDraft,
+  awaitRecipientDelivery, DRAFT_REPLACED, DRAFT_REREAD_FAILED, editAndSendPendingDraft,
   eligibleDrafts, pickLatestDraft, queueDraftApproval, repostPendingCard, sendPendingDraftByText, showReplacedDrafts,
 } from "./approvals.js";
 import { holdForVoiceNote } from "./voice_cards.js";
@@ -118,8 +120,10 @@ export interface Outcome {
   hint?: string;
   /** He has already seen this in Telegram. */
   shown?: boolean;
-  result?: "sent" | "not_sent" | "unknown" | "write_failed" | "cancelled";
+  result?: "sent" | "not_sent" | "unknown" | "write_failed" | "cancelled" | "recent_send";
   messageId?: string;
+  /** For recent_send: who was emailed in the window, from records, when it was held. */
+  recentSends?: RecentSend[];
   /** The same command again: its follow-ups were handled the first time. */
   repeat?: boolean;
   recoverable?: boolean;
@@ -168,6 +172,9 @@ export interface CommandRequest {
   /** He tapped Confirm on a card that said "You emailed X at T": address to the newest
    *  send that card named. Later sends to them still wait for him. */
   recentSendsConfirmed?: Record<string, string>;
+  /** Addresses taken from a photo or quoted message he pointed at, never typed or known
+   *  from records: the card always shows them as new. */
+  externalRecipients?: string[];
 }
 
 let telegram: Api | undefined;
@@ -483,11 +490,25 @@ async function sendVerdictFor(
     recipients,
     known: await knownRecipients(recipients),
     confirmed,
-    recentSends: recentSendsFor(
-      toEmailsOf(request),
-      request.draftId && confirmation ? recentSendWarningsShownBefore(request.draftId, confirmation.messageId) : new Map(),
-    ),
+    recentSends: recentSendsFor(toEmailsOf(request), acknowledgedFor(request, confirmation)),
+    external: externalOf(request),
   });
+}
+
+/** The recent sends a card for this draft warned him about before his message. */
+function acknowledgedFor(
+  request: CommandRequest,
+  confirmation: { chatId: number; messageId: number } | undefined,
+): Map<string, string> {
+  return request.draftId && confirmation
+    ? recentSendWarningsShownBefore(request.draftId, confirmation.messageId)
+    : new Map<string, string>();
+}
+
+/** Addresses taken from something he pointed at (a photo's text, a quoted message):
+ *  always new on the card, even when known. */
+function externalOf(request: CommandRequest): Set<string> {
+  return new Set((request.externalRecipients ?? []).map((email) => email.toLowerCase()));
 }
 
 /** The To addresses a request goes to (never Cc), lowercased. */
@@ -512,6 +533,12 @@ export async function writeAndSend(
     /** decideSendAction's answer for these recipients. Anything but "send" leaves the
      *  written email as a draft with its card. */
     verdict: SendVerdict;
+    /** The recent sends a card warned him about before he confirmed (email to the newest
+     *  send it named). Rechecked right before Gmail, so a send since then holds it. */
+    acknowledged?: ReadonlyMap<string, string>;
+    /** A scheduled send: a recent send returns result recent_send for the caller to hold
+     *  for his Confirm, instead of making a Send card. */
+    holdOnRecentSend?: boolean;
   },
 ): Promise<Outcome> {
   const to = request.to.map((slot) => slot.mailbox!);
@@ -630,10 +657,37 @@ export async function writeAndSend(
   // Narrowed above; a closure below would lose the narrowing of options.verdict.
   const decision = options.verdict;
   const signatureHtml = await signatureHtmlFor(account);
-  const release = claimRecipientDelivery(account.id, toHeader);
+  const release = await awaitRecipientDelivery(account.id, toHeader);
   if (!release) {
     if (getCommandSendByKey(key)) return gateRefusal("already_handled");
     return { text: "Not sent: another email to that recipient is already going out.", result: "cancelled", recoverable: true };
+  }
+  // Holding the claim, right before Gmail. This same command already went (a second call
+  // that waited for the first): nothing more. Anyone on To emailed since the decision, or
+  // in the window without a card that warned him first: a card, never a second send.
+  if (getCommandSendByKey(key)) {
+    release();
+    return gateRefusal("already_handled");
+  }
+  const repeats = recentSendsFor(to.map((item) => item.email.toLowerCase()), options.acknowledged ?? new Map());
+  if (repeats.length > 0) {
+    release();
+    console.log(`Command send: held at delivery, recipient emailed recently key=${key.slice(0, 8)}`);
+    if (options.holdOnRecentSend) {
+      return { text: `Not sent: ${recentSendLine(repeats)}`, result: "recent_send", recentSends: repeats };
+    }
+    return showSendCard({
+      key,
+      request,
+      account,
+      confirmation,
+      verdict: { action: "card", newAddresses: [], notOwnTurn: false, recentSends: repeats },
+      toHeader,
+      ccHeader,
+      subject,
+      body: written.body,
+      reply: !newConversation && thread ? { threadId: request.threadId!, inReplyTo: thread.inReplyTo, references: thread.references } : undefined,
+    });
   }
   let messageId: string;
   let replacedDrafts: PendingAction[];
@@ -988,8 +1042,14 @@ export async function scheduledSendVerdict(request: CommandRequest): Promise<Sen
     confirmed: new Set((request.confirmedRecipients ?? []).map((email) => email.toLowerCase())),
     // At fire time: another email to someone Aadi emailed in the last 30 minutes waits
     // for his Confirm, unless he confirmed it on a card that said so.
-    recentSends: recentSendsFor(toEmailsOf(request), new Map(Object.entries(request.recentSendsConfirmed ?? {}))),
+    recentSends: recentSendsFor(toEmailsOf(request), scheduledAcknowledged(request)),
+    external: externalOf(request),
   });
+}
+
+/** What his Confirm on a held schedule's card covered: email to the newest send it named. */
+export function scheduledAcknowledged(request: CommandRequest): Map<string, string> {
+  return new Map(Object.entries(request.recentSendsConfirmed ?? {}));
 }
 
 async function finishRequest(
@@ -1002,7 +1062,10 @@ async function finishRequest(
     return scheduleRequest(request, base, confirmation);
   }
   if (request.kind !== "meeting") {
-    return writeAndSend(request, base, confirmation, now, { verdict: await sendVerdictFor(request, confirmation) });
+    return writeAndSend(request, base, confirmation, now, {
+      verdict: await sendVerdictFor(request, confirmation),
+      acknowledged: acknowledgedFor(request, confirmation),
+    });
   }
   const attendees = request.to.map((slot) => slot.mailbox!);
   const result = await bookResolvedMeeting({
@@ -1420,12 +1483,19 @@ export async function sendEmailFromTool(
   if (!instruction) {
     return "Not sent: I don't know what it should say. Ask him.";
   }
-  const slots = await recipientSlots(
-    [...toQueries, ...ccQueries],
+  // The address he pointed at this turn (a photo or quoted message he replied to): used
+  // as it is for this email only, never as a fact about people, and always new on its
+  // card even if he has emailed it before. Everyone else comes from the facts.
+  const referencedSlot: RecipientSlot | undefined = referencedEmail
+    ? { query: referencedEmail, mailbox: { email: referencedEmail, name: "" } }
+    : undefined;
+  const resolvedSlots = await recipientSlots(
+    referencedSlot ? ccQueries : [...toQueries, ...ccQueries],
     { chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: ownWords, threadPeople: await threadPeopleOf(values) },
     now,
     when ? "Not scheduled" : "Not sent",
   );
+  const slots = typeof resolvedSlots === "string" || !referencedSlot ? resolvedSlots : [referencedSlot, ...resolvedSlots];
   if (typeof slots === "string") {
     // A missing address must not discard the owner's original scheduled
     // instruction and time. A follow-up can identify the person without
@@ -1471,6 +1541,7 @@ export async function sendEmailFromTool(
     ...(when && typeof values.draft_id === "string" && values.draft_id.trim()
       ? { draftId: values.draft_id.trim() }
       : {}),
+    ...(referencedEmail ? { externalRecipients: [referencedEmail] } : {}),
   };
   const outcome = await resolveAndContinue(
     request,
@@ -1716,22 +1787,44 @@ export async function bookPendingMeetingAt(
   );
 }
 
-/** add_calendar_attendee while this is on: the same facts as an email's recipients, so
- *  an invite can't reach an address that only came from something Aadi read. */
+/** add_calendar_attendee while this is on: the invite goes only to an address in his own
+ *  words (this message or the open workflow's), one of his confirmed contacts (or his
+ *  earlier pick for this name), or an attendee already resolved on this workflow. An
+ *  address from a photo, an email or a lookup is never invited unless he typed it. */
 export async function resolveCommandAttendee(
   query: string,
   context: { chatId: number; messageId: number; ownerText: string },
 ): Promise<{ email: string } | { refused: string }> {
-  const slots = await recipientSlots([query], context, new Date(), "Not added");
-  if (typeof slots === "string") {
-    return { refused: slots };
+  const typed = parseAddressList(query)[0]?.email.toLowerCase();
+  const ownWords = parseAddressList(authorizationWords(context.chatId, context.ownerText)).map((mailbox) => mailbox.email.toLowerCase());
+  // An attendee resolved earlier on this workflow counts, unless it came from a photo or
+  // a quoted message and he hasn't typed it.
+  const external = externalAddresses(context.chatId);
+  const remembered = pendingResolvedEmails(context.chatId).get(typed ?? query.trim().toLowerCase());
+  if (remembered?.resolved && (!external.has(remembered.email.toLowerCase()) || ownWords.includes(remembered.email.toLowerCase()))) {
+    return { email: remembered.email };
   }
-  const slot = slots[0]!;
-  if (slot.mailbox) {
-    return { email: slot.mailbox.email };
+  const { people, picked } = confirmedContacts(typed ? "" : query);
+  if (typed) {
+    if (ownWords.includes(typed) || people.has(typed)) {
+      return { email: typed };
+    }
+    return {
+      refused: `Not added: ${typed} isn't in Vishnu's own message or one of his confirmed contacts. An address from a photo, an email or a lookup is never invited; ask him to type it.`,
+    };
+  }
+  const tokens = nameTokens(query);
+  const matches = [...people]
+    .map(([email, name]) => ({ email, name }))
+    .filter((mailbox) => picked.has(mailbox.email) || (tokens.length > 0 && mailboxMatches(mailbox, tokens)));
+  if (matches.length === 1) {
+    return { email: matches[0]!.email };
+  }
+  if (matches.length > 1) {
+    return { refused: `Not added: "${query}" matches ${matches.map(formatMailbox).join(", ")}. Ask Vishnu which one.` };
   }
   return {
-    refused: `Not added: "${query}" matches ${(slot.options ?? []).map(formatMailbox).join(", ")}. Ask Vishnu which one.`,
+    refused: `Not added: "${query}" isn't one of Vishnu's confirmed contacts. Ask him for the address and add it once he has typed it.`,
   };
 }
 
