@@ -18,7 +18,7 @@ import {
   resolveContact,
   setContactCalendarForTests,
 } from "../src/contacts.ts";
-import { createBill, createTask, listActiveIgnoreRules } from "../src/db.ts";
+import { createBill, createTask, listActiveIgnoreRules, recordConversationParticipants } from "../src/db.ts";
 import {
   setGoogleAccountForTests,
   type LoadedGoogleAccount,
@@ -200,6 +200,13 @@ setOwnerMeetingTestHooks({
 }
 
 {
+  // The model looks people up first (resolve_contact), and what that showed on his own
+  // turn is who the names in this chat mean. Here the lookup's results are recorded directly.
+  recordConversationParticipants(CHAT, [
+    { email: "nithish@epicode.in", name: "Nithish Bharadwaj" },
+    { email: "tripthi.anchan@epicode.in", name: "Tripthi Anchan" },
+    { email: "sendhil@epicode.in", name: "Sendhil Kumar" },
+  ], "contact", "lookup", NOW);
   const first = await bookMeetingFromTool(
     { attendees: ["Nithish", "Tripthi", "Sendhil"], title: "BTS prep meeting" },
     owner("Book a BTS prep meeting with Nithish, Tripthi and Sendhil."),

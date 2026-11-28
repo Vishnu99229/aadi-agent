@@ -15,10 +15,21 @@ export interface SendDecision {
   readonly [DECIDED]: true;
 }
 
+/** An email Aadi sent to this To address within the recent-send window, from records. */
+export interface RecentSend {
+  readonly email: string;
+  readonly name: string;
+  /** ISO, UTC. */
+  readonly sentAt: string;
+}
+
+/** How far back another email to the same person needs his confirmation. */
+export const RECENT_SEND_WINDOW_MS = 30 * 60 * 1000;
+
 export type SendVerdict =
   | SendDecision
   /** Show him the card; nothing goes out until his tap. */
-  | { action: "card"; newAddresses: string[]; notOwnTurn: boolean }
+  | { action: "card"; newAddresses: string[]; notOwnTurn: boolean; recentSends?: RecentSend[] }
   /** He asked for a draft: never a send. */
   | { action: "draft" };
 
@@ -34,6 +45,9 @@ export interface SendFacts {
   /** Confirmed by him: shown on the card he tapped Send on (or on this draft's card
    *  before his "send it"), an address button he tapped, or a schedule he confirmed. */
   confirmed?: ReadonlySet<string>;
+  /** Aadi's sends to these To addresses in the last 30 minutes that no card he acted
+   *  on has shown him. Any of them makes this a card, never a second silent send. */
+  recentSends?: readonly RecentSend[];
 }
 
 function normalize(email: string): string {
@@ -58,10 +72,29 @@ export function decideSendAction(facts: SendFacts): SendVerdict {
   const newAddresses = recipients.filter(
     (email) => !facts.known.has(email) && !(facts.confirmed?.has(email) ?? false),
   );
-  if (!facts.ownTurn || newAddresses.length > 0) {
-    return { action: "card", newAddresses, notOwnTurn: !facts.ownTurn };
+  const repeats = (facts.recentSends ?? []).filter((send) => recipients.includes(normalize(send.email)));
+  if (!facts.ownTurn || newAddresses.length > 0 || repeats.length > 0) {
+    return {
+      action: "card", newAddresses, notOwnTurn: !facts.ownTurn,
+      ...(repeats.length > 0 ? { recentSends: repeats } : {}),
+    };
   }
   return { action: "send", recipients, [DECIDED]: true };
+}
+
+const IST_TIME = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
+
+/** "You emailed Ashwin Kumar at 12:04. Send another?" */
+export function recentSendLine(sends: readonly RecentSend[]): string {
+  const people = sends.map((send) => {
+    const at = new Date(send.sentAt);
+    const time = Number.isFinite(at.getTime()) ? ` at ${IST_TIME.format(at)}` : "";
+    return `${send.name.trim() || send.email}${time}`;
+  });
+  const list = people.length <= 1 ? people.join("") : `${people.slice(0, -1).join(", ")} and ${people.at(-1)}`;
+  return `You emailed ${list}. Send another?`;
 }
 
 /** Every Gmail send calls this right before it: a real "send" decision that covers
@@ -83,8 +116,13 @@ export function cardReason(verdict: Exclude<SendVerdict, SendDecision>, to: stri
   if (verdict.action === "draft") {
     return "Draft ready. Tap Send when you want it to go.";
   }
-  if (verdict.newAddresses.length > 0) {
-    return `New address: ${verdict.newAddresses.join(", ")}. Tap Send to confirm.`;
+  const repeats = verdict.recentSends ?? [];
+  if (verdict.newAddresses.length > 0 || repeats.length > 0) {
+    const parts = [
+      ...(verdict.newAddresses.length > 0 ? [`New address: ${verdict.newAddresses.join(", ")}.`] : []),
+      ...(repeats.length > 0 ? [recentSendLine(repeats)] : []),
+    ];
+    return `${parts.join(" ")} Tap Send to confirm.`;
   }
   if (!verdict.notOwnTurn) {
     // His own message, but code couldn't read who it goes to: never a guess.

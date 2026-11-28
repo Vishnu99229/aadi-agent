@@ -111,7 +111,6 @@ export function dropSelf(header: string): string {
 }
 
 export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
-  const recovery = turn.replyDraftThread;
   const referencedEmail = emailReferenceForTurn(turn.confirmation?.chatId, turn.confirmation?.messageId);
   if (referencedEmail) {
     return `Not drafted: ${referencedEmail} was selected from the OCR/photo or quoted message, not from a Gmail thread. Use draft_new_email for that address; no old reply was created.`;
@@ -131,12 +130,12 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("body must be a non-empty plain-text reply.");
   }
 
-  if (!recovery && values.send_immediately === true) {
+  if (values.send_immediately === true) {
     const hold = deliveryTimeHold(turn.userText ?? "");
     if (hold) return hold;
   }
   const emailId = values.email_id.trim();
-  const mailbox = recovery?.account ?? parseGoogleAccountFilter(values.account);
+  const mailbox = parseGoogleAccountFilter(values.account);
   const { account, message: original } = await emailProviderRead(() => resolveGmailMessage(
     emailId, mailbox,
     "metadata",
@@ -144,26 +143,25 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   ).catch(error => {
     if (error instanceof GmailMessageNotFoundError) throw new EmailOperationError(
       "That message ID isn't in Gmail. Find the original email before drafting a reply.", "message_missing",
-      { account: mailbox, threadId: recovery?.threadId },
+      { account: mailbox },
     );
     throw error;
-  }), "I couldn't read the original email. No reply draft was created.", { account: mailbox, messageId: emailId, threadId: recovery?.threadId });
+  }), "I couldn't read the original email. No reply draft was created.", { account: mailbox, messageId: emailId });
   const headers = original.payload?.headers;
   const threadId = original.threadId;
   const from = header(headers, "From");
   const messageId = header(headers, "Message-ID");
   const senders = parseAddressList(from);
 
-  if (!threadId || !from || !messageId || (recovery && (threadId !== recovery.threadId ||
-    senders.length !== 1 || isSelfEmail(senders[0]!.email) || !recovery.recipients.includes(senders[0]!.email)))) {
+  if (!threadId || !from || !messageId) {
     throw new EmailOperationError(
       "The original email is missing threading or sender metadata.",
-      "message_missing", { account: account.id, threadId: recovery?.threadId, recipient: recovery?.recipients[0] },
+      "message_missing", { account: account.id, threadId: threadId ?? undefined },
     );
   }
 
-  const explicitTo = recovery ? "" : toAddressList(values.to).join(", ");
-  const explicitCc = recovery ? "" : toAddressList(values.cc).join(", ");
+  const explicitTo = toAddressList(values.to).join(", ");
+  const explicitCc = toAddressList(values.cc).join(", ");
   const fromIsSelf = senders.every((item) =>
     isSelfEmail(item.email),
   );
@@ -192,10 +190,6 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   const subject = replySubject(header(headers, "Subject"));
   const signatureHtml = await emailProviderRead(() => signatureHtmlFor(account),
     "I couldn't read the mailbox signature. No reply draft was created.", { account: account.id, messageId: emailId, threadId, recipient: to });
-  if (recovery && !recovery.claimWrite()) {
-    throw new EmailOperationError("A reply draft write was already attempted for this request. Read the thread to check its state.",
-      "write_unconfirmed", { account: account.id, messageId: emailId, threadId, recipient: to });
-  }
   const { draftId } = await createThreadReplyDraft({
     account,
     threadId,
@@ -210,7 +204,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   let cardNote = "";
   const sendImmediately =
-    !recovery && values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
+    values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({
       draftId,

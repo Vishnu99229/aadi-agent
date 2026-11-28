@@ -1542,6 +1542,49 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_card_message_recipients_draft ON card_message_recipients (draft_id);
 `);
 
+db.exec(`
+  -- People a read tool showed on his own chat turn: the From/To/Cc headers of an email
+  -- or draft it read, a calendar event's attendees, a contact lookup's one match. Headers
+  -- and attendee lists only, never body text. Short-lived: they are who a name in this
+  -- chat can mean.
+  CREATE TABLE IF NOT EXISTS conversation_participants (
+    chat_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, email, source, source_ref)
+  );
+  CREATE INDEX IF NOT EXISTS idx_conversation_participants_chat ON conversation_participants (chat_id, seen_at);
+  -- The people an Aadi message was about (a meeting brief's attendees, from Calendar),
+  -- so his Telegram reply to that message can mean one of them.
+  CREATE TABLE IF NOT EXISTS telegram_message_participants (
+    message_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    participants_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, source, source_ref)
+  );
+  -- A card that told him "You emailed X at T. Send another?", written only by the card
+  -- builder once Telegram confirmed it. His tap on that card, or his own message after
+  -- it, confirms another email to X for sends up to sent_at.
+  CREATE TABLE IF NOT EXISTS card_recent_send_warnings (
+    message_id INTEGER NOT NULL,
+    card_key TEXT NOT NULL,
+    email TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    shown_watermark INTEGER NOT NULL,
+    shown_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, card_key, email)
+  );
+`);
+// Who a direct command send went to, so a second email to them can be checked.
+if (!tableHasColumn("command_sends", "to_header")) {
+  db.exec("ALTER TABLE command_sends ADD COLUMN to_header TEXT");
+}
+
 /**
  * Pre-fix NiCE HQ caches stored Asia/Jerusalem on sales_sequences.prospect_timezone,
  * which stops the sequence runner from calling chooseProspectZone. There is no
@@ -2321,6 +2364,223 @@ export function draftRecipientsShownBefore(draftId: string, messageId: number): 
   return new Set(rows.map((row) => row.email));
 }
 
+/** SQLite's CURRENT_TIMESTAMP and ISO strings, both as an ISO string in UTC. */
+export function recordedIso(value: string): string {
+  const parsed = new Date(value.includes("T") ? value : `${value.replace(" ", "T")}Z`);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : value;
+}
+
+function normalizedEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+export interface ConversationParticipant {
+  email: string;
+  name: string;
+  source: string;
+  sourceRef: string;
+  seenAt: string;
+}
+
+const PARTICIPANT_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/** People a read tool showed on his own turn (headers or attendees only). */
+export function recordConversationParticipants(
+  chatId: number,
+  people: ReadonlyArray<{ email: string; name?: string }>,
+  source: string,
+  sourceRef: string,
+  now = new Date(),
+): void {
+  const upsert = db.prepare(
+    `INSERT INTO conversation_participants (chat_id, email, name, source, source_ref, seen_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(chat_id, email, source, source_ref) DO UPDATE SET
+       name = CASE WHEN length(excluded.name) > length(conversation_participants.name)
+         THEN excluded.name ELSE conversation_participants.name END,
+       seen_at = excluded.seen_at`,
+  );
+  db.transaction(() => {
+    for (const person of people) {
+      const email = normalizedEmail(person.email);
+      if (!email.includes("@")) continue;
+      upsert.run(chatId, email, (person.name ?? "").trim(), source, sourceRef, now.toISOString());
+    }
+    db.prepare("DELETE FROM conversation_participants WHERE chat_id = ? AND seen_at < ?")
+      .run(chatId, new Date(now.getTime() - PARTICIPANT_RETENTION_MS).toISOString());
+  })();
+}
+
+export function conversationParticipants(chatId: number, sinceIso: string): ConversationParticipant[] {
+  const rows = db.prepare(
+    `SELECT email, name, source, source_ref, seen_at FROM conversation_participants
+     WHERE chat_id = ? AND seen_at >= ? ORDER BY seen_at DESC`,
+  ).all(chatId, sinceIso) as Array<{ email: string; name: string; source: string; source_ref: string; seen_at: string }>;
+  return rows.map((row) => ({ email: row.email, name: row.name, source: row.source, sourceRef: row.source_ref, seenAt: row.seen_at }));
+}
+
+/** The people an Aadi message was about, recorded when it was posted. */
+export function linkTelegramMessageParticipants(
+  messageId: number,
+  source: string,
+  sourceRef: string,
+  people: ReadonlyArray<{ email: string; name?: string }>,
+  now = new Date(),
+): void {
+  const list = people
+    .map((person) => ({ email: normalizedEmail(person.email), name: (person.name ?? "").trim() }))
+    .filter((person) => person.email.includes("@"));
+  db.prepare(
+    `INSERT OR REPLACE INTO telegram_message_participants (message_id, source, source_ref, participants_json, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(messageId, source, sourceRef, JSON.stringify(list), now.toISOString());
+}
+
+export function telegramMessageParticipants(messageId: number): ConversationParticipant[] {
+  const rows = db.prepare(
+    "SELECT source, source_ref, participants_json, created_at FROM telegram_message_participants WHERE message_id = ?",
+  ).all(messageId) as Array<{ source: string; source_ref: string; participants_json: string; created_at: string }>;
+  return rows.flatMap((row) => {
+    let people: Array<{ email?: string; name?: string }> = [];
+    try {
+      people = JSON.parse(row.participants_json) as Array<{ email?: string; name?: string }>;
+    } catch {
+      return [];
+    }
+    return people.flatMap((person) => person.email
+      ? [{ email: normalizedEmail(person.email), name: person.name ?? "", source: row.source, sourceRef: row.source_ref, seenAt: row.created_at }]
+      : []);
+  });
+}
+
+export interface RecentSendRecord {
+  email: string;
+  name: string;
+  /** ISO, UTC. */
+  sentAt: string;
+}
+
+/**
+ * Aadi's own sends since `sinceIso` whose To included one of these addresses: draft
+ * cards, direct command sends, scheduled sends and follow-up steps. The newest per
+ * address. Records only.
+ */
+export function recentSendsTo(addresses: readonly string[], sinceIso: string): RecentSendRecord[] {
+  const wanted = new Set(addresses.map(normalizedEmail).filter(Boolean));
+  if (wanted.size === 0) return [];
+  const newest = new Map<string, RecentSendRecord>();
+  const note = (email: string, name: string, sentAt: string): void => {
+    const address = normalizedEmail(email);
+    if (!wanted.has(address)) return;
+    const iso = recordedIso(sentAt);
+    const previous = newest.get(address);
+    if (!previous || previous.sentAt < iso) newest.set(address, { email: address, name: name.trim() || previous?.name || "", sentAt: iso });
+  };
+  const fromHeader = (header: string | null, sentAt: string): void => {
+    for (const mailbox of parseAddressList(header ?? "")) note(mailbox.email, mailbox.name, sentAt);
+  };
+  for (const row of db.prepare(
+    `SELECT COALESCE(live_to_header, to_header) AS to_header, sent_at FROM pending_actions
+     WHERE type = 'send_draft' AND status = 'sent' AND sent_at IS NOT NULL AND julianday(sent_at) >= julianday(?)`,
+  ).all(sinceIso) as Array<{ to_header: string | null; sent_at: string }>) {
+    fromHeader(row.to_header, row.sent_at);
+  }
+  for (const row of db.prepare(
+    `SELECT to_header, sent_at FROM command_sends
+     WHERE status = 'sent' AND sent_at IS NOT NULL AND to_header IS NOT NULL AND julianday(sent_at) >= julianday(?)`,
+  ).all(sinceIso) as Array<{ to_header: string | null; sent_at: string }>) {
+    fromHeader(row.to_header, row.sent_at);
+  }
+  for (const row of db.prepare(
+    `SELECT request, sent_at FROM scheduled_sends
+     WHERE status = 'sent' AND sent_at IS NOT NULL AND julianday(sent_at) >= julianday(?)`,
+  ).all(sinceIso) as Array<{ request: string; sent_at: string }>) {
+    try {
+      const request = JSON.parse(row.request) as { to?: Array<{ mailbox?: { email?: string; name?: string } }> };
+      for (const slot of request.to ?? []) {
+        if (slot.mailbox?.email) note(slot.mailbox.email, slot.mailbox.name ?? "", row.sent_at);
+      }
+    } catch {
+      continue;
+    }
+  }
+  for (const row of db.prepare(
+    `SELECT s.prospect_email AS email, s.prospect_name AS name, st.sent_at AS sent_at
+     FROM sales_sequence_steps st JOIN sales_sequences s ON s.id = st.sequence_id
+     WHERE st.status = 'sent' AND st.sent_at IS NOT NULL AND julianday(st.sent_at) >= julianday(?)`,
+  ).all(sinceIso) as Array<{ email: string; name: string; sent_at: string }>) {
+    note(row.email, row.name, row.sent_at);
+  }
+  return [...newest.values()];
+}
+
+/** Aadi's newest delivered email whose To included this address, from its own records
+ *  (a draft card's send or a direct command send). */
+export function latestRecordedSendTo(address: string): { sentMessageId: string; account: GoogleAccountId; sentAt: string } | undefined {
+  const email = normalizedEmail(address);
+  let best: { sentMessageId: string; account: GoogleAccountId; sentAt: string } | undefined;
+  const consider = (header: string | null, id: string | null, account: string, sentAt: string | null): void => {
+    if (!id || !sentAt || (account !== "work" && account !== "personal")) return;
+    if (!parseAddressList(header ?? "").some((mailbox) => mailbox.email === email)) return;
+    const iso = recordedIso(sentAt);
+    if (!best || best.sentAt < iso) best = { sentMessageId: id, account, sentAt: iso };
+  };
+  for (const row of db.prepare(
+    `SELECT COALESCE(live_to_header, to_header) AS to_header, sent_message_id, google_account, sent_at FROM pending_actions
+     WHERE type = 'send_draft' AND status = 'sent' AND sent_message_id IS NOT NULL ORDER BY id DESC LIMIT 200`,
+  ).all() as Array<{ to_header: string | null; sent_message_id: string | null; google_account: string; sent_at: string | null }>) {
+    consider(row.to_header, row.sent_message_id, row.google_account, row.sent_at);
+  }
+  for (const row of db.prepare(
+    `SELECT to_header, sent_message_id, account, sent_at FROM command_sends
+     WHERE status = 'sent' AND sent_message_id IS NOT NULL AND to_header IS NOT NULL ORDER BY id DESC LIMIT 200`,
+  ).all() as Array<{ to_header: string | null; sent_message_id: string | null; account: string; sent_at: string | null }>) {
+    consider(row.to_header, row.sent_message_id, row.account, row.sent_at);
+  }
+  return best;
+}
+
+/** The card builder's record of a "You emailed X at T" warning on a posted card. It
+ *  replaces whatever that message showed before. */
+export const recordCardRecentSendWarnings = db.transaction((
+  messageId: number,
+  cardKey: string,
+  warnings: ReadonlyArray<{ email: string; sentAt: string }>,
+): void => {
+  db.prepare("DELETE FROM card_recent_send_warnings WHERE message_id = ? AND card_key = ?").run(messageId, cardKey);
+  const insert = db.prepare(
+    `INSERT OR REPLACE INTO card_recent_send_warnings (message_id, card_key, email, sent_at, shown_watermark, shown_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  const watermark = latestProcessedMessageId();
+  for (const warning of warnings) {
+    insert.run(messageId, cardKey, normalizedEmail(warning.email), recordedIso(warning.sentAt), watermark, new Date().toISOString());
+  }
+});
+
+function warningMap(rows: Array<{ email: string; sent_at: string }>): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const row of rows) {
+    const previous = map.get(row.email);
+    if (!previous || previous < row.sent_at) map.set(row.email, row.sent_at);
+  }
+  return map;
+}
+
+/** What this card message warned about: email to the newest send it showed. */
+export function recentSendWarningsForMessage(cardKey: string, messageId: number): Map<string, string> {
+  return warningMap(db.prepare(
+    "SELECT email, sent_at FROM card_recent_send_warnings WHERE card_key = ? AND message_id = ?",
+  ).all(cardKey, messageId) as Array<{ email: string; sent_at: string }>);
+}
+
+/** Warnings this card key showed before his message `messageId`. */
+export function recentSendWarningsShownBefore(cardKey: string, messageId: number): Map<string, string> {
+  return warningMap(db.prepare(
+    "SELECT email, sent_at FROM card_recent_send_warnings WHERE card_key = ? AND shown_watermark < ?",
+  ).all(cardKey, messageId) as Array<{ email: string; sent_at: string }>);
+}
+
 export function isKnownRecipientCached(email: string): boolean {
   return db.prepare(`SELECT 1 FROM known_recipients WHERE email = ?`).get(email.trim().toLowerCase()) !== undefined;
 }
@@ -2329,6 +2589,17 @@ export function recordKnownRecipient(email: string, source: string): void {
   db.prepare(
     `INSERT OR IGNORE INTO known_recipients (email, source, checked_at) VALUES (?, ?, ?)`,
   ).run(email.trim().toLowerCase(), source, new Date().toISOString());
+}
+
+/** Every address already recorded as one he has sent to. */
+export function listKnownRecipientEmails(): string[] {
+  return (db.prepare(`SELECT email FROM known_recipients`).all() as Array<{ email: string }>).map((row) => row.email);
+}
+
+/** Who a posted card message showed, whatever it was a card for. */
+export function cardRecipientsOnMessage(messageId: number): string[] {
+  return (db.prepare(`SELECT DISTINCT email FROM card_message_recipients WHERE message_id = ?`)
+    .all(messageId) as Array<{ email: string }>).map((row) => row.email);
 }
 
 /** A "send then follow-ups" request waiting on this card's Send tap. */
@@ -5853,13 +6124,15 @@ export function claimCommandSend(input: {
   key: string;
   account: string;
   threadId: string | null;
+  /** The To header it goes to. Recorded for the recent-send check. */
+  to?: string;
 }): boolean {
   const result = db
     .prepare(
-      `INSERT OR IGNORE INTO command_sends (idem_key, status, account, thread_id)
-       VALUES (?, 'sending', ?, ?)`,
+      `INSERT OR IGNORE INTO command_sends (idem_key, status, account, thread_id, to_header)
+       VALUES (?, 'sending', ?, ?, ?)`,
     )
-    .run(input.key, input.account, input.threadId);
+    .run(input.key, input.account, input.threadId, input.to ?? null);
   return result.changes === 1;
 }
 
@@ -6147,19 +6420,6 @@ export function getClosedEmailContext(chatId: number): (ClosedEmailContext & { c
   const row = db.prepare("SELECT detail, closed_at FROM closed_email_contexts WHERE chat_id = ?").get(chatId) as
     { detail: string; closed_at: string } | undefined;
   return row ? { ...JSON.parse(row.detail) as ClosedEmailContext, closedAt: row.closed_at } : undefined;
-}
-
-/** A Gmail read can restore focus on precisely the closed email's thread. */
-export function focusClosedEmailFromRead(input: {
-  chatId: number; messageId: number; account: GoogleAccountId; threadId: string;
-}): void {
-  db.prepare(`UPDATE closed_email_contexts
-    SET detail = json_set(detail, '$.focusMessageId', ?)
-    WHERE chat_id = ?
-      AND json_extract(detail, '$.account') = ?
-      AND json_extract(detail, '$.threadId') = ?
-      AND COALESCE(json_extract(detail, '$.focusMessageId'), 0) < ?`)
-    .run(input.messageId, input.chatId, input.account, input.threadId, input.messageId);
 }
 
 function sameEmailLink(email: EmailLink, ref: ClosedEmailContext): boolean {

@@ -738,9 +738,7 @@ export async function runOwnerTurn(modelText: string, options: OwnerTurnOptions)
   const { ownerText, quoted, chatId, postCard, route: routeOut, ...agentOptions } = options;
   const picked = pickRoute(ownerText, { quoted, chatId });
   // A direct answer is taken before this point, so here it only means "let the model try".
-  const route: Route = agentOptions.replyDraftThread && config.agentRouting !== "off"
-    ? { kind: "specialist", agentId: "email" }
-    : picked.kind === "direct" ? { kind: "aadi", reason: "direct answer fell back" } : picked;
+  const route: Route = picked.kind === "direct" ? { kind: "aadi", reason: "direct answer fell back" } : picked;
   const report = newRunReport();
   const startedAt = Date.now();
   const meter = newTurnMeter();

@@ -2,8 +2,8 @@ import type { gmail_v1 } from "googleapis";
 import type { LlmTool } from "../llm.js";
 import { parseGoogleAccountFilter } from "../google/auth.js";
 import { resolveGmailMessage } from "../google/mail.js";
-import { focusClosedEmailFromRead } from "../db.js";
 import type { ToolTurn } from "./index.js";
+import { headerPeople, noteShownPeople } from "../conversation_people.js";
 
 const BODY_LIMIT = 3000;
 
@@ -160,9 +160,8 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   const body = truncate(removeQuotedReplies(rawBody));
   const headers = payload.headers;
   const cc = header(headers, "Cc");
-  if (message.threadId && turn?.ownTurn && turn.confirmation) {
-    focusClosedEmailFromRead({ ...turn.confirmation, account: account.id, threadId: message.threadId });
-  }
+  // The people on it (headers only, never the body) are who a name can mean next.
+  noteShownPeople(turn, headerPeople(header(headers, "From"), header(headers, "To"), cc), "email", message.id ?? values.id.trim());
 
   return [
     `Account: ${account.label}`,

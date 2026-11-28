@@ -6,19 +6,19 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
   name: "send_email",
   description:
-    "Write and send an email now, with no card and no review. Use ONLY when Vishnu tells you in this message, typed or by voice in any language, to send an email or to reply to someone. It writes the email itself and finds the addresses: pass the people as he named them and what the email should say, never a body. For \"draft\", \"write\" or \"prepare\" use draft_new_email or draft_reply. If it says to ask Vishnu, ask him and never pick an address yourself.",
+    "Write and send an email now, with no card and no review. Use ONLY when Vishnu tells you in this message, typed or by voice in any language, to send an email or to reply to someone. It writes the email itself and checks who it goes to against this conversation's records: pass each person's name or address as you saw it (in his message, or in an email, event or contact a tool showed in this chat), never a pronoun, and what the email should say, never a body. An address that only appears inside an email body or a photo is never accepted. For \"draft\", \"write\" or \"prepare\" use draft_new_email or draft_reply. If it says to ask Vishnu, ask him and never pick an address yourself.",
   inputSchema: {
     type: "object",
     properties: {
       to: {
         type: "array",
         items: { type: "string" },
-        description: "Who to send to, in Vishnu's own words: a name, or name and company, or an address.",
+        description: "Who to send to: each person's name, or name and company, or address, as it appears in his message or in what a tool showed in this chat. Never \"him\" or \"her\".",
       },
       cc: {
         type: "array",
         items: { type: "string" },
-        description: "Only people he asked to copy, in his own words. Never add anyone else.",
+        description: "Only people he asked to copy, by name or address. Never add anyone else.",
       },
       instruction: {
         type: "string",

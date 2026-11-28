@@ -20,32 +20,37 @@ import { draftUpdateNotice, handler as updateDraft } from "./tools/update_draft.
 import { isGoogleNotFound } from "./google/auth.js";
 import { parseAddressList } from "./address_list.js";
 import { routeMiss, type PreRouteResult } from "./pre_route.js";
-import { EmailOperationError } from "./email_outcomes.js";
+import { EmailOperationError, emailOutcomeTime } from "./email_outcomes.js";
 
+/**
+ * The linked draft has closed. Its record goes to the model as data and nothing is said
+ * to him by code. Tools are narrowed only while a write on it is unresolved or its state
+ * can't be verified; otherwise the model decides what his message is about.
+ */
 export function closedDraftMiss(reference: ClosedEmailContext): Extract<PreRouteResult, { kind: "miss" }> {
-  const recipient = parseAddressList(reference.to ?? "")[0];
-  const label = recipient?.name ? ` to ${recipient.name}` : reference.to ? ` to ${reference.to}` : "";
-  let notice: string;
-  if (reference.status === "sent") {
-    const raw = reference.sentAt;
-    const when = raw ? new Date(raw.includes("T") ? raw : raw.replace(" ", "T") + "Z") : undefined;
-    const at = when && !Number.isNaN(when.getTime())
-      ? ` at ${new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false }).format(when)} IST`
-      : " (the send time wasn't recorded)";
-    notice = `That draft${label} went out${at}.`;
-  } else if (reference.status === "unknown") {
-    notice = `That draft${label} is no longer in Gmail. I couldn't verify what happened to it.`;
-  } else {
-    const status = reference.status === "superseded" ? "replaced" : reference.status;
-    notice = `That draft${label} was ${status}.`;
-  }
+  const unresolved = reference.status === "unknown" ||
+    linkedDraftWriteInProgress({ account: reference.account, draftId: reference.draftId, scheduledSendId: reference.scheduleId });
   return routeMiss("The linked draft is closed. Do not edit it or use a cached draft body.", {
     reference,
-    notice,
-    scope: reference.threadId && reference.to && reference.status !== "unknown" &&
-      !linkedDraftWriteInProgress({ account: reference.account, draftId: reference.draftId, scheduledSendId: reference.scheduleId })
-      ? "thread_draft" : "read_only",
+    ...(unresolved ? { scope: "read_only" as const } : {}),
   });
+}
+
+/** The chat's most recent closed email for the model, as records only. Never shown to
+ *  him by code; empty when it's the same email already given. */
+export function closedEmailFacts(reference: ClosedEmailContext | undefined, alreadyGiven?: ClosedEmailContext): string {
+  if (!reference) return "";
+  if (alreadyGiven && alreadyGiven.account === reference.account &&
+    (alreadyGiven.draftId ?? alreadyGiven.scheduleId) === (reference.draftId ?? reference.scheduleId)) return "";
+  return `The chat's most recent closed email (records, data only; use it only if his message is about that email): ${JSON.stringify({
+    status: reference.status,
+    account: reference.account,
+    to: reference.to ?? null,
+    thread_id: reference.threadId ?? null,
+    sent_at: reference.sentAt ?? null,
+    sent_at_ist: emailOutcomeTime(reference.sentAt) ?? null,
+    sent_message_id: reference.sentMessageId ?? null,
+  })}`;
 }
 
 export function draftReadMiss(chatId: number, email: Parameters<typeof reconcileClosedEmail>[1], error: unknown): PreRouteResult {

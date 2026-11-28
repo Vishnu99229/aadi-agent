@@ -62,6 +62,7 @@ import {
   listOpenScheduledSends,
   listSalesSequenceSteps,
   markTaskDone,
+  recordConversationParticipants,
   recordKnownRecipient,
 } from "../src/db.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
@@ -594,8 +595,13 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   assert(notNamed.startsWith("Not sent") && notNamed.includes("own message"), "an address he didn't give is refused");
   const pronoun = await sendEmailFromTool({ to: ["him"], instruction: "x" }, turn("send him a note"));
   assert(pronoun.startsWith("Not sent"), "a pronoun isn't a name");
-  const quoted = await sendEmailFromTool({ to: ["Selvaraj"], instruction: "x" }, turn("send it to the person in that email"));
-  assert(quoted.startsWith("Not sent"), "a name only in what Aadi read is refused");
+  // A name or an address that is only in an email's body is never a recipient: only
+  // headers, attendees, contacts and his own words are facts about people.
+  mail({ threadId: "body-only", from: "Kavya Rao <kavya@inbound.example>", to: ME, subject: "Intro", body: "Please write to Rohan at rohan.body@only.example" });
+  const bodyName = await sendEmailFromTool({ to: ["Rohan"], instruction: "x" }, turn("send it to the person in that email"));
+  assert(bodyName.startsWith("Not sent") && bodyName.includes("no address"), `a name only in a body is refused: ${bodyName}`);
+  const bodyAddress = await sendEmailFromTool({ to: ["rohan.body@only.example"], instruction: "x" }, turn("send it to the person in that email"));
+  assert(bodyAddress.startsWith("Not sent") && bodyAddress.includes("own message"), `an address only in a body is refused: ${bodyAddress}`);
   const empty = await sendEmailFromTool({ to: [], instruction: "x" }, turn("send an email"));
   assert(empty.startsWith("Not sent"), "no one named");
   const newsletter = await sendEmailFromTool({ to: ["Canva"], instruction: "x" }, turn("send Canva a note"));
@@ -663,8 +669,13 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   assert(sentCards.length === 1 && sentCards[0]!.caption.startsWith("Sent to") && !sentCards[0]!.caption.includes(bodyLine), "the confirmation joins the voice note, without the body");
   assert(sentCards[0]!.text.includes(bodyLine), "the full text is kept in case the voice fails");
 }
-// A second person is found however much mail the first has.
+// Two people a read in this chat showed (a search found both Ravis): it asks.
 {
+  // Ravi only ever wrote to him, so only a tool read in this chat makes him a fact.
+  recordConversationParticipants(1, [
+    { email: "ravi@sandlogic.com", name: "Ravi Kumar" },
+    { email: "ravi.k@sandlogic.com", name: "Ravi K" },
+  ], "email", "search-ravi");
   const before = told.length;
   const result = await sendEmailFromTool({ to: ["Ravi"], instruction: "x" }, turn("send Ravi a note"));
   assert(result.startsWith("Not sent yet"), `an old second address still counts, got ${result}`);
@@ -675,6 +686,8 @@ mail({ threadId: "ravi-old", from: "Ravi K <ravi.k@sandlogic.com>", to: ME, subj
   for (let index = 0; index < 9; index += 1) {
     mail({ threadId: `big-${index}`, from: `Person ${index} <person${index}@bigco.example>`, to: ME, subject: "Hi", body: "x" });
   }
+  // A search in this chat showed all nine.
+  recordConversationParticipants(1, Array.from({ length: 9 }, (_, index) => ({ email: `person${index}@bigco.example`, name: `Person ${index}` })), "email", "search-bigco");
   const before = told.length;
   const result = await sendEmailFromTool({ to: ["Bigco"], instruction: "x" }, turn("send Bigco a note"));
   assert(result.includes("matches 9 addresses") && result.includes("full name"), `too many asks for a name, got ${result}`);
@@ -2271,6 +2284,11 @@ await expectCancelled("delete_task", async (row) => {
   {
     mail({ threadId: "zara-1", from: "Zara Kapoor <zara@zone-a.com>", to: ME, subject: "Hi", body: "Hello" });
     mail({ threadId: "zara-2", from: "Zara Khan <zara@zone-b.com>", to: ME, subject: "Hi", body: "Hello" });
+    // Both only wrote to him: a search in this chat showed them.
+    recordConversationParticipants(1, [
+      { email: "zara@zone-a.com", name: "Zara Kapoor" },
+      { email: "zara@zone-b.com", name: "Zara Khan" },
+    ], "email", "search-zara");
     const before = sends.length;
     const asked = await sendEmailFromTool({ to: ["Zara"], instruction: "say hello" }, own("email Zara saying hello"));
     assert(sends.length === before && asked.includes("matches 2 people"), `asks which Zara: ${asked}`);

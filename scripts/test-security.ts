@@ -1025,10 +1025,16 @@ assert(
 const commandEmailSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
 assert(
   commandEmailSrc.includes("sendCommandEmail({") &&
-    commandEmailSrc.includes("namedInOwnWords(query, ownWords)") &&
+    commandEmailSrc.includes("resolvePersonFromFacts(query,") &&
+    !commandEmailSrc.includes("namedInOwnWords(query, ownWords)") &&
     commandEmailSrc.includes("if (!confirmation)") &&
     commandEmailSrc.includes("bookResolvedMeeting({"),
-  "send_email and book_meeting need his own message, and a recipient from his own words",
+  "send_email and book_meeting need his own message, and a recipient resolved from the conversation's records",
+);
+const factsSrc = await readFile(join(root, "src/recipient_facts.ts"), "utf8");
+assert(
+  !/\.body\b|plainTextBody|extracted_text/.test(factsSrc),
+  "recipient facts never read an email body or a photo's text",
 );
 assert(!/sendSchedulingEmail|messages.send/.test(toolsIndex), "model tools have no send");
 assert(!/calendar\.events/.test(toolsIndex), "model tools have no calendar write");

@@ -54,6 +54,8 @@ import {
   listOpenCommandChoices,
   setPendingActionFollowups,
   draftRecipientsShownBefore,
+  recentSendWarningsForMessage,
+  recentSendWarningsShownBefore,
   claimCommandSend,
   markCommandSendUnconfirmed,
   releaseCommandSend,
@@ -65,6 +67,8 @@ import {
   type PendingAction,
 } from "./db.js";
 import { formatMailbox, formatMailboxList } from "./draft_recipients.js";
+import { recentSendsFor } from "./recent_sends.js";
+import { personRefusal, resolvePersonFromFacts } from "./recipient_facts.js";
 import { parseAddressList, type ParsedMailbox } from "./address_list.js";
 import { getSentThreadMetadata, loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { messageHeader } from "./gmail_attachments.js";
@@ -161,6 +165,9 @@ export interface CommandRequest {
   confirmedRecipients?: string[];
   /** His whole message, when it also asked for follow-ups: they ride on the card. */
   followupWords?: string;
+  /** He tapped Confirm on a card that said "You emailed X at T": address to the newest
+   *  send that card named. Later sends to them still wait for him. */
+  recentSendsConfirmed?: Record<string, string>;
 }
 
 let telegram: Api | undefined;
@@ -476,7 +483,16 @@ async function sendVerdictFor(
     recipients,
     known: await knownRecipients(recipients),
     confirmed,
+    recentSends: recentSendsFor(
+      toEmailsOf(request),
+      request.draftId && confirmation ? recentSendWarningsShownBefore(request.draftId, confirmation.messageId) : new Map(),
+    ),
   });
+}
+
+/** The To addresses a request goes to (never Cc), lowercased. */
+function toEmailsOf(request: CommandRequest): string[] {
+  return request.to.flatMap((slot) => (slot.mailbox ? [slot.mailbox.email.toLowerCase()] : []));
 }
 
 export async function writeAndSend(
@@ -970,6 +986,9 @@ export async function scheduledSendVerdict(request: CommandRequest): Promise<Sen
     recipients,
     known: await knownRecipients(recipients),
     confirmed: new Set((request.confirmedRecipients ?? []).map((email) => email.toLowerCase())),
+    // At fire time: another email to someone Aadi emailed in the last 30 minutes waits
+    // for his Confirm, unless he confirmed it on a card that said so.
+    recentSends: recentSendsFor(toEmailsOf(request), new Map(Object.entries(request.recentSendsConfirmed ?? {}))),
   });
 }
 
@@ -1048,16 +1067,6 @@ async function resolveAndContinue(
   confirmation: { chatId: number; messageId: number } | undefined,
   now: Date,
 ): Promise<Outcome> {
-  const account = await emailProviderRead(() => getGoogleAccount(request.account),
-    "I couldn't open the mailbox to resolve the recipient. No email write was attempted.", { account: request.account });
-  const gmail = gmailClient(account);
-  const selfAddresses = await loadFollowupSelfAddresses();
-  let threadMailboxes: ParsedMailbox[] | undefined;
-  if (request.threadId) {
-    threadMailboxes = await readThread(gmail, request.threadId)
-      .then((thread) => thread?.mailboxes)
-      .catch(() => undefined);
-  }
   const missing: string[] = [];
   const ambiguous: Array<{ slot: RecipientSlot; options: ParsedMailbox[] }> = [];
   const resolved: string[] = [];
@@ -1066,35 +1075,20 @@ async function resolveAndContinue(
       resolved.push(slot.mailbox.name || slot.query);
       continue;
     }
-    const match = await resolveNamedRecipient({
-      gmail,
-      query: slot.query,
-      selfAddresses,
-      threadMailboxes,
-    });
-    if (match.kind === "one") {
-      slot.mailbox = match.mailbox;
-      rememberContactChoice(slot.query, {
-        name: match.mailbox.name,
-        emails: [match.mailbox.email],
-        company: undefined,
-        sources: ["gmail"],
-      });
-      resolved.push(match.mailbox.name || slot.query);
-      continue;
-    }
-    if (match.kind === "none") {
+    // The facts already gave several people (recipient_facts.ts): he picks on the card.
+    // A slot with neither is never looked up across his whole mailbox.
+    const options = slot.options ?? [];
+    if (options.length === 0) {
       missing.push(slot.query);
       continue;
     }
-    if (match.options.length > MAX_BUTTONS) {
+    if (options.length > MAX_BUTTONS) {
       return {
-        text: `${notDone(request)}: "${slot.query}" matches ${match.options.length} addresses, so nothing went out.`,
+        text: `${notDone(request)}: "${slot.query}" matches ${options.length} addresses, so nothing went out.`,
         hint: "Ask Vishnu for the person's full name or address.",
       };
     }
-    slot.options = match.options;
-    ambiguous.push({ slot, options: match.options });
+    ambiguous.push({ slot, options });
   }
   if (ambiguous.length > 0) {
     const first = ambiguous[0]!;
@@ -1140,83 +1134,58 @@ async function resolveAndContinue(
   return finishRequest(request, base, confirmation, now);
 }
 
-function ownerNamed(
-  query: string,
-  ownWords: string,
-  contact: { email: string; name: string },
-): boolean {
-  if (/^(?:him|her|them|it)$/i.test(query.trim())) {
-    return true;
+/** The people on the Gmail thread a reply names (headers only), or none. */
+async function threadPeopleOf(values: { thread_id?: unknown; account?: unknown }): Promise<ParsedMailbox[]> {
+  const threadId = typeof values.thread_id === "string" ? values.thread_id.trim() : "";
+  if (!threadId) return [];
+  try {
+    const account = await getGoogleAccount(values.account === "personal" ? "personal" : "work");
+    return (await readThread(gmailClient(account), threadId))?.mailboxes ?? [];
+  } catch {
+    // Unreadable: the send path below refuses it on its own read.
+    return [];
   }
-  if (/\b(?:this|that|the|same)\s+(?:email(?:\s+id)?|address)\b|\bemail i\b|\baddress i\b/i.test(query)) {
-    return true;
-  }
-  const said = (token: string) =>
-    new RegExp(`(?<![\\p{L}\\p{N}])${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "iu").test(ownWords);
-  const typed = parseAddressList(query)[0]?.email;
-  if (typed && ownWords.toLowerCase().includes(typed)) {
-    return true;
-  }
-  const spoken = nameTokens(query).filter((token) => token.length >= 3);
-  const known = nameTokens(contact.name).filter((token) => token.length >= 3);
-  const first = known[0];
-  return (spoken.length > 0 && spoken.every(said)) || (first !== undefined && said(first));
 }
 
-/** Who he named, checked against his own words, or why it can't be used. An address
- *  Aadi already offered him counts, because he's answering that question. A
- *  previously resolved attendee on this workflow also counts, even if the email
- *  is not repeated in the latest message. */
-function recipientSlots(
+/** Who each person he wants is, from facts (recipient_facts.ts), or why not. One
+ *  address fills the slot; several leave options for the address-choice card; none is
+ *  a refusal that says how to find the person. Whether it then sends or becomes a card
+ *  (a new address, a recent send, not his own turn) is decided downstream as before. */
+async function recipientSlots(
   queries: readonly string[],
-  ownWords: string,
+  context: { chatId: number; messageId: number; ownerText: string; threadPeople?: readonly ParsedMailbox[] },
   now: Date,
   refusal: string,
-  chatId?: number,
-  messageId?: number,
-): RecipientSlot[] | string {
+): Promise<RecipientSlot[] | string> {
+  // A card that offered him addresses to pick from: typing one of them answers it.
   const open = listOpenCommandChoices(new Date(now.getTime() - CHOICE_TTL_MS).toISOString());
-  const offeredIn = (address: string) =>
-    open.filter((choice) => {
-      const request = JSON.parse(choice.request) as CommandRequest;
-      return [...request.to, ...request.cc].some((slot) =>
-        (slot.options ?? []).some((option) => option.email === address),
-      );
-    });
+  const offeredBy = new Map<string, number[]>();
+  for (const choice of open) {
+    const request = JSON.parse(choice.request) as CommandRequest;
+    for (const slot of [...request.to, ...request.cc]) {
+      for (const option of slot.options ?? []) {
+        offeredBy.set(option.email, [...(offeredBy.get(option.email) ?? []), choice.id]);
+      }
+    }
+  }
+  const offered = open.flatMap((choice) => {
+    const request = JSON.parse(choice.request) as CommandRequest;
+    return [...request.to, ...request.cc].flatMap((slot) => slot.options ?? []);
+  });
   const answered = new Set<number>();
-  const prior = pendingResolvedEmails(chatId, now);
-  const referenced = emailReferenceForTurn(chatId, messageId, now.getTime());
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
-    const address = parseAddressList(query)[0]?.email;
-    if (address && referenced && address === referenced) {
-      slots.push({ query, mailbox: { email: address, name: "" } });
+    // The thread he wants a reply on is one this chat refers to: its people count.
+    const match = await resolvePersonFromFacts(query, { ...context, offered: [...offered, ...(context.threadPeople ?? [])], now });
+    if (match.kind === "none") {
+      return personRefusal(refusal, query, match);
+    }
+    if (match.kind === "many") {
+      slots.push({ query, options: match.options });
       continue;
     }
-    const offers = address ? offeredIn(address) : [];
-    const remembered = prior.get(query.trim().toLowerCase()) ?? (address ? prior.get(address) : undefined);
-    const supplied = matchOwnerSupplied(chatId, query, now);
-    if (supplied.kind === "many") {
-      return `${refusal}: "${query}" matches more than one address Vishnu typed (${supplied.contacts.map((item) => item.email).join(", ")}). Ask which one.`;
-    }
-    if (address && offers.length > 0) {
-      offers.forEach((choice) => answered.add(choice.id));
-      slots.push({ query, mailbox: { email: address, name: "" } });
-    } else if (remembered?.resolved) {
-      slots.push({
-        query,
-        mailbox: { email: remembered.email, name: remembered.name },
-      });
-    } else if (supplied.kind === "one" && ownerNamed(query, ownWords, supplied.contact)) {
-      slots.push({
-        query,
-        mailbox: { email: supplied.contact.email, name: supplied.contact.name },
-      });
-    } else if (namedInOwnWords(query, ownWords)) {
-      slots.push({ query });
-    } else {
-      return `${refusal}: "${query}" isn't a name or address in Vishnu's own message, so nothing went out. Ask him who he means.`;
-    }
+    for (const id of offeredBy.get(match.mailbox.email) ?? []) answered.add(id);
+    slots.push({ query, mailbox: match.mailbox });
   }
   // Answered by typing, so the old buttons can't act a second time.
   answered.forEach((id) => closeCommandChoice(id, "used"));
@@ -1446,13 +1415,11 @@ export async function sendEmailFromTool(
   if (!instruction) {
     return "Not sent: I don't know what it should say. Ask him.";
   }
-  const slots = recipientSlots(
+  const slots = await recipientSlots(
     [...toQueries, ...ccQueries],
-    authorizationWords(confirmation.chatId, ownWords, now),
+    { chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: ownWords, threadPeople: await threadPeopleOf(values) },
     now,
     when ? "Not scheduled" : "Not sent",
-    confirmation.chatId,
-    confirmation.messageId,
   );
   if (typeof slots === "string") {
     // A missing address must not discard the owner's original scheduled
@@ -1571,7 +1538,7 @@ export async function followupsAfterDraftSend(
  *  resolves to exactly one address, so the invite can't reach the wrong person. */
 export async function bookMeetingFromTool(
   input: unknown,
-  turn: Pick<ToolTurn, "confirmation" | "userText">,
+  turn: Pick<ToolTurn, "confirmation" | "userText" | "ownTurn">,
   now = new Date(),
 ): Promise<string> {
   if (!config.sendOnCommandEnabled) {
@@ -1605,7 +1572,12 @@ export async function bookMeetingFromTool(
   if (queries.length === 0) {
     return "Not booked: he didn't name anyone. For a calendar-only event use create_event.";
   }
-  const slots = recipientSlots(queries, authWords, now, "Not booked", confirmation.chatId);
+  const slots = await recipientSlots(
+    queries,
+    { chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: ownWords },
+    now,
+    "Not booked",
+  );
   if (typeof slots === "string") {
     return slots;
   }
@@ -1687,8 +1659,6 @@ async function resolveAttendeesForPending(
   slots: RecipientSlot[],
   now: Date,
 ): Promise<ResolvedAttendee[] | string> {
-  const selfAddresses = await loadFollowupSelfAddresses();
-  const gmail = gmailClient(await getGoogleAccount("work"));
   const attendees: ResolvedAttendee[] = [];
   const missing: string[] = [];
   const ambiguous: string[] = [];
@@ -1702,28 +1672,10 @@ async function resolveAttendeesForPending(
       });
       continue;
     }
-    const match = await resolveNamedRecipient({
-      gmail,
-      query: slot.query,
-      selfAddresses,
-    });
-    if (match.kind === "one") {
-      rememberContactChoice(slot.query, {
-        name: match.mailbox.name,
-        emails: [match.mailbox.email],
-        sources: ["gmail"],
-      });
-      attendees.push({
-        query: slot.query,
-        name: match.mailbox.name,
-        email: match.mailbox.email,
-        resolved: true,
-      });
-      continue;
-    }
-    if (match.kind === "many") {
+    // Several people from the facts: he says which. Never a mailbox-wide guess.
+    if (slot.options?.length) {
       ambiguous.push(
-        `"${slot.query}" (${match.options.map((item) => item.email).join(", ")})`,
+        `"${slot.query}" (${slot.options.map((item) => item.email).join(", ")})`,
       );
       attendees.push({ query: slot.query, name: slot.query, email: "", resolved: false });
       continue;
@@ -1753,42 +1705,28 @@ export async function bookPendingMeetingAt(
 ): Promise<string> {
   return bookMeetingFromTool(
     { attendees: [], start_time: startIso },
-    { confirmation, userText: startIso },
+    // His own reply with the time (bot.ts only calls this for his own message).
+    { confirmation, userText: startIso, ownTurn: true },
     now,
   );
 }
 
-/** add_calendar_attendee while this is on: the same rule, so an invite can't reach an
- *  address that came from something Aadi read. */
+/** add_calendar_attendee while this is on: the same facts as an email's recipients, so
+ *  an invite can't reach an address that only came from something Aadi read. */
 export async function resolveCommandAttendee(
   query: string,
-  ownWords: string,
-  chatId?: number,
+  context: { chatId: number; messageId: number; ownerText: string },
 ): Promise<{ email: string } | { refused: string }> {
-  const authWords = authorizationWords(chatId, ownWords);
-  const remembered = pendingResolvedEmails(chatId).get(query.trim().toLowerCase());
-  if (remembered?.resolved) {
-    return { email: remembered.email };
+  const slots = await recipientSlots([query], context, new Date(), "Not added");
+  if (typeof slots === "string") {
+    return { refused: slots };
   }
-  if (!namedInOwnWords(query, authWords)) {
-    return {
-      refused: `Not added: "${query}" isn't a name or address in Vishnu's own message. Pass the name as he said it, or ask him.`,
-    };
-  }
-  const gmail = gmailClient(await getGoogleAccount("work"));
-  const match = await resolveNamedRecipient({
-    gmail,
-    query,
-    selfAddresses: await loadFollowupSelfAddresses(),
-  });
-  if (match.kind === "one") {
-    return { email: match.mailbox.email };
+  const slot = slots[0]!;
+  if (slot.mailbox) {
+    return { email: slot.mailbox.email };
   }
   return {
-    refused:
-      match.kind === "none"
-        ? `Not added: I found no address for "${query}". Ask Vishnu for it.`
-        : `Not added: "${query}" matches ${match.options.map(formatMailbox).join(", ")}. Ask Vishnu to give the full address.`,
+    refused: `Not added: "${query}" matches ${(slot.options ?? []).map(formatMailbox).join(", ")}. Ask Vishnu which one.`,
   };
 }
 

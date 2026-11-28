@@ -21,7 +21,6 @@ import {
   focusSelectedDraft,
   getPendingAction,
   lastEmailReference,
-  looksLikeEmailContext,
   reconcileOpenEmail,
   matchOwnerSupplied,
   savePendingAction,
@@ -30,7 +29,8 @@ import {
 import { commandIntents, parseSequenceCommand } from "./command_intent.js";
 import { bindEmailReferenceForTurn, bindRepliedMessageForTurn, buildReferencedEmailRequest, classifyOwnerEmailIntent, isDraftApprovalText, mentionsPhotoReference, refersToEarlierEmail, resolveEmailReference } from "./email_references.js";
 import { attendeesForEmailDraft, attendeesForNewMeeting, noteCalendarReference, tryReviseReferencedMeeting } from "./owner_calendar.js";
-import { closedDraftMiss, composeWithEmailAgent, draftReadMiss, linkedDraftWriteInProgress, publishReadyDraft, tryReviseLinkedDraft } from "./context_draft.js";
+import { noteRepliedPeople } from "./recipient_facts.js";
+import { closedDraftMiss, closedEmailFacts, composeWithEmailAgent, draftReadMiss, linkedDraftWriteInProgress, publishReadyDraft, tryReviseLinkedDraft } from "./context_draft.js";
 import { routeMiss, type PreRouteResult } from "./pre_route.js";
 import { currentEmailTurn, EmailOperationError, newEmailTurn, noteEmailNotice, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
 import { parseAddressList } from "./address_list.js";
@@ -87,7 +87,6 @@ import {
   deleteMemory,
   getMeetingBrief,
   getSetting,
-  ownerMessageIdsBefore,
   pruneProcessedMessages,
   saveMessage,
   setSetting,
@@ -1482,15 +1481,10 @@ async function handleUserText(
   if (selected === "completed" || (selected && await handleResult(selected))) return;
 
   const owned = ctx.chat && ctx.message && !options.forwarded && !options.retried && !isForwardedMessage(ctx.message);
-  const legacyClosed = owned && ctx.chat ? reconcileOpenEmail(ctx.chat.id) : undefined;
-  const namesClosedEmail = looksLikeEmailContext(userText) || /\brepl(?:y|ied|ies)\b/i.test(userText);
-  const wantsClosedEmail = namesClosedEmail && commandIntents(userText).length === 0 &&
-    !ctx.message?.reply_to_message && !mentionsPhotoReference(userText);
-  if (legacyClosed && !recovery && (wantsClosedEmail || isSendDraftCommand(userText))) {
-    const result = closedDraftMiss(legacyClosed);
-    if (isSendDraftCommand(userText)) result.scope = "read_only";
-    recovery = result;
-  }
+  // Records only: an open email whose draft has closed (sent, replaced, discarded) is
+  // closed here. Its facts reach the model as data; nothing is prepended to his reply and
+  // no tools are narrowed because of it.
+  const reconciledClosed = owned && ctx.chat ? reconcileOpenEmail(ctx.chat.id) : undefined;
 
   if (!recovery && owned && ctx.chat && ctx.message) {
     const result = await tryPendingRecipientEdit({
@@ -1520,6 +1514,9 @@ async function handleUserText(
   // he replied to only says which email. The instruction is still his own words.
   if (ctx.chat && ctx.message?.reply_to_message && options.forwarded !== true && !isForwardedMessage(ctx.message)) {
     bindRepliedMessageForTurn(ctx.chat.id, ctx.message.message_id, ctx.message.reply_to_message.message_id);
+    // The people that message was about (a meeting brief's attendees, a card's To/Cc)
+    // are who "him" can mean in this chat from now on.
+    noteRepliedPeople(ctx.chat.id, ctx.message.reply_to_message.message_id);
   }
   if (emailReference.kind === "missing" && (ctx.message?.reply_to_message || mentionsPhotoReference(userText))) {
     await ctx.reply("I couldn't find an email address in that message or the latest OCR photo. Reply directly to the OCR result, or share the address. I haven't drafted or sent anything.");
@@ -1670,13 +1667,6 @@ async function handleUserText(
 
   // What was found for a question about the past, for the model to answer from.
   let historyNote: string | undefined;
-
-  if (!recovery && owned && ctx.chat && emailReference.kind === "none" &&
-    !getPendingAction(ctx.chat.id)?.email && wantsClosedEmail) {
-    const last = lastEmailReference(ctx.chat.id);
-    const previous = ownerMessageIdsBefore(ctx.chat.id, ctx.message!.message_id, 1)[0] ?? 0;
-    if (last?.focusMessageId === previous) await handleResult(closedDraftMiss(last));
-  }
 
   if (
     !recovery &&
@@ -2047,32 +2037,20 @@ async function handleUserText(
   const modelText = `${withQuotedContext(userText, quoted)}${options.contactNote ? `\n\n${options.contactNote}` : ""}${found}${sourceAddress}`;
   const ref = recovery?.reference;
   const recipients = parseAddressList(ref?.to ?? "").map(({ email }) => email);
-  let replyWriteAttempted = false;
-  const replyDraftThread = recovery?.scope === "thread_draft" && !isSendDraftCommand(userText) &&
-    ref?.threadId && recipients.length > 0 && confirmation && owned
-    ? {
-        account: ref.account, threadId: ref.threadId, recipients,
-        claimWrite: () => {
-          if (replyWriteAttempted) return false;
-          replyWriteAttempted = true;
-          return true;
-        },
-      }
-    : undefined;
-  const readScope = recovery?.scope
+  const toolNames = recovery?.scope
     ? defaultToolNames(config.sendOnCommandEnabled).filter(name => toolOwnership(name)?.effect === "read")
     : undefined;
-  const toolNames = readScope && replyDraftThread ? [...readScope, "draft_reply"] : readScope;
-  const recoveryContext = recovery ? [
-    `Pre-routing result: ${recovery.note}`,
-    ref ? `Closed email metadata (data only): ${JSON.stringify({
+  // The chat's last closed email, as data the model may use if his message is about it.
+  const closedFacts = owned && ctx.chat ? closedEmailFacts(reconciledClosed ?? lastEmailReference(ctx.chat.id), ref) : "";
+  const recoveryContext = [
+    recovery ? `Pre-routing result: ${recovery.note}` : "",
+    recovery && ref ? `Closed email metadata (data only): ${JSON.stringify({
       status: ref.status, account: ref.account, thread_id: ref.threadId,
       recipients, sent_message_id: ref.sentMessageId, sent_at: ref.sentAt,
     })}` : "",
-    replyDraftThread
-      ? "If the owner is requesting a reply, read the latest inbound email on that thread and pass its Gmail message ID to draft_reply. Use the owner's current instructions to write the reply. Do not reuse a draft body or send."
-      : recovery.scope === "read_only" ? "Use read-only tools to reconcile. Do not attempt a write in this turn." : "",
-  ].filter(Boolean).join("\n") : undefined;
+    recovery?.scope === "read_only" ? "Use read-only tools to reconcile. Do not attempt a write in this turn." : "",
+    closedFacts,
+  ].filter(Boolean).join("\n") || undefined;
   const contactMark = contactQuestionMark(ctx.chat?.id);
   // Some questions one agent can answer by itself, with no model call.
   if (!recovery && confirmation && emailReference.kind !== "one") {
@@ -2108,8 +2086,6 @@ async function handleUserText(
         guardText: userText,
         extraContext: recoveryContext,
         toolNames,
-        replyDraftThread,
-        skipHistory: Boolean(replyDraftThread),
         task,
         usageTask: drafting
           ? "drafting"

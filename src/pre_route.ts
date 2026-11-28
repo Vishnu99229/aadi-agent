@@ -5,7 +5,7 @@ export type PreRouteResult =
   | {
       kind: "miss";
       note: string;
-      scope?: "read_only" | "thread_draft";
+      scope?: "read_only";
       reference?: ClosedEmailContext;
       notice?: string;
     };

@@ -9,6 +9,7 @@ import {
   getMeetingBrief,
   getMeetingBriefByEvent,
   getSetting,
+  linkTelegramMessageParticipants,
   listMeetingBriefs,
   parseThresholdsSent,
   recordMeetingBrief,
@@ -204,7 +205,9 @@ async function sendBriefAtThreshold(
     });
   }
 
-  await api.sendMessage(config.ownerTelegramId, built.text);
+  const posted = await api.sendMessage(config.ownerTelegramId, built.text);
+  // His reply to this brief can mean one of its attendees (from Calendar).
+  linkBriefMessage(posted, event.id, built.attendees);
   recordMeetingBriefThreshold(row.id, thresholdMinutes);
   const idealAt =
     new Date(startKey).getTime() - thresholdMinutes * 60 * 1000;
@@ -213,6 +216,17 @@ async function sendBriefAtThreshold(
     `Pre-meeting brief sent: event=${event.id} threshold=${thresholdMinutes} timing=${timing}`,
   );
   return getMeetingBrief(row.id);
+}
+
+/** Records who a posted brief or nudge was about. Never stops the message itself. */
+function linkBriefMessage(posted: { message_id?: number } | undefined, eventId: string, attendees: ReadonlyArray<{ email: string; name: string }>): void {
+  if (typeof posted?.message_id !== "number") return;
+  try {
+    linkTelegramMessageParticipants(posted.message_id, "event", eventId, attendees);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "UnknownError";
+    console.error(`Meeting brief: attendee link not recorded (${errorType})`);
+  }
 }
 
 export async function sendNextMeetingBrief(api: Api): Promise<string> {
@@ -252,11 +266,12 @@ export async function sendNextMeetingBrief(api: Api): Promise<string> {
 
 async function sendNudge(api: Api, brief: MeetingBriefRecord): Promise<void> {
   const attendees = parseAttendeesJson(brief.attendees_json);
-  await api.sendMessage(
+  const posted = await api.sendMessage(
     config.ownerTelegramId,
     nudgeQuestion(brief.title, attendees),
     { reply_markup: nudgeKeyboard(brief.id) },
   );
+  linkBriefMessage(posted, brief.event_id, attendees);
   console.log(`Post-call nudge sent: brief=${brief.id}`);
 }
 

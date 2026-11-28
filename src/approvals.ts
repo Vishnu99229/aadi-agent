@@ -30,7 +30,10 @@ import {
   pendingActionFollowups,
   cardRecipientsForMessage,
   draftHasCardRecords,
+  recentSendWarningsForMessage,
+  recentSendWarningsShownBefore,
 } from "./db.js";
+import { recentSendsFor, toAddresses } from "./recent_sends.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import {
   allowCreateEvent,
@@ -44,7 +47,7 @@ import { draftSendCallback, postConfirmCard, type ConfirmCardSpec } from "./conf
 import { classifyOwnerEmailIntent } from "./email_references.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
 import { followupsAfterSend } from "./sequences.js";
-import { assertSendDecision, cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
+import { assertSendDecision, cardReason, decideSendAction, recentSendLine, type RecentSend, type SendVerdict } from "./security/send_decision.js";
 import { plainTextBody, stripSignature } from "./google/mail.js";
 import { collectAttachmentParts } from "./gmail_attachments.js";
 import { evaluateCommandSendGate } from "./security/command_send.js";
@@ -208,6 +211,7 @@ function draftCardSpec(
   actionId: number,
   preview: DraftApprovalPreview,
   sendOnly: boolean,
+  recentSends: readonly RecentSend[] = [],
 ): Extract<ConfirmCardSpec, { kind: "draft_send" }> {
   const mailbox =
     preview.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
@@ -219,7 +223,7 @@ function draftCardSpec(
   const bodyChars = Array.from(preview.body).length;
   const long = bodyChars > DRAFT_SUMMARY_CHARS;
   const captionTail = [...extra, `Subject: ${preview.subject}`, "", preview.body];
-  const base = { kind: "draft_send" as const, key: preview.draftId, actionId, sendOnly, showFull: long, to: preview.to, cc, captionTail };
+  const base = { kind: "draft_send" as const, key: preview.draftId, actionId, sendOnly, showFull: long, to: preview.to, cc, captionTail, recentSends };
   if (long) {
     const count = bodyChars.toLocaleString("en-US");
     return {
@@ -467,10 +471,12 @@ export async function queueDraftApproval(
   if (sendOnly) sendOnlyActions.add(action.id);
   else sendOnlyActions.delete(action.id);
 
+  // Aadi emailed someone on its To within the last 30 minutes: the card says so, and a
+  // tap on it confirms another email to them.
   const spec = draftCardSpec(action.id, {
     ...preview,
     extraLines: [...(preview.extraLines ?? []), ...(notice ? notice.split("\n") : [])],
-  }, sendOnlyActions.has(action.id));
+  }, sendOnlyActions.has(action.id), recentSendsFor(toAddresses(preview.to)));
 
   if (action.telegram_message_id && options.newCard !== true) {
     try {
@@ -697,13 +703,19 @@ function shownOnTappedCard(action: PendingAction, messageId: number | undefined)
 /** His own "send it" for a draft he was shown: only addresses its card showed before
  *  his message, or that he's sent to before, go out with no further tap. */
 async function textSendVerdict(action: PendingAction, messageId: number, ownTurn: boolean): Promise<{ verdict: SendVerdict; to: string }> {
-  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id) : [];
+  const live = action.draft_id ? await readDraftRecipients(action.google_account, action.draft_id) : undefined;
+  const recipients = live?.recipients ?? [];
   const verdict = decideSendAction({
     intent: "send",
     ownTurn,
     recipients,
     known: await knownRecipients(recipients),
     confirmed: action.draft_id ? draftRecipientsShownBefore(action.draft_id, messageId) : new Set(),
+    // Only a warning this draft's card showed before his message confirms another email.
+    recentSends: recentSendsFor(
+      toAddresses(live?.to),
+      action.draft_id ? recentSendWarningsShownBefore(action.draft_id, messageId) : new Map(),
+    ),
   });
   return { verdict, to: action.live_to_header ?? action.to_header ?? recipients.join(", ") };
 }
@@ -923,6 +935,8 @@ export async function sendCreatedDraftNow(params: {
     ownTurn: params.ownTurn === true,
     recipients,
     known: await knownRecipients(recipients),
+    // Someone on To was emailed in the last 30 minutes: their card asks first.
+    recentSends: recentSendsFor(toAddresses(to)),
   });
   if (verdict.action !== "send") {
     return { ok: false, reason: "card", message: cardReason(verdict, recipients.join(", ")) };
@@ -1064,9 +1078,10 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   // His tap on the card's own Send confirms the people the card showed. Anyone else on
   // the Gmail draft now (changed outside Aadi) must be someone he has emailed before.
   let recipients: string[] = [];
+  let liveTo = "";
   if (action.draft_id) {
     try {
-      recipients = await draftRecipients(action.google_account, action.draft_id);
+      ({ recipients, to: liveTo } = await readDraftRecipients(action.google_account, action.draft_id));
     } catch {
       console.log(`Approval action ${action.id}: send refused, draft unreadable`);
       await ctx.answerCallbackQuery({ text: DRAFT_REREAD_FAILED, show_alert: true });
@@ -1081,7 +1096,24 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     recipients,
     known: await knownRecipients(recipients.filter((email) => !shown.has(email))),
     confirmed: shown,
+    // The tap confirms another email only to people this very card warned about.
+    recentSends: recentSendsFor(
+      toAddresses(liveTo),
+      action.draft_id && tappedMessage !== undefined ? recentSendWarningsForMessage(action.draft_id, tappedMessage) : new Map(),
+    ),
   });
+  if (verdict.action === "card" && (verdict.recentSends?.length ?? 0) > 0 && verdict.newAddresses.length === 0) {
+    // A card posted before that email went out: say so on a fresh card, send nothing.
+    console.log(`Approval action ${action.id}: send held, recipient emailed recently`);
+    const refreshed = await postRefreshedCard(action, shown);
+    await ctx.answerCallbackQuery({
+      text: refreshed.ok
+        ? `Not sent: ${recentSendLine(verdict.recentSends ?? [])} Tap Send on the new card to send it.`
+        : `Not sent: ${recentSendLine(verdict.recentSends ?? [])} I couldn't post a new card, so ask me to show it again.`,
+      show_alert: true,
+    }).catch(() => undefined);
+    return;
+  }
   if (verdict.action === "card" && verdict.newAddresses.length > 0) {
     console.log(`Approval action ${action.id}: send refused, draft has addresses the card didn't show`);
     await ctx.answerCallbackQuery({
@@ -1482,8 +1514,10 @@ export async function sendPendingDraftByText(
     }
     const { verdict, to } = decision;
     if (verdict.action !== "send") {
-      console.log(`Approval action ${action.id}: card, not sent (${verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
-      if (options.refreshOnCard && verdict.action === "card") {
+      const repeat = verdict.action === "card" && (verdict.recentSends?.length ?? 0) > 0;
+      console.log(`Approval action ${action.id}: card, not sent (${repeat ? "recent send" : verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
+      // Another email to someone Aadi just emailed: a card that says so, never a silent block.
+      if ((options.refreshOnCard || repeat) && verdict.action === "card") {
         const confirmed = action.draft_id ? draftRecipientsShownBefore(action.draft_id, confirmation.messageId) : undefined;
         const refreshed = await postRefreshedCard(action, confirmed);
         if (!refreshed.ok) {

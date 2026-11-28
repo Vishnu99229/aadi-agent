@@ -13,7 +13,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
       attendees: {
         type: "array",
         items: { type: "string" },
-        description: "Who to invite, in his own words: a name, or name and company, or an address.",
+        description: "Who to invite: each person's name, or name and company, or address, as it appears in his message or in what a tool showed in this chat.",
       },
       title: { type: "string", description: "Event title, as he said it. Omit for 'Vishnu <> name'." },
       start_time: {
