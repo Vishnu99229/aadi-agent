@@ -3234,7 +3234,9 @@ await expectCancelled("delete_task", async (row) => {
   const body = "Hi,\n\nHere is the note.";
   const original = mail({ threadId: "tool-recovery-thread", from, to: ME, subject, body, at: Date.now() });
   const dispatch = (name: string, input: unknown, userText: string, modelCalled = true) => {
-    const confirmation = { chatId: 91, messageId: 250_000 + nextTurn() };
+    // His message comes after every card it may confirm: above the newest processed
+    // message, which earlier blocks push past any fixed base.
+    const confirmation = { chatId: 91, messageId: Math.max(latestProcessedMessageId(), 250_000) + nextTurn() };
     const grant = issueGrant({ source: "owner_chat", confirmation, ownerText: userText });
     const ctx = newTurnContext({ title: "Email recovery test", grant });
     const send = (tool: string, args: unknown) => dispatchTool({ id: `call-${nextTurn()}`, name: tool, input: args, execution: "client" },
