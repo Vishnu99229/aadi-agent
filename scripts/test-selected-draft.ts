@@ -9,7 +9,7 @@ import { bot } from "../src/bot.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests, setRouteModelCompleteForTests, type CompleteParams, type CompleteResult } from "../src/llm.ts";
-import { claimCommandSend, db, getClosedEmailContext, getPendingAction, reconcileClosedEmail, settleDraftDelivery, transitionPendingAction } from "../src/db.ts";
+import { claimCommandSend, conversationParticipants, db, getClosedEmailContext, getPendingAction, reconcileClosedEmail, settleDraftDelivery, transitionPendingAction } from "../src/db.ts";
 import { handler as confirmDraft } from "../src/tools/confirm_send_pending_draft.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
 import { modelReply, nextMessageId } from "./fakes.ts";
@@ -241,7 +241,8 @@ await say("make it shorter");
 assert(editedIds.at(-1) === bob.id && drafts.get(bob.id)!.body.startsWith("Hi,\n\nShorter version."), "the newly selected draft is the one changed");
 assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email");
 
-// A sent approval closes the editable email. A later reply uses the recorded thread.
+// A sent approval closes the editable email. Later turns get its record as data only:
+// nothing is prepended to his reply and no tools are narrowed because of it.
 {
   const draftId = "fahim-original";
   const subject = "Reseller partnership";
@@ -271,7 +272,8 @@ assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email"
     const prior = JSON.stringify(params.messages.slice(0, -1));
     if (typeof current === "string" && current.startsWith("make it shorter")) {
       shortenedAnswer = prior.includes("Canberra is the capital of Australia.");
-      assert(!JSON.stringify(params.system).includes(fahimThread), "an unrelated follow-up does not bind to the closed thread");
+      const system = JSON.stringify(params.system);
+      assert(!system.includes("Pre-routing result"), "an unrelated follow-up is not routed through the closed email");
       return modelReply({ text: "Canberra." });
     }
     if (params.messages.at(-1)?.role === "tool") return modelReply({ text: "Fahim raised four concerns about the partnership." });
@@ -282,34 +284,37 @@ assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email"
   };
   setCompleteForTests(topicChange);
   setRouteModelCompleteForTests(async (_spec, params) => topicChange(params));
+  const topicStart = replies.length;
   await say("What is the capital of Australia?");
   await say("make it shorter");
   assert(shortenedAnswer, "a follow-up to an unrelated answer retains normal chat history");
-  const beforeRead = getClosedEmailContext(1)?.focusMessageId;
+  assert(!replies.slice(topicStart).some(line => line.includes("went out at")), "no closed-email note on unrelated turns");
   await say("What did Fahim say in his latest email?");
-  assert(getClosedEmailContext(1)?.focusMessageId !== beforeRead, "reading Fahim's thread restores its focus");
+  assert(conversationParticipants(1, new Date(Date.now() - 60_000).toISOString()).some(person => person.email === fahimMailbox),
+    "the email it read makes Fahim (from its headers) one of this chat's people");
 
-  const instructions = "Also mention flexible negotiation, a one-off 24/7 availability exception, APIs and webhooks ready now, and about 300 sequential outbound calls per agent each day.";
+  // Fahim's message much later: the closed Ashwin-style email is data, never a prefix,
+  // and the reply goes on the thread the model read, not one code picked.
+  // Placed by today's keyword routing with an agent that drafts replies (routing by the
+  // conversation's objective is PR D); what's checked here is that nothing is narrowed.
+  const instructions = "Draft a reply to Fahim that also mentions flexible negotiation, a one-off exception for round-the-clock agents, that APIs and webhooks are ready now, and about 300 sequential outbound dials per agent each day.";
   let reads = 0;
-  let reachedEmail = false;
+  let sawFacts = false;
+  let narrowed = true;
   const replyBody = "Hi Fahim,\n\nWe can be flexible on negotiation and make a one-off exception for 24/7 agent availability. APIs and webhooks are ready now. Each agent can make about 300 sequential outbound calls per day.";
   const trace = async (params: CompleteParams): Promise<CompleteResult> => {
     if (!params.tools.length) return modelReply({ text: '{"facts":[]}' });
     const system = JSON.stringify(params.system);
-    assert(system.includes(fahimThread) && system.includes(fahimMailbox), "the model received the recorded thread and recipient");
-    assert(!system.includes(staleBody), "the old draft body isn't in the recovery context");
-    assert(!params.tools.some(tool => "name" in tool && ["send_email", "confirm_send_pending_draft", "book_meeting", "start_sequence"].includes(tool.name)), "recovery cannot send, book, or start a sequence");
-    reachedEmail = params.route?.agentId === "email";
+    sawFacts ||= system.includes(fahimThread) && system.includes(fahimMailbox) && system.includes("data only");
+    assert(!system.includes(staleBody), "the old draft body isn't in the context");
+    narrowed &&= !params.tools.some(tool => "name" in tool && tool.name === "draft_reply");
     const results = params.messages.filter(message => message.role === "tool");
     if (results.length === 0) {
       reads += 1;
       return modelReply({ tools: [{ name: "read_email", input: { id: "fahim-inbound", account: "work" } }] });
     }
     if (results.length === 1) {
-      return modelReply({ tools: [{ name: "draft_reply", input: { email_id: "wrong-thread", body: replyBody } }] });
-    }
-    if (results.length === 2) {
-      return modelReply({ tools: [{ name: "draft_reply", input: { email_id: "fahim-inbound", body: replyBody, send_immediately: true } }] });
+      return modelReply({ tools: [{ name: "draft_reply", input: { email_id: "fahim-inbound", body: replyBody } }] });
     }
     return modelReply({ text: "Here is the reply for your review." });
   };
@@ -318,10 +323,12 @@ assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email"
   const replyStart = replies.length;
   const writes = createdThreads.length;
   await say(instructions);
-  assert(reachedEmail && reads === 1, "the Email agent reads the latest inbound message");
-  assert(createdThreads.length === writes + 1 && createdThreads.at(-1) === fahimThread, "only the reply on Fahim’s thread is drafted");
-  assert(sends.join() === draftId, "recovery cannot send even when the model passes send_immediately");
-  assert(replies.slice(replyStart).some(line => line.includes("That draft to Fahim went out at")), "delivery history is stated from the recorded send");
+  assert(reads === 1, "the model reads the latest inbound message");
+  assert(sawFacts, "the closed email's record reached the model as data");
+  assert(!narrowed, "no tools were narrowed because of the closed email");
+  assert(createdThreads.length === writes + 1 && createdThreads.at(-1) === fahimThread, "the reply is drafted on Fahim's thread");
+  assert(sends.join() === draftId, "drafting a reply sends nothing");
+  assert(!replies.slice(replyStart).some(line => line.includes("went out at")), "code never prepends the closed email's history");
   assert(!replies.slice(replyStart).some(line => /couldn't read the current draft|latest OCR photo/i.test(line)), "neither incident dead end is repeated");
 
   let rejected = false;

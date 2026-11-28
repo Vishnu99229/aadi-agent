@@ -18,6 +18,7 @@ import {
   getSalesSequence,
   getSalesSequenceByThread,
   isSalesDoNotContact,
+  latestRecordedSendTo,
   recordSalesPitchScan,
   reproposeDeclinedSalesSequence,
   SALES_SEQUENCE_DECLINED,
@@ -43,6 +44,7 @@ import { completeBackground } from "./llm.js";
 import { blockedAutoSendDomains, PERSONAL_DOMAINS } from "./meeting_book.js";
 import { isSelfEmail } from "./mom_logic.js";
 import { repliedMessageForTurn } from "./email_references.js";
+import { resolvePersonFromFacts } from "./recipient_facts.js";
 import {
   allowOwnerChatStartSequence,
   allowOwnTurnSequenceEnrollment,
@@ -1141,6 +1143,53 @@ interface CarryContext {
   api: Api;
   /** The email the follow-ups are for, when the email (not a name) decides. */
   email?: { sentMessageId: string; account: string };
+  /** The model's start_sequence argument: who the follow-ups are for, by name or address. */
+  asked?: string;
+}
+
+/**
+ * Who named follow-ups are for, from facts (recipient_facts.ts), on his own turn: the
+ * name in his words, then the model's argument. One address, or a reply that asks.
+ * Off his own turn, or with no match, the name goes to the Sent-mail search.
+ */
+async function namedProspect(person: string, carry: CarryContext): Promise<string | { reply: string }> {
+  const confirmation = carry.turn.confirmation;
+  if (!confirmation || carry.turn.ownTurn !== true) return person;
+  // His words' name first. Only when that is nobody does the model's argument decide
+  // who: either the same person by name, or decideSequenceAction already made it a
+  // Start card that names the difference.
+  const queries = [...new Set([person.trim(), carry.asked?.trim()].filter((query): query is string => Boolean(query)))];
+  for (const query of queries) {
+    const match = await resolvePersonFromFacts(query, {
+      chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: carry.turn.userText ?? "",
+    });
+    if (match.kind === "one") return match.mailbox.email;
+    if (match.kind === "many") {
+      const options = match.options.map((option) => `- ${prospectDisplay(option.name, option.email)}`);
+      return { reply: `Not started: more than one person matches "${query}". Which one?\n${options.join("\n")}` };
+    }
+  }
+  // Nobody in the facts: his Sent mail's To headers by name, as before (people he has
+  // emailed), which is the same kind of record.
+  return person;
+}
+
+/** Aadi's own record of its newest email to this address, when Gmail search hasn't
+ *  caught up with it yet. */
+async function recordedThreadFor(
+  gmail: gmail_v1.Gmail,
+  address: string,
+  selfAddresses: ReadonlySet<string>,
+  ownAddress: string,
+): Promise<ThreadAssessment | undefined> {
+  const recorded = latestRecordedSendTo(address);
+  if (!recorded || recorded.account !== "work") return undefined;
+  const message = await gmail.users.messages.get({ userId: "me", id: recorded.sentMessageId, format: "minimal" });
+  const threadId = message.data.threadId;
+  if (!threadId) return undefined;
+  return (await assessLive(gmail, threadId, selfAddresses, ownAddress, {
+    ignoreSequence: (row) => row.thread_id === threadId && revivable(row),
+  })) ?? undefined;
 }
 
 /** The one executor: after decideSequenceAction, enrol or post a pre-filled card.
@@ -1166,11 +1215,20 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     const ownAddress = await ownAddressOf(gmail);
     const selfAddresses = await loadFollowupSelfAddresses();
     if (decision.via === "named") {
-      const found = await newestThreadFor(gmail, decision.person!, selfAddresses, ownAddress);
-      if (typeof found === "string") {
-        return found;
+      const target = await namedProspect(decision.person!, carry);
+      if (typeof target !== "string") {
+        return target.reply;
       }
-      chosen = found;
+      const found = await newestThreadFor(gmail, target, selfAddresses, ownAddress);
+      if (typeof found === "string") {
+        const recorded = target.includes("@") ? await recordedThreadFor(gmail, target, selfAddresses, ownAddress) : undefined;
+        if (!recorded) {
+          return found;
+        }
+        chosen = recorded;
+      } else {
+        chosen = found;
+      }
     } else {
       const message = await gmail.users.messages.get({ userId: "me", id: carry.email!.sentMessageId, format: "minimal" });
       const threadId = message.data.threadId;
@@ -1189,7 +1247,7 @@ async function carryOutSequenceDecision(decision: SequenceDecision, carry: Carry
     console.error(`Sequence command: thread check failed (${errorType})`);
     return noteEmailFailure(new EmailOperationError(
       "Not started: I couldn't check that thread. Read the latest sent email before requesting follow-ups.", "provider_read_failed",
-      { account: "work", messageId: carry.email?.sentMessageId, recipient: decision.person },
+      { account: "work", messageId: carry.email?.sentMessageId ?? undefined, recipient: decision.person ?? undefined },
     ));
   }
   noteEmailTarget("start_sequence", { recipient: chosen.prospect?.email, threadId: chosen.prospect ? undefined : chosen.threadId });
@@ -1347,6 +1405,7 @@ export async function followupsAfterSend(input: {
     turn: input.turn,
     api: cardApi(),
     email: input.sentMessageId ? { sentMessageId: input.sentMessageId, account: input.account } : undefined,
+    asked: entry?.modelAsked ?? input.recipient,
   });
   return { text };
 }
@@ -1366,7 +1425,7 @@ export async function startSequenceFromTool(
     modelCalled: turn.modelCalled === true,
     toolTarget: target,
   };
-  const carry: CarryContext = { turn, api };
+  const carry: CarryContext = { turn, api, asked: target };
   const command = parseSequenceCommand(words);
   const key = commandKeyOf(turn);
   if (command.kind === "direct" && command.combined) {

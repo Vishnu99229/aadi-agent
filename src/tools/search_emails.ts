@@ -10,6 +10,7 @@ import { peopleNamedInQuery, rewriteQuery, type Contact, type NamedInQuery } fro
 import { askWhichContact, type UnresolvedContact } from "../contact_questions.js";
 import { resolveContact } from "../contacts.js";
 import type { ToolTurn } from "./index.js";
+import { headerPeople, noteShownPeople } from "../conversation_people.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -155,5 +156,9 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     return "No emails found.";
   }
 
+  // Who these emails are from and to (headers only) is what a name can mean next.
+  for (const email of emails as Array<{ id?: unknown; from?: string; to?: string; cc?: string }>) {
+    noteShownPeople(turn, headerPeople(email.from, email.to, email.cc), "email", String(email.id ?? ""));
+  }
   return JSON.stringify(emails, null, 2);
 }

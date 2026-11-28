@@ -1,5 +1,7 @@
 import { google } from "googleapis";
 import type { LlmTool } from "../llm.js";
+import type { ToolTurn } from "./index.js";
+import { noteShownPeople } from "../conversation_people.js";
 import {
   accountsForFilter,
   parseGoogleAccountFilter,
@@ -81,7 +83,7 @@ function startOfDate(value: unknown, field: string): Date {
   return date;
 }
 
-export async function handler(input: unknown): Promise<string> {
+export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
   const values = input as {
     start_date?: unknown;
     end_date?: unknown;
@@ -122,6 +124,14 @@ export async function handler(input: unknown): Promise<string> {
         pageToken,
       });
       for (const event of response.data.items ?? []) {
+        // The attendees (from Calendar, never the description) are who a name can mean next.
+        noteShownPeople(
+          turn,
+          (event.attendees ?? []).flatMap((attendee) =>
+            attendee.email && !attendee.self ? [{ email: attendee.email, name: attendee.displayName ?? "" }] : []),
+          "event",
+          event.id ?? "",
+        );
         const attendees = (event.attendees ?? [])
           .map((attendee) => {
             const email = attendee.email?.trim() ?? "";

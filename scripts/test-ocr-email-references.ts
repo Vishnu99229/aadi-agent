@@ -334,8 +334,9 @@ assert.equal(latestDraftRecipient.toLowerCase().includes("info@msopsai.com"), tr
 assert.equal(latestDraftRecipient.toLowerCase().includes("vasanth"), false);
 assert.match(replies.join("\n"), /New address: info@msopsai\.com\. Tap Send to confirm\./);
 assert.equal(draftSends, 0);
-// From here on he has emailed both (as if he had tapped Send), so the address-choice
-// cases below keep sending directly; what they check is which address is used.
+// From here on he has emailed both (as if he had tapped Send). An address from the photo
+// still always goes through the new-address card, even when known; what the cases below
+// check is which address the card's draft uses, and that nothing goes out on its own.
 recordKnownRecipient("info@msopsai.com", "test");
 recordKnownRecipient("alice.copied@example.com", "test");
 
@@ -392,18 +393,19 @@ savePendingAction(1, {
 const sendsBeforeNew = messageSends;
 const draftSendsBeforeNew = draftSends;
 await say("Send an email to the address above now about our discussion");
-assert.match(latestSentTo, /info@msopsai\.com/i);
-assert.doesNotMatch(latestSentTo, /old-scheduled@example\.com/i);
-assert.equal(messageSends, sendsBeforeNew + 1);
+assert.match(latestDraftRecipient, /info@msopsai\.com/i);
+assert.doesNotMatch(latestDraftRecipient, /old-scheduled@example\.com/i);
+assert.equal(messageSends, sendsBeforeNew, "a known address from the photo still gets the card, not a send");
+assert.match(replies.join("\n"), /New address: info@msopsai\.com\. Tap Send to confirm\./);
 assert.equal(draftSends, draftSendsBeforeNew, "the older scheduled draft must not be dispatched");
 assert.equal(getScheduledSend(oldSchedule!.id)?.status, "scheduled");
 
 rememberContactChoice("Alice", { name: "Alice", emails: ["alice.copied@example.com"], sources: ["known"] });
 const sendsBeforeCc = messageSends;
 await say("Send an email to the address above about the launch and Cc Alice");
-assert.match(latestSentTo, /info@msopsai\.com/i);
-assert.match(latestSentCc, /alice\.copied@example\.com/i);
-assert.equal(messageSends, sendsBeforeCc + 1);
+assert.match(latestDraftRecipient, /info@msopsai\.com/i);
+assert.match(latestDraftCc, /alice\.copied@example\.com/i);
+assert.equal(messageSends, sendsBeforeCc, "the photo's address waits on its card");
 assert.equal(draftSends, draftSendsBeforeNew);
 
 const draftsBeforeCompose = gmailDrafts;
@@ -753,17 +755,21 @@ for (const email of ["jeff@example.com", "munil@example.com", "dorothy@example.c
 {
   const sendsBefore = messageSends;
   const scheduledBefore = listOpenScheduledSends().length;
+  const draftsBefore = gmailDrafts;
   await ocrSay(53, "Send an email to the address above saying the call is on 2026-11-25 at 10:00");
-  assert.equal(messageSends, sendsBefore + 1, "a date in the body must send now");
+  assert.equal(messageSends, sendsBefore, "the photo's address waits on its card");
+  assert.equal(gmailDrafts, draftsBefore + 1, "a date in the body is content: a card now, not a schedule");
   assert.equal(listOpenScheduledSends().length, scheduledBefore);
-  assert.match(latestSentTo, /info@msopsai\.com/i);
+  assert.match(latestDraftRecipient, /info@msopsai\.com/i);
 }
 
 {
   const sendsBefore = messageSends;
   const scheduledBefore = listOpenScheduledSends().length;
+  const draftsBefore = gmailDrafts;
   await ocrSay(54, "Send an email to the address above about our meeting tomorrow at 10:00");
-  assert.equal(messageSends, sendsBefore + 1, "about tomorrow is content, not a schedule");
+  assert.equal(messageSends, sendsBefore, "the photo's address waits on its card");
+  assert.equal(gmailDrafts, draftsBefore + 1, "about tomorrow is content: a card now, not a schedule");
   assert.equal(listOpenScheduledSends().length, scheduledBefore);
 }
 
@@ -778,15 +784,21 @@ for (const email of ["jeff@example.com", "munil@example.com", "dorothy@example.c
 
 {
   const sendsBefore = messageSends;
+  const draftsBefore = gmailDrafts;
+  const scheduledBefore = listOpenScheduledSends().length;
   await ocrSay(56, "Send an email to the address above ki the call is on 2026-11-25 at 10:00");
-  assert.equal(messageSends, sendsBefore + 1, "Hindi ki keeps the date in the body");
+  assert.equal(messageSends, sendsBefore, "the photo's address waits on its card");
+  assert.equal(gmailDrafts, draftsBefore + 1, "Hindi ki keeps the date in the body: a card now");
+  assert.equal(listOpenScheduledSends().length, scheduledBefore);
 }
 
 {
   const sendsBefore = messageSends;
   const scheduledBefore = listOpenScheduledSends().length;
+  const draftsBefore = gmailDrafts;
   await ocrSay(57, "Send an email to the address above, the call is on 2026-11-25 at 10:00 ennu parayu");
-  assert.equal(messageSends, sendsBefore + 1, "Malayalam ennu never becomes the send time");
+  assert.equal(messageSends, sendsBefore, "the photo's address waits on its card");
+  assert.equal(gmailDrafts, draftsBefore + 1, "Malayalam ennu never becomes the send time: a card now");
   assert.equal(listOpenScheduledSends().length, scheduledBefore);
 }
 

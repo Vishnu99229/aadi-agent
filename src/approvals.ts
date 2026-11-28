@@ -30,7 +30,11 @@ import {
   pendingActionFollowups,
   cardRecipientsForMessage,
   draftHasCardRecords,
+  recentSendWarningsForMessage,
+  recentSendWarningsShownBefore,
+  recordImmediateDraftSend,
 } from "./db.js";
+import { recentSendsFor, toAddresses } from "./recent_sends.js";
 import { getGoogleClientFor } from "./google/auth.js";
 import {
   allowCreateEvent,
@@ -44,7 +48,7 @@ import { draftSendCallback, postConfirmCard, type ConfirmCardSpec } from "./conf
 import { classifyOwnerEmailIntent } from "./email_references.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
 import { followupsAfterSend } from "./sequences.js";
-import { assertSendDecision, cardReason, decideSendAction, type SendVerdict } from "./security/send_decision.js";
+import { assertSendDecision, cardReason, decideSendAction, recentSendLine, type RecentSend, type SendVerdict } from "./security/send_decision.js";
 import { plainTextBody, stripSignature } from "./google/mail.js";
 import { collectAttachmentParts } from "./gmail_attachments.js";
 import { evaluateCommandSendGate } from "./security/command_send.js";
@@ -100,6 +104,23 @@ export function claimRecipientDelivery(account: GoogleAccountId, to: string): ((
   if (keys.some((key) => deliveringTo.has(key))) return undefined;
   keys.forEach((key) => deliveringTo.add(key));
   return () => keys.forEach((key) => deliveringTo.delete(key));
+}
+
+const DELIVERY_WAIT_MS = 20_000;
+const DELIVERY_POLL_MS = 100;
+
+/** The claim on these people, once another delivery to them has finished. Whoever goes
+ *  second then rechecks the recent-send records while holding it, so two sends that
+ *  were decided at once can't both go out. Undefined if the other never finishes. */
+export async function awaitRecipientDelivery(
+  account: GoogleAccountId, to: string, waitMs = DELIVERY_WAIT_MS,
+): Promise<(() => void) | undefined> {
+  const started = Date.now();
+  for (;;) {
+    const release = claimRecipientDelivery(account, to);
+    if (release || Date.now() - started >= waitMs) return release;
+    await new Promise((resolve) => setTimeout(resolve, DELIVERY_POLL_MS));
+  }
 }
 
 export function draftWriteInProgress(draftId: string, account: GoogleAccountId): boolean {
@@ -208,6 +229,7 @@ function draftCardSpec(
   actionId: number,
   preview: DraftApprovalPreview,
   sendOnly: boolean,
+  recentSends: readonly RecentSend[] = [],
 ): Extract<ConfirmCardSpec, { kind: "draft_send" }> {
   const mailbox =
     preview.googleAccount === "work" ? "work (Epicode)" : "personal (Gmail)";
@@ -219,7 +241,7 @@ function draftCardSpec(
   const bodyChars = Array.from(preview.body).length;
   const long = bodyChars > DRAFT_SUMMARY_CHARS;
   const captionTail = [...extra, `Subject: ${preview.subject}`, "", preview.body];
-  const base = { kind: "draft_send" as const, key: preview.draftId, actionId, sendOnly, showFull: long, to: preview.to, cc, captionTail };
+  const base = { kind: "draft_send" as const, key: preview.draftId, actionId, sendOnly, showFull: long, to: preview.to, cc, captionTail, recentSends };
   if (long) {
     const count = bodyChars.toLocaleString("en-US");
     return {
@@ -467,10 +489,12 @@ export async function queueDraftApproval(
   if (sendOnly) sendOnlyActions.add(action.id);
   else sendOnlyActions.delete(action.id);
 
+  // Aadi emailed someone on its To within the last 30 minutes: the card says so, and a
+  // tap on it confirms another email to them.
   const spec = draftCardSpec(action.id, {
     ...preview,
     extraLines: [...(preview.extraLines ?? []), ...(notice ? notice.split("\n") : [])],
-  }, sendOnlyActions.has(action.id));
+  }, sendOnlyActions.has(action.id), recentSendsFor(toAddresses(preview.to)));
 
   if (action.telegram_message_id && options.newCard !== true) {
     try {
@@ -616,9 +640,11 @@ type SendOutcome =
   | { ok: true; sentMessageId?: string; replacementNotice: string }
   | {
       ok: false;
-      reason: "send_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused" | "superseded" | "to_changed";
+      reason: "send_failed" | "already_sent" | "in_progress" | "unconfirmed" | "not_decided" | "reread_failed" | "gate_refused" | "superseded" | "to_changed" | "recent_send";
       /** The content gate's reason, for gate_refused. */
       detail?: string;
+      /** For recent_send: who was emailed since the decision, from records. */
+      recentSends?: RecentSend[];
     };
 
 /** The draft as Gmail has it now, for the content gate at delivery. */
@@ -697,18 +723,38 @@ function shownOnTappedCard(action: PendingAction, messageId: number | undefined)
 /** His own "send it" for a draft he was shown: only addresses its card showed before
  *  his message, or that he's sent to before, go out with no further tap. */
 async function textSendVerdict(action: PendingAction, messageId: number, ownTurn: boolean): Promise<{ verdict: SendVerdict; to: string }> {
-  const recipients = action.draft_id ? await draftRecipients(action.google_account, action.draft_id) : [];
+  const live = action.draft_id ? await readDraftRecipients(action.google_account, action.draft_id) : undefined;
+  const recipients = live?.recipients ?? [];
   const verdict = decideSendAction({
     intent: "send",
     ownTurn,
     recipients,
     known: await knownRecipients(recipients),
     confirmed: action.draft_id ? draftRecipientsShownBefore(action.draft_id, messageId) : new Set(),
+    // Only a warning this draft's card showed before his message confirms another email.
+    recentSends: recentSendsFor(
+      toAddresses(live?.to),
+      action.draft_id ? recentSendWarningsShownBefore(action.draft_id, messageId) : new Map(),
+    ),
   });
   return { verdict, to: action.live_to_header ?? action.to_header ?? recipients.join(", ") };
 }
 
+/** A tap that would send to someone Aadi just emailed: a fresh card that says so, and
+ *  why nothing went out. */
+async function answerRecentSend(ctx: Context, action: PendingAction, shown: ReadonlySet<string>, sends: readonly RecentSend[]): Promise<void> {
+  const refreshed = await postRefreshedCard(action, shown);
+  const line = recentSendLine(sends);
+  await ctx.answerCallbackQuery({
+    text: refreshed.ok
+      ? `Not sent: ${line} Tap Send on the new card to send it.`
+      : `Not sent: ${line} I couldn't post a new card, so ask me to show it again.`,
+    show_alert: true,
+  }).catch(() => undefined);
+}
+
 function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], detail?: string): string {
+  if (reason === "recent_send") return "Not sent: you emailed them in the last 30 minutes. Check the newest card before sending another.";
   if (reason === "superseded") return [DRAFT_REPLACED, detail].filter(Boolean).join("\n");
   if (reason === "to_changed") return "The draft's To addresses changed in Gmail. Ask me to show the updated card before sending.";
   if (reason === "gate_refused") {
@@ -732,9 +778,18 @@ function sendFailureText(reason: Exclude<SendOutcome, { ok: true }>["reason"], d
   return "Gmail rejected the send. The draft is still pending. Check the draft in Gmail.";
 }
 
-async function deliverGmailDraft(gmail: gmail_v1.Gmail, input: {
+async function deliverGmailDraft(gmail: gmail_v1.Gmail, delivery: {
   account: GoogleAccountId; draftId: string; recipient: string;
+  /** decideSendAction's "send" for exactly these people. Without it nothing goes out. */
+  decision: SendVerdict; recipients: readonly string[];
 }): Promise<{ id: string; threadId?: string } | { reason: "send_failed" | "unconfirmed" }> {
+  const { decision, recipients, ...input } = delivery;
+  // The one Gmail draft send checks the decision itself, right before Gmail.
+  try {
+    assertSendDecision(decision, recipients);
+  } catch {
+    return { reason: "send_failed" };
+  }
   const unconfirmed = (): { reason: "unconfirmed" } => {
     noteEmailFailure(new EmailOperationError("Gmail didn't confirm the draft send. Check Sent mail before any further action.", "write_unconfirmed", { ...input, lookup: "sent" }));
     return { reason: "unconfirmed" };
@@ -769,7 +824,14 @@ function draftToMatchesApproval(action: PendingAction, to: string, ownerEdit?: O
   );
 }
 
-async function performDraftSend(action: PendingAction, decision: SendVerdict, ownerEdit?: OwnerToEdit): Promise<SendOutcome> {
+async function performDraftSend(
+  action: PendingAction,
+  decision: SendVerdict,
+  ownerEdit: OwnerToEdit | undefined,
+  /** The recent sends a card already warned him about before he confirmed: email to the
+   *  newest send it named. Anything else sent to them in the window holds this send. */
+  acknowledged: ReadonlyMap<string, string>,
+): Promise<SendOutcome> {
   const draftId = action.draft_id;
   if (!draftId) {
     return { ok: false, reason: "send_failed" };
@@ -825,8 +887,16 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict, ow
   }
   if (current?.status !== "pending") return { ok: false, reason: "not_decided" };
   if (!draftToMatchesApproval(current, to, ownerEdit)) return { ok: false, reason: "to_changed" };
-  const release = claimRecipientDelivery(action.google_account, to);
+  const release = await awaitRecipientDelivery(action.google_account, to);
   if (!release) return { ok: false, reason: "in_progress" };
+  // Holding the claim, right before Gmail: anyone on To emailed since the decision, or in
+  // the window without a card that warned him first, holds this send for a new card.
+  const repeats = recentSendsFor(toAddresses(to), acknowledged);
+  if (repeats.length > 0) {
+    release();
+    console.log(`Approval action ${action.id}: send held at delivery, recipient emailed recently`);
+    return { ok: false, reason: "recent_send", recentSends: repeats };
+  }
   let sentMessageId: string | undefined;
   let replacedOnSend: PendingAction[];
   try {
@@ -837,7 +907,7 @@ async function performDraftSend(action: PendingAction, decision: SendVerdict, ow
       console.log(`Approval action ${action.id}: send blocked reason=${claim.state}`);
       return { ok: false, reason: claim.state };
     }
-    const delivery = await deliverGmailDraft(gmail, { account: action.google_account, draftId, recipient: to });
+    const delivery = await deliverGmailDraft(gmail, { account: action.google_account, draftId, recipient: to, decision, recipients });
     if ("reason" in delivery) return { ok: false, reason: delivery.reason };
     sentMessageId = delivery.id;
     replacedOnSend = settleDraftDelivery({
@@ -923,6 +993,8 @@ export async function sendCreatedDraftNow(params: {
     ownTurn: params.ownTurn === true,
     recipients,
     known: await knownRecipients(recipients),
+    // Someone on To was emailed in the last 30 minutes: their card asks first.
+    recentSends: recentSendsFor(toAddresses(to)),
   });
   if (verdict.action !== "send") {
     return { ok: false, reason: "card", message: cardReason(verdict, recipients.join(", ")) };
@@ -933,8 +1005,14 @@ export async function sendCreatedDraftNow(params: {
     return { ok: false, reason: "send_failed" };
   }
   const gmail = await gmailFor(params.googleAccount);
-  const release = claimRecipientDelivery(params.googleAccount, to);
+  const release = await awaitRecipientDelivery(params.googleAccount, to);
   if (!release) return { ok: false, reason: "send_failed" };
+  // Holding the claim: someone on To emailed since the decision gets the card instead.
+  const repeats = recentSendsFor(toAddresses(to));
+  if (repeats.length > 0) {
+    release();
+    return { ok: false, reason: "card", message: cardReason({ action: "card", newAddresses: [], notOwnTurn: false, recentSends: repeats }, to) };
+  }
   let sentMessageId: string | undefined;
   let replaced: PendingAction[];
   try {
@@ -943,10 +1021,16 @@ export async function sendCreatedDraftNow(params: {
       console.log(`Draft ${params.draftId}: immediate send blocked reason=${claim.state}`);
       return { ok: false, reason: claim.state === "unconfirmed" || claim.state === "in_progress" ? "unconfirmed" : "send_failed" };
     }
-    const delivery = await deliverGmailDraft(gmail, { account: params.googleAccount, draftId: params.draftId, recipient: to });
+    const delivery = await deliverGmailDraft(gmail, { account: params.googleAccount, draftId: params.draftId, recipient: to, decision: verdict, recipients });
     if ("reason" in delivery) return { ok: false, reason: delivery.reason };
     sentMessageId = delivery.id;
     const deliveredAt = new Date().toISOString();
+    // No card means no pending_actions row: record the delivery where the recent-send
+    // check reads it.
+    recordImmediateDraftSend({
+      key: `draftnow:${params.googleAccount}:${params.draftId}`, account: params.googleAccount,
+      threadId: delivery.threadId ?? null, to, sentMessageId,
+    });
     replaced = settleDraftDelivery({
       account: params.googleAccount, to, draftId: params.draftId, sentMessageId, sentThreadId: delivery.threadId,
       schedule: claim.state === "claimed" ? claim : undefined,
@@ -1064,9 +1148,10 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   // His tap on the card's own Send confirms the people the card showed. Anyone else on
   // the Gmail draft now (changed outside Aadi) must be someone he has emailed before.
   let recipients: string[] = [];
+  let liveTo = "";
   if (action.draft_id) {
     try {
-      recipients = await draftRecipients(action.google_account, action.draft_id);
+      ({ recipients, to: liveTo } = await readDraftRecipients(action.google_account, action.draft_id));
     } catch {
       console.log(`Approval action ${action.id}: send refused, draft unreadable`);
       await ctx.answerCallbackQuery({ text: DRAFT_REREAD_FAILED, show_alert: true });
@@ -1075,13 +1160,24 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
   }
   const tappedMessage = ctx.callbackQuery?.message?.message_id;
   const shown = shownOnTappedCard(action, tappedMessage);
+  // The tap confirms another email only to people this very card warned about.
+  const tapAcknowledged = action.draft_id && tappedMessage !== undefined
+    ? recentSendWarningsForMessage(action.draft_id, tappedMessage)
+    : new Map<string, string>();
   const verdict = decideSendAction({
     intent: "send",
     ownTurn: true,
     recipients,
     known: await knownRecipients(recipients.filter((email) => !shown.has(email))),
     confirmed: shown,
+    recentSends: recentSendsFor(toAddresses(liveTo), tapAcknowledged),
   });
+  if (verdict.action === "card" && (verdict.recentSends?.length ?? 0) > 0 && verdict.newAddresses.length === 0) {
+    // A card posted before that email went out: say so on a fresh card, send nothing.
+    console.log(`Approval action ${action.id}: send held, recipient emailed recently`);
+    await answerRecentSend(ctx, action, shown, verdict.recentSends ?? []);
+    return;
+  }
   if (verdict.action === "card" && verdict.newAddresses.length > 0) {
     console.log(`Approval action ${action.id}: send refused, draft has addresses the card didn't show`);
     await ctx.answerCallbackQuery({
@@ -1094,7 +1190,12 @@ async function sendDraft(ctx: Context, action: PendingAction): Promise<void> {
     });
     return;
   }
-  const outcome = await performDraftSend(action, verdict);
+  const outcome = await performDraftSend(action, verdict, undefined, tapAcknowledged);
+  if (!outcome.ok && outcome.reason === "recent_send") {
+    // Another email went to them while this tap waited: a fresh card that says so.
+    await answerRecentSend(ctx, action, shown, outcome.recentSends ?? []);
+    return;
+  }
   if (!outcome.ok) {
     if (outcome.reason === "already_sent") {
       await showSentCard(ctx, action).catch(() => undefined);
@@ -1482,8 +1583,10 @@ export async function sendPendingDraftByText(
     }
     const { verdict, to } = decision;
     if (verdict.action !== "send") {
-      console.log(`Approval action ${action.id}: card, not sent (${verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
-      if (options.refreshOnCard && verdict.action === "card") {
+      const repeat = verdict.action === "card" && (verdict.recentSends?.length ?? 0) > 0;
+      console.log(`Approval action ${action.id}: card, not sent (${repeat ? "recent send" : verdict.action === "card" && verdict.newAddresses.length > 0 ? "new address" : "not own turn"})`);
+      // Another email to someone Aadi just emailed: a card that says so, never a silent block.
+      if ((options.refreshOnCard || repeat) && verdict.action === "card") {
         const confirmed = action.draft_id ? draftRecipientsShownBefore(action.draft_id, confirmation.messageId) : undefined;
         const refreshed = await postRefreshedCard(action, confirmed);
         if (!refreshed.ok) {
@@ -1497,7 +1600,21 @@ export async function sendPendingDraftByText(
       noteEmailNotice(message);
       return { ok: false, message };
     }
-    const outcome = await performDraftSend(action, verdict, options[OWNER_TO_EDIT]);
+    const acknowledged = action.draft_id
+      ? recentSendWarningsShownBefore(action.draft_id, confirmation.messageId)
+      : new Map<string, string>();
+    const outcome = await performDraftSend(action, verdict, options[OWNER_TO_EDIT], acknowledged);
+    if (!outcome.ok && outcome.reason === "recent_send") {
+      // Another email went to them while this waited: a fresh card that says so.
+      const confirmed = action.draft_id ? draftRecipientsShownBefore(action.draft_id, confirmation.messageId) : undefined;
+      const refreshed = await postRefreshedCard(action, confirmed);
+      const line = recentSendLine(outcome.recentSends ?? []);
+      const message = refreshed.ok
+        ? `Not sent: ${line} Tap Send on the new card to send it.`
+        : `Not sent: ${line} I couldn't post a new card, so ask me to show it again.`;
+      noteEmailNotice(message);
+      return { ok: false, message };
+    }
     if (!outcome.ok) {
       const failure = outcome.reason === "reread_failed" ? "miss"
         : outcome.reason === "unconfirmed" || outcome.reason === "in_progress"

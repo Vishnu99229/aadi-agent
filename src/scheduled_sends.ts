@@ -2,6 +2,7 @@ import { InlineKeyboard, type Context } from "grammy";
 import {
   commandApi,
   readThread,
+  scheduledAcknowledged,
   scheduledSendVerdict,
   scheduledWhen,
   writeAndSend,
@@ -38,7 +39,8 @@ import { retireDraftApproval } from "./approvals.js";
 import { allowInboundCommands } from "./security/owner_lock.js";
 import { allowOwnerChatCancelScheduledSend } from "./security/send_approval.js";
 import { recipientFingerprint } from "./security/send_decision.js";
-import { cardRecipientsForMessage } from "./db.js";
+import { cardRecipientsForMessage, recentSendWarningsForMessage } from "./db.js";
+import { mergeAcknowledged } from "./recent_sends.js";
 import { postConfirmCard, scheduleCardKey, type ConfirmCardSpec } from "./confirm_cards.js";
 import type { ToolTurn } from "./tools/index.js";
 
@@ -203,12 +205,17 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
   if (verdict.action !== "send") {
     if (holdScheduledSendForConfirm(row.id)) {
       const newAddresses = verdict.action === "card" ? verdict.newAddresses : [];
-      console.log(`Scheduled send ${row.id}: status -> held for confirm`);
+      // Aadi emailed someone on its To within the last 30 minutes: he confirms another.
+      const recentSends = verdict.action === "card" ? verdict.recentSends ?? [] : [];
+      console.log(`Scheduled send ${row.id}: status -> held for confirm${recentSends.length > 0 ? " (recent send)" : ""}`);
       await tellCard({
         kind: "schedule_confirm",
         scheduleId: row.id,
         ...peopleOf(request),
-        headline: `Held, not sent: ${row.item_text}\nNew address: ${newAddresses.join(", ") || "unconfirmed"}. Tap Confirm to send it.`,
+        headline: newAddresses.length > 0 || recentSends.length === 0
+          ? `Held, not sent: ${row.item_text}\nNew address: ${newAddresses.join(", ") || "unconfirmed"}. Tap Confirm to send it.`
+          : `Held, not sent: ${row.item_text}\nTap Confirm to send it.`,
+        recentSends,
       });
     }
     return;
@@ -237,8 +244,25 @@ export async function fireScheduledSend(due: ScheduledSendRecord, now: Date, res
       prepared: snapshot,
       explicitSubject: request.subjectEdited ? request.finalSubject || request.subject : undefined,
       verdict,
+      // Rechecked right before Gmail: a send to them since this verdict holds it.
+      acknowledged: scheduledAcknowledged(request),
+      holdOnRecentSend: true,
     },
   );
+  if (outcome.result === "recent_send") {
+    // Someone on To was emailed while this was being prepared: he confirms another.
+    if (holdScheduledSendForConfirm(row.id)) {
+      console.log(`Scheduled send ${row.id}: status -> held for confirm (recent send at delivery)`);
+      await tellCard({
+        kind: "schedule_confirm",
+        scheduleId: row.id,
+        ...peopleOf(request),
+        headline: `Held, not sent: ${row.item_text}\nTap Confirm to send it.`,
+        recentSends: outcome.recentSends ?? [],
+      });
+    }
+    return;
+  }
   if (outcome.result === "sent") {
     recordScheduledSendSent(row.id, outcome.messageId ?? null);
     markTaskDone(row.task_id);
@@ -446,10 +470,19 @@ export async function handleScheduledSendCallback(ctx: Context): Promise<void> {
         scheduleId: held.id,
         ...peopleOf(request),
         headline: `Held, not sent: ${held.item_text}\nIt now goes to ${everyone.join(", ")}.${newAddresses.length > 0 ? ` New address: ${newAddresses.join(", ")}.` : ""} Tap Confirm to send it to them.`,
+        recentSends: verdict.action === "card" ? verdict.recentSends ?? [] : [],
       });
       return;
     }
     request.confirmedRecipients = [...new Set([...(request.confirmedRecipients ?? []), ...everyone])];
+    // The card he tapped said "You emailed X at T": that confirms another email to X,
+    // for sends up to T. Anything sent after that card still waits for him.
+    const warned = tapped === undefined ? new Map<string, string>() : recentSendWarningsForMessage(scheduleCardKey(held.id), tapped);
+    if (warned.size > 0) {
+      request.recentSendsConfirmed = Object.fromEntries(
+        mergeAcknowledged(new Map(Object.entries(request.recentSendsConfirmed ?? {})), warned),
+      );
+    }
     if (!releaseHeldScheduledSend(held.id, JSON.stringify(request), held.request)) {
       await ctx.editMessageText("Not confirmed: it changed while you tapped. Check the newest card.", { reply_markup: undefined }).catch(() => undefined);
       return;

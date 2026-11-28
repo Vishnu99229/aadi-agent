@@ -178,6 +178,7 @@ export async function sendCommandEmail(
       key: params.key,
       account: params.account.id,
       threadId: params.threadId,
+      to: params.to,
     })
   ) {
     throw new CommandSendRefusedError("already_handled");

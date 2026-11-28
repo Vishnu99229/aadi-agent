@@ -3,6 +3,7 @@ import { describeContact, displayQuery } from "../contact_logic.js";
 import { askWhichContact } from "../contact_questions.js";
 import { resolveContact } from "../contacts.js";
 import type { ToolTurn } from "./index.js";
+import { noteShownPeople } from "../conversation_people.js";
 
 export const definition: Extract<LlmTool, { type: "function" }> = {
   type: "function",
@@ -28,6 +29,7 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   }
   const resolution = await resolveContact(name);
   if (resolution.kind === "one") {
+    noteShownPeople(turn, resolution.contact.emails.map((email) => ({ email, name: resolution.contact.name })), "contact", name.trim().toLowerCase());
     const seen = resolution.contact.sources.length > 0 ? ` Seen in: ${resolution.contact.sources.join(", ")}.` : "";
     return `One match for "${displayQuery(name)}": ${describeContact(resolution.contact)}.${seen}`;
   }

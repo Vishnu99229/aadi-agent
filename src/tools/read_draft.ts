@@ -1,4 +1,6 @@
 import type { LlmTool } from "../llm.js";
+import type { ToolTurn } from "./index.js";
+import { headerPeople, noteShownPeople } from "../conversation_people.js";
 import {
   getLatestPendingSendAction,
   getPendingActionForDraft,
@@ -30,7 +32,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   },
 };
 
-export async function handler(input: unknown): Promise<string> {
+export async function handler(input: unknown, turn?: ToolTurn): Promise<string> {
   const values = (input ?? {}) as { draft_id?: unknown };
   let draftId =
     typeof values.draft_id === "string" ? values.draft_id.trim() : "";
@@ -58,6 +60,7 @@ export async function handler(input: unknown): Promise<string> {
       ? `${characters.slice(0, BODY_LIMIT).join("")}\n[truncated]`
       : characters.join("");
 
+  noteShownPeople(turn, headerPeople(messageHeader(headers, "To"), messageHeader(headers, "Cc")), "draft", draftId);
   return [
     `Draft ID: ${draftId}`,
     `Account: ${account.label}`,

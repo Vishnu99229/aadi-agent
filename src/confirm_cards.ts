@@ -1,10 +1,10 @@
 import { InlineKeyboard, type Api } from "grammy";
 import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
-import { recordCardRecipients } from "./db.js";
+import { recordCardRecentSendWarnings, recordCardRecipients } from "./db.js";
 import { formatMailbox } from "./draft_recipients.js";
 import { parseAddressList, type ParsedMailbox } from "./mail_helpers.js";
-import { recipientFingerprint } from "./security/send_decision.js";
+import { recentSendLine, recipientFingerprint, type RecentSend } from "./security/send_decision.js";
 import { CARD_CAPTION_CHARS, holdForVoiceNote } from "./voice_cards.js";
 import { emailCardAcknowledgement, emailProviderWrite, outcomeRecipient } from "./email_outcomes.js";
 
@@ -33,8 +33,11 @@ export type ConfirmCardSpec =
       tail: string;
       /** The caption's lines after To and Cc. */
       captionTail: readonly string[];
+      /** Aadi emailed someone on its To within the last 30 minutes: the card says so,
+       *  and once posted it records that he was shown it. */
+      recentSends?: readonly RecentSend[];
     }
-  | { kind: "schedule_confirm"; scheduleId: number; to: string; cc: string; headline: string }
+  | { kind: "schedule_confirm"; scheduleId: number; to: string; cc: string; headline: string; recentSends?: readonly RecentSend[] }
   | { kind: "address_choice"; choiceId: number; options: readonly ParsedMailbox[]; headline: string }
   | { kind: "schedule_pick"; scheduleId: number; slotIndex: number; options: readonly ParsedMailbox[]; headline: string };
 
@@ -46,6 +49,8 @@ export interface RenderedConfirmCard {
   confirms: string[];
   /** What the posted message's recipients are recorded under. */
   key: string;
+  /** The recent sends the card's text names, recorded for the posted message. */
+  recentSends: readonly RecentSend[];
 }
 
 /** The callback a draft card's Send button carries (also what a text "send it" checks). */
@@ -133,24 +138,30 @@ export function renderConfirmCard(spec: ConfirmCardSpec): RenderedConfirmCard {
   switch (spec.kind) {
     case "draft_send": {
       const cc = spec.cc.trim();
+      const recentSends = spec.recentSends ?? [];
+      const warning = recentSends.length > 0 ? [recentSendLine(recentSends), ""] : [];
       return {
-        text: `${[...spec.head, ...recipientLines(spec.to, cc, spec.ccWhenEmpty)].join("\n")}\n${spec.tail}`,
-        caption: captionOf([], [`Draft to ${spec.to}`, ...(cc ? [`Cc: ${cc}`] : [])], spec.captionTail),
+        text: `${[...warning, ...spec.head, ...recipientLines(spec.to, cc, spec.ccWhenEmpty)].join("\n")}\n${spec.tail}`,
+        caption: captionOf(warning.slice(0, 1), [`Draft to ${spec.to}`, ...(cc ? [`Cc: ${cc}`] : [])], spec.captionTail),
         keyboard: draftKeyboard(spec.actionId, spec.sendOnly, spec.showFull),
         confirms: unique([...emails(spec.to), ...emails(cc)]),
         key: spec.key,
+        recentSends,
       };
     }
     case "schedule_confirm": {
       const cc = spec.cc.trim();
       const confirms = unique([...emails(spec.to), ...emails(cc)]);
       const people = recipientLines(spec.to, cc, "omit");
+      const recentSends = spec.recentSends ?? [];
+      const lead = recentSends.length > 0 ? [recentSendLine(recentSends), spec.headline] : [spec.headline];
       return {
-        text: [spec.headline, ...people].join("\n"),
-        caption: captionOf([spec.headline], people, []),
+        text: [...lead, ...people].join("\n"),
+        caption: captionOf(lead, people, []),
         keyboard: scheduleConfirmKeyboard(spec.scheduleId, confirms),
         confirms,
         key: scheduleCardKey(spec.scheduleId),
+        recentSends,
       };
     }
     case "address_choice":
@@ -165,6 +176,7 @@ export function renderConfirmCard(spec: ConfirmCardSpec): RenderedConfirmCard {
             : pickKeyboard(spec.scheduleId, spec.slotIndex, spec.options),
         confirms: unique(spec.options.map((option) => option.email.toLowerCase())),
         key: spec.kind === "address_choice" ? choiceCardKey(spec.choiceId) : scheduleCardKey(spec.scheduleId),
+        recentSends: [],
       };
     }
   }
@@ -193,6 +205,8 @@ export async function postConfirmCard(
   const shown = (messageId: number): void => {
     if (!options.repeated) acknowledged(messageId);
     recordCardRecipients(messageId, card.key, card.confirms.join(","));
+    // What this message now says about recent sends, and nothing it said before.
+    recordCardRecentSendWarnings(messageId, card.key, card.recentSends);
     options.onShown?.(messageId);
   };
   if (options.editMessageId !== undefined) {

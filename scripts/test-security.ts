@@ -360,7 +360,22 @@ assert(
   "performDraftSend is present and precedes sendDraft",
 );
 const performFn = approvalsSrc.slice(performStart, performEnd);
-assert(performFn.includes("drafts.send"), "performDraftSend still sends the draft");
+// The Gmail call itself lives in deliverGmailDraft (right before performDraftSend), which
+// tracks the provider write; performDraftSend sends through it.
+const deliverStart = approvalsSrc.indexOf("async function deliverGmailDraft");
+assert(
+  deliverStart >= 0 && deliverStart < performStart,
+  "deliverGmailDraft is present and precedes performDraftSend",
+);
+assert(
+  approvalsSrc.slice(deliverStart, performStart).includes("drafts.send("),
+  "deliverGmailDraft sends the draft",
+);
+assert(
+  (approvalsSrc.match(/drafts\.send\(/g) ?? []).length === 1,
+  "deliverGmailDraft is the only drafts.send in approvals.ts",
+);
+assert(performFn.includes("deliverGmailDraft("), "performDraftSend still sends the draft, through deliverGmailDraft");
 
 const textSendStart = approvalsSrc.indexOf("export async function sendPendingDraftByText");
 assert(textSendStart >= 0, "sendPendingDraftByText entrypoint exists");
@@ -632,6 +647,8 @@ assert(
 const commandSendSrc = await readFile(join(root, "src/security/command_send.ts"), "utf8");
 const draftDbSrc = await readFile(join(root, "src/db.ts"), "utf8");
 const commandRecipientSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
+// Who a send goes to is resolved in recipient_facts.ts, with the same mailbox parser.
+const recipientFactsSrc = await readFile(join(root, "src/recipient_facts.ts"), "utf8");
 const commandLookupSrc = await readFile(join(root, "src/command_recipients.ts"), "utf8");
 const commandLogicSrc = await readFile(join(root, "src/command_logic.ts"), "utf8");
 const newDraftToolSrc = await readFile(join(root, "src/tools/draft_new_email.ts"), "utf8");
@@ -641,7 +658,8 @@ assert(
     commandSendSrc.includes('from "../address_list.js"') && draftDbSrc.includes("parseAddressList(action.live_to_header") &&
     approvalsSrc.includes("parseAddressList(to).map(({ email }) => `${account}:${email}`)") &&
     commandSendSrc.includes("parseAddressList(header).map((item) => item.email.toLowerCase())") &&
-    commandRecipientSrc.includes(`from ${mailboxParserPath}`) && commandRecipientSrc.includes("parseAddressList(query)[0]?.email") &&
+    commandRecipientSrc.includes(`from ${mailboxParserPath}`) &&
+    recipientFactsSrc.includes(`from ${mailboxParserPath}`) && recipientFactsSrc.includes("parseAddressList(query)[0]?.email") &&
     commandLookupSrc.includes(`from ${mailboxParserPath}`) && commandLookupSrc.includes("parseAddressList(input.query)[0]?.email") &&
     commandLogicSrc.includes(`from ${mailboxParserPath}`) && newDraftToolSrc.includes('from "../address_list.js"'),
   "draft overlap, recipient resolution, delivery claims, and send gates use the same parsed mailbox helper",
@@ -791,7 +809,7 @@ assert(
       );
     }
   }
-  assert(sendSites === 3, `the three checked send sites: command_send.ts and two in approvals.ts, got ${sendSites}`);
+  assert(sendSites === 2, `the two checked send sites: command_send.ts and deliverGmailDraft in approvals.ts, got ${sendSites}`);
   // One card builder: only src/confirm_cards.ts makes a button that can confirm who an
   // email goes to (a draft's Send, a held schedule's Confirm, an address choice), and only
   // it records who a posted card showed. Every other file can only parse those buttons.
@@ -840,9 +858,10 @@ assert(
   const approvalsGateSrc = await readFile(join(root, "src/approvals.ts"), "utf8");
   const performStart = approvalsGateSrc.indexOf("async function performDraftSend(");
   const performBody = approvalsGateSrc.slice(performStart, approvalsGateSrc.indexOf("\n}\n", performStart));
-  assert(performStart !== -1 && performBody.includes(".drafts.send("), "performDraftSend is the card route's Gmail send");
+  // The Gmail call itself is deliverGmailDraft's; performDraftSend reaches it after the gate.
+  assert(performStart !== -1 && performBody.includes("deliverGmailDraft("), "performDraftSend is the card route's Gmail send");
   assert(
-    performBody.indexOf("evaluateCommandSendGate(") !== -1 && performBody.indexOf("evaluateCommandSendGate(") < performBody.indexOf(".drafts.send("),
+    performBody.indexOf("evaluateCommandSendGate(") !== -1 && performBody.indexOf("evaluateCommandSendGate(") < performBody.indexOf("deliverGmailDraft("),
     "the card route's drafts.send runs the shared gate first",
   );
   const commandEmailSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
@@ -862,11 +881,14 @@ assert(
   };
   const legacyImmediate = bodyOf(approvalsGateSrc, "sendCreatedDraftNow");
   const gatedDraftSends = [performBody, legacyImmediate];
+  // One Gmail draft send, in deliverGmailDraft, reached only from the gated delivery functions.
   const gmailDraftSend = /\.users\.drafts\.send\s*\(/g;
-  assert((approvalsGateSrc.match(gmailDraftSend) ?? []).length === gatedDraftSends.length, "every draft Gmail call is in a gated delivery function");
+  assert((approvalsGateSrc.match(gmailDraftSend) ?? []).length === 1 && bodyOf(approvalsGateSrc, "deliverGmailDraft").match(gmailDraftSend),
+    "the draft Gmail call is deliverGmailDraft's alone");
+  assert((approvalsGateSrc.match(/await deliverGmailDraft\(/g) ?? []).length === gatedDraftSends.length, "every draft Gmail call is in a gated delivery function");
   for (const body of gatedDraftSends) {
     const check = body.indexOf("assertSendDecision(");
-    assert(check >= 0 && check < body.indexOf(".users.drafts.send("), "each draft Gmail call checks the shared decision first");
+    assert(check >= 0 && check < body.indexOf("deliverGmailDraft("), "each draft Gmail call checks the shared decision first");
   }
   const rawCommand = bodyOf(commandSendSrc, "sendCommandEmail");
   assert(rawCommand.indexOf("assertSendDecision(") >= 0 && rawCommand.indexOf("assertSendDecision(") < rawCommand.indexOf(".users.messages.send("), "the direct and scheduled command Gmail call checks the same decision");
@@ -1010,10 +1032,16 @@ assert(
 const commandEmailSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
 assert(
   commandEmailSrc.includes("sendCommandEmail({") &&
-    commandEmailSrc.includes("namedInOwnWords(query, ownWords)") &&
+    commandEmailSrc.includes("resolvePersonFromFacts(query,") &&
+    !commandEmailSrc.includes("namedInOwnWords(query, ownWords)") &&
     commandEmailSrc.includes("if (!confirmation)") &&
     commandEmailSrc.includes("bookResolvedMeeting({"),
-  "send_email and book_meeting need his own message, and a recipient from his own words",
+  "send_email and book_meeting need his own message, and a recipient resolved from the conversation's records",
+);
+const factsSrc = await readFile(join(root, "src/recipient_facts.ts"), "utf8");
+assert(
+  !/\.body\b|plainTextBody|extracted_text/.test(factsSrc),
+  "recipient facts never read an email body or a photo's text",
 );
 assert(!/sendSchedulingEmail|messages.send/.test(toolsIndex), "model tools have no send");
 assert(!/calendar\.events/.test(toolsIndex), "model tools have no calendar write");
