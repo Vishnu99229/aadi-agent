@@ -360,7 +360,22 @@ assert(
   "performDraftSend is present and precedes sendDraft",
 );
 const performFn = approvalsSrc.slice(performStart, performEnd);
-assert(performFn.includes("drafts.send"), "performDraftSend still sends the draft");
+// The Gmail call itself lives in deliverGmailDraft (right before performDraftSend), which
+// tracks the provider write; performDraftSend sends through it.
+const deliverStart = approvalsSrc.indexOf("async function deliverGmailDraft");
+assert(
+  deliverStart >= 0 && deliverStart < performStart,
+  "deliverGmailDraft is present and precedes performDraftSend",
+);
+assert(
+  approvalsSrc.slice(deliverStart, performStart).includes("drafts.send("),
+  "deliverGmailDraft sends the draft",
+);
+assert(
+  (approvalsSrc.match(/drafts\.send\(/g) ?? []).length === 1,
+  "deliverGmailDraft is the only drafts.send in approvals.ts",
+);
+assert(performFn.includes("deliverGmailDraft("), "performDraftSend still sends the draft, through deliverGmailDraft");
 
 const textSendStart = approvalsSrc.indexOf("export async function sendPendingDraftByText");
 assert(textSendStart >= 0, "sendPendingDraftByText entrypoint exists");
