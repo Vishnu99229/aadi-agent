@@ -160,12 +160,15 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   const body = truncate(removeQuotedReplies(rawBody));
   const headers = payload.headers;
   const cc = header(headers, "Cc");
+  const record = { account: account.id, id: message.id ?? values.id.trim(), sent: message.labelIds?.includes("SENT") === true };
   // The people on it (headers only, never the body) are who a name can mean next.
-  noteShownPeople(turn, headerPeople(header(headers, "From"), header(headers, "To"), cc), "email", message.id ?? values.id.trim());
+  const source = message.labelIds?.includes("DRAFT") ? "draft" : "email";
+  noteShownPeople(turn, headerPeople(header(headers, "From"), header(headers, "To"), cc), source, record.id);
 
   return [
     `Account: ${account.label}`,
     `Tag: ${account.tag}`,
+    `Message record: ${JSON.stringify(record)}`,
     ...(message.threadId ? [`Thread ID: ${message.threadId}`] : []),
     `From: ${header(headers, "From")}`,
     `To: ${header(headers, "To")}`,

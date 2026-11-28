@@ -1,4 +1,4 @@
-import { addressIn, nameTokens, notASendCommand, splitOwnerEmailCommand } from "./command_logic.js";
+import { addressIn, nameTokens, splitOwnerEmailCommand } from "./command_logic.js";
 import { namesFuzzyEqual } from "./contact_logic.js";
 import { rememberContactChoice } from "./contacts.js";
 import { retrieveRelevantContext, wantsHistoricalContext } from "./context_lookup.js";
@@ -754,11 +754,6 @@ function shell(chatId: number, now: Date, existing?: PendingAction): PendingActi
   );
 }
 
-export function messageAuthorizesExternalSend(text: string): boolean {
-  const command = splitOwnerEmailCommand(text).command;
-  return /\b(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\b(?:don'?t|do not|never)\s+(?:send|e-?mail|mail|schedule)\b/i.test(command) && !/\bdraft\b/i.test(command);
-}
-
 export function looksLikeEmailContext(text: string): boolean {
   if (/^(?:what|who|when|where|why|how|show|list|find|search)\b/i.test(text.trim())) {
     return false;
@@ -989,7 +984,7 @@ export function applyOwnerContextTurn(
   text: string,
   messageId: number,
   now = new Date(),
-  options: { forwarded?: boolean } = {},
+  options: { forwarded?: boolean; deferEmailProse?: boolean } = {},
 ): OwnerTurnResult {
   if (options.forwarded) {
     return { handled: false };
@@ -1317,10 +1312,10 @@ export function applyOwnerContextTurn(
       },
     };
   } else if (
+    !options.deferEmailProse &&
     openEmail &&
     next.email &&
     looksLikeEmailContext(clean) &&
-    !messageAuthorizesExternalSend(clean) &&
     emails.length === 0
   ) {
     if (next.email.draftId || next.email.scheduledSendId) {
@@ -1338,9 +1333,9 @@ export function applyOwnerContextTurn(
       },
     };
   } else if (
+    !options.deferEmailProse &&
     pending?.status === "cancelled" &&
-    looksLikeEmailContext(clean) &&
-    !messageAuthorizesExternalSend(clean)
+    looksLikeEmailContext(clean)
   ) {
     const contact = supplied[supplied.length - 1];
     next = {
@@ -1376,12 +1371,12 @@ export function applyOwnerContextTurn(
   }
   savePendingAction(chatId, next, now);
   if (
+    !options.deferEmailProse &&
     looksLikeEmailContext(clean) &&
     next.email &&
     next.status === "open" &&
     next.email.to.length > 0 &&
-    next.email.purpose &&
-    !messageAuthorizesExternalSend(clean)
+    next.email.purpose
   ) {
     return { handled: true, publishDraft: true };
   }
@@ -1392,65 +1387,6 @@ export function applyOwnerContextTurn(
     };
   }
   return unhandled();
-}
-
-/** Tool-side gate: a context update must not send, and a cancelled email stays cancelled. */
-export function holdEmailToolTurn(
-  chatId: number,
-  ownWords: string,
-  now = new Date(),
-): string | undefined {
-  const pending = getPendingAction(chatId, now);
-  if (correctionOfEmail(ownWords, pending?.email) && pending?.email && pending.status === "open") {
-    const locked = lockedScheduleFor(pending.email);
-    if (locked) {
-      return tooLateToCancelText(locked);
-    }
-    cancelLinkedSend(pending.email);
-    savePendingAction(
-      chatId,
-      {
-        ...pending,
-        status: "cancelled",
-        email: undefined,
-      },
-      now,
-    );
-    return "Cancelled that email. It will not be sent.";
-  }
-  if (
-    pending?.status === "cancelled" &&
-    !messageAuthorizesExternalSend(ownWords)
-  ) {
-    return "Not sent: that email was cancelled. Nothing from it will go out. Say send when you want a new one.";
-  }
-  if (pending?.status === "open" && pending.email?.needsFreshAuthorization) {
-    const command = splitOwnerEmailCommand(ownWords).command;
-    const confirms =
-      messageAuthorizesExternalSend(ownWords) &&
-      /\b(?:send|schedule)\b/i.test(command) &&
-      notASendCommand(ownWords) === undefined;
-    if (!confirms) {
-      return "Not sent: the recipient is saved, but this message does not schedule or send it. Say schedule it to confirm. Nothing went out.";
-    }
-    return undefined;
-  }
-  if (pending?.status === "open" && pending.email && !messageAuthorizesExternalSend(ownWords)) {
-    const command = splitOwnerEmailCommand(ownWords).command;
-    if (notASendCommand(ownWords) === undefined && /\b(?:send|e-?mail|mail|reply|schedule)\b/i.test(command)) {
-      return undefined;
-    }
-    const stillAuthorized =
-      pending.action === "send_email" &&
-      messageAuthorizesExternalSend(pending.ownerWords) &&
-      Boolean(pending.email.sendAt) &&
-      Number.isFinite(Date.parse(pending.authorizedAt ?? "")) &&
-      now.getTime() - Date.parse(pending.authorizedAt ?? "") <= AUTH_TTL_MS;
-    if (!stillAuthorized) {
-      return "Not sent: this message adds context, and it does not send or schedule anything.";
-    }
-  }
-  return undefined;
 }
 
 const NEW_REQUEST =

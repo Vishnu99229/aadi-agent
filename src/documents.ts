@@ -1,3 +1,4 @@
+import { addressesFromReference } from "./email_references.js";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +12,7 @@ import {
   deleteExpiredDocuments,
   getDocument,
   rememberTelegramDocumentRef,
+  recordExternalAddress,
   updateDocument,
   type DocumentActionItem,
   type ItemTag,
@@ -588,7 +590,7 @@ export async function analyzePhotoBytes(
 
 export async function processIncomingPhoto(
   ctx: Context,
-  options?: { useCaption?: boolean },
+  options?: { useCaption?: boolean; deferCaption?: boolean },
 ): Promise<{ documentId: number; answeredPrompt: boolean } | null> {
   const photos = ctx.message?.photo;
   if (!photos?.length) {
@@ -609,25 +611,29 @@ export async function processIncomingPhoto(
     const photo = await analyzePhotoBytes(
       bytes,
       "image/jpeg",
-      userPrompt || undefined,
+      options?.deferCaption ? undefined : userPrompt || undefined,
     );
+    const extracted = photo.analysis.extracted_text || extractedFallback(photo.analysis);
     persistAnalysis(
       record.id,
       photo.analysis,
-      photo.analysis.extracted_text || extractedFallback(photo.analysis),
+      extracted,
     );
 
     // The source photo must remain addressable even when Aadi's OCR response
     // was a long message or the conversation has since discussed other emails.
     if (ctx.chat && ctx.message) {
       rememberTelegramDocumentRef(ctx.chat.id, ctx.message.message_id, record.id);
+      for (const email of addressesFromReference(extracted)) {
+        recordExternalAddress(ctx.chat.id, email, `document:${record.id}`);
+      }
     }
 
     const pending =
       photo.analysis.action_items.length > 0
         ? photo.analysis.action_items
         : null;
-    const answeredPrompt = Boolean(userPrompt) && photo.source === "ocr";
+    const answeredPrompt = !options?.deferCaption && Boolean(userPrompt) && photo.source === "ocr";
     if (answeredPrompt) {
       const keyboard = documentKeyboard(record.id, Boolean(pending?.length));
       const sent = await ctx.reply(photo.reply, { reply_markup: keyboard });

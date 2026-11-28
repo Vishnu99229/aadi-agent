@@ -126,6 +126,7 @@ const SALES_SEQUENCES_BODY = `
     prospect_timezone_source TEXT,
     total_steps INTEGER NOT NULL DEFAULT 4 CHECK (total_steps BETWEEN 1 AND 9),
     step_days INTEGER CHECK (step_days BETWEEN 1 AND 14),
+    cc_first_only INTEGER NOT NULL DEFAULT 1 CHECK (cc_first_only IN (0, 1)),
     cta TEXT,
     command_key TEXT,
     UNIQUE (account, thread_id)
@@ -996,7 +997,7 @@ db.exec(`
 if (!tableHasColumn("sales_sequences", "prospect_timezone_source")) {
   db.exec(`ALTER TABLE sales_sequences ADD COLUMN prospect_timezone_source TEXT`);
 }
-// Follow-up 1 may copy his own team from the pitch's Cc. Later steps never do.
+// Each planned step stores its allowed copies from the original pitch.
 if (!tableHasColumn("sales_sequence_steps", "cc")) {
   db.exec(`ALTER TABLE sales_sequence_steps ADD COLUMN cc TEXT`);
 }
@@ -1005,6 +1006,7 @@ if (!tableHasColumn("sales_sequence_steps", "cc")) {
 for (const [column, type] of [
   ["total_steps", "INTEGER NOT NULL DEFAULT 4"],
   ["step_days", "INTEGER"],
+  ["cc_first_only", "INTEGER NOT NULL DEFAULT 1 CHECK (cc_first_only IN (0, 1))"],
   ["cta", "TEXT"],
   ["command_key", "TEXT"],
 ] as const) {
@@ -2416,7 +2418,7 @@ export function recordConversationParticipants(
       if (!email.includes("@")) continue;
       upsert.run(chatId, email, (person.name ?? "").trim(), source, sourceRef, now.toISOString());
     }
-    db.prepare("DELETE FROM conversation_participants WHERE chat_id = ? AND seen_at < ?")
+    db.prepare("DELETE FROM conversation_participants WHERE chat_id = ? AND source <> 'owner_text' AND seen_at < ?")
       .run(chatId, new Date(now.getTime() - PARTICIPANT_RETENTION_MS).toISOString());
   })();
 }
@@ -2424,7 +2426,7 @@ export function recordConversationParticipants(
 export function conversationParticipants(chatId: number, sinceIso: string): ConversationParticipant[] {
   const rows = db.prepare(
     `SELECT email, name, source, source_ref, seen_at FROM conversation_participants
-     WHERE chat_id = ? AND seen_at >= ? ORDER BY seen_at DESC`,
+     WHERE chat_id = ? AND (source = 'owner_text' OR seen_at >= ?) ORDER BY seen_at DESC`,
   ).all(chatId, sinceIso) as Array<{ email: string; name: string; source: string; source_ref: string; seen_at: string }>;
   return rows.map((row) => ({ email: row.email, name: row.name, source: row.source, sourceRef: row.source_ref, seenAt: row.seen_at }));
 }
@@ -2629,15 +2631,16 @@ export function cardRecipientsOnMessage(messageId: number): string[] {
 }
 
 /** A "send then follow-ups" request waiting on this card's Send tap. */
-export function setPendingActionFollowups(id: number, words: string, key: string): void {
-  db.prepare(`UPDATE pending_actions SET followup_words = ?, followup_key = ? WHERE id = ?`).run(words, key, id);
+export function setPendingActionFollowups(id: number, settings: string, key: string): boolean {
+  return db.prepare(`UPDATE pending_actions SET followup_words = ?, followup_key = ? WHERE id = ? AND status = 'pending'`)
+    .run(settings, key, id).changes > 0;
 }
 
-export function pendingActionFollowups(id: number): { words: string; key: string } | undefined {
+export function pendingActionFollowups(id: number): { settings: string; key: string } | undefined {
   const row = db
     .prepare(`SELECT followup_words, followup_key FROM pending_actions WHERE id = ?`)
     .get(id) as { followup_words: string | null; followup_key: string | null } | undefined;
-  return row?.followup_words && row.followup_key ? { words: row.followup_words, key: row.followup_key } : undefined;
+  return row?.followup_words && row.followup_key ? { settings: row.followup_words, key: row.followup_key } : undefined;
 }
 
 /** Tests only: pin created/updated so recency and 3-hour expiry are deterministic. */
@@ -3009,15 +3012,6 @@ export function documentRefForTelegramMessage(
     `SELECT document_id FROM telegram_document_refs
      WHERE chat_id = ? AND message_id = ? AND created_ms >= ?`,
   ).get(chatId, messageId, sinceMs) as { document_id: number } | undefined;
-  return row?.document_id;
-}
-
-export function latestTelegramDocumentRef(chatId: number, sinceMs: number): number | undefined {
-  const row = db.prepare(
-    `SELECT document_id FROM telegram_document_refs
-     WHERE chat_id = ? AND created_ms >= ?
-     ORDER BY created_ms DESC, rowid DESC LIMIT 1`,
-  ).get(chatId, sinceMs) as { document_id: number } | undefined;
   return row?.document_id;
 }
 
@@ -5522,6 +5516,7 @@ export interface SalesSequenceRecord {
   total_steps: number;
   /** Days between follow-ups. Null means SEQUENCE_STEP_DAYS. */
   step_days: number | null;
+  cc_first_only: number;
   /** His own call-to-action. Null means the ask in his email. */
   cta: string | null;
   /** The owner message that enrolled it by command, so a second run of the same
@@ -5687,6 +5682,7 @@ export function activateSalesSequence(
     /** His own team from the pitch's Cc. Kept on step 1 only when step 1 is a
      *  sequence send; every later step has no Cc. */
     stepOneCc?: readonly string[];
+    ccFirstOnly?: boolean;
     /** Follow-ups Aadi sends, on top of the ones he sent himself. Omitted for a
      *  Start tap, which keeps 4 steps in all. */
     followups?: number;
@@ -5710,7 +5706,7 @@ export function activateSalesSequence(
         `UPDATE sales_sequences
          SET status = 'active', stop_reason = NULL, enrolled_at = ?,
              next_step_at = ?, current_step = ?, manual_followups = ?,
-             total_steps = ?, step_days = ?, cta = ?, command_key = ?,
+             total_steps = ?, step_days = ?, cc_first_only = ?, cta = ?, command_key = ?,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND status = 'proposed'`,
       )
@@ -5721,6 +5717,7 @@ export function activateSalesSequence(
         input.manualFollowups,
         total,
         input.stepDays ?? null,
+        input.ccFirstOnly === false ? 0 : 1,
         input.cta ?? null,
         input.commandKey ?? null,
         id,
@@ -5741,7 +5738,7 @@ export function activateSalesSequence(
         step === input.manualFollowups + 1 ? input.nextStepAt : null,
         manual ? "skipped" : "planned",
         manual ? "manual_followup" : null,
-        step === 1 && !manual && stepOneCc ? stepOneCc : null,
+        !manual && (step === 1 || input.ccFirstOnly === false) && stepOneCc ? stepOneCc : null,
       );
     }
     return true;
@@ -5755,6 +5752,7 @@ export function setProposedSalesSequenceSettings(
     totalSteps: number;
     stepDays: number | null;
     cta: string | null;
+    ccFirstOnly?: boolean;
     commandKey: string | null;
     /** The follow-ups he has sent himself as of this card, so total minus this is
      *  exactly the number the card offered. Omitted: leave as stored. */
@@ -5765,11 +5763,11 @@ export function setProposedSalesSequenceSettings(
     db
       .prepare(
         `UPDATE sales_sequences
-         SET total_steps = ?, step_days = ?, cta = ?, command_key = ?,
+         SET total_steps = ?, step_days = ?, cc_first_only = ?, cta = ?, command_key = ?,
              manual_followups = COALESCE(?, manual_followups), updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND status = 'proposed'`,
       )
-      .run(input.totalSteps, input.stepDays, input.cta, input.commandKey, input.manualFollowups ?? null, id).changes > 0
+      .run(input.totalSteps, input.stepDays, input.ccFirstOnly === false ? 0 : 1, input.cta, input.commandKey, input.manualFollowups ?? null, id).changes > 0
   );
 }
 

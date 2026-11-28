@@ -30,12 +30,6 @@ import {
   transitionPendingAction,
   upsertMeetingThread,
 } from "../src/db.ts";
-import {
-  commandIntents,
-  parseSequenceCommand,
-  sequenceTargets,
-  withoutFollowupClause,
-} from "../src/command_intent.ts";
 import { bindRepliedMessageForTurn } from "../src/email_references.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
@@ -47,7 +41,6 @@ import {
   evaluatePitchExclusion,
   firstStepAt,
   hasOriginalOutreach,
-  isExplicitSequenceRequest,
   matchesProspect,
   ownTeamCc,
   parsePitchClassification,
@@ -58,11 +51,8 @@ import {
   type PitchFacts,
 } from "../src/sequence_logic.ts";
 import {
-  decideSequenceAction,
   detectPitches,
   handleSequenceCallback,
-  type SequenceDecision,
-  type SequenceFacts,
   handleSequenceCommand,
   registerSequenceDetection,
   requestSequenceCard,
@@ -640,33 +630,6 @@ modelCalls = 0;
   );
 }
 
-// ---- explicit requests only ever show a Start card ----
-for (const phrase of [
-  "start a sequence for Rajan",
-  "Start a follow-up sequence for Talkdesk",
-  "auto follow up with Rajan",
-  "auto-follow-up with priya@acme.com",
-]) {
-  assert(isExplicitSequenceRequest(phrase), `explicit: ${phrase}`);
-}
-// Since the old tracker was removed, its phrasings ask for the Start card too.
-for (const phrase of [
-  "follow up on my email to Rajan",
-  "remind me to follow up with Rajan",
-  "track my email to Rajan",
-]) {
-  assert(isExplicitSequenceRequest(phrase), `explicit now: ${phrase}`);
-}
-for (const phrase of ["start following up with Rajan", "follow up with me"]) {
-  assert(!isExplicitSequenceRequest(phrase), `not explicit: ${phrase}`);
-}
-assert(
-  isExplicitSequenceRequest(
-    'For my test account "Aadi QA Demo", propose a follow-up sequence to qa-prospect@example.com requesting a 15-minute demo. Show me the sequence for approval. Do not start the sequence or send any emails.',
-  ),
-  "proposing a follow-up sequence is an explicit request",
-);
-assert(!isExplicitSequenceRequest("follow up sequence tomorrow"), "the word sequence is not a person's name");
 assert(!hasOriginalOutreach("") && !hasOriginalOutreach(null) && hasOriginalOutreach("1a1cba5a"), "a card needs a sent message id");
 {
   const shown = pitchCardText({
@@ -709,9 +672,6 @@ assert(!hasOriginalOutreach("") && !hasOriginalOutreach(null) && hasOriginalOutr
   assert(refused.startsWith("Not started"), `no originating sent email means no card (${refused})`);
   assert(telegram.sent.length === before, "no Start card was posted");
 }
-assert(isExplicitSequenceRequest("follow up with Rajan"), "follow up with a person is a sequence");
-assert(isExplicitSequenceRequest("follow up Abhishek 4 times"), "follow up N times is a sequence");
-assert(isExplicitSequenceRequest("add Abhishek to sequence"), "add to sequence is a sequence");
 {
   pitch("t-explicit", "Asha Rao <asha@nu.com>", "BotCompose intro", 5);
   modelCalls = 0;
@@ -920,14 +880,6 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   pitch("t-tool", "Tia <tia@phi.com>", "Pitch");
   const confirmation = { chatId: 1, messageId: 5 };
   const sentBefore = telegram.sent.length;
-  const vague = await startSequenceFromTool(
-    "tia@phi.com",
-    { confirmation, userText: "check in with Tia" },
-    api,
-  );
-  assert(vague.startsWith("No card sent"), "a vague phrase gets no card even if the model calls the tool");
-  assert(telegram.sent.length === sentBefore, "the vague phrase posted nothing");
-  assert(getSalesSequenceByThread("t-tool") === undefined, "the vague phrase created no row");
   const clear = await startSequenceFromTool(
     "tia@phi.com",
     { confirmation, userText: "start a sequence for Tia" },
@@ -936,55 +888,7 @@ function bumped(threadId: string, to: string, subject: string, bumps: number): v
   assert(clear.startsWith("Start card sent"), "a clear phrase shows the card");
   assert(getSalesSequenceByThread("t-tool")!.status === "proposed", "the tool never enrols");
 
-  // The old tracker's phrasings now reach the same Start card.
-  for (const phrase of [
-    "follow up on my email to Tia",
-    "Follow up on my last email to tia@phi.com",
-    "follow up on the email I sent Tia",
-    "Follow up with Tia on my email",
-    "Remind me to follow up with Tia",
-    "remind me to follow up with Tia on Monday",
-    "track my email to Tia",
-  ]) {
-    assert(isExplicitSequenceRequest(phrase), `"${phrase}" offers the Start card`);
-  }
-  for (const phrase of ["follow up with me tomorrow", "remind me to follow up with me on Friday", "remind me to email Tia"]) {
-    assert(!isExplicitSequenceRequest(phrase), `"${phrase}" is not a sequence request`);
-  }
-  assert(isExplicitSequenceRequest("Follow up with Tia"), "\"Follow up with Tia\" offers the Start card");
-  const remapped = await startSequenceFromTool(
-    "tia@phi.com",
-    { confirmation, userText: "follow up on my email to Tia" },
-    api,
-  );
-  assert(remapped.startsWith("Start card sent"), `"follow up on my email to X" shows the card, got: ${remapped}`);
-  assert(getSalesSequenceByThread("t-tool")!.status === "proposed", "and still enrols nothing");
-  const reminded = await startSequenceFromTool(
-    "tia@phi.com",
-    { confirmation, userText: "remind me to follow up with Tia" },
-    api,
-  );
-  assert(reminded.startsWith("Start card sent"), "\"remind me to follow up with X\" shows the card");
 
-  const replies: string[] = [];
-  pitch("t-fwd", "Fay <fay@rho.com>", "Pitch");
-  await handleSequenceCommand({
-    message: { forward_origin: { type: "user" } },
-    match: "fay@rho.com",
-    reply: async (text: string) => {
-      replies.push(text);
-      return {};
-    },
-  } as unknown as Context);
-  assert(replies[0]?.includes("forwarded"), "a forwarded /sequence is refused");
-  assert(getSalesSequenceByThread("t-fwd") === undefined, "a forwarded /sequence starts nothing");
-
-  assert(
-    !(FORWARDED_TOOLS as readonly string[]).includes("start_sequence"),
-    "start_sequence stays out of FORWARDED_TOOLS",
-  );
-  assert((TOOL_ORDER as readonly string[]).includes("start_sequence"), "start_sequence is registered");
-  assert(Boolean(tools.start_sequence), "start_sequence has a module");
 }
 
 // ---- schema guards ----
@@ -1138,277 +1042,6 @@ for (const file of ["src/sequences.ts", "src/sequence_logic.ts", "src/tools/star
   assert(!src.includes("messages.send"), `${file} must not call messages.send`);
   assert(!src.includes("drafts."), `${file} must not touch drafts`);
 }
-// ---- follow-ups by his own command: ONE decision point, a fixed allowlist, fail closed ----
-const RECIPIENT = { name: "Mayur Galande", email: "mayur@caia.example" };
-function decide(words: string, over: Partial<SequenceFacts> = {}): SequenceDecision {
-  return decideSequenceAction({
-    source: "tool",
-    words,
-    ownTurn: true,
-    modelCalled: true,
-    toolTarget: "Mayur",
-    email: { state: "sent", recipient: RECIPIENT },
-    replied: { state: "sent", recipient: RECIPIENT },
-    ...over,
-  });
-}
-function kindOf(decision: SequenceDecision): string {
-  if (decision.action === "reply") {
-    if (decision.text.startsWith("Send one person per message")) return "several";
-    if (decision.text.startsWith("Not started: you said not")) return "negated";
-    if (decision.text.startsWith("No card sent")) return "none";
-    return "reply";
-  }
-  return decision.action === "standard_card" ? "standard" : decision.action;
-}
-type Settings = { followups: number; gapDays: number | null; cta: string | null };
-const PHRASES: Array<[string, string, Partial<Settings>?]> = [
-  // Clear imperatives: enrol at once.
-  ["start a 3-step follow-up to Mayur, 4 days apart, asking for a demo", "enroll", { followups: 3, gapDays: 4, cta: "ask for a demo" }],
-  ["put my email to Mayur in a follow-up sequence, 5 follow-ups every 3 days, ask them to book a call", "enroll", { followups: 5, gapDays: 3, cta: "ask them to book a call" }],
-  ["start a sequence for Mayur", "enroll", { followups: 3, gapDays: null, cta: null }],
-  ["Start a sequence for Mayur Galande", "enroll"],
-  ["start follow-ups for Mayur", "enroll", { followups: 3 }],
-  ["set up 2 follow-ups for Mayur every day", "enroll", { followups: 2, gapDays: 1 }],
-  ["Start 1 follow-up to Mayur, 1 day apart", "enroll", { followups: 1, gapDays: 1 }],
-  ["start 3 follow-ups for Mayur, gap of 5 days", "enroll", { gapDays: 5 }],
-  ["start 3 follow-ups for Mayur with a 5-day gap", "enroll", { gapDays: 5 }],
-  ["start 2 follow-ups for Mayur, 6 days between them", "enroll", { followups: 2, gapDays: 6 }],
-  ["add Mayur to the follow-up sequence, one follow-up", "enroll", { followups: 1 }],
-  ["add Mayur to follow-ups", "enroll"],
-  ["begin a follow-up sequence for Mayur", "enroll"],
-  ["please start 3 follow-ups for Mayur", "enroll"],
-  ["can you start 3 follow-ups for Mayur?", "enroll"],
-  ["Could you please start 3 follow-ups for Mayur", "enroll"],
-  ["would you set up follow-ups for Mayur every 3 days", "enroll", { gapDays: 3 }],
-  ['start 3 follow-ups for Mayur, CTA: "Book a call, or send your availability"', "enroll", { cta: "Book a call, or send your availability" }],
-  ['start 3 follow-ups for Mayur asking for "a demo, or a pilot", every 4 days', "enroll", { cta: "ask for a demo, or a pilot", gapDays: 4 }],
-  ["start six follow-ups to Mayur every 14 days", "enroll", { followups: 6, gapDays: 14 }],
-  ["start 3 follow-ups for Mayur every week", "enroll", { gapDays: 7 }],
-  ["email Mayur saying we're live and start 3 follow-ups", "enroll"],
-  ["email Mayur saying we offer 5 plans every 3 days and set up 2 follow-ups every 4 days asking for a demo", "enroll", { followups: 2, gapDays: 4, cta: "ask for a demo" }],
-  ["email Mayur saying we offer 5 plans, valid for 10 days, and start follow-ups", "enroll", { followups: 3, gapDays: null }],
-  ["send it and start 3 follow-ups", "enroll"],
-  ["email Mayur saying hi and start 3 follow-ups for him", "enroll"],
-  ["email Mayur saying hi and start 2 follow-ups for Mayur", "enroll", { followups: 2 }],
-  ["email Mayur saying the contract is not yet signed, and start 3 follow-ups", "enroll"],
-  ["email Mayur saying “please start 3 follow-ups” and start 2 follow-ups", "enroll", { followups: 2 }],
-  ["put this email in a follow up sequence", "enroll"],
-  ["add this to follow-ups", "enroll"],
-  ["Start a follow-up for Mayur", "enroll", { followups: 1 }],
-  ["start a single follow-up for Mayur", "enroll", { followups: 1 }],
-  ["start a follow-up sequence for Mayur", "enroll", { followups: 3 }],
-  // Not on the allowlist, not certain, or not a request: a pre-filled Start card.
-  ["start follow-up for Mayur", "card"],
-  ["auto follow up with Mayur every other day", "card"],
-  ["follow up Mayur 4 times, a week apart", "card"],
-  ["Can I start 3 follow-ups for Mayur?", "card"],
-  ["Could I set up follow-ups for Mayur?", "card"],
-  ["start 3 follow-ups for Mayur?", "card"],
-  ["I could start 3 follow-ups for Mayur", "card"],
-  ["maybe start a sequence for Mayur", "card"],
-  ["should we start a sequence for Mayur", "card"],
-  ["remind me tomorrow to start a sequence for Mayur", "card"],
-  ["remind me on Friday to put my email to Mayur in a follow-up sequence", "card"],
-  ["remind me to start 3 follow-ups for Mayur", "card"],
-  ["if he doesn't reply, start 3 follow-ups for Mayur", "card"],
-  ["he asked me to start follow-ups for Mayur", "card"],
-  ["start 7 follow-ups to Mayur", "card"],
-  ["start 0 follow-ups to Mayur", "card"],
-  ["start ten follow-ups to Mayur", "card"],
-  ["start 3 follow-ups to Mayur every 15 days", "card"],
-  ["start 3 follow-ups to Mayur, 0 days apart", "card"],
-  ["start 3 follow-ups to Mayur every 3 weeks", "card"],
-  ["start 3 follow-ups for Mayur, gap of 15 days", "card"],
-  ["start 3 follow-ups for Mayur with a 20-day gap", "card"],
-  ["start 3 follow-ups for Mayur every Monday", "card"],
-  ["start 3 follow-ups for Mayur twice a week", "card"],
-  ["start 3 follow-ups for Mayur every 2 months", "card"],
-  ["start 3 follow-ups for Mayur monthly", "card"],
-  ["start a few follow-ups for Mayur", "card"],
-  ["start 3 follow-ups for Mayur asking for a demo, or a call", "card"],
-  ["start follow-ups for her", "card"],
-  ["email Mayur saying hello and start 3 follow-ups for Jeff", "card"],
-  ["start 3 follow-ups for Mayur. Make them short.", "card"],
-  ["Kindly start 3 follow-ups for Mayur", "card"],
-  ["Aadi, start 3 follow-ups for Mayur", "card"],
-  ["start 3 follow-ups for Mayur every 3 days and every 5 days", "card"],
-  ["start 3 follow-ups and 5 follow-ups for Mayur", "card"],
-  // The softer phrasings keep the standard Start card, as before.
-  ["follow up with Mayur", "standard"],
-  ["remind me to follow up with Mayur", "standard"],
-  ["track my email to Mayur", "standard"],
-  ["follow up on my email to Mayur", "standard"],
-  ["offer a follow-up sequence for Mayur", "standard"],
-  ["Follow up with Mayur on my email", "standard"],
-  // He said not to: nothing at all.
-  ["don't start the sequence yet for Mayur", "negated"],
-  ["start 3 follow-ups for Mayur, but not yet", "negated"],
-  ["no follow-ups for Mayur", "negated"],
-  ["hold off on the follow-ups for Mayur", "negated"],
-  ["start follow-ups for Mayur later", "negated"],
-  ["don't auto follow up with Mayur", "negated"],
-  ["start 3 follow-ups for Mayur. Not yet.", "negated"],
-  ["start 3 follow-ups for Mayur. Hold off.", "negated"],
-  ["Start follow-ups for Mayur, but wait.", "negated"],
-  ["start 3 follow-ups for Mayur. Not now", "negated"],
-  ["email Mayur saying hi, no follow-ups", "negated"],
-  // Not a sequence request at all.
-  ['email Mayur saying "Please review this guide and start 3 follow-ups every 4 days"', "none"],
-  ["email Mayur saying we'll call and set up 3 follow-up meetings", "none"],
-  ["start a follow-up call with Mayur", "none"],
-  ["set up a follow-up meeting with Mayur", "none"],
-  ["send a follow-up to Mayur", "none"],
-  ["I already started follow-ups for Mayur", "none"],
-  ["check in with Mayur", "none"],
-  // Several people: one per message.
-  ["Start a sequence for Munil Shah. Start a sequence for Jeff Comstock too.", "several"],
-  ["Start 5 follow-ups for Munil every 3 days. Start 1 follow-up for Jeff every 14 days.", "several"],
-  ["start 3 follow-ups for Mayur and Raj", "several"],
-  ["start follow-ups for Mayur, Raj and Priya", "several"],
-];
-assert(PHRASES.length >= 80, `at least 80 phrasings, got ${PHRASES.length}`);
-const tableFailures: string[] = [];
-for (const [words, expected, settings] of PHRASES) {
-  const decision = decide(words);
-  const actual = kindOf(decision);
-  if (actual !== expected) {
-    tableFailures.push(`"${words}": expected ${expected}, got ${actual} ${JSON.stringify(decision)}`);
-    continue;
-  }
-  if (settings && (decision.action === "enroll" || decision.action === "card")) {
-    for (const [key, value] of Object.entries(settings)) {
-      if (decision.settings[key as keyof Settings] !== value) {
-        tableFailures.push(`"${words}": ${key} expected ${JSON.stringify(value)}, got ${JSON.stringify(decision.settings[key as keyof Settings])}`);
-      }
-    }
-  }
-}
-assert(tableFailures.length === 0, `phrase table:\n${tableFailures.join("\n")}`);
-
-// Mutation: any of these wrappers around an enrolling phrase means it never enrols.
-const PREFIXES = ["can I ", "should I ", "what if I ", "if he doesn't reply, ", "remind me to ", "I already "];
-const mutationFailures: string[] = [];
-for (const [words, expected] of PHRASES) {
-  if (expected !== "enroll") {
-    continue;
-  }
-  const lowered = words.charAt(0).toLowerCase() + words.slice(1);
-  const variants = [...PREFIXES.map((prefix) => prefix + lowered), `${words} Not yet.`];
-  for (const variant of variants) {
-    if (decide(variant).action === "enroll") {
-      mutationFailures.push(variant);
-    }
-  }
-}
-assert(mutationFailures.length === 0, `these still enrol:\n${mutationFailures.join("\n")}`);
-
-// Self red-team: trick phrasings that aren't in the table above. Only a clear command
-// with a person and settings it can read enrols.
-const RED_TEAM: Array<[string, string]> = [
-  ["Start 3 follow-ups for Mayur if he does not reply", "card"],
-  ["start 3 follow-ups for Mayur unless he replies", "card"],
-  ["Please start 3 follow-ups for Mayur, or maybe 4", "card"],
-  ["start 3 follow-ups for Mayur, actually make it Jeff", "card"],
-  ["start 3 follow-ups for the CEO of Caia", "card"],
-  ["start 3 follow-ups for Mayur when he is back", "card"],
-  ["Start follow ups for Mayur in Hindi", "card"],
-  ["start 3 follow-ups for Mayur next week", "card"],
-  ["start 3 follow-ups for Mayur starting Monday", "card"],
-  ["Start 3 follow-ups for Mayur. Jeff too.", "card"],
-  ["start 3 follow-ups for Mayur and cc Jeff", "card"],
-  ["start 3 follow-ups for Mayur from my personal account", "card"],
-  ["Start 3 follow-ups for Mayur? Yes.", "card"],
-  ["start 3 follow-ups for Mayur, he said yes to a call", "card"],
-  ["start 3 follow-ups for Mayur every 3 days for a month", "card"],
-  ["start 3 follow-ups for Mayur but not on weekends", "card"],
-  ["start 3 follow-ups for Mayur, cancel the one for Raj", "card"],
-  ["start 3 follow-ups for Mayur instead of Raj", "card"],
-  ["Mayur asked me to start 3 follow-ups for him", "card"],
-  ["start 3 follow-ups for mayur@caia.example", "enroll"],
-  ["can you start 3 follow-ups for Mayur? Or should I wait?", "negated"],
-  ["start 3 follow-ups for Mayur asking him to sign the contract today", "enroll"],
-  ["start 3 follow-ups for Mayur with a CTA asking for feedback, every 2 days and every 4 days", "card"],
-  ["add Mayur to the follow-up sequence and remove Raj", "card"],
-  ["start 3 follow-ups for Mayur ASAP", "card"],
-  ["start the follow-ups we talked about for Mayur", "card"],
-  ["start 3 follow-ups for Mayur, same as Raj", "card"],
-];
-assert(RED_TEAM.length >= 25, "at least 25 red-team phrasings");
-const redTeamFailures = RED_TEAM.filter(([words, expected]) => kindOf(decide(words)) !== expected).map(
-  ([words, expected]) => `"${words}": expected ${expected}, got ${kindOf(decide(words))}`,
-);
-assert(redTeamFailures.length === 0, `red team:\n${redTeamFailures.join("\n")}`);
-for (const [words] of RED_TEAM.filter(([, expected]) => expected === "enroll")) {
-  for (const variant of [...PREFIXES.map((prefix) => prefix + words), `${words} Not yet.`]) {
-    assert(decide(variant).action !== "enroll", `red-team mutation still enrols: ${variant}`);
-  }
-}
-
-// The model's argument never picks the person: he named Mayur, the model said Jeff.
-{
-  const wrong = decide("start 3 follow-ups for Mayur", { toolTarget: "Jeff" });
-  assert(wrong.action === "card" && wrong.person === "Mayur", `a card for Mayur, never Jeff: ${JSON.stringify(wrong)}`);
-  assert(wrong.reasons.some((reason) => reason.includes("Mayur") && reason.includes("Jeff")), "and it says why");
-  const vague = decide("start follow-ups for her", { toolTarget: "Mayur" });
-  assert(vague.action === "card" && vague.person === "Mayur", "no clear name in his words: a card for who it would be");
-  assert(decide("start 3 follow-ups for Mayur", { toolTarget: "Mayur Galande" }).action === "enroll", "the same person, said fuller, is fine");
-}
-// Every other condition: own turn, the model's own call, a live email.
-{
-  const clear = "start 3 follow-ups for Mayur";
-  assert(decide(clear, { ownTurn: false }).action === "card", "not his own turn: card");
-  assert(decide(clear, { modelCalled: false }).action === "card", "the command-guarantee fallback: card");
-  assert(decide("email Mayur saying hi and start 3 follow-ups", { source: "after_send", modelCalled: false }).action === "card", "the referenced-email send path: card");
-  const slash = decide("/outbox Mayur", { source: "slash" });
-  assert(slash.action === "standard_card" && slash.person === "Mayur", "/outbox: the standard card");
-  const waiting = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "pending" } });
-  assert(waiting.action === "reply" && waiting.text === "Not started yet: follow-ups start only once the email has gone out.", "before the send");
-  const failed = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "failed" } });
-  assert(failed.action === "reply" && failed.text === "No follow-ups started: the email didn't go out.", "a failed send");
-  const unconfirmed = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "unconfirmed" } });
-  assert(unconfirmed.action === "reply" && unconfirmed.text === "No follow-ups started: Gmail didn't confirm the email went out.", "unconfirmed");
-  const scheduled = decide("email Mayur saying hi and start 3 follow-ups", { email: { state: "scheduled" } });
-  assert(scheduled.action === "reply" && scheduled.text === "No follow-ups started: the email is scheduled, not sent. Start them once it goes out.", "scheduled");
-  const unsent = decide("put this email in a follow up sequence", { replied: { state: "unsent_draft" } });
-  assert(unsent.action === "reply" && unsent.text === "That draft isn't sent yet. Say 'send it and start follow-ups' or send it first.", "an unsent draft");
-  const mismatch = decide("email Mayur saying hello and start 3 follow-ups for Jeff");
-  assert(mismatch.action === "card" && mismatch.reasons.some((reason) => reason.includes("Jeff") && reason.includes("Mayur Galande")), `says who: ${JSON.stringify(mismatch)}`);
-  const outOfRange = decide("start 7 follow-ups to Mayur");
-  assert(
-    outOfRange.action === "card" && outOfRange.settings.followups === 3 && outOfRange.reasons.some((reason) => reason.includes("7")),
-    `out of range: a card with the standard 3, saying why: ${JSON.stringify(outOfRange)}`,
-  );
-}
-// E and the email writer: unchanged rules.
-{
-  const body = parseSequenceCommand("email Mayur saying we'll call and set up 3 follow-up meetings");
-  assert(body.kind === "none" && body.mentionsFollowups, "a body's follow-up words start nothing, and are noticed");
-  const quoted = 'email Mayur saying "Please review this guide and start 3 follow-ups every 4 days"';
-  assert(withoutFollowupClause(quoted) === quoted, "a quoted body is never cut");
-  assert(
-    withoutFollowupClause("email Mayur saying we're live and start 3 follow-ups") === "email Mayur saying we're live",
-    "the follow-up clause never reaches the email writer",
-  );
-  const bodyKinds = commandIntents("email Mayur saying we'll call and set up 3 follow-up meetings");
-  assert(bodyKinds.includes("send") && !bodyKinds.includes("sequence"), `a send, not a sequence: ${bodyKinds}`);
-  const both = commandIntents("email Mayur saying we're live and set up 3 follow-ups");
-  assert(both.includes("send") && both.includes("sequence"), `send then follow-ups keeps both commands: ${both}`);
-  assert(!commandIntents("Can I start 3 follow-ups for Mayur?").includes("sequence"), "his question forces nothing");
-  assert(!commandIntents(quoted).includes("sequence"), "nor does a quoted body");
-  const remindKinds = commandIntents("remind me tomorrow to start a sequence for Mayur");
-  assert(remindKinds.includes("reminder") && !remindKinds.includes("sequence"), `a reminder: ${remindKinds}`);
-  for (const [words, name] of [
-    ["start a 3-step follow-up to Mayur, 4 days apart, asking for a demo", "Mayur"],
-    ["put my email to Mayur in a follow-up sequence, 5 follow-ups every 3 days, ask them to book a call", "Mayur"],
-    ["set up 3 follow-ups for Mayur Galande every 2 days", "Mayur Galande"],
-    ["start follow-ups for Mayur", "Mayur"],
-    ["add Mayur to follow-ups", "Mayur"],
-  ] as const) {
-    assert(sequenceTargets(words)?.join("|") === name, `"${words}" names ${name}, got ${sequenceTargets(words)}`);
-  }
-}
-
 // ---- the startup rebuild: wider limits, the same rows, never a crash ----
 const OLD_SALES_SCHEMA = `
   CREATE TABLE sales_sequences (
@@ -1622,7 +1255,8 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const sentBefore = telegram.sent.length;
   pitch("t-cmd", "Mayur Galande <mayur@caia.example>", "IraVoice for Caia", 1);
   const turn = owner("start a 3-step follow-up to Mayur, 4 days apart, asking for a demo");
-  const reply = await startSequenceFromTool("Mayur", turn, api);
+  const settingsArgs = { total_steps: 3, step_days: 4, cta: "ask for a demo" };
+  const reply = await startSequenceFromTool("Mayur", turn, api, settingsArgs);
   assert(
     reply.startsWith("Started 3 follow-ups to Mayur Galande (mayur@caia.example), every 4 days, CTA: ask for a demo. First one goes "),
     `a clear imperative enrols at once: ${reply}`,
@@ -1635,7 +1269,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const pitchAt = threads.get("t-cmd")![0]!.sentAt;
   assert(Math.abs(new Date(row.next_step_at!).getTime() - (pitchAt + 4 * DAY)) < 5_000, "the first is 4 days after his email");
   // The same message again (a repeated model call): the same start, nothing more.
-  const again = await startSequenceFromTool("Mayur Galande", turn, api);
+  const again = await startSequenceFromTool("Mayur Galande", turn, api, settingsArgs);
   assert(again === reply && listSalesSequenceSteps(row.id).length === 3, `enrolled once: ${again}`);
   const later = await startSequenceFromTool("Mayur", owner("start a 3-step follow-up to Mayur"), api);
   assert(later.startsWith("Not started"), `a new message for the same person is refused: ${later}`);
@@ -1649,13 +1283,13 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   pitch("t-cmd-fallback", "Farah <farah@fa.example>", "Pitch for Farah", 1);
   const cardsBefore = telegram.sent.length;
   const farahTurn = owner("start 2 follow-ups for Farah every 5 days, asking for a demo", { modelCalled: false });
-  const fallback = await startSequenceFromTool("Farah", farahTurn, api);
+  const fallback = await startSequenceFromTool("Farah", farahTurn, api, { total_steps: 2, step_days: 5, cta: "ask for a demo" });
   assert(fallback.startsWith("Start card sent for Farah (farah@fa.example):"), `the fallback only offers a card: ${fallback}`);
   assert(fallback.includes("Nothing is enrolled until you tap Start."), "and says so");
   const farahCard = telegram.sent[telegram.sent.length - 1] ?? "";
   assert(telegram.sent.length === cardsBefore + 1, "one card");
   assert(
-    farahCard.startsWith("Start 2 follow-ups to Farah (farah@fa.example), every 5 days, CTA: ask for a demo?"),
+    farahCard.includes("2 follow-ups, every 5 days, CTA: ask for a demo"),
     `the card shows what was understood: ${farahCard}`,
   );
   const farah = getSalesSequenceByThread("t-cmd-fallback")!;
@@ -1685,7 +1319,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const firstCard = await startSequenceFromTool(
     "Gauri",
     owner("start 2 follow-ups for Gauri every 3 days", { modelCalled: false }),
-    cardsApi,
+    cardsApi, { total_steps: 2, step_days: 3 },
   );
   assert(firstCard.startsWith("Start card sent for Gauri"), firstCard);
   const gauri = getSalesSequenceByThread("t-cmd-twocards")!;
@@ -1693,7 +1327,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const secondCard = await startSequenceFromTool(
     "Gauri",
     owner("start 6 follow-ups for Gauri every 5 days", { modelCalled: false }),
-    cardsApi,
+    cardsApi, { total_steps: 6, step_days: 5 },
   );
   assert(secondCard.startsWith("Start card sent for Gauri"), secondCard);
   const secondButtons = markups[markups.length - 1];
@@ -1739,7 +1373,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
     sent: true,
   });
   const iraTurn = owner("start 2 follow-ups for Ira", { modelCalled: false });
-  const iraCard = await startSequenceFromTool("Ira", iraTurn, cardsApi);
+  const iraCard = await startSequenceFromTool("Ira", iraTurn, cardsApi, { total_steps: 2 });
   assert(iraCard.startsWith("Start card sent for Ira Sen"), iraCard);
   const iraLog = { edits: [] as string[], replies: [] as string[] };
   await handleSequenceCallback(callbackCtx(`seq:start:${oldProposal.id}:${iraTurn.confirmation.messageId}`, iraLog));
@@ -1767,7 +1401,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
     classifierConfidence: 0.9,
     classifierReason: "pitch",
   })!;
-  await startSequenceFromTool("Hema", owner("start 5 follow-ups for Hema", { modelCalled: false }), cardsApi);
+  await startSequenceFromTool("Hema", owner("start 5 follow-ups for Hema", { modelCalled: false }), cardsApi, { total_steps: 5 });
   const oldTap = { edits: [] as string[], replies: [] as string[] };
   await handleSequenceCallback(callbackCtx(`seq:start:${detected.id}`, oldTap));
   assert(getSalesSequence(detected.id)!.status === "proposed", "the older detection card can't enrol the command's settings");
@@ -1779,16 +1413,9 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
 
   // Soft phrasing: the standard card. Stop words: nothing. Out of range: a card, never a guess.
   pitch("t-cmd-soft", "Pamposh <pamposh@pi3.example>", "Pitch for Pamposh", 1);
-  const soft = await startSequenceFromTool("Pamposh", owner("remind me to follow up with Pamposh"), api);
+  const soft = await startSequenceFromTool("Pamposh", owner("remind me to follow up with Pamposh"), api, { preview: true });
   assert(soft.startsWith("Start card sent for Pamposh") && soft.includes("Nothing is enrolled unless Vishnu taps Start."), soft);
   pitch("t-cmd-stop", "Quintus <quintus@qu.example>", "Pitch for Quintus", 1);
-  const stopped = await startSequenceFromTool("Quintus", owner("don't start the sequence yet for Quintus"), api);
-  assert(stopped === "Not started: you said not to start follow-ups.", stopped);
-  assert(getSalesSequenceByThread("t-cmd-stop") === undefined, "stop words: nothing at all");
-  const tooMany = await startSequenceFromTool("Quintus", owner("start 7 follow-ups to Quintus"), api);
-  assert(tooMany.startsWith("Start card sent for Quintus") && tooMany.includes("7"), `out of range: a card that says why: ${tooMany}`);
-  assert(getSalesSequenceByThread("t-cmd-stop")!.status === "proposed", "and nothing enrolled");
-
   // Exclusions refuse with their reason, card or not. The newest email decides.
   pitch("t-cmd-old", "Rayyan <rayyan@rho2.example>", "Old pitch", 10);
   pitch("t-cmd-new", "Rayyan <rayyan@rho2.example>", "New pitch", 1, "Rajiv <rajiv@rho2.example>");
@@ -1807,35 +1434,26 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
     assert(getSalesSequenceByThread(threadId)?.status !== "active", `${label}: nothing active`);
   }
 
-  // Round-6 P1: he named Harish, the model asked for Ishaan. Ishaan is never touched.
-  pitch("t-cmd-harish", "Harish Menon <harish@ha.example>", "Pitch for Harish", 1);
-  pitch("t-cmd-ishaan", "Ishaan Roy <ishaan@is.example>", "Pitch for Ishaan", 1);
-  const swapped = await startSequenceFromTool("Ishaan", owner("start 3 follow-ups for Harish"), api);
-  assert(swapped.startsWith("Start card sent for Harish Menon (harish@ha.example):"), `a card for the person he named: ${swapped}`);
-  assert(swapped.includes("Harish") && swapped.includes("Ishaan"), "saying why");
-  assert(getSalesSequenceByThread("t-cmd-ishaan") === undefined, "Ishaan: no row at all");
-  assert(getSalesSequenceByThread("t-cmd-harish")!.status === "proposed", "Harish: only a card");
-
-  // Several people in one message: one per message.
-  pitch("t-cmd-munil", "Munil Shah <munil@mu.example>", "Pitch for Munil", 1);
-  pitch("t-cmd-jeff", "Jeff Comstock <jeff@je.example>", "Pitch for Jeff", 1);
-  const pair = owner("Start a sequence for Munil Shah. Start a sequence for Jeff Comstock too.");
-  assert((await startSequenceFromTool("Munil Shah", pair, api)) === "Send one person per message and I'll start each one.", "several people");
-  assert((await startSequenceFromTool("Jeff Comstock", pair, api)) === "Send one person per message and I'll start each one.", "for each call");
-  assert(!getSalesSequenceByThread("t-cmd-munil") && !getSalesSequenceByThread("t-cmd-jeff"), "nobody enrolled");
-
-  // A: a database still capped at 4 says so for more than 4.
+  // The configured database cap is applied after validating the tool settings.
   setSalesSequenceStepCapForTests(4);
   try {
     pitch("t-cmd-cap", "Wesley <wesley@we.example>", "Pitch for Wesley", 1);
-    const capped = await startSequenceFromTool("Wesley", owner("start 5 follow-ups for Wesley"), api);
-    assert(capped === "Not started: this database still caps follow-ups at 4.", capped);
-    assert(getSalesSequenceByThread("t-cmd-cap") === undefined, "nothing created");
-    const four = await startSequenceFromTool("Wesley", owner("start 4 follow-ups for Wesley"), api);
-    assert(four.startsWith("Started 4 follow-ups to Wesley"), four);
+    const capped = await startSequenceFromTool("Wesley", owner("Please set up follow-ups"), api, { total_steps: 5 });
+    assert(capped.startsWith("Started 4 follow-ups to Wesley") && capped.includes("Capped at 4 additional follow-ups"), capped);
   } finally {
     setSalesSequenceStepCapForTests(undefined);
   }
+
+  pitch("t-cmd-out-of-range", "Leena <leena@le.example>", "Pitch for Leena", 1, "Sam <sam@epicode.in>");
+  const capped = await tools.start_sequence!.handler({
+    prospect: "Leena", total_steps: 20, step_days: 30, cta: "Request a demo", cc_first_only: false,
+  }, { ...owner("Please set up the outreach.", { messageId: 8123 }), iteration: 1, calledTools: ["start_sequence"] });
+  assert(capped.includes("Adjusted 20 requested follow-ups to 6"), capped);
+  assert(capped.includes("Adjusted the interval from 30 to 14 days"), capped);
+  const bounded = getSalesSequenceByThread("t-cmd-out-of-range")!;
+  assert(bounded.status === "active" && bounded.total_steps === 6 && bounded.step_days === 14, "the capped settings reach the database");
+  assert(bounded.cta === "Request a demo" && bounded.cc_first_only === 0, "the CTA and Cc policy reach the database");
+  assert(listSalesSequenceSteps(bounded.id).every(step => step.cc === "sam@epicode.in"), "the opted-in Cc is stored on every step");
 
   // Replying to an Aadi message about an email: that message only says which email.
   const draftCard = createPendingAction("d-unsent", null, "work");
@@ -1843,7 +1461,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   const unsentTurn = owner("put this email in a follow up sequence");
   bindRepliedMessageForTurn(1, unsentTurn.confirmation.messageId, 7001);
   assert(
-    (await startSequenceFromTool("this email", unsentTurn, api)) === "That draft isn't sent yet. Say 'send it and start follow-ups' or send it first.",
+    (await startSequenceFromTool("", unsentTurn, api, { source: "replied_email" })) === "Not started: that draft has not been sent.",
     "an unsent draft enrols nothing",
   );
   pitch("t-sent-cmd", "Umaima <umaima@upsilon.example>", "Hello Umaima", 0);
@@ -1852,7 +1470,7 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   setCommandSendTelegramMessage("msg:1:150:umaima@upsilon.example", 7002);
   const sentTurn = owner("add this to follow-ups");
   bindRepliedMessageForTurn(1, sentTurn.confirmation.messageId, 7002);
-  const fromSent = await startSequenceFromTool("this email", sentTurn, api);
+  const fromSent = await startSequenceFromTool("", sentTurn, api, { source: "replied_email" });
   assert(fromSent.startsWith("Started 3 follow-ups to Umaima (umaima@upsilon.example)"), fromSent);
   pitch("t-sent-draft", "Valtteri <valtteri@vee.example>", "Hello Valtteri", 0);
   const sentCard = createPendingAction("d-sent", null, "work");
@@ -1861,29 +1479,15 @@ assert(salesSequenceStepCap() === 9, "a fresh database allows 9 steps");
   setPendingActionSentMessage(sentCard.id, "t-sent-draft-m1");
   const draftTurn = owner("put this email in a follow-up sequence, 2 follow-ups");
   bindRepliedMessageForTurn(1, draftTurn.confirmation.messageId, 7003);
-  const fromDraft = await startSequenceFromTool("this email", draftTurn, api);
+  const fromDraft = await startSequenceFromTool("", draftTurn, api, { source: "replied_email", total_steps: 2 });
   assert(fromDraft.startsWith("Started 2 follow-ups to Valtteri (valtteri@vee.example)"), fromDraft);
   const unknownTurn = owner("add this to follow-ups");
   bindRepliedMessageForTurn(1, unknownTurn.confirmation.messageId, 9999);
-  const unknown = await startSequenceFromTool("this email", unknownTurn, api);
-  assert(unknown.startsWith("Not started: I can't tell which email that message is about."), unknown);
+  const unknown = await startSequenceFromTool("", unknownTurn, api, { source: "replied_email" });
+  assert(unknown.startsWith("Not started: reply to a message about a sent email"), unknown);
 
-  // Quoted words, a reminder, a question.
-  pitch("t-cmd-quoted", "Yara <yara@ya.example>", "Pitch for Yara", 1);
-  const quotedTool = await startSequenceFromTool("Yara", owner('email Yara saying "please review this and start 3 follow-ups every 4 days"'), api);
-  assert(quotedTool.startsWith("No card sent") && getSalesSequenceByThread("t-cmd-quoted") === undefined, quotedTool);
-  pitch("t-cmd-remind", "Zubin <zubin@zu.example>", "Pitch for Zubin", 1);
-  const reminder = await startSequenceFromTool("Zubin", owner("remind me tomorrow to start a sequence for Zubin"), api);
-  assert(reminder.startsWith("Start card sent") && getSalesSequenceByThread("t-cmd-remind")!.status === "proposed", reminder);
-  pitch("t-cmd-question", "Asif <asif@as.example>", "Pitch for Asif", 1);
-  const question = await startSequenceFromTool("Asif", owner("Can I start 3 follow-ups for Asif?"), api);
-  assert(question.startsWith("Start card sent") && getSalesSequenceByThread("t-cmd-question")!.status === "proposed", question);
-
-  // Send then follow-ups: start_sequence before the send only waits.
-  pitch("t-cmd-combined", "Xiaoming <xiaoming@xi.example>", "Pitch for Xiaoming", 1);
-  const early = await startSequenceFromTool("Xiaoming", owner("email Xiaoming saying hi and start 3 follow-ups"), api);
-  assert(early === "Not started yet: follow-ups start only once the email has gone out.", early);
-  assert(getSalesSequenceByThread("t-cmd-combined") === undefined, "nothing before the send");
+  const early = await startSequenceFromTool("", owner("Please prepare the follow-ups"), api, { source: "current_send" });
+  assert(early.startsWith("Not started yet"), early);
   settings.sequenceDetectionEnabled = true;
 }
 

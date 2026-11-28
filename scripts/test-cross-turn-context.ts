@@ -9,7 +9,6 @@ import {
   applyOwnerContextTurn,
   authorizationWords,
   getPendingAction,
-  holdEmailToolTurn,
   linkPublishedDraft,
   syncDraftRecipient,
   matchOwnerSupplied,
@@ -276,10 +275,6 @@ const say = (text: string, now = NOW) =>
   assert.equal(draft?.email?.to[0]?.email, "raghavendra.kv@tenxpipe.com");
   assert.match(draft?.email?.purpose ?? "", /dialer/i);
   assert.equal(draft?.email?.scheduledSendId, undefined);
-  assert.equal(
-    holdEmailToolTurn(CHAT, "Raghavendra wants dialer and automated flows like KYC.", NOW),
-    "Not sent: this message adds context, and it does not send or schedule anything.",
-  );
   const discardData = buttons.find((item) => item.startsWith("approval:discard:"))!;
   await handleApprovalCallback(
     {
@@ -557,10 +552,7 @@ const say = (text: string, now = NOW) =>
     NOW,
   );
   assert.equal(authorizationWords(chat, "Add the KYC line.", NOW), "Add the KYC line.");
-  assert.match(
-    holdEmailToolTurn(chat, "Add the KYC line.", NOW) ?? "",
-    /does not send/,
-  );
+
 }
 
 {

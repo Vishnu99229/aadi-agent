@@ -11,6 +11,8 @@ import { renderConfirmCard } from "../src/confirm_cards.ts";
 import { closedDraftMiss, closedEmailFacts } from "../src/context_draft.ts";
 import { noteShownPeople } from "../src/conversation_people.ts";
 import {
+  createDocument,
+  rememberTelegramDocumentRef,
   claimCommandSend,
   conversationParticipants,
   createDocument,
@@ -24,7 +26,7 @@ import {
   recordExternalAddress,
   recordKnownRecipient,
 } from "../src/db.ts";
-import { bindEmailReferenceForTurn } from "../src/email_references.ts";
+import { bindPhotoForTurn } from "../src/email_references.ts";
 import { fireScheduledSend } from "../src/scheduled_sends.ts";
 import { setDomainLookupForTests } from "../src/email_grounding.ts";
 import { setGoogleAccountForTests, type LoadedGoogleAccount } from "../src/google/auth.ts";
@@ -257,7 +259,7 @@ setRecentSendGuardForTests(true);
 
 // ---- 3. Ashwin, 26 Nov: send the draft, then "start follow-ups", then "send it" again ----
 {
-  const chat = 10;
+  const chat = config.ownerTelegramId;
   const to = "Ashwin Kumar <ashwin.kumar@logosys.cloud>";
   const cc = "Ashwini <ashwini@epicode.in>";
   const subject = "Following up from BTS - Epicode voice AI and contact center";
@@ -479,17 +481,18 @@ setRecentSendGuardForTests(true);
   assert(recentSendsFor([address]).length === 1, "and is recorded where the recent-send check reads");
 }
 
-// ---- 14. "Email this address" on a photo: the card, even for an address he knows ----
+// ---- 14. A Sent record establishes the recipient independently of the photo ----
 {
   const chat = 24;
   const address = "photo.known@known.example";
   recordKnownRecipient(address, "test");
   const turn = ownTurn(chat, "email this address saying we met at BTS");
-  bindEmailReferenceForTurn(chat, turn.confirmation.messageId, address);
-  recordExternalAddress(chat, address, "document:1");
+  const photo = createDocument("business-card.jpg", "personal", address, null);
+  rememberTelegramDocumentRef(chat, turn.confirmation.messageId, photo.id);
+  bindPhotoForTurn({ ...turn.confirmation, currentPhoto: true });
   const before = messageSends.length;
-  const result = await sendEmailFromTool({ to: [address], instruction: "say we met at BTS" }, turn);
-  assert(result.includes(`New address: ${address}. Tap Send to confirm.`) && messageSends.length === before, `a photo's address gets the card: ${result}`);
+  const result = await sendEmailFromTool({ to: [address], photo_address: address, instruction: "say we met at BTS" }, turn);
+  assert(result.startsWith("Sent to") && messageSends.length === before + 1, `the independent Sent record uses the normal delivery decision: ${result}`);
 }
 
 // ---- 15. A photo's address is never an attendee or an invitee unless he types it ----

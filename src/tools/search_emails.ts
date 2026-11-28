@@ -54,7 +54,19 @@ async function searchAccount(
   account: LoadedGoogleAccount,
   query: string,
   maxResults: number,
-): Promise<object[]> {
+): Promise<Array<{
+  account: LoadedGoogleAccount["id"];
+  tag: LoadedGoogleAccount["tag"];
+  id?: string | null;
+  sent: boolean;
+  draft: boolean;
+  from: string;
+  to: string;
+  cc: string;
+  subject: string;
+  date: string;
+  snippet: string;
+}>> {
   const gmail = gmailClient(account);
   const result = await gmail.users.messages.list({
     userId: "me",
@@ -77,6 +89,8 @@ async function searchAccount(
         account: account.id,
         tag: account.tag,
         id: response.data.id ?? message.id,
+        sent: response.data.labelIds?.includes("SENT") === true,
+        draft: response.data.labelIds?.includes("DRAFT") === true,
         from: header(headers, "From"),
         to: header(headers, "To"),
         cc: header(headers, "Cc"),
@@ -157,8 +171,8 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
   }
 
   // Who these emails are from and to (headers only) is what a name can mean next.
-  for (const email of emails as Array<{ id?: unknown; from?: string; to?: string; cc?: string }>) {
-    noteShownPeople(turn, headerPeople(email.from, email.to, email.cc), "email", String(email.id ?? ""));
+  for (const email of emails) {
+    noteShownPeople(turn, headerPeople(email.from, email.to, email.cc), email.draft ? "draft" : "email", String(email.id ?? ""));
   }
   return JSON.stringify(emails, null, 2);
 }

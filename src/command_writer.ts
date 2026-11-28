@@ -16,7 +16,7 @@ const OWN_EMAIL_CHARS = 1500;
 export const COMMAND_WRITER_SYSTEM = `You write one email for Vishnu Rajan, in his voice. It goes out as soon as you finish, and nobody reads it first.
 
 Rules:
-- Do what VISHNU'S WORDS and THE INSTRUCTION ask. VISHNU'S WORDS win if they differ.
+- Follow THE INSTRUCTION for what the email should say.
 - Plain text. Match the tone and language of HIS RECENT EMAILS.
 - Be accurate from the context. Never invent a fact, name, date, number or commitment that isn't in his words or the context. If you don't know something, leave it out.
 - Never write a placeholder such as [date] or [name].
@@ -169,7 +169,6 @@ export async function commandWriterInput(input: CommandEmailInput, knownName?: s
   return stripSensitive(
     [
       `TODAY: ${input.now.toISOString().slice(0, 10)}`,
-      `VISHNU'S WORDS: ${input.ownWords}`,
       `THE INSTRUCTION: ${input.instruction}`,
       `RECIPIENTS: ${input.recipientNames.join(", ")}`,
       `RECIPIENT NAME: ${ground.allowedName ?? "none, use a neutral greeting"}`,

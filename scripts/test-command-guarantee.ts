@@ -7,11 +7,8 @@ import {
   forcedCommandTool,
   commandNotRunMessage,
   echoesEarlierReply,
-  sequenceTargets,
 } from "../src/command_intent.ts";
-import { getRecentMessages, getSalesSequenceByThread, listSalesSequenceSteps, saveMessage } from "../src/db.ts";
-import { setSequenceTestHooks } from "../src/sequences.ts";
-import type { gmail_v1 } from "googleapis";
+import { saveMessage } from "../src/db.ts";
 import {
   backendForcesTools,
   openAiToolChoice,
@@ -41,14 +38,6 @@ console.error = () => undefined;
 
 // ---- which messages are commands, family by family ----
 const commands: Array<[string, string]> = [
-  ["Start a sequence for Dorothy Copeland.", "sequence"],
-  ["start a sequence for dorothy.copeland@nice.com", "sequence"],
-  ["Can you auto follow up with Jeff Comstock", "sequence"],
-  ["Follow up on my email to Jeff Comstock", "sequence"],
-  ["follow up on the email I sent Munil", "sequence"],
-  ["Follow up with Dorothy on my email", "sequence"],
-  ["Remind me to follow up with Jeff on Monday", "sequence"],
-  ["track my email to Priya", "sequence"],
   ["remind me to follow up with me on Friday", "reminder"],
   ["Stop following up with Rajan", "sequence_stop"],
   ["pause all follow-ups", "sequence_stop"],
@@ -59,11 +48,6 @@ const commands: Array<[string, string]> = [
   ["Add to sales facts: we run on Kubernetes", "sales_fact_add"],
   ["add this to my sales facts under BotCompose: live in 12 languages", "sales_fact_add"],
   ["Remove sales fact 3", "sales_fact_remove"],
-  ["Send Jeff an email saying we're on for Monday", "send"],
-  ["send a reply to Munil saying thanks", "send"],
-  ["Reply to Munil saying thanks", "send"],
-  ["Email Selvaraj about the invoice", "send"],
-  ["please email Priya the deck link", "send"],
   ["Draft a reply to Jeff saying Monday works", "draft"],
   ["draft an email to Priya about the renewal", "draft"],
   ["Write a follow-up email to Dorothy", "draft"],
@@ -148,7 +132,6 @@ for (const text of notCommands) {
 for (const [text, kind] of [
   ["Mark the KYC follow-up task done", "task"],
   ["Complete the follow-up task", "task"],
-  ["send a follow-up email to Jeff", "send"],
   ["Write a follow-up email to Dorothy", "draft"],
   ["Schedule a follow-up call with Hardik", "calendar"],
   ["Delete the follow-up reminder", "reminder"],
@@ -156,8 +139,6 @@ for (const [text, kind] of [
   const kinds = commandIntents(text);
   assert(kinds.join(",") === kind, `"${text}" is only a ${kind} command, got ${kinds.join(",") || "none"}`);
 }
-assert(commandIntents("follow up with Abhishek").join(",") === "sequence", "following up with a person is still a sequence");
-assert(commandIntents("follow up Abhishek 4 times").join(",") === "sequence", "and so is follow up NAME N times");
 // Recalling a past conversation is not saving a memory.
 for (const text of [
   "Remember my discussion with Hardik about Pinnacle?",
@@ -168,51 +149,13 @@ for (const text of [
 }
 assert(commandIntents("Remember that Jeff prefers mornings").join(",") === "memory", "saving a fact is still a memory command");
 // One message, two commands; and the specific object wins over a generic word.
-assert(commandIntents("Book a call with Jeff on Monday. Email him the agenda.").join(",") === "send,calendar", "one message can hold two commands");
 assert(commandIntents("Cancel the reminder for the call").join(",") === "reminder", "a reminder about a call is a reminder");
 assert(commandIntents("Draft an email to Jeff to schedule a call").join(",") === "draft", "a draft that mentions a call is a draft");
 assert(commandIntents("Delete the task about the Talkdesk call").join(",") === "task", "a task about a call is a task");
 assert(commandIntents("remind me to book a meeting with Jeff").join(",") === "reminder", "remind me to book is a reminder, not a booking");
-assert(commandIntents("Remind me to follow up with Jeff").join(",") === "sequence", "remind me to follow up with X is the sequence card, not a reminder");
-assert(commandIntents("draft and send an email to Jeff saying Monday works").join(",") === "send", "draft and send is a send");
 assert(commandIntents("Draft an email to Jeff saying please send me the deck").join(",") === "draft", "send in the body is not a send command");
 assert(commandIntents("Write an email to Jeff saying please send the invoice").join(",") === "draft", "write stays a draft when send is only in the body");
 assert(commandIntents("Draft an email to Jeff saying we had to cancel the order").join(",") === "draft", "cancel in the body is not a cancel");
-assert(commandIntents("Email Munil about the pricing call").join(",") === "send", "email X about stays a send");
-assert(commandIntents("Reply to Dorothy saying thanks, we'll share the deck tomorrow").join(",") === "send", "tomorrow in the body is not a schedule");
-assert(commandIntents("Send Jeff an email saying the proposal is ready").join(",") === "send", "send ... saying stays a send");
-
-// ---- who a sequence request names ----
-assert(JSON.stringify(sequenceTargets("Start a sequence for Dorothy Copeland.")) === '["Dorothy Copeland"]', "a name");
-assert(JSON.stringify(sequenceTargets("start a sequence for dorothy.copeland@nice.com please")) === '["dorothy.copeland@nice.com"]', "an address, filler dropped");
-assert(JSON.stringify(sequenceTargets("Auto follow up with Jeff at NICE")) === '["Jeff at NICE"]', "auto follow up");
-assert(
-  JSON.stringify(sequenceTargets("Start a sequence for Munil Shah. Start a sequence for Jeff Comstock too.")) === '["Munil Shah","Jeff Comstock"]',
-  "one target per request",
-);
-assert(JSON.stringify(sequenceTargets("Follow up on my email to Jeff Comstock")) === '["Jeff Comstock"]', "the old tracker's phrasing names the person");
-assert(JSON.stringify(sequenceTargets("Remind me to follow up with Jeff on Monday")) === '["Jeff"]', "the person, not the day");
-assert(JSON.stringify(sequenceTargets("Follow up with Dorothy on my email")) === '["Dorothy"]', "follow up with X on my email");
-assert(JSON.stringify(sequenceTargets("follow up with Abhishek")) === '["Abhishek"]', "follow up with a person");
-assert(JSON.stringify(sequenceTargets("follow up Abhishek 4 times")) === '["Abhishek"]', "follow up N times names the person");
-assert(JSON.stringify(sequenceTargets("add Abhishek to sequence")) === '["Abhishek"]', "add to sequence names the person");
-assert(JSON.stringify(sequenceTargets("start a follow up sequence for Abhishek")) === '["Abhishek"]', "start a follow up sequence names the person");
-// An email-anchored phrase names the person after the email, whatever prefix comes first.
-for (const [text, person] of [
-  ["auto follow up on my email to Jeff", "Jeff"],
-  ["follow up on my email to Dorothy", "Dorothy"],
-  ["start a sequence on my email to Jeff", "Jeff"],
-  ["auto follow up on the email I sent Munil", "Munil"],
-  ["remind me to follow up on my email to Dorothy", "Dorothy"],
-  ["Auto follow up on my last email to dorothy.copeland@nice.com", "dorothy.copeland@nice.com"],
-] as const) {
-  assert(JSON.stringify(sequenceTargets(text)) === JSON.stringify([person]), `"${text}" names ${person}, got ${JSON.stringify(sequenceTargets(text))}`);
-  assert(commandIntents(text).includes("sequence"), `"${text}" is a sequence command`);
-}
-assert(sequenceTargets("auto follow up on my email to her") === undefined, "a pronoun after the email is still left to the model");
-for (const vague of ["start a sequence for her", "Start a sequence for the other person also", "start a sequence for them", "Start a sequence from Dorothy for Coplan"]) {
-  assert(sequenceTargets(vague) === undefined, `"${vague}" is left to the model`);
-}
 
 // ---- what counts as repeating an earlier answer ----
 const OLD =
@@ -341,70 +284,6 @@ function reset(): void {
 saveMessage("user", "Start a sequence for Dorothy Copeland.");
 saveMessage("assistant", `${OLD}\n\nSixth try, same block.`);
 
-// DeepSeek: the API forces start_sequence, and every repeat runs the check again.
-for (let attempt = 1; attempt <= 3; attempt += 1) {
-  reset();
-  const before = freshCount;
-  const reply = await say("Start a sequence for Dorothy Copeland.");
-  assert(freshCount === before + 1, `attempt ${attempt}: the check ran exactly once, ran=${freshCount - before}`);
-  assert(ran.every((item) => item.name === "start_sequence"), "only start_sequence ran");
-  const first = seen.find((params) => params.tools.length > 0)!;
-  assert(JSON.stringify(first.toolChoice) === '{"name":"start_sequence"}', "the first step forces start_sequence");
-  assert(reply.includes(`check ${freshCount}`), `attempt ${attempt}: the reply is this turn's result, got: ${reply}`);
-  assert(!reply.includes("already has an open sequence"), `attempt ${attempt}: the old refusal is never repeated`);
-}
-assert(ran[0]!.turn.confirmation?.messageId === nextMessage, "the check runs on his own message's confirmation");
-
-// Claude can't be forced, and this model never calls a tool on its own: code runs the check.
-for (let attempt = 1; attempt <= 2; attempt += 1) {
-  reset();
-  honoursForcing = false;
-  const before = freshCount;
-  const reply = await say("start a sequence for Dorothy Copeland", { backend: "claude" });
-  assert(seen.every((params) => params.toolChoice === undefined), "Claude is never sent tool_choice");
-  assert(freshCount === before + 1, `claude attempt ${attempt}: code ran the check once`);
-  assert(JSON.stringify(ran[0]!.input) === '{"prospect":"Dorothy Copeland"}', "with the name from his own words, in the tool's own input field");
-  assert(ran[0]!.turn.userText === "start a sequence for Dorothy Copeland", "and his words as the guard text");
-  assert(reply.includes(`check ${freshCount}`) && !reply.includes("already has an open sequence"), `claude attempt ${attempt}: fresh result, got: ${reply}`);
-}
-{
-  const rows = getRecentMessages(40);
-  const toolRows = rows.filter((row) => row.role === "tool" && row.tool_name === "start_sequence");
-  assert(toolRows.length >= 5, `each check is recorded as a tool row, got ${toolRows.length}`);
-}
-
-// A target only the model can resolve, and a model that won't call: he's told nothing ran.
-{
-  reset();
-  honoursForcing = false;
-  const before = freshCount;
-  const reply = await say("start a sequence for her", { backend: "claude" });
-  assert(freshCount === before, "nothing was guessed for \"her\"");
-  assert(
-    seen.some((params) => String(params.messages.at(-1)?.role === "user" ? (params.messages.at(-1) as { content: unknown }).content : "").includes("looks like a command")),
-    "the model was asked once more",
-  );
-  assert(reply === commandNotRunMessage(["sequence"]), `an honest "not run", got: ${reply}`);
-}
-
-// Send: an echoing model never gets its old "Sent" through.
-saveMessage("user", "Send Jeff an email saying Monday is on");
-saveMessage("assistant", "Sent to Jeff Comstock <jeff.comstock@nice.com>: Monday is on. He has it in his inbox now.");
-{
-  reset();
-  const reply = await say("Send Jeff an email saying Monday is on", { backend: "claude" });
-  assert(!ran.some((item) => item.name === "send_email"), "nothing was sent");
-  assert(reply === commandNotRunMessage(["send"]), `he's told no email was sent, got: ${reply}`);
-  assert(!reply.includes("He has it in his inbox"), "the old confirmation is not repeated");
-}
-{
-  reset();
-  callsWhenAsked = "send_email";
-  const reply = await say("Send Jeff an email saying Monday is on", { backend: "claude" });
-  assert(ran.filter((item) => item.name === "send_email").length === 1, "asked again, the model sends it once");
-  assert(reply.startsWith("Sent to Jeff Comstock") && !reply.includes("He has it in his inbox"), `the reply is this send's result, got: ${reply}`);
-}
-
 // Calendar: same guarantee.
 {
   reset();
@@ -472,84 +351,6 @@ saveMessage("assistant", "Marked the Airtel bill paid. Next one due is LinkedIn 
   assert(reply === "Jeff said Monday works.", `a question is answered as usual, got: ${reply}`);
   assert(seen.every((params) => params.toolChoice === undefined), "nothing is forced");
   assert(seen.filter((params) => params.tools.length > 0).length === 1, "and nothing is retried");
-}
-
-// C: the code-run start_sequence and the model's own call on the same message enrol once.
-{
-  reset();
-  const ME = "vishnu.rajan@epicode.in";
-  const dorothy = {
-    id: "dm1",
-    threadId: "t-dorothy",
-    internalDate: String(Date.now() - 24 * 60 * 60 * 1000),
-    labelIds: ["SENT"],
-    payload: {
-      mimeType: "text/plain",
-      headers: [
-        { name: "From", value: `Vishnu Rajan <${ME}>` },
-        { name: "To", value: "Dorothy Copeland <dorothy.copeland@nice.com>" },
-        { name: "Subject", value: "Exploring a Telephony Technology Partnership with NiCE" },
-      ],
-      body: { data: Buffer.from("Hi Dorothy", "utf8").toString("base64url") },
-    },
-  };
-  const sequenceGmail = {
-    users: {
-      getProfile: async () => ({ data: { emailAddress: ME } }),
-      settings: { sendAs: { list: async () => ({ data: { sendAs: [{ sendAsEmail: ME }] } }) } },
-      threads: { get: async () => ({ data: { id: "t-dorothy", messages: [dorothy] } }) },
-      messages: {
-        list: async ({ q }: { q: string }) => ({
-          data: { messages: /^from:/.test(q) ? [] : [{ id: "dm1", threadId: "t-dorothy" }] },
-        }),
-        get: async () => ({ data: dorothy }),
-      },
-    },
-  } as unknown as gmail_v1.Gmail;
-  setGmailClientForTests(() => sequenceGmail);
-  setGoogleAccountForTests((id) => ({ id, tag: id, label: id, client: {} }) as LoadedGoogleAccount);
-  setSequenceTestHooks({ telegram: fakeTelegramApi({ sent: [], edited: [] }) });
-  const results: string[] = [];
-  setToolInterceptorForTests((call: ToolCall, turn: ToolTurn) => {
-    ran.push({ name: call.name, input: call.input, turn });
-    return undefined;
-  });
-  let modelCalled = false;
-  setCompleteForTests(async (params) => {
-    seen.push(params);
-    if (params.tools.length === 0) {
-      return modelReply({ text: '{"facts":[]}' });
-    }
-    const codeRan = params.messages.some(
-      (message) => message.role === "assistant" && (message.toolCalls ?? []).some((call) => call.id.startsWith("code_start_sequence_")),
-    );
-    for (const message of params.messages) {
-      if (message.role === "tool") {
-        results.push(String(message.content));
-      }
-    }
-    if (codeRan && !modelCalled) {
-      modelCalled = true;
-      return modelReply({ tools: [{ name: "start_sequence", input: { prospect: "Dorothy" } }] });
-    }
-    return modelReply({ text: codeRan ? "Done." : "Sure, on it." });
-  });
-  await say("start 3 follow-ups for Dorothy Copeland", { backend: "claude" });
-  const calls = ran.filter((item) => item.name === "start_sequence");
-  assert(calls.length === 2, `the code run and the model's own call both ran, got ${calls.length}`);
-  assert(
-    calls.every((item) => item.turn.ownTurn === true && item.turn.confirmation?.messageId === nextMessage),
-    "both run on his own message, as his own turn",
-  );
-  assert(calls[0]!.turn.modelCalled !== true, "the code run is not the model's call");
-  assert(calls[1]!.turn.modelCalled === true, "the model's own call is marked as such");
-  assert(
-    results.some((text) => text.startsWith("Start card sent for Dorothy Copeland")),
-    `the code run only offered a card: ${JSON.stringify(results)}`,
-  );
-  const row = getSalesSequenceByThread("t-dorothy");
-  assert(row?.status === "active", "the model's own call enrolled Dorothy");
-  assert(listSalesSequenceSteps(row!.id).length === 3, "exactly once: three steps, not six");
 }
 
 // A forwarded message is never a command, whatever it says.

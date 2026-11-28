@@ -34,7 +34,6 @@ import {
   commandNotRunMessage,
   commandRetryPrompt,
   echoesEarlierReply,
-  sequenceTargets,
   type CommandKind,
 } from "./command_intent.js";
 import type { UsageTask } from "./usage.js";
@@ -67,6 +66,7 @@ import { AgentTaskError } from "./agents/types.js";
 import type { ReactionSession } from "./contextual_react.js";
 import {
   isSuccessfulToolResult,
+  isDeliveryTool,
   receiptFailureMessage,
   isLookupQuestion,
   receiptActionTools,
@@ -76,11 +76,10 @@ import {
   type ReceiptRetryMetadata,
   type ToolReceipt,
 } from "./receipt.js";
-import { contradictsRecordedSend, recordedReceipt } from "./receipt_records.js";
+import { deliveryReadsFromTool, recordedReceipt } from "./receipt_records.js";
 import { emailRecoveryForModel, hasEmailRecovery, recordEmailRecovery, type EmailRecovery } from "./email_recovery.js";
 import { addEmailOutcomes, currentEmailTurn, newEmailTurn, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
 import type { WorkflowToolRun } from "./agents/dispatch.js";
-import { repliedMessageForTurn } from "./email_references.js";
 import {
   parseSearchSources,
   withSearchCitations,
@@ -127,7 +126,7 @@ const WRITTEN_ANSWER_NOTE =
   "Vishnu sent this as a voice note but wants the answer in writing. Give the full, detailed text answer. If he's saying yes to your offer to send something in writing, write out in full what you summarised before.";
 
 const SEND_ON_COMMAND_NOTE =
-  "Sending email: when Vishnu tells you in this message, in any language, to send an email or to reply to someone, call send_email straight away with the names as he said them. It finds the address and writes the email, so never ask him for an address or for wording first, and don't look the address up yourself. For a reply, find the thread with search_emails and pass thread_id. Ask him only when send_email tells you to. Never set send_immediately: it only makes a Send card. draft_new_email and draft_reply are for when he says draft, write or prepare. \"Remind me to email X\" stays set_reminder, and \"follow up on my email to X\" or \"remind me to follow up with X\" is start_sequence. Calendar: when he tells you to create an event, block his calendar or add something to it, call create_event right away, on the work calendar and 30 minutes unless he said otherwise, and don't ask which calendar or how long; to meet with someone, call book_meeting with the names as he said them; to delete, cancel or move an event, call delete_calendar_event or move_event. None of these needs a card or a tap, and create_meeting is unavailable. Use propose_calendar_event only when he says propose or park. For add_calendar_attendee, pass the name as he said it in attendee_email. Sending later: when he says send on Monday or a date or time, call send_email with send_on (and send_time if he gave one), and a short subject for a new email; these timers do exist. To schedule a Gmail draft he means, also pass its draft_id; never pass a draft_id for a different email, even one to the same person. A date inside what the email should say isn't a send date. To cancel one, call cancel_scheduled_send.";
+  "Sending email: when Vishnu tells you in this message, in any language, to send an email or to reply to someone, call send_email straight away with the names as he said them. It finds the address and writes the email, so never ask him for an address or for wording first, and don't look the address up yourself. For a reply, find the thread with search_emails and pass thread_id. Ask him only when send_email tells you to. Use confirm_send_pending_draft for delivery of an existing draft. A bare affirmation can confirm only the live card the current message replies to. When the owner asks for follow-ups on this turn’s delivery, call start_sequence with source current_send after the send tool returns. Pass follow-up count, interval, CTA and Cc policy as structured arguments. draft_new_email and draft_reply are for when he says draft, write or prepare. \"Remind me to email X\" stays set_reminder, and \"follow up on my email to X\" or \"remind me to follow up with X\" is start_sequence. Calendar: when he tells you to create an event, block his calendar or add something to it, call create_event right away, on the work calendar and 30 minutes unless he said otherwise, and don't ask which calendar or how long; to meet with someone, call book_meeting with the names as he said them; to delete, cancel or move an event, call delete_calendar_event or move_event. None of these needs a card or a tap, and create_meeting is unavailable. Use propose_calendar_event only when he says propose or park. For add_calendar_attendee, pass the name as he said it in attendee_email. Sending later: when he says send on Monday or a date or time, call send_email with send_on (and send_time if he gave one), and a short subject for a new email; these timers do exist. To schedule a Gmail draft he means, also pass its draft_id; never pass a draft_id for a different email, even one to the same person. A date inside what the email should say isn't a send date. To cancel one, call cancel_scheduled_send.";
 
 function formatCurrentTime(): string {
   return new Intl.DateTimeFormat("en-IN", {
@@ -649,7 +648,6 @@ async function runAgentLoop(
   options: RunAgentOptions,
   local?: LocalRun,
 ): Promise<string> {
-  const turnStartedAt = Date.now();
   const saveUserMessage = options.saveUserMessage ?? true;
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
   const saveReply = (reply: string, save: boolean): string => {
@@ -705,6 +703,7 @@ async function runAgentLoop(
     dynamic: [
       `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
       sendIntentContext(options.sendConfirmation),
+      "Report a delivery as new only after a send succeeded in this turn. When a mail lookup shows an earlier delivery, answer about that message and its date.",
       config.sendOnCommandEnabled && (!specialist || specialist.usesCommandTools())
         ? SEND_ON_COMMAND_NOTE
         : "",
@@ -853,10 +852,12 @@ async function runAgentLoop(
     },
     credit: (runs) => {
       for (const run of runs) {
-        if (run.emailOutcomes) addEmailOutcomes(run.emailOutcomes);
+        if (run.emailOutcomes) {
+          addEmailOutcomes(run.emailOutcomes.filter(outcome => outcome.recordedAt >= turnContext.emailTurn.startedAt));
+        }
         if (run.emailRecoveryUpdate) recordEmailRecovery(turnContext.emailTurn, run.emailRecoveryUpdate);
         toolsUsed.add(run.tool);
-        receipts.push({ name: run.tool, success: run.ok, content: run.content });
+        noteToolReceipt({ name: run.tool, success: run.ok, content: run.content }, run.emailRecovery);
         if (isFamilyTool(run.tool)) {
           freshResults.push(run.content);
         }
@@ -901,8 +902,20 @@ async function runAgentLoop(
   let receiptRetryUsed = false;
   let receiptRetryReadOnly = false;
   const receipts: ToolReceipt[] = [];
-  const receiptReads: string[] = [];
-  let previousReceipt: ReturnType<typeof recordedReceipt>;
+  const receiptReads: ReturnType<typeof deliveryReadsFromTool> = [];
+  let writeFailed = false;
+  function noteToolReceipt(receipt: ToolReceipt, recovery?: EmailRecovery): void {
+    receipts.push(receipt);
+    const effect = toolOwnership(receipt.name)?.effect;
+    if (effect === "read" && receipt.success && receipt.content !== undefined) {
+      receiptReads.push(...deliveryReadsFromTool(receipt.name, receipt.content));
+    }
+    if (effect && effect !== "read" && (!receipt.success || recovery)) {
+      writeFailed = true;
+      const reason = recovery?.userMessage ?? receipt.content;
+      if (reason?.trim()) turnContext.emailTurn.notices.add(reason);
+    }
+  }
   const draftBodies: string[] = [];
   let searchSources: SearchHit[] = [];
   /** The official release pages a release check read. They are cited ahead of search hits. */
@@ -944,7 +957,6 @@ async function runAgentLoop(
   const firstForced = forcing(intents);
   let toolChoice: ToolChoice | undefined = firstForced;
   let commandRetryUsed = false;
-  let sequenceRunInCode = false;
   if (intents.length > 0) {
     console.log(`Command turn: kinds=${intents.join(",")} forced=${firstForced?.name ?? "none"}`);
   }
@@ -1105,21 +1117,7 @@ async function runAgentLoop(
         const call = clientToolCalls[i]!;
         const result = toolResults[i]!;
         const success = isSuccessfulToolResult(result.content, result.isError);
-        if (success && call.name === "search_emails") receiptReads.push(result.content);
-        if (success && call.name === "read_email") {
-          const id = (call.input as { id?: unknown } | undefined)?.id;
-          const tag = /^Account: [^\n]+\nTag: (work|personal)\n/.exec(result.content)?.[1];
-          if (typeof id === "string" && tag) receiptReads.push(JSON.stringify({ id: id.trim(), account: tag }));
-        }
-        if (success && call.name === "read_draft") {
-          const draftId = /^Draft ID: (\S+)\n/.exec(result.content)?.[1];
-          if (draftId) receiptReads.push(JSON.stringify({ draft_id: draftId }));
-        }
-        receipts.push({
-          name: call.name,
-          success,
-          content: result.content,
-        });
+        noteToolReceipt({ name: call.name, success, content: result.content }, result.emailRecovery);
         const draftBody = draftBodyFromCall(call.name, call.input, success);
         if (draftBody) {
           draftBodies.push(draftBody);
@@ -1181,45 +1179,6 @@ async function runAgentLoop(
       ? []
       : intents.filter((kind) => !commandFamilyTools(kind).some((name) => toolsUsed.has(name)));
     if (response.toolCalls.length === 0 && missingKinds.length > 0) {
-      // A sequence request names the person in his words, so code runs the check
-      // itself rather than trusting the model's answer.
-      const targets =
-        missingKinds.includes("sequence") && !sequenceRunInCode ? sequenceTargets(guardText) : undefined;
-      if (targets) {
-        sequenceRunInCode = true;
-        console.log(`Command check: start_sequence run in code, targets=${targets.length} iteration=${iteration}`);
-        const calls: ToolCall[] = targets.map((target, index) => ({
-          id: `code_start_sequence_${iteration}_${index}`,
-          name: "start_sequence",
-          input: { prospect: target },
-          execution: "client",
-        }));
-        const turn: ToolTurn = {
-          iteration,
-          calledTools: calls.map((call) => call.name),
-          confirmation: options.sendConfirmation,
-          userText: guardText,
-          ctx: options.ctx,
-        };
-        const results: AgentToolResult[] = [];
-        for (const call of calls) {
-          const result = await runTool(call, turn, allowedTools);
-          results.push(result);
-          toolsUsed.add(call.name);
-          receipts.push({ name: call.name, success: isSuccessfulToolResult(result.content, result.isError), content: result.content });
-          freshResults.push(result.content);
-          actionResults.push(result.content);
-          if (result.isError) {
-            toolFailed = true;
-          }
-          if (saveAssistantMessage) {
-            saveMessage("tool", result.content, call.name);
-          }
-        }
-        messages.push({ role: "assistant", textParts: [], toolCalls: calls });
-        messages.push(...results.map(toolResultForModel));
-        continue;
-      }
       if (!commandRetryUsed) {
         commandRetryUsed = true;
         console.log(`Command check: retry kinds=${missingKinds.join(",")} iteration=${iteration}`);
@@ -1355,21 +1314,6 @@ async function runAgentLoop(
       succeeded = !toolFailed;
       return "";
     }
-    const record = recordedReceipt({
-      ownerText: guardText,
-      reply: finalReply,
-      repliedCard: repliedMessageForTurn(options.sendConfirmation?.chatId, options.sendConfirmation?.messageId),
-      reads: receiptReads,
-      history: history.messages.filter(message => message.role === "assistant").map(message => message.content),
-      turnStartedAt,
-    });
-    if (contradictsRecordedSend(finalReply)) {
-      const completed = record ?? (receiptRetryUsed && !/[@#]|\b(?:draft_id|thread_id|sent_message_id)\b/i.test(finalReply) ? previousReceipt : undefined);
-      if (completed?.actions.includes("sent")) {
-        succeeded = true;
-        return saveReply(completed.summary, saveAssistantMessage);
-      }
-    }
     if (
       !receiptRetryUsed && intents.length > 0 &&
       echoesEarlierReply(finalReply, earlierReplies, freshResults, earlierToolResults)
@@ -1386,12 +1330,16 @@ async function runAgentLoop(
     const missing = unreceiptedClaims(finalReply, receipts, {
       ownerText: guardText,
       isReadTool: (name) => toolOwnership(name)?.effect === "read",
-      recordedActions: record?.actions,
+      deliveryGrounded: recordedReceipt({
+        outcomeIds: turnContext.emailTurn.writes.keys(),
+        reads: receiptReads,
+        deliveryAttempted: receipts.some(receipt => isDeliveryTool(receipt.name)),
+        writeFailed,
+      }),
     });
     if (missing.length > 0) {
       if (!receiptRetryUsed) {
         receiptRetryUsed = true;
-        previousReceipt = record;
         const retryText = options.delegation || options.toolNames ? "" : guardText;
         receiptRetryReadOnly = receiptRetryIsReadOnly(missing, retryText);
         allowedTools.receiptToolAllowed = (name) => toolOwnership(name)?.effect === "read" ||

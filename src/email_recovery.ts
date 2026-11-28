@@ -4,7 +4,7 @@ import {
   unconfirmedDraftDelivery, type GoogleAccountId,
 } from "./db.js";
 import { parseAddressList } from "./address_list.js";
-import { confirmsExistingDraft } from "./email_references.js";
+import { repliedDraftForTurn } from "./email_references.js";
 import { emailOutcomeTime, EmailOperationError, type EmailFailureReason, type EmailTurnOutcomes } from "./email_outcomes.js";
 import type { ToolTurn } from "./tools/index.js";
 
@@ -123,12 +123,15 @@ export function emailRecoveryFor(tool: string, input: unknown, turn: ToolTurn, c
   const mailbox = accountArg === "personal" ? "personal" : "work";
   const command = tool === "send_email" ? commandRecord(mailbox, turn) : undefined;
   const commandDraft = command ? pendingActionForCommandKey(command.idem_key) : undefined;
-  const draftId = evidence?.draftId ?? textField(input, "draft_id") ?? commandDraft?.draft_id ?? undefined;
+  const replied = tool === "confirm_send_pending_draft" && turn.confirmation
+    ? repliedDraftForTurn(turn.confirmation.chatId, turn.confirmation.messageId)
+    : undefined;
+  const draftId = evidence?.draftId ?? replied?.draft_id ?? textField(input, "draft_id") ?? commandDraft?.draft_id ?? undefined;
   const draft = draftId ? latestDraftAction(draftId, accountArg === "personal" || accountArg === "work" ? accountArg : undefined) : undefined;
   const account = draft?.google_account ?? mailbox;
   const last = turn.confirmation ? getClosedEmailContext(turn.confirmation.chatId) : undefined;
   const closed = (draftId ? recordedClosedEmail({ account, draftId }) : undefined) ??
-    (last && (draftId ? last.draftId === draftId && last.account === account : confirmsExistingDraft(turn.userText ?? "")) ? last : undefined);
+    (last && draftId && last.draftId === draftId && last.account === account ? last : undefined);
   const boundSchedule = evidence?.scheduleId ? getScheduledSend(evidence.scheduleId) :
     draftId ? db.prepare(`SELECT id, status, send_at FROM scheduled_sends
       WHERE json_valid(request)

@@ -1595,7 +1595,7 @@ function localHour(at: Date, zone: string): number {
       ownTurn: true,
       modelCalled: true,
     },
-    api,
+    api, { total_steps: 5, step_days: 3, cta: "ask them to book a call", cc_first_only: true },
   );
   assert(
     reply.startsWith(`Started 5 follow-ups to Hana Kapoor (${email}), every 3 days, CTA: ask them to book a call. First one goes `),
@@ -1676,7 +1676,7 @@ function localHour(at: Date, zone: string): number {
   const reply = await startSequenceFromTool(
     "Ivo",
     { confirmation: { chatId: 1, messageId: 5002 }, userText: "start 2 follow-ups to Ivo", ownTurn: true, modelCalled: true },
-    api,
+    api, { total_steps: 2 },
   );
   assert(reply.startsWith(`Started 2 follow-ups to Ivo Pinto (${email}), every 2 days, CTA: same ask as your email.`), reply);
   const id = getSalesSequenceByThread(threadId)!.id;

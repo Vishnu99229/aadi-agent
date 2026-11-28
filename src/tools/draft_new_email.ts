@@ -11,9 +11,8 @@ import {
 import { parseAddressList } from "../address_list.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor, signaturePlainText } from "../google/mail.js";
-import { deliveryTimeHold, notASendCommand } from "../command_logic.js";
 import { linkPublishedDraft } from "../action_context.js";
-import { emailReferenceForTurn, refersToEarlierEmail } from "../email_references.js";
+import { photoRecipientForNewEmail } from "../email_references.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 import { emailProviderRead, EmailOperationError, noteEmailFailure, noteEmailTarget } from "../email_outcomes.js";
@@ -26,6 +25,7 @@ export const definition: Extract<LlmTool, { type: "function" }> = {
   inputSchema: {
     type: "object",
     properties: {
+      photo_address: { type: "string", description: "Exact photo address from this turn, if used. Also pass it as the sole To address." },
       to: {
         type: "string",
         description:
@@ -72,26 +72,17 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     body?: unknown;
     account?: unknown;
     send_immediately?: unknown;
+    photo_address?: unknown;
   };
   if (typeof values.to !== "string" || !values.to.trim()) {
     throw new Error("to must be a non-empty email address.");
   }
-  const referencedEmail = emailReferenceForTurn(
-    turn.confirmation?.chatId,
-    turn.confirmation?.messageId,
+  const selectedTo = values.to.trim();
+  const copyHeaders = toAddressList(values.cc);
+  const photo = await photoRecipientForNewEmail(
+    turn, parseAddressList(selectedTo), copyHeaders.flatMap(parseAddressList), values.photo_address,
   );
-  const selectedTo = referencedEmail && refersToEarlierEmail(values.to)
-    ? referencedEmail
-    : values.to.trim();
-  if (referencedEmail) {
-    const chosen = parseAddressList(selectedTo);
-    if (
-      chosen.length !== 1 || chosen[0]!.email.toLowerCase() !== referencedEmail ||
-      (values.cc !== undefined && !/\bcc\b/i.test(turn.userText ?? ""))
-    ) {
-      return `Not drafted: the referenced photo/message identifies ${referencedEmail}, but the agent chose different recipients. No Gmail draft was created.`;
-    }
-  }
+  if (photo.error) return `Not drafted: ${photo.error}`;
   if (typeof values.subject !== "string" || !values.subject.trim()) {
     throw new Error("subject must be a non-empty string.");
   }
@@ -109,7 +100,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   let ccHeader = "";
   if (values.cc !== undefined) {
     ccHeader = dropSelf(toAddressList(values.cc).join(", "));
-  } else {
+  } else if (!photo.recipient) {
     const split = splitDraftRecipients(
       parseAddressList(toHeader),
       `${subject}\n${values.body}`,
@@ -122,10 +113,6 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
     throw new Error("to has no remaining recipient after dropping Vishnu's own addresses.");
   }
 
-  if (values.send_immediately === true) {
-    const hold = deliveryTimeHold(turn.userText ?? "");
-    if (hold) return hold;
-  }
   const mailbox = values.account === "personal" ? "personal" : "work";
   noteEmailTarget("draft_new_email", { recipient: toHeader });
   const { account, signatureHtml } = await emailProviderRead(
@@ -145,7 +132,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   let cardNote = "";
   const sendImmediately =
-    values.send_immediately === true && notASendCommand(turn.userText ?? "") === undefined;
+    values.send_immediately === true && !photo.recipient;
   const signature = signaturePlainText(signatureHtml);
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({

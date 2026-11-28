@@ -37,7 +37,7 @@ import {
   telegramMessageParticipants,
 } from "./db.js";
 import { chosenContact } from "./contacts.js";
-import { repliedMessageForTurn } from "./email_references.js";
+import { CONVERSATION_WINDOW_MS, repliedMessageForTurn } from "./email_references.js";
 import { messageHeader } from "./gmail_attachments.js";
 import { getGoogleAccount, type GoogleAccountId } from "./google/auth.js";
 import { gmailClient } from "./google/mail.js";
@@ -45,8 +45,6 @@ import { knownRecipients } from "./known_recipients.js";
 import { loadFollowupSelfAddresses } from "./mail_helpers.js";
 import { isSelfEmail } from "./mom_logic.js";
 
-/** How long a read tool's participants count as this conversation's people. */
-export const CONVERSATION_WINDOW_MS = 3 * 60 * 60 * 1000;
 const SENT_SEARCH_RESULTS = 25;
 const SENT_SEARCH_TIMEOUT_MS = 5_000;
 const MEMORY_RESULTS = 8;
@@ -59,6 +57,7 @@ export interface PeopleContext {
   ownerText: string;
   /** Addresses a card in this chat just offered him to pick from. */
   offered?: readonly ParsedMailbox[];
+  threadPeople?: readonly ParsedMailbox[];
   now?: Date;
 }
 
@@ -101,7 +100,9 @@ export function conversationPeople(context: PeopleContext): Map<string, string> 
   const closed = lastEmailReference(context.chatId, now);
   for (const candidate of fromHeader(closed?.to)) add(found, candidate);
   const since = new Date(now.getTime() - CONVERSATION_WINDOW_MS).toISOString();
-  for (const person of conversationParticipants(context.chatId, since)) add(found, person);
+  const participants = conversationParticipants(context.chatId, since);
+  for (const person of participants) add(found, person);
+  for (const person of context.threadPeople ?? []) add(found, person);
   const replied = repliedMessageForTurn(context.chatId, context.messageId, now.getTime());
   if (replied !== undefined) {
     for (const person of telegramMessageParticipants(replied)) add(found, person);
@@ -113,14 +114,15 @@ export function conversationPeople(context: PeopleContext): Map<string, string> 
     for (const email of cardRecipientsOnMessage(replied)) add(found, { email, name: named.get(email) ?? "" });
   }
   for (const option of context.offered ?? []) add(found, option);
-  // An address that came from a photo or a quoted message he pointed at (an open email
-  // made from one, say) is never a fact about people unless he typed it himself.
-  const typed = new Set([
+  // Draft and card records can carry a photo recipient. Independent sources can still establish the address.
+  const independent = new Set([
     ...fromHeader(context.ownerText).map((item) => lower(item.email)),
     ...(pending?.ownerSupplied ?? []).map((item) => lower(item.email)),
+    ...participants.filter(person => person.source === "email" || person.source === "owner_text").map(person => person.email),
+    ...(context.threadPeople ?? []).map(person => person.email),
   ]);
   for (const email of externalAddresses(context.chatId)) {
-    if (!typed.has(email)) found.delete(email);
+    if (!independent.has(email)) found.delete(email);
   }
   return found;
 }

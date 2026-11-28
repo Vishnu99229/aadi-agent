@@ -5,9 +5,11 @@ import type { EmailRecovery, EmailRecoveryUpdate } from "./email_recovery.js";
 export interface EmailOutcome {
   id: string;
   line: string;
+  recordedAt: number;
 }
 
 export interface EmailTurnOutcomes {
+  startedAt: number;
   writes: Map<string, EmailOutcome>;
   notices: Set<string>;
   recoveries: Map<EmailRecoveryUpdate["operation"], EmailRecovery>;
@@ -33,7 +35,7 @@ export function currentEmailTurn(): EmailTurnOutcomes | undefined {
 }
 
 export function newEmailTurn(): EmailTurnOutcomes {
-  return { writes: new Map(), notices: new Set(), recoveries: new Map(), recoveryUpdates: new WeakSet(), uncertain: false, inFlight: 0 };
+  return { startedAt: Date.now(), writes: new Map(), notices: new Set(), recoveries: new Map(), recoveryUpdates: new WeakSet(), uncertain: false, inFlight: 0 };
 }
 
 export function withEmailTurn<T>(journal: EmailTurnOutcomes, work: () => T): T {
@@ -55,7 +57,7 @@ export function addEmailOutcomes(outcomes: readonly EmailOutcome[]): void {
 }
 
 export function recordEmailOutcome(id: string, line: string): void {
-  const outcome = { id, line };
+  const outcome = { id, line, recordedAt: Date.now() };
   operations.getStore()?.writes.push(outcome);
   addEmailOutcomes([outcome]);
 }
@@ -74,7 +76,7 @@ export function emailCardAcknowledgement(key: string, line: string): (messageId:
   const journal = currentEmailTurn();
   const observation = operations.getStore();
   return (messageId) => {
-    const outcome = { id: `card:${messageId}:${key}`, line };
+    const outcome = { id: `card:${messageId}:${key}`, line, recordedAt: Date.now() };
     observation?.writes.push(outcome);
     if (journal) withEmailTurn(journal, () => addEmailOutcomes([outcome]));
   };

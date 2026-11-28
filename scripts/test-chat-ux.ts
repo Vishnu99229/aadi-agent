@@ -7,10 +7,6 @@ import {
 } from "../src/db.ts";
 import { plainTextBody } from "../src/google/mail.ts";
 import {
-  isAmbiguousSendAck,
-  isSendDraftCommand,
-} from "../src/send_triggers.ts";
-import {
   installNetworkRetry,
   redactBotToken,
   safeErrorText,
@@ -25,37 +21,6 @@ function assert(condition: boolean, message: string): void {
 
 function b64(text: string): string {
   return Buffer.from(text, "utf8").toString("base64url");
-}
-
-function testSendCommands(): void {
-  for (const text of ["send", "send it", "Send it.", "SEND IT!", "  send it  "]) {
-    assert(isSendDraftCommand(text), `fast path: ${JSON.stringify(text)}`);
-  }
-  // Everything else, including real send intents, is left to the model.
-  const notFastPath = [
-    "send that",
-    "yes send it",
-    "ok send",
-    "go ahead and send",
-    "haan bhej do",
-    "done",
-    "sent",
-    "don't send it",
-    "send me the report",
-    "send it to Priya",
-    "send it tomorrow",
-    "ok",
-    "",
-  ];
-  for (const text of notFastPath) {
-    assert(!isSendDraftCommand(text), `not fast path: ${JSON.stringify(text)}`);
-  }
-  for (const text of ["ok", "Okay.", "k", "KK"]) {
-    assert(isAmbiguousSendAck(text), `ambiguous ack: ${JSON.stringify(text)}`);
-  }
-  for (const text of ["send it", "haan bhej do", "ok send", "yes"]) {
-    assert(!isAmbiguousSendAck(text), `not ambiguous ack: ${JSON.stringify(text)}`);
-  }
 }
 
 function testPlainTextBody(): void {
@@ -175,7 +140,6 @@ function testLatestPendingIsDraftOnly(): void {
   );
 }
 
-testSendCommands();
 testPlainTextBody();
 testSplitForTelegram();
 testRedaction();

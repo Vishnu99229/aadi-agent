@@ -1,6 +1,5 @@
-import { COMMAND_TOOLS, REQUEST_TO_AADI, commandIntents } from "./command_intent.js";
-import { mentionsSendDate, splitOwnerEmailCommand } from "./command_logic.js";
-import { isSendDraftCommand } from "./send_triggers.js";
+import { COMMAND_TOOLS, commandIntents } from "./command_intent.js";
+import { splitOwnerEmailCommand } from "./command_logic.js";
 
 export const CLAIM_ACTIONS = [
   "sent",
@@ -82,6 +81,10 @@ const TOOLS_FOR: Record<ClaimAction, ReadonlySet<string>> = {
   offered: new Set(["start_sequence", "draft_new_email", "draft_reply", "draft_mom"]),
 };
 
+export function isDeliveryTool(name: string): boolean {
+  return TOOLS_FOR.sent.has(name);
+}
+
 const CLAIM_RE: Record<ClaimAction, RegExp> = {
   sent: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?(?:sent|emailed)\b|\bsent (?:it|that|the (?:email|reply|mail))\b|\b(?:email|mail|reply)\s+(?:was\s+)?sent\b|^sent\b/i,
   booked: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?booked\b|\b(?:meeting|call|event)\s+(?:is\s+|was\s+)?booked\b|^booked\b/i,
@@ -153,8 +156,8 @@ export interface ClaimContext {
   ownerText?: string;
   /** True for a tool that only reads. */
   isReadTool?: (name: string) => boolean;
-  /** Actions grounded in the specific earlier record described by this reply. */
-  recordedActions?: readonly ClaimAction[];
+  /** Whether this turn has structured evidence for an email delivery. */
+  deliveryGrounded?: boolean;
 }
 
 export interface ReceiptRetryMetadata {
@@ -214,6 +217,8 @@ const ASKS_TO_LOOK =
 const ASKS_WHAT_HAPPENED = /^\s*(?:(?:thanks|thank you|please|hey|aadi)[,\s]+)*(?:how|why|any|did|does|has|have|had|was|were|is|are|when|where|who|what|which)\b/i;
 const REQUESTED_ACTION_VERB = /^(?:send|e-?mail|mail|reply|respond|start|begin|stop|set|pause|add|book|schedule|create|move|cancel|delete|remove|remember|forget|draft|write|compose|update|change|mark|complete|discard|learn|remind|block|arrange|prepare|follow)\b/i;
 
+const REQUEST_TO_AADI = /^(?:please\s+)?(?:can|could|would)\s+you\b/i;
+
 export function isLookupQuestion(ownerText: string): boolean {
   if (ASKS_WHAT_HAPPENED.test(ownerText)) return true;
   const text = ownerText.trim();
@@ -229,28 +234,17 @@ function instructionClauses(ownerText: string): string[] {
   return ownerText.split(/(?<=[?!;\n]|\.\s)\s*/).filter(clause => !isLookupQuestion(clause));
 }
 
-export function hasCurrentSendRequest(ownerText: string): boolean {
-  return instructionClauses(ownerText).some(clause => isSendDraftCommand(clause) || commandIntents(clause).includes("send"));
-}
-
 /** Only an instruction in the owner's current message can authorize an action retry. */
 export function receiptActionTools(action: ClaimAction, ownerText: string): string[] {
   // Evaluate clauses separately so "Did he reply? Send him a nudge" keeps its command.
   return [...new Set(instructionClauses(ownerText).flatMap((clause) => {
     if (action === "searched") return /\b(?:find|search|look|check|verify|latest|current)\b/i.test(clause) ? [...TOOLS_FOR.searched] : [];
-    if (action === "sent" && isSendDraftCommand(clause)) return ["confirm_send_pending_draft"];
     const kinds = commandIntents(clause);
-    if (action === "sent" && !kinds.includes("send")) return [];
+    if (action === "sent" || action === "scheduled") return [];
     const command = splitOwnerEmailCommand(clause).command;
     const verb = command.trim().replace(/^(?:(?:please|kindly|pls|can you|could you|would you|then|also)\s+)*/i, "").split(/\s+/, 2).join(" ");
     if (action !== "sent" && action !== "offered" && !ASKED_FOR[action].test(verb)) return [];
-    // A sequence mentions an email but only a separate send instruction requests delivery.
-    if (action === "sent" && kinds.includes("sequence") && !/\b(?:send|reply|respond|e-?mail)\b/i.test(clause.trim().split(/\s+/).slice(0, 4).join(" "))) return [];
-    return kinds.flatMap(kind => {
-      if (kind === "send" && action === "scheduled" && !mentionsSendDate(clause) && !/^\s*(?:please\s+)?schedule\b/i.test(clause)) return [];
-      if (kind === "send" && action === "sent" && mentionsSendDate(clause)) return [];
-      return COMMAND_TOOLS[kind].filter(tool => TOOLS_FOR[action].has(tool));
-    });
+    return kinds.flatMap(kind => COMMAND_TOOLS[kind].filter(tool => TOOLS_FOR[action].has(tool)));
   }))];
 }
 
@@ -308,8 +302,10 @@ export function unreceiptedClaims(
   if (claimed.length === 0) {
     return [];
   }
-  const missing = claimed.filter(action => !context.recordedActions?.includes(action) &&
-    !receipts.some(receipt => receiptsAction(receipt, action)),
+  const missing = claimed.filter(action =>
+    action === "sent" && context.deliveryGrounded !== undefined
+      ? !context.deliveryGrounded
+      : !receipts.some(receipt => receiptsAction(receipt, action)),
   );
   const { ownerText, isReadTool } = context;
   if (missing.length === 0 || !ownerText || !isReadTool) {
@@ -321,6 +317,7 @@ export function unreceiptedClaims(
   return missing.filter(
     (action) =>
       action === "searched" ||
+      (action === "sent" && context.deliveryGrounded !== undefined) ||
       receipts.some((row) => TOOLS_FOR[action].has(row.name)) ||
       !askedOnlyToLook(ownerText, action) ||
       claimsItself(reply, action),
