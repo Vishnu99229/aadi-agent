@@ -295,7 +295,9 @@ assert(getChatAction(1)?.email?.draftId === bob.id, "and becomes the open email"
 
   // Fahim's message much later: the closed Ashwin-style email is data, never a prefix,
   // and the reply goes on the thread the model read, not one code picked.
-  const instructions = "Also mention flexible negotiation, a one-off 24/7 availability exception, APIs and webhooks ready now, and about 300 sequential outbound calls per agent each day.";
+  // Placed by today's keyword routing with an agent that drafts replies (routing by the
+  // conversation's objective is PR D); what's checked here is that nothing is narrowed.
+  const instructions = "Draft a reply to Fahim that also mentions flexible negotiation, a one-off exception for round-the-clock agents, that APIs and webhooks are ready now, and about 300 sequential outbound dials per agent each day.";
   let reads = 0;
   let sawFacts = false;
   let narrowed = true;
