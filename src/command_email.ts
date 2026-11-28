@@ -1185,6 +1185,11 @@ async function recipientSlots(
       continue;
     }
     for (const id of offeredBy.get(match.mailbox.email) ?? []) answered.add(id);
+    // A name found in what's saved is remembered for the next turn, as the Gmail lookup
+    // this replaces did. One found only in this conversation is not.
+    if (match.tier === "saved" && parseAddressList(query).length === 0) {
+      rememberContactChoice(query, { name: match.mailbox.name, emails: [match.mailbox.email], company: undefined, sources: ["gmail"] });
+    }
     slots.push({ query, mailbox: match.mailbox });
   }
   // Answered by typing, so the old buttons can't act a second time.
