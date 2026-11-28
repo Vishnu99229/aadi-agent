@@ -303,8 +303,10 @@ function stubOkTts(): void {
       /voiceReply: spoken,/.test(botSrc),
     "voice only for non-forwarded voice turns that didn't ask for writing",
   );
-  assert(/await replyInKind\(ctx, result\.message, spoken, userText\);/.test(botSrc), "\"send it\" is spoken on a spoken turn");
-  assert(/held \? \(\) => held\.run\(work\) : work/.test(botSrc), "a spoken turn collects its cards");
+  // Since PR #42 the reply carries its recorded outcome lines, and the turn runs in its
+  // email journal; the spoken path and the card collector are the same.
+  assert(/await replyInKind\(ctx, replyFromActions\(result\.message\), spoken, userText\);/.test(botSrc), "\"send it\" is spoken on a spoken turn");
+  assert(/held \? held\.run\(work\) : work\(\)/.test(botSrc), "a spoken turn collects its cards");
   assert(/installCaptionEditFallback\(bot\.api\);/.test(botSrc), "bot edits fall back to captions");
   assert(
     /handleUserText\(ctx, ctx\.from\.id, transcript, \{ voiceReply: true \}\)/.test(
