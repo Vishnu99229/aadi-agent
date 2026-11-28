@@ -1,18 +1,19 @@
 import assert from "node:assert/strict";
 import { newRunReport, runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import { toolOwnership } from "../src/agents/registry.ts";
+import { config } from "../src/config.ts";
 import { createScheduledSend, db, recordScheduledSendSent, saveMessage } from "../src/db.ts";
 import { setCompleteForTests, type CompleteParams } from "../src/llm.ts";
 import { newTurnMeter, recordTurn } from "../src/metrics.ts";
 import { askedOnlyToLook, receiptRetryPrompt, unreceiptedClaims } from "../src/receipt.ts";
-import { recordedReceipt } from "../src/receipt_records.ts";
+import { deliveryReadsFromTool, recordedReceipt } from "../src/receipt_records.ts";
 import { modelReply } from "./fakes.ts";
 
 assert.equal(process.env.AADI_DB_PATH, ":memory:");
 assert.equal(process.env.DOTENV_CONFIG_PATH, "scripts/fixtures/test.env");
 
 const READ_RETRY = "Don't take any new action. Check the record with a read tool, then say what actually happened and when, or say you aren't sure.";
-const ADDRESS = "mukesh@example.test";
+const ADDRESS = "alice@example.test";
 const QUESTION = "thanks how many follow up does this email thread has?";
 const SENT = "2026-11-25 18:45:29";
 const originalLog = console.log;
@@ -36,7 +37,7 @@ function incident(): void {
 }
 
 type Step = Parameters<typeof modelReply>[0];
-async function replay(ownerText: string, steps: Step[], options: { confirmation?: boolean } = {}) {
+async function replay(ownerText: string, steps: Step[], options: { confirmation?: boolean; realSend?: boolean } = {}) {
   const calls: CompleteParams[] = [];
   const ran: string[] = [];
   const report = newRunReport();
@@ -44,6 +45,7 @@ async function replay(ownerText: string, steps: Step[], options: { confirmation?
     ran.push(call.name);
     if (call.name === "search_emails") return JSON.stringify([{ id: "sent43", to: ADDRESS, account: "work" }]);
     if (call.name === "start_sequence") return "Sequence offer posted.";
+    if (call.name === "send_email" && options.realSend) return undefined;
     return "Sent.";
   });
   setCompleteForTests(async (params) => {
@@ -89,26 +91,28 @@ await test("retry instructions follow current command intent", () => {
   assert.equal(receiptRetryPrompt(["sent"], `Can you check whether to send the email to ${ADDRESS}?`), READ_RETRY);
 });
 
-await test("incident question accepts the earlier send without touching pending draft 42", async () => {
+await test("looking up last week’s email returns the historical answer without a delivery outcome", async () => {
   incident();
-  const result = await replay(QUESTION, [
-    { tools: [{ name: "search_emails", input: { query: `to:${ADDRESS}` } }] },
-    { text: `I sent the email to ${ADDRESS} earlier. There are no follow-ups.` },
+  const answer = "The email was sent to Alice last week.";
+  const result = await replay("Did I email Alice last week?", [
+    { tools: [{ name: "search_emails", input: { query: `in:sent to:${ADDRESS}` } }] },
+    { text: answer },
   ]);
   assert.deepEqual(result.ran, ["search_emails"]);
   assert.equal(result.calls.length, 2);
-  assert.doesNotMatch(result.reply, /didn't happen|couldn't do that/);
+  assert.equal(result.reply, answer);
   assert.equal((db.prepare("SELECT status FROM pending_actions WHERE id=42").get() as {status:string}).status, "pending");
 });
 
 await test("sequence instruction can mention a receipted earlier send", async () => {
   incident();
   const result = await replay(`Start a sequence for ${ADDRESS}`, [
+    { tools: [{ name: "search_emails", input: { query: `in:sent to:${ADDRESS}` } }] },
     { tools: [{ name: "start_sequence", input: { prospect: ADDRESS } }] },
     { text: `I sent the email to ${ADDRESS} earlier (sent43). Sequence offer posted.` },
   ]);
-  assert.deepEqual(result.ran, ["start_sequence"]);
-  assert.equal(result.calls.length, 2);
+  assert.deepEqual(result.ran, ["search_emails", "start_sequence"]);
+  assert.equal(result.calls.length, 3);
 });
 
 await test("unknown historical claim restricts offered and executed tools including delegation", async () => {
@@ -129,16 +133,43 @@ await test("unknown historical claim restricts offered and executed tools includ
   assert.deepEqual(JSON.parse(row.receipt_retries_json), [{ actions: ["sent"], lookup: true, toolsRestricted: true }]);
 });
 
-await test("retry denial is replaced by the completed record", async () => {
+await test("a refused send stays visible even after a lookup returns an old send to Alice", async () => {
   incident();
-  const result = await replay(QUESTION, [
-    { text: `I sent the email to ${ADDRESS} (sent43). I deleted the draft.` },
-    { text: "It didn't happen. No send tool confirmed anything. Say send it." },
-  ]);
-  assert(result.reply.startsWith(`Sent to ${ADDRESS} at `));
-  assert.match(result.reply, /00:15:29/);
-  assert.doesNotMatch(result.reply, /didn't happen|Say send it/);
+  const settings = config as { sendOnCommandEnabled: boolean };
+  const previous = settings.sendOnCommandEnabled;
+  settings.sendOnCommandEnabled = true;
+  try {
+    const result = await replay(`Send the attachment to ${ADDRESS}`, [
+      { tools: [{ name: "search_emails", input: { query: `in:sent to:${ADDRESS}` } }] },
+      { tools: [{ name: "send_email", input: { to: [ADDRESS], instruction: "Send the attachment", attachment_requested: true } }] },
+      { text: `Sent to ${ADDRESS}.` },
+      { text: "Nothing went out." },
+    ], { realSend: true });
+    assert.deepEqual(result.ran, ["search_emails", "send_email"]);
+    assert.ok(result.reply.includes("I can't attach a file here"));
+    assert.ok(!result.reply.includes(`Sent to ${ADDRESS}`));
+  } finally {
+    settings.sendOnCommandEnabled = previous;
+  }
+});
+
+await test("a model claim without a send or lookup gets no credit from an older send", async () => {
+  incident();
+  const claimed = { text: `Sent to ${ADDRESS}.` };
+  const result = await replay(`Send a new email to ${ADDRESS}`, [claimed, claimed]);
   assert.deepEqual(result.ran, []);
+  assert.ok(result.reply.includes("couldn't verify"));
+  assert.ok(!result.reply.includes(claimed.text));
+});
+
+await test("a historical read never replaces the model's reply with a send summary", async () => {
+  incident();
+  const answer = "I couldn't confirm a new delivery.";
+  const result = await replay(QUESTION, [
+    { tools: [{ name: "search_emails", input: { query: `in:sent to:${ADDRESS}` } }] },
+    { text: answer },
+  ]);
+  assert.equal(result.reply, answer);
 });
 
 await test("an unrelated sent recipient cannot ground a false claim", async () => {
@@ -151,29 +182,31 @@ await test("an unrelated sent recipient cannot ground a false claim", async () =
   assert.match(result.reply, /not sure/);
 });
 
-await test("card, draft, thread and Gmail IDs distinguish sent and pending mail", () => {
+await test("delivery receipts require an exact sent message in its mailbox", () => {
   incident();
-  for (const subject of ["card #1949", "draft #43", "draft43", "thread43", "sent43"]) {
-    const record = recordedReceipt({ ownerText: `Was ${subject} sent?`, reply: "I sent it.", turnStartedAt: Date.now() });
-    assert.deepEqual(record?.actions, ["sent"], subject);
-  }
-  assert.equal(recordedReceipt({ ownerText: "Was card #1946 sent?", reply: `I sent the email to ${ADDRESS}.`, turnStartedAt: Date.now() }), undefined);
-  assert.equal(recordedReceipt({ ownerText: `Was the invoice email to ${ADDRESS} sent?`, reply: "It didn't happen.", turnStartedAt: Date.now() }), undefined);
+  const check = (content: object) => recordedReceipt({
+    outcomeIds: [],
+    reads: deliveryReadsFromTool("search_emails", JSON.stringify([content])),
+    deliveryAttempted: false, writeFailed: false,
+  });
+  assert.equal(check({ account: "work", id: "sent43" }), true);
+  assert.equal(check({ account: "personal", id: "sent43" }), false);
+  assert.equal(check({ account: "work", id: "draft42", threadId: "thread43" }), false);
+  assert.equal(check({ account: "work", id: "gmail-only", sent: true }), true);
 });
 
-await test("a schedule becomes a delivery receipt only after it is marked sent", () => {
+await test("a schedule provides current delivery evidence only after it is marked sent", () => {
   const schedule = createScheduledSend({
     key: "msg:1:8:other@example.com:future", sendAt: "2030-01-01T09:00:00Z", itemText: "Email",
     tag: "work", request: JSON.stringify({ account: "work", draftId: "schedule-draft", to: [{ mailbox: { email: "other@example.com" } }] }),
     confirmChat: 1, confirmMessage: 8,
   })!;
-  const context = { ownerText: "What happened to schedule-draft?", turnStartedAt: Date.now() };
-  assert.deepEqual(recordedReceipt({ ...context, reply: "I scheduled it." })?.actions, ["scheduled"]);
-  assert.equal(recordedReceipt({ ...context, reply: "I sent it." }), undefined);
+  const context = { outcomeIds: ["send:work:delivered-schedule"], reads: [], deliveryAttempted: true, writeFailed: false };
+  assert.equal(recordedReceipt(context), false);
   assert.deepEqual(unreceiptedClaims("Sent.", [{ name: "send_email", success: true, content: "Scheduled: Tomorrow" }]), ["sent"]);
   assert.deepEqual(unreceiptedClaims("Sent.", [{ name: "draft_reply", success: true, content: "Draft ready for approval." }]), ["sent"]);
   recordScheduledSendSent(schedule.id, "delivered-schedule");
-  assert.deepEqual(recordedReceipt({ ...context, turnStartedAt: Date.now(), reply: "I sent it." })?.actions, ["sent"]);
+  assert.equal(recordedReceipt(context), true);
 });
 
 console.log = originalLog;

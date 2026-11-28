@@ -27,7 +27,8 @@ import {
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 import { sameConversation } from "../subject_logic.js";
-import { unlinkedPhotoAddress } from "../email_references.js";
+import { parseAddressList } from "../address_list.js";
+import { photoOnlyRecipients } from "../email_references.js";
 import {
   emailProviderRead, emailProviderWrite, EmailOperationError, noteEmailFailure, noteEmailNotice,
   oneLine, outcomeRecipient, recordEmailOutcome,
@@ -136,8 +137,8 @@ export async function handler(input: unknown, turn?: ToolTurn): Promise<string> 
     throw new Error("Pass body, to, cc, subject, or a combination.");
   }
 
-  const changedRecipients = [...toAddressList(values.to), ...toAddressList(values.cc)];
-  if (unlinkedPhotoAddress(turn?.confirmation?.chatId, turn?.userText ?? "", changedRecipients)) {
+  const changedRecipients = [...toAddressList(values.to), ...toAddressList(values.cc)].flatMap(parseAddressList);
+  if ((await photoOnlyRecipients(turn ?? {}, changedRecipients)).size > 0) {
     return "Not updated: a photo address is available only for a new email with a Send card.";
   }
   const draftId = values.draft_id.trim();

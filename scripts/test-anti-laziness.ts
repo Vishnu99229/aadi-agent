@@ -1,3 +1,5 @@
+import { recordImmediateDraftSend } from "../src/db.ts";
+import { recordEmailOutcome } from "../src/email_outcomes.ts";
 import { runAgent, setToolInterceptorForTests } from "../src/agent.ts";
 import {
   detectClaimedActions,
@@ -93,14 +95,19 @@ async function testRealToolSuccessAllowed(): Promise<void> {
       tools: [{ name: "draft_reply", input: { send_immediately: true } }],
     });
   });
-  setToolInterceptorForTests(() => "Sent to priya@acme.com.");
+  setToolInterceptorForTests(() => {
+    const line = "Sent to priya@acme.com.";
+    recordImmediateDraftSend({ key: "test-delivery", account: "work", threadId: null, to: "priya@acme.com", sentMessageId: "test-sent" });
+    recordEmailOutcome("send:work:test-sent", line);
+    return line;
+  });
   const reply = await runAgent("send the Eternal email", {
     saveUserMessage: false,
     saveAssistantMessage: false,
     skipHistory: true,
   });
   assert(
-    reply === "I sent the email to Priya.",
+    reply === "Sent to priya@acme.com.\n\nI sent the email to Priya.",
     `successful send tool allows the claim, got: ${reply}`,
   );
   setCompleteForTests(undefined);

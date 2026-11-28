@@ -5,16 +5,18 @@ import type { gmail_v1 } from "googleapis";
 import { setApprovalsTestHooks } from "../src/approvals.ts";
 import { sendEmailFromTool, setCommandEmailTestHooks } from "../src/command_email.ts";
 import { config } from "../src/config.ts";
-import { createDocument, recordKnownRecipient, rememberTelegramDocumentRef } from "../src/db.ts";
-import { bindPhotoForTurn, photoForTurn } from "../src/email_references.ts";
+import { createDocument, recordConversationParticipants, recordExternalAddress, rememberTelegramDocumentRef, upsertCanonicalContact } from "../src/db.ts";
+import { bindPhotoForTurn, photoForTurn, recordOwnerTypedEmailAddresses } from "../src/email_references.ts";
 import { setGoogleAccountForTests } from "../src/google/auth.ts";
 import { setGmailClientForTests } from "../src/google/mail.ts";
 import { setCompleteForTests } from "../src/llm.ts";
 import { handler as draftNewEmail } from "../src/tools/draft_new_email.ts";
+import { handler as updateDraft } from "../src/tools/update_draft.ts";
 import { modelReply, nextMessageId } from "./fakes.ts";
 
 assert.equal(process.env.AADI_DB_PATH, ":memory:");
 let gmailDrafts = 0;
+let draftUpdates = 0;
 let draftSends = 0;
 let messageSends = 0;
 let latestDraftRecipient = "";
@@ -36,7 +38,10 @@ const gmailFor = () => ({
       get: async ({ id }: { id: string }) => ({
         data: { id, message: { id, threadId: `thread-${id}`, payload: { headers: [{ name: "To", value: draftTo.get(id) ?? "alice@example.com" }, { name: "Subject", value: "Hello" }], mimeType: "text/plain", body: { data: Buffer.from("Hello", "utf8").toString("base64url") } } } },
       }),
-      update: async ({ id }: { id: string }) => ({ data: { id, message: { id, threadId: `thread-${id}` } } }),
+      update: async ({ id }: { id: string }) => {
+        draftUpdates += 1;
+        return { data: { id, message: { id, threadId: `thread-${id}` } } };
+      },
       delete: async () => ({ data: {} }),
     },
     messages: {
@@ -72,7 +77,7 @@ const email = "info@photo.example";
 const source = createDocument("business-card.jpg", "personal", `Contact: ${email}`, null);
 const photoMessage = nextMessageId();
 rememberTelegramDocumentRef(chatId, photoMessage, source.id);
-recordKnownRecipient(email, "fixture");
+recordExternalAddress(chatId, email, `document:${source.id}`);
 const words = "Email this address about our meeting";
 const selected = { to: [email], instruction: "Thank them for meeting with me", photo_address: email };
 const turn = (messageId: number) => ({
@@ -86,7 +91,9 @@ const turn = (messageId: number) => ({
 const unlinked = turn(nextMessageId());
 assert.equal(bindPhotoForTurn(unlinked.confirmation), undefined);
 assert.equal(photoForTurn(chatId, unlinked.confirmation.messageId), undefined);
-assert.match(await sendEmailFromTool(selected, unlinked), /address is unavailable/);
+const unavailable = await sendEmailFromTool(selected, unlinked);
+assert.ok(unavailable.includes("photo address is unavailable"));
+assert.ok((await draftNewEmail({ to: email, subject: "Hello", body: "Hello." }, unlinked)).includes("photo address is unavailable"));
 assert.equal(gmailDrafts, 0);
 assert.equal(draftSends + messageSends, 0);
 
@@ -99,10 +106,10 @@ const linked = turn(nextMessageId());
 assert.deepEqual(bindPhotoForTurn({
   ...linked.confirmation, replyTo: { message_id: photoMessage, photo: [{}] },
 })?.emails, [email]);
-assert.match(await sendEmailFromTool(selected, linked), /Tap Send to confirm/);
+assert.ok((await sendEmailFromTool(selected, linked)).includes("Tap Send to confirm"));
 assert.ok(latestDraftRecipient.includes(email));
 assert.equal(gmailDrafts, 1);
-assert.equal(draftSends + messageSends, 0, "even a known photo address waits on a Send card");
+assert.equal(draftSends + messageSends, 0, "the photo-only address waits on its Send card");
 
 const sameTurn = turn(nextMessageId());
 rememberTelegramDocumentRef(chatId, sameTurn.confirmation.messageId, source.id);
@@ -111,8 +118,39 @@ await draftNewEmail({ to: email, photo_address: email, subject: "Hello", body: "
 assert.equal(gmailDrafts, 2);
 assert.equal(draftSends + messageSends, 0);
 assert.equal(cardIds.length, 2);
-assert.match(await draftNewEmail({ to: email, subject: "Hello", body: "Hello." }, unlinked), /photo address is unavailable/);
+assert.ok((await draftNewEmail({ to: email, subject: "Hello", body: "Hello." }, unlinked)).includes("photo address is unavailable"));
 assert.equal(gmailDrafts, 2, "a stale OCR selection cannot create a draft");
+
+const alice = "alice@example.com";
+const oldPhoto = createDocument("older-photo.jpg", "personal", `Email: ${alice}`, null);
+recordExternalAddress(chatId, alice, `document:${oldPhoto.id}`);
+upsertCanonicalContact({
+  nameKey: "alice", displayName: "Alice", emailsJson: JSON.stringify([alice]),
+  aliasesJson: "[]", sourcesJson: "[]", confirmed: true, updatedAt: new Date().toISOString(),
+});
+const aliceTurn = turn(nextMessageId());
+assert.equal(photoForTurn(chatId, aliceTurn.confirmation.messageId), undefined);
+const drafted = await draftNewEmail({ to: alice, subject: "Hello Alice", body: "Hello." }, aliceTurn);
+assert.ok(drafted.includes("Draft created for") && drafted.includes(alice), drafted);
+assert.equal(gmailDrafts, 3);
+const updated = await updateDraft({ draft_id: "new-3", to: alice, subject: "New subject" }, turn(nextMessageId()));
+assert.equal(JSON.parse(updated).draft_id, "new-3");
+assert.equal(draftUpdates, 1);
+const blockedUpdate = await updateDraft({ draft_id: "new-3", to: email }, turn(nextMessageId()));
+assert.ok(blockedUpdate.includes("Not updated"));
+assert.equal(draftUpdates, 1);
+
+const typed = "provided@example.com";
+const participant = "participant@example.com";
+for (const address of [typed, participant]) recordExternalAddress(chatId, address, `document:${oldPhoto.id}`);
+recordOwnerTypedEmailAddresses(chatId, `Contact: ${typed}`);
+recordConversationParticipants(chatId, [{ email: participant }], "email", "gmail-thread");
+for (const address of [typed, participant]) {
+  const result = await draftNewEmail({ to: address, subject: "Hello", body: "Hello." }, turn(nextMessageId()));
+  assert.ok(result.includes("Draft created for") && result.includes(address), result);
+}
+assert.equal(gmailDrafts, 5);
+assert.equal(draftSends + messageSends, 0);
 
 setCompleteForTests(undefined);
 console.log("OCR recipient checks passed.");

@@ -481,7 +481,7 @@ setRecentSendGuardForTests(true);
   assert(recentSendsFor([address]).length === 1, "and is recorded where the recent-send check reads");
 }
 
-// ---- 14. "Email this address" on a photo: the card, even for an address he knows ----
+// ---- 14. A Sent record establishes the recipient independently of the photo ----
 {
   const chat = 24;
   const address = "photo.known@known.example";
@@ -492,7 +492,7 @@ setRecentSendGuardForTests(true);
   bindPhotoForTurn({ ...turn.confirmation, currentPhoto: true });
   const before = messageSends.length;
   const result = await sendEmailFromTool({ to: [address], photo_address: address, instruction: "say we met at BTS" }, turn);
-  assert(result.includes(`New address: ${address}. Tap Send to confirm.`) && messageSends.length === before, `a photo's address gets the card: ${result}`);
+  assert(result.startsWith("Sent to") && messageSends.length === before + 1, `the independent Sent record uses the normal delivery decision: ${result}`);
 }
 
 // ---- 15. A photo's address is never an attendee or an invitee unless he types it ----

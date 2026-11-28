@@ -81,6 +81,10 @@ const TOOLS_FOR: Record<ClaimAction, ReadonlySet<string>> = {
   offered: new Set(["start_sequence", "draft_new_email", "draft_reply", "draft_mom"]),
 };
 
+export function isDeliveryTool(name: string): boolean {
+  return TOOLS_FOR.sent.has(name);
+}
+
 const CLAIM_RE: Record<ClaimAction, RegExp> = {
   sent: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?(?:sent|emailed)\b|\bsent (?:it|that|the (?:email|reply|mail))\b|\b(?:email|mail|reply)\s+(?:was\s+)?sent\b|^sent\b/i,
   booked: /\b(i(?:'ve| have)?|we)\s+(?:just\s+)?booked\b|\b(?:meeting|call|event)\s+(?:is\s+|was\s+)?booked\b|^booked\b/i,
@@ -152,8 +156,8 @@ export interface ClaimContext {
   ownerText?: string;
   /** True for a tool that only reads. */
   isReadTool?: (name: string) => boolean;
-  /** Actions grounded in the specific earlier record described by this reply. */
-  recordedActions?: readonly ClaimAction[];
+  /** Whether this turn has structured evidence for an email delivery. */
+  deliveryGrounded?: boolean;
 }
 
 export interface ReceiptRetryMetadata {
@@ -298,8 +302,10 @@ export function unreceiptedClaims(
   if (claimed.length === 0) {
     return [];
   }
-  const missing = claimed.filter(action => !context.recordedActions?.includes(action) &&
-    !receipts.some(receipt => receiptsAction(receipt, action)),
+  const missing = claimed.filter(action =>
+    action === "sent" && context.deliveryGrounded !== undefined
+      ? !context.deliveryGrounded
+      : !receipts.some(receipt => receiptsAction(receipt, action)),
   );
   const { ownerText, isReadTool } = context;
   if (missing.length === 0 || !ownerText || !isReadTool) {
@@ -311,6 +317,7 @@ export function unreceiptedClaims(
   return missing.filter(
     (action) =>
       action === "searched" ||
+      (action === "sent" && context.deliveryGrounded !== undefined) ||
       receipts.some((row) => TOOLS_FOR[action].has(row.name)) ||
       !askedOnlyToLook(ownerText, action) ||
       claimsItself(reply, action),

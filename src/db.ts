@@ -2418,7 +2418,7 @@ export function recordConversationParticipants(
       if (!email.includes("@")) continue;
       upsert.run(chatId, email, (person.name ?? "").trim(), source, sourceRef, now.toISOString());
     }
-    db.prepare("DELETE FROM conversation_participants WHERE chat_id = ? AND seen_at < ?")
+    db.prepare("DELETE FROM conversation_participants WHERE chat_id = ? AND source <> 'owner_text' AND seen_at < ?")
       .run(chatId, new Date(now.getTime() - PARTICIPANT_RETENTION_MS).toISOString());
   })();
 }
@@ -2426,7 +2426,7 @@ export function recordConversationParticipants(
 export function conversationParticipants(chatId: number, sinceIso: string): ConversationParticipant[] {
   const rows = db.prepare(
     `SELECT email, name, source, source_ref, seen_at FROM conversation_participants
-     WHERE chat_id = ? AND seen_at >= ? ORDER BY seen_at DESC`,
+     WHERE chat_id = ? AND (source = 'owner_text' OR seen_at >= ?) ORDER BY seen_at DESC`,
   ).all(chatId, sinceIso) as Array<{ email: string; name: string; source: string; source_ref: string; seen_at: string }>;
   return rows.map((row) => ({ email: row.email, name: row.name, source: row.source, sourceRef: row.source_ref, seenAt: row.seen_at }));
 }

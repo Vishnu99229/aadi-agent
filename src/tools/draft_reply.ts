@@ -15,7 +15,7 @@ import {
 import { linkPublishedDraft } from "../action_context.js";
 import { parseAddressList } from "../mail_helpers.js";
 import { isSelfEmail } from "../mom_logic.js";
-import { unlinkedPhotoAddress } from "../email_references.js";
+import { photoOnlyRecipients } from "../email_references.js";
 import { groundGreeting, recipientGrounding } from "../email_grounding.js";
 import { emailProviderRead, EmailOperationError, noteEmailFailure } from "../email_outcomes.js";
 
@@ -153,7 +153,8 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   const explicitTo = toAddressList(values.to).join(", ");
   const explicitCc = toAddressList(values.cc).join(", ");
-  if (unlinkedPhotoAddress(turn.confirmation?.chatId, turn.userText ?? "", [explicitTo, explicitCc])) {
+  const threadPeople = [from, header(headers, "To"), header(headers, "Cc")].flatMap(parseAddressList);
+  if ((await photoOnlyRecipients(turn, [explicitTo, explicitCc].flatMap(parseAddressList), { threadPeople })).size > 0) {
     return "Not drafted: a photo address is available only for a new email with a Send card.";
   }
   const fromIsSelf = senders.every((item) =>

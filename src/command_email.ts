@@ -20,7 +20,7 @@ import {
   type ResolvedAttendee,
 } from "./action_context.js";
 import { rememberContactChoice } from "./contacts.js";
-import { addressesFromReference, photoForTurn, selectedPhotoAddress } from "./email_references.js";
+import { photoOnlyRecipients, photoRecipientForNewEmail } from "./email_references.js";
 import { writeCommandEmail } from "./command_writer.js";
 import { knownRecipients, markRecipientsKnown } from "./known_recipients.js";
 import { cardReason, decideSendAction, recentSendLine, type RecentSend, type SendVerdict } from "./security/send_decision.js";
@@ -153,8 +153,7 @@ export interface CommandRequest {
   /** He tapped Confirm on a card that said "You emailed X at T": address to the newest
    *  send that card named. Later sends to them still wait for him. */
   recentSendsConfirmed?: Record<string, string>;
-  /** Addresses taken from a photo or quoted message he pointed at, never typed or known
-   *  from records: the card always shows them as new. */
+  /** Recipients available only from a photo linked to the turn. */
   externalRecipients?: string[];
 }
 
@@ -1164,7 +1163,7 @@ async function recipientSlots(
   const slots: RecipientSlot[] = [];
   for (const query of queries) {
     // The thread he wants a reply on is one this chat refers to: its people count.
-    const match = await resolvePersonFromFacts(query, { ...context, offered: [...offered, ...(context.threadPeople ?? [])], now });
+    const match = await resolvePersonFromFacts(query, { ...context, offered, now });
     if (match.kind === "none") {
       return personRefusal(refusal, query, match);
     }
@@ -1252,22 +1251,21 @@ export async function sendEmailFromTool(
   const parsedWhen = parseSendAt(values.send_on, values.send_time, now);
   if (typeof parsedWhen === "object") return parsedWhen.refused;
   const when = parsedWhen ?? (typeof values.draft_id === "string" && pendingEmail?.draftId === values.draft_id ? pendingEmail?.sendAt : undefined);
-  const photo = photoForTurn(confirmation.chatId, confirmation.messageId, now.getTime());
-  const referencedEmail = selectedPhotoAddress(values.photo_address, photo);
-  if (values.photo_address !== undefined && !referencedEmail) {
-    return "Not sent: that address is unavailable. Reply directly to the photo or attach it to this message.";
-  }
-  if (referencedEmail && (when || values.thread_id || values.draft_id)) {
-    return "Not sent: a photo address requires a new email with a Send card. Use draft_new_email to prepare it.";
-  }
-  if (!when && values.draft_id !== undefined) {
-    return "Use confirm_send_pending_draft to send an existing draft from its card.";
-  }
   const toQueries = stringList(values.to);
   const ccQueries = stringList(values.cc);
   const instruction = typeof values.instruction === "string" ? values.instruction.trim() : "";
-  if (referencedEmail && (toQueries.length !== 1 || toQueries[0]?.trim().toLowerCase() !== referencedEmail)) {
-    return "Not sent: To must match the selected address from the photo.";
+  const threadPeople = await threadPeopleOf(values);
+  const sourceOptions = { threadPeople, now };
+  const photo = await photoRecipientForNewEmail(
+    turn, toQueries.flatMap(parseAddressList), ccQueries.flatMap(parseAddressList), values.photo_address, sourceOptions,
+  );
+  if (photo.error) return `Not sent: ${photo.error}`;
+  const referencedEmail = photo.recipient;
+  if (referencedEmail && (when || values.thread_id || values.draft_id)) {
+    return "Not sent: a photo-only address requires a new email with a Send card. Use draft_new_email to prepare it.";
+  }
+  if (!when && values.draft_id !== undefined) {
+    return "Use confirm_send_pending_draft to send an existing draft from its card.";
   }
   if (toQueries.length === 0) {
     return "Not sent: he didn't name anyone. Ask him who it's for.";
@@ -1275,15 +1273,13 @@ export async function sendEmailFromTool(
   if (!instruction) {
     return "Not sent: I don't know what it should say. Ask him.";
   }
-  // The address from the photo linked to this turn is used
-  // as it is for this email only, never as a fact about people, and always new on its
-  // card even if he has emailed it before. Everyone else comes from the facts.
+  // Only a photo-only recipient needs a Send card because of its source.
   const referencedSlot: RecipientSlot | undefined = referencedEmail
     ? { query: referencedEmail, mailbox: { email: referencedEmail, name: "" } }
     : undefined;
   const resolvedSlots = await recipientSlots(
     referencedSlot ? ccQueries : [...toQueries, ...ccQueries],
-    { chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: ownWords, threadPeople: await threadPeopleOf(values) },
+    { chatId: confirmation.chatId, messageId: confirmation.messageId, ownerText: ownWords, threadPeople },
     now,
     when ? "Not scheduled" : "Not sent",
   );
@@ -1313,9 +1309,10 @@ export async function sendEmailFromTool(
     }
     return slots;
   }
-  const typed = new Set(addressesFromReference(ownWords));
-  if (!referencedEmail && slots.some(slot => slot.mailbox && photo?.emails.includes(slot.mailbox.email) && !typed.has(slot.mailbox.email))) {
-    return "Not sent: use photo_address for an address from the linked photo and prepare it with a Send card.";
+  const resolvedPeople = slots.slice(referencedEmail ? 1 : 0)
+    .flatMap(slot => slot.mailbox ? [slot.mailbox] : slot.options ?? []);
+  if ((await photoOnlyRecipients(turn, resolvedPeople, sourceOptions)).size > 0) {
+    return "Not sent: select the address from the linked photo as To to prepare its Send card.";
   }
   const request: CommandRequest = {
     kind: "email",

@@ -66,6 +66,7 @@ import { AgentTaskError } from "./agents/types.js";
 import type { ReactionSession } from "./contextual_react.js";
 import {
   isSuccessfulToolResult,
+  isDeliveryTool,
   receiptFailureMessage,
   isLookupQuestion,
   receiptActionTools,
@@ -75,11 +76,10 @@ import {
   type ReceiptRetryMetadata,
   type ToolReceipt,
 } from "./receipt.js";
-import { contradictsRecordedSend, recordedReceipt } from "./receipt_records.js";
+import { deliveryReadsFromTool, recordedReceipt } from "./receipt_records.js";
 import { emailRecoveryForModel, hasEmailRecovery, recordEmailRecovery, type EmailRecovery } from "./email_recovery.js";
 import { addEmailOutcomes, currentEmailTurn, newEmailTurn, renderEmailOutcomes, withEmailTurn } from "./email_outcomes.js";
 import type { WorkflowToolRun } from "./agents/dispatch.js";
-import { repliedMessageForTurn } from "./email_references.js";
 import {
   parseSearchSources,
   withSearchCitations,
@@ -648,7 +648,6 @@ async function runAgentLoop(
   options: RunAgentOptions,
   local?: LocalRun,
 ): Promise<string> {
-  const turnStartedAt = Date.now();
   const saveUserMessage = options.saveUserMessage ?? true;
   const saveAssistantMessage = options.saveAssistantMessage ?? true;
   const saveReply = (reply: string, save: boolean): string => {
@@ -704,6 +703,7 @@ async function runAgentLoop(
     dynamic: [
       `Current date and time in ${TIME_ZONE}: ${formatCurrentTime()}`,
       sendIntentContext(options.sendConfirmation),
+      "Report a delivery as new only after a send succeeded in this turn. When a mail lookup shows an earlier delivery, answer about that message and its date.",
       config.sendOnCommandEnabled && (!specialist || specialist.usesCommandTools())
         ? SEND_ON_COMMAND_NOTE
         : "",
@@ -852,10 +852,12 @@ async function runAgentLoop(
     },
     credit: (runs) => {
       for (const run of runs) {
-        if (run.emailOutcomes) addEmailOutcomes(run.emailOutcomes);
+        if (run.emailOutcomes) {
+          addEmailOutcomes(run.emailOutcomes.filter(outcome => outcome.recordedAt >= turnContext.emailTurn.startedAt));
+        }
         if (run.emailRecoveryUpdate) recordEmailRecovery(turnContext.emailTurn, run.emailRecoveryUpdate);
         toolsUsed.add(run.tool);
-        receipts.push({ name: run.tool, success: run.ok, content: run.content });
+        noteToolReceipt({ name: run.tool, success: run.ok, content: run.content }, run.emailRecovery);
         if (isFamilyTool(run.tool)) {
           freshResults.push(run.content);
         }
@@ -900,8 +902,20 @@ async function runAgentLoop(
   let receiptRetryUsed = false;
   let receiptRetryReadOnly = false;
   const receipts: ToolReceipt[] = [];
-  const receiptReads: string[] = [];
-  let previousReceipt: ReturnType<typeof recordedReceipt>;
+  const receiptReads: ReturnType<typeof deliveryReadsFromTool> = [];
+  let writeFailed = false;
+  function noteToolReceipt(receipt: ToolReceipt, recovery?: EmailRecovery): void {
+    receipts.push(receipt);
+    const effect = toolOwnership(receipt.name)?.effect;
+    if (effect === "read" && receipt.success && receipt.content !== undefined) {
+      receiptReads.push(...deliveryReadsFromTool(receipt.name, receipt.content));
+    }
+    if (effect && effect !== "read" && (!receipt.success || recovery)) {
+      writeFailed = true;
+      const reason = recovery?.userMessage ?? receipt.content;
+      if (reason?.trim()) turnContext.emailTurn.notices.add(reason);
+    }
+  }
   const draftBodies: string[] = [];
   let searchSources: SearchHit[] = [];
   /** The official release pages a release check read. They are cited ahead of search hits. */
@@ -1103,21 +1117,7 @@ async function runAgentLoop(
         const call = clientToolCalls[i]!;
         const result = toolResults[i]!;
         const success = isSuccessfulToolResult(result.content, result.isError);
-        if (success && call.name === "search_emails") receiptReads.push(result.content);
-        if (success && call.name === "read_email") {
-          const id = (call.input as { id?: unknown } | undefined)?.id;
-          const tag = /^Account: [^\n]+\nTag: (work|personal)\n/.exec(result.content)?.[1];
-          if (typeof id === "string" && tag) receiptReads.push(JSON.stringify({ id: id.trim(), account: tag }));
-        }
-        if (success && call.name === "read_draft") {
-          const draftId = /^Draft ID: (\S+)\n/.exec(result.content)?.[1];
-          if (draftId) receiptReads.push(JSON.stringify({ draft_id: draftId }));
-        }
-        receipts.push({
-          name: call.name,
-          success,
-          content: result.content,
-        });
+        noteToolReceipt({ name: call.name, success, content: result.content }, result.emailRecovery);
         const draftBody = draftBodyFromCall(call.name, call.input, success);
         if (draftBody) {
           draftBodies.push(draftBody);
@@ -1314,21 +1314,6 @@ async function runAgentLoop(
       succeeded = !toolFailed;
       return "";
     }
-    const record = recordedReceipt({
-      ownerText: guardText,
-      reply: finalReply,
-      repliedCard: repliedMessageForTurn(options.sendConfirmation?.chatId, options.sendConfirmation?.messageId),
-      reads: receiptReads,
-      history: history.messages.filter(message => message.role === "assistant").map(message => message.content),
-      turnStartedAt,
-    });
-    if (contradictsRecordedSend(finalReply)) {
-      const completed = record ?? (receiptRetryUsed && !/[@#]|\b(?:draft_id|thread_id|sent_message_id)\b/i.test(finalReply) ? previousReceipt : undefined);
-      if (completed?.actions.includes("sent")) {
-        succeeded = true;
-        return saveReply(completed.summary, saveAssistantMessage);
-      }
-    }
     if (
       !receiptRetryUsed && intents.length > 0 &&
       echoesEarlierReply(finalReply, earlierReplies, freshResults, earlierToolResults)
@@ -1345,12 +1330,16 @@ async function runAgentLoop(
     const missing = unreceiptedClaims(finalReply, receipts, {
       ownerText: guardText,
       isReadTool: (name) => toolOwnership(name)?.effect === "read",
-      recordedActions: record?.actions,
+      deliveryGrounded: recordedReceipt({
+        outcomeIds: turnContext.emailTurn.writes.keys(),
+        reads: receiptReads,
+        deliveryAttempted: receipts.some(receipt => isDeliveryTool(receipt.name)),
+        writeFailed,
+      }),
     });
     if (missing.length > 0) {
       if (!receiptRetryUsed) {
         receiptRetryUsed = true;
-        previousReceipt = record;
         const retryText = options.delegation || options.toolNames ? "" : guardText;
         receiptRetryReadOnly = receiptRetryIsReadOnly(missing, retryText);
         allowedTools.receiptToolAllowed = (name) => toolOwnership(name)?.effect === "read" ||

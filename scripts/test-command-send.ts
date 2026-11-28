@@ -1734,7 +1734,7 @@ await expectCancelled("delete_task", async (row) => {
   // emailed before (known): the email itself goes out with no Send card.
   for (const address of [
     "kai@kappa-co.com", "kim@kim-co.com", "fay@fay-co.com", "lee@lambda-co.com", "lia@lambda-co.com",
-    "mia@mu-co.com", "mona@mo-co.com", "omi@omi-co.com",
+    "mia@mu-co.com", "mona@mo-co.com",
   ]) {
     mail({ threadId: `earlier-${address}`, from: `Vishnu <${ME}>`, to: address, subject: "Earlier", body: "Hi", sent: true });
   }
@@ -1759,7 +1759,7 @@ await expectCancelled("delete_task", async (row) => {
   const unsent = own("Please start follow-ups on the email you send now.");
   assert((await startSequenceFromTool("", model(unsent), undefined, args)).startsWith("Not started yet"), "no sequence before delivery");
 
-  // This address is known from Sent mail, but here it was selected from a photo.
+  // This fixture introduces the address only through a linked photo.
   const address = "omi@omi-co.com";
   const ocrTurn = own("Email the person on this card and set up follow-ups.");
   const photo = createDocument("business-card.jpg", "personal", address, null);

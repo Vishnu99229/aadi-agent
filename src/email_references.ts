@@ -1,6 +1,12 @@
-import { documentRefForTelegramMessage, externalAddresses, getDocument, pendingDraftActionForMessage, recordExternalAddress } from "./db.js";
+import {
+  conversationParticipants, documentRefForTelegramMessage, externalAddresses, getDocument,
+  listCanonicalContacts, pendingDraftActionForMessage, recordConversationParticipants, recordExternalAddress,
+} from "./db.js";
 import { config } from "./config.js";
-import { parseAddressList } from "./address_list.js";
+import { parseAddressList, type ParsedMailbox } from "./address_list.js";
+import { knownRecipients } from "./known_recipients.js";
+
+export const CONVERSATION_WINDOW_MS = 3 * 60 * 60 * 1000;
 
 const REPLY_WINDOW_MS = 4 * 60 * 60_000;
 const BINDING_WINDOW_MS = 10 * 60_000;
@@ -58,19 +64,77 @@ export function addressesFromReference(text: string): string[] {
   return [...new Set((text.match(EMAILS) ?? []).map(email => email.toLowerCase()))];
 }
 
-export function unlinkedPhotoAddress(chatId: number | undefined, ownerText: string, headers: string[]): string | undefined {
-  if (chatId === undefined) return undefined;
-  const typed = new Set(addressesFromReference(ownerText));
-  const external = new Set(externalAddresses(chatId));
-  return headers.flatMap(header => parseAddressList(header)).map(({ email }) => email.toLowerCase())
-    .find(email => external.has(email) && !typed.has(email));
+export function recordOwnerTypedEmailAddresses(chatId: number, text: string): void {
+  const addresses = parseAddressList(text);
+  if (addresses.length > 0) recordConversationParticipants(chatId, addresses, "owner_text", "");
 }
 
-/** A model-provided address is data and must match one extracted from the linked photo. */
-export function selectedPhotoAddress(value: unknown, photo: PhotoBinding | undefined): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const address = value.trim().toLowerCase();
-  return photo?.emails.includes(address) && parseAddressList(address)[0]?.email === address ? address : undefined;
+interface RecipientSourceContext {
+  confirmation?: { chatId: number; messageId: number };
+  ownTurn?: boolean;
+  userText?: string;
+}
+
+function independentlyRecordedRecipients(chatId: number, now: Date): Set<string> {
+  const confirmed = new Set<string>();
+  for (const contact of listCanonicalContacts()) {
+    if (!contact.confirmed) continue;
+    try {
+      const emails: unknown = JSON.parse(contact.emails_json);
+      if (!Array.isArray(emails)) continue;
+      for (const email of emails) if (typeof email === "string") confirmed.add(email.trim().toLowerCase());
+    } catch {
+      // An unreadable contact supplies no recipient evidence.
+    }
+  }
+  const since = new Date(now.getTime() - CONVERSATION_WINDOW_MS).toISOString();
+  for (const person of conversationParticipants(chatId, since)) {
+    if (person.source === "owner_text" || person.source === "email") confirmed.add(person.email);
+  }
+  return confirmed;
+}
+
+/** An address from a photo needs separate handling only until another source establishes it. */
+export async function photoOnlyRecipients(
+  context: RecipientSourceContext,
+  recipients: readonly ParsedMailbox[],
+  options: { photoAddress?: string; threadPeople?: readonly ParsedMailbox[]; now?: Date } = {},
+): Promise<Set<string>> {
+  const chatId = context.confirmation?.chatId;
+  const exposed = chatId === undefined ? new Set<string>() : externalAddresses(chatId);
+  if (options.photoAddress) exposed.add(options.photoAddress);
+  const candidates = new Set(recipients.map(({ email }) => email).filter(email => exposed.has(email)));
+  if (candidates.size === 0) return candidates;
+  const independent = chatId === undefined ? new Set<string>() : independentlyRecordedRecipients(chatId, options.now ?? new Date());
+  const typed = context.ownTurn ? parseAddressList(context.userText ?? "") : [];
+  for (const { email } of [...typed, ...(options.threadPeople ?? [])]) independent.add(email);
+  const unchecked = [...candidates].filter(email => !independent.has(email));
+  const sent = await knownRecipients(unchecked);
+  return new Set(unchecked.filter(email => !sent.has(email)));
+}
+
+export async function photoRecipientForNewEmail(
+  context: RecipientSourceContext,
+  to: readonly ParsedMailbox[],
+  cc: readonly ParsedMailbox[],
+  value: unknown,
+  options: { threadPeople?: readonly ParsedMailbox[]; now?: Date } = {},
+): Promise<{ recipient?: string; error?: string }> {
+  const selected = typeof value === "string" ? value.trim().toLowerCase() : undefined;
+  if (value !== undefined && (!selected || to.length !== 1 || to[0]?.email !== selected)) {
+    return { error: "To must match the selected photo address." };
+  }
+  const restricted = await photoOnlyRecipients(context, [...to, ...cc], { ...options, photoAddress: selected });
+  if (restricted.size === 0) return {};
+  const photo = photoForTurn(context.confirmation?.chatId, context.confirmation?.messageId, options.now?.getTime());
+  if ([...restricted].some(email => !photo?.emails.includes(email))) {
+    return { error: "That photo address is unavailable. Reply directly to the photo or attach it to this message." };
+  }
+  const address = to[0]?.email;
+  if (to.length !== 1 || !address || !restricted.has(address) || cc.some(({ email }) => restricted.has(email))) {
+    return { error: "Use the linked photo address as the sole To recipient on a new email." };
+  }
+  return { recipient: address };
 }
 
 /** The Telegram message his own message replied to, for this turn only. It says which

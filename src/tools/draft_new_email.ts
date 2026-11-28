@@ -12,7 +12,7 @@ import { parseAddressList } from "../address_list.js";
 import { getGoogleAccount } from "../google/auth.js";
 import { createNewEmailDraft, signatureHtmlFor, signaturePlainText } from "../google/mail.js";
 import { linkPublishedDraft } from "../action_context.js";
-import { photoForTurn, selectedPhotoAddress, unlinkedPhotoAddress } from "../email_references.js";
+import { photoRecipientForNewEmail } from "../email_references.js";
 import { dropSelf, toAddressList } from "./draft_reply.js";
 import type { ToolTurn } from "./index.js";
 import { emailProviderRead, EmailOperationError, noteEmailFailure, noteEmailTarget } from "../email_outcomes.js";
@@ -77,20 +77,12 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   if (typeof values.to !== "string" || !values.to.trim()) {
     throw new Error("to must be a non-empty email address.");
   }
-  const chatId = turn.confirmation?.chatId;
-  const photo = photoForTurn(chatId, turn.confirmation?.messageId);
-  const selectedPhoto = selectedPhotoAddress(values.photo_address, photo);
   const selectedTo = values.to.trim();
-  if (values.photo_address !== undefined) {
-    const chosen = parseAddressList(selectedTo);
-    if (!selectedPhoto || chosen.length !== 1 || chosen[0]?.email.toLowerCase() !== selectedPhoto) {
-      return "Not drafted: To must match the selected address in the photo attached to this message or replied to.";
-    }
-  }
   const copyHeaders = toAddressList(values.cc);
-  if (unlinkedPhotoAddress(chatId, turn.userText ?? "", [...(selectedPhoto ? [] : [selectedTo]), ...copyHeaders])) {
-    return "Not drafted: that photo address is unavailable. Reply directly to the photo or provide the address.";
-  }
+  const photo = await photoRecipientForNewEmail(
+    turn, parseAddressList(selectedTo), copyHeaders.flatMap(parseAddressList), values.photo_address,
+  );
+  if (photo.error) return `Not drafted: ${photo.error}`;
   if (typeof values.subject !== "string" || !values.subject.trim()) {
     throw new Error("subject must be a non-empty string.");
   }
@@ -108,7 +100,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
   let ccHeader = "";
   if (values.cc !== undefined) {
     ccHeader = dropSelf(toAddressList(values.cc).join(", "));
-  } else {
+  } else if (!photo.recipient) {
     const split = splitDraftRecipients(
       parseAddressList(toHeader),
       `${subject}\n${values.body}`,
@@ -140,7 +132,7 @@ export async function handler(input: unknown, turn: ToolTurn): Promise<string> {
 
   let cardNote = "";
   const sendImmediately =
-    values.send_immediately === true && !selectedPhoto;
+    values.send_immediately === true && !photo.recipient;
   const signature = signaturePlainText(signatureHtml);
   if (sendImmediately) {
     const sent = await sendCreatedDraftNow({
