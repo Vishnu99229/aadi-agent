@@ -855,9 +855,10 @@ assert(
   const approvalsGateSrc = await readFile(join(root, "src/approvals.ts"), "utf8");
   const performStart = approvalsGateSrc.indexOf("async function performDraftSend(");
   const performBody = approvalsGateSrc.slice(performStart, approvalsGateSrc.indexOf("\n}\n", performStart));
-  assert(performStart !== -1 && performBody.includes(".drafts.send("), "performDraftSend is the card route's Gmail send");
+  // The Gmail call itself is deliverGmailDraft's; performDraftSend reaches it after the gate.
+  assert(performStart !== -1 && performBody.includes("deliverGmailDraft("), "performDraftSend is the card route's Gmail send");
   assert(
-    performBody.indexOf("evaluateCommandSendGate(") !== -1 && performBody.indexOf("evaluateCommandSendGate(") < performBody.indexOf(".drafts.send("),
+    performBody.indexOf("evaluateCommandSendGate(") !== -1 && performBody.indexOf("evaluateCommandSendGate(") < performBody.indexOf("deliverGmailDraft("),
     "the card route's drafts.send runs the shared gate first",
   );
   const commandEmailSrc = await readFile(join(root, "src/command_email.ts"), "utf8");
@@ -877,11 +878,14 @@ assert(
   };
   const legacyImmediate = bodyOf(approvalsGateSrc, "sendCreatedDraftNow");
   const gatedDraftSends = [performBody, legacyImmediate];
+  // One Gmail draft send, in deliverGmailDraft, reached only from the gated delivery functions.
   const gmailDraftSend = /\.users\.drafts\.send\s*\(/g;
-  assert((approvalsGateSrc.match(gmailDraftSend) ?? []).length === gatedDraftSends.length, "every draft Gmail call is in a gated delivery function");
+  assert((approvalsGateSrc.match(gmailDraftSend) ?? []).length === 1 && bodyOf(approvalsGateSrc, "deliverGmailDraft").match(gmailDraftSend),
+    "the draft Gmail call is deliverGmailDraft's alone");
+  assert((approvalsGateSrc.match(/await deliverGmailDraft\(/g) ?? []).length === gatedDraftSends.length, "every draft Gmail call is in a gated delivery function");
   for (const body of gatedDraftSends) {
     const check = body.indexOf("assertSendDecision(");
-    assert(check >= 0 && check < body.indexOf(".users.drafts.send("), "each draft Gmail call checks the shared decision first");
+    assert(check >= 0 && check < body.indexOf("deliverGmailDraft("), "each draft Gmail call checks the shared decision first");
   }
   const rawCommand = bodyOf(commandSendSrc, "sendCommandEmail");
   assert(rawCommand.indexOf("assertSendDecision(") >= 0 && rawCommand.indexOf("assertSendDecision(") < rawCommand.indexOf(".users.messages.send("), "the direct and scheduled command Gmail call checks the same decision");
